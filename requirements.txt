@@ -1,4 +1,5 @@
-cadquery-ocp>=7.8
+# OpenCascade 8 (Python 3.11+): 7.9 drops the reflection of mirrored STEP instances.
+cadquery-ocp>=8.0
 fastapi>=0.110
 uvicorn>=0.29
 python-multipart>=0.0.9
@@ -8,3 +9,5 @@ trimesh>=4.0
 networkx>=3.0
 lxml>=5.0
 pycollada>=0.8
+# trimesh's fallback decoder for text files that are not UTF-8
+charset-normalizer>=3

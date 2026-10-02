@@ -17,8 +17,15 @@ import { ROOT, approx, approxVec, fixtureBytes, loadExpected } from './helpers.m
 
 // Parity tolerances (see the shared spec).
 const EXACT = 1e-7; // volume, area, centroid: exact B-rep integrals on both sides
+// Analytic volume of rational NURBS solids: BRepGProp's adaptive integration
+// (Eps 1e-10 in both engines) converges to about 2e-8 of the true value there.
+const NURBS = 1e-7;
 const BBOX = 1e-6; // bounding boxes, relative to the model size
-const MESH = 2e-3; // tessellation-dependent values (OCCT versions differ)
+const OBB = 1e-6; // oriented envelope of one and the same tessellation (R4 parity target)
+// Mesh volume of one and the same tessellation (same triangle count) in both
+// engines: only the summation order differs (observed: below 1e-14).
+const SAME_MESH = 1e-9;
+const OTHER_MESH = 1e-2; // oriented envelope of another tessellation of the model
 const COLOR = 1e-3;
 
 const expected = loadExpected();
@@ -109,9 +116,10 @@ function checkParity(result, exp, name) {
     approxVec(body.bbox.min, eb.bbox.min, 0, BBOX * size, `${label}: bbox.min`);
     approxVec(body.bbox.max, eb.bbox.max, 0, BBOX * size, `${label}: bbox.max`);
     approxVec(body.bbox.size, eb.bbox.size, 0, BBOX * size, `${label}: bbox.size`);
-    approx(body.mesh_volume, eb.mesh_volume, MESH, 0, `${label}: mesh_volume`);
+    checkMeshVolume(body, eb, label);
     approxVec(body.color, eb.color, 0, COLOR, `${label}: color`);
   });
+  checkTessellationError(result, name);
 
   // Totals, computed like reader3d/model.py::summarize (envelopes are checked below).
   const s = exp.summary;
@@ -130,6 +138,41 @@ function checkParity(result, exp, name) {
   const max = [0, 1, 2].map((k) => Math.max(...result.bodies.map((b) => b.bbox.max[k])));
   approxVec(min, s.bbox.min, 0, BBOX * size, `${name}: bbox.min`);
   approxVec(max, s.bbox.max, 0, BBOX * size, `${name}: bbox.max`);
+}
+
+/**
+ * Mesh volume (volume of the display tessellation) against the Python engine.
+ *
+ * Both engines tessellate with a deflection taken from OpenCascade's rough
+ * bounding box of the model. Where it is the same, so is the tessellation (same
+ * triangle count) and the mesh volumes agree to rounding. OpenCascade 8 makes
+ * that box up to 2.5 times larger than 7.6 on surfaces of revolution
+ * (revolved_spline.step): the two meshes then differ by up to 0.25 %, as much
+ * as the coarser of them differs from the exact volume, and no more.
+ */
+function checkMeshVolume(body, eb, label) {
+  if (eb.mesh_volume == null || body.triangles === eb.triangles) {
+    approx(body.mesh_volume, eb.mesh_volume, SAME_MESH, 0, `${label}: mesh_volume (same tessellation)`);
+    return;
+  }
+  const tessellationError = Math.max(Math.abs(eb.mesh_volume - eb.volume), Math.abs(body.mesh_volume - body.volume));
+  approx(body.mesh_volume, eb.mesh_volume, 0, tessellationError, `${label}: mesh_volume (other tessellation)`);
+}
+
+/**
+ * Mesh volume against the exact volume: the display mesh lies within the
+ * linear deflection (QUALITY[quality][0] x model diagonal) of the surfaces, so
+ * the volumes differ by less than area x deflection. A face lost, flipped or
+ * misplaced by the tessellation reader does not fit in that bound.
+ */
+function checkTessellationError(result, name, quality = 'normal') {
+  const min = [0, 1, 2].map((k) => Math.min(...result.bodies.map((b) => b.bbox.min[k])));
+  const max = [0, 1, 2].map((k) => Math.max(...result.bodies.map((b) => b.bbox.max[k])));
+  const deflection = QUALITY[quality][0] * Math.hypot(...max.map((v, k) => v - min[k]));
+  for (const b of result.bodies) {
+    if (b.volume == null) continue;
+    approx(b.mesh_volume, b.volume, 0, b.area * deflection, `${name} "${b.name}": mesh_volume vs exact volume (${quality})`);
+  }
 }
 
 const totalVolume = (result) => result.bodies.reduce((sum, b) => sum + (b.volume ?? 0), 0);
@@ -224,6 +267,8 @@ describe('CAD parity with the Python engine', () => {
     for (const name of [
       'holed_block.step', 'holed_block.igs', 'holed_block.brep', 'sphere.stp', 'two_solids.step',
       'box_in_metres.step', 'named_assembly.step', 'surface_box.step', 'as1_pe_203.stp', 'io1-cm-214.stp',
+      'nurbs_torus.step', 'nurbs_cylinder.step', 'sphere_face.step', 'revolved_spline.step',
+      'mirror_halfturn.step', 'pointmirror_identity.step',
     ]) {
       assert.ok(cadFiles.includes(name), `${name} missing from expected.json`);
     }
@@ -235,7 +280,8 @@ describe('CAD parity with the Python engine', () => {
       parityResults.set(name, result);
       checkParity(result, expected[name], name);
       const analytic = expected[name].analytic_volume;
-      if (analytic != null) approx(totalVolume(result), analytic, EXACT, 0, `${name}: analytic volume`);
+      const tol = name.startsWith('nurbs_') ? NURBS : EXACT;
+      if (analytic != null) approx(totalVolume(result), analytic, tol, 0, `${name}: analytic volume`);
     });
   }
 });
@@ -284,7 +330,8 @@ describe('CAD specifics', () => {
       approx(totalVolume(runs[q]), totalVolume(runs.normal), 1e-12, 0, `volume with quality ${q}`);
       approx(runs[q].bodies[0].area, runs.normal.bodies[0].area, 1e-12, 0, `area with quality ${q}`);
     }
-    // A finer mesh approximates the exact volume better.
+    // A finer mesh approximates the exact volume better, within its deflection.
+    for (const q of Object.keys(QUALITY)) checkTessellationError(runs[q], name, q);
     const err = (q) => Math.abs(runs[q].bodies[0].mesh_volume - runs[q].bodies[0].volume);
     assert.ok(err('fine') < err('normal') && err('normal') < err('coarse'), 'mesh volume converges');
     // Unknown presets fall back to "normal", like read_cad.
@@ -393,19 +440,163 @@ describe('CAD specifics', () => {
     approxVec(rotated.bbox.min, [0, 25, -2], 0, 1e-9, 'rotated bbox.min');
     assert.deepEqual(rotated.notes, []);
   });
+
+  test('only the mirrored occurrence is mirrored, not the others placed the same way', () => {
+    // Every component whose placement was the rigid part of a mirroring
+    // operator used to be mirrored: here all three. Only "Right" uses the operator.
+    const halfTurn = [[-1, 0, 0], [0, -1, 0], [0, 0, 1]];
+    const written = xcafStep('mirrored_twins.step', ({ shapeTool: st, named }) => {
+      const top = named(st.NewShape(), 'Twins');
+      const plate = named(st.AddShape(box(0, 0, 0, 10, 5, 2), false, true), 'Plate');
+      const pin = named(st.AddShape(new oc.BRepPrimAPI_MakeCylinder_1(1, 4).Shape(), false, true), 'Pin');
+      named(st.AddComponent_1(top, plate, placement(halfTurn, [0, 0, 0])), 'Left');
+      named(st.AddComponent_1(top, plate, placement(halfTurn, [0, 0, 0])), 'Right');
+      named(st.AddComponent_1(top, pin, placement(halfTurn, [0, 0, 0])), 'Axle');
+    });
+    const bytes = new TextEncoder().encode(mirrorStepInstance(new TextDecoder().decode(written), [0, 0, 0], 'Right'));
+    const { bodies } = analyzeCad(oc, bytes, 'mirrored_twins.step');
+    // Parts are named after the part, then the instance: in component order.
+    assert.deepEqual(bodies.map((b) => b.name), ['Plate', 'Plate', 'Pin']);
+    const [left, right, axle] = bodies;
+    // Half a turn about z: (x, y, z) -> (-x, -y, z).
+    approxVec(left.bbox.min, [-10, -5, 0], 0, 1e-9, 'left bbox.min');
+    approxVec(left.bbox.max, [0, 0, 2], 0, 1e-9, 'left bbox.max');
+    assert.deepEqual(left.notes, []);
+    // Then the reflection through the origin: (x, y, z) -> (x, y, -z).
+    approxVec(right.bbox.min, [0, 0, -2], 0, 1e-9, 'right bbox.min');
+    approxVec(right.bbox.max, [10, 5, 0], 0, 1e-9, 'right bbox.max');
+    approxVec(right.centroid, [5, 2.5, -1], 0, 1e-9, 'right centroid');
+    assert.deepEqual(right.notes, [NOTE_INVERTED]);
+    approxVec(axle.bbox.min, [-1, -1, 0], 0, 1e-6, 'axle bbox.min');
+    approxVec(axle.centroid, [0, 0, 2], 0, 1e-9, 'axle centroid');
+    assert.deepEqual(axle.notes, []);
+
+    // A reflection through the origin is written with an identity rigid part:
+    // the other part, placed as is, has that same (identity) placement.
+    const pointMirror = xcafStep('point_mirror.step', ({ shapeTool: st, named }) => {
+      const top = named(st.NewShape(), 'Pair');
+      const a = named(st.AddShape(box(2, 3, 4, 6, 7, 8), false, true), 'A');
+      const b = named(st.AddShape(box(10, 0, 0, 5, 5, 5), false, true), 'B');
+      named(st.AddComponent_1(top, a, placement([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0, 0, 0])), 'Mirrored');
+      named(st.AddComponent_1(top, b, placement([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0, 0, 0])), 'AsIs');
+    });
+    const text = mirrorStepInstance(new TextDecoder().decode(pointMirror), [0, 0, 0], 'Mirrored');
+    const [a, b] = analyzeCad(oc, new TextEncoder().encode(text), 'point_mirror.step').bodies;
+    approxVec(a.bbox.min, [-8, -10, -12], 0, 1e-9, 'point-mirrored bbox.min');
+    approxVec(a.bbox.max, [-2, -3, -4], 0, 1e-9, 'point-mirrored bbox.max');
+    assert.deepEqual(a.notes, [NOTE_INVERTED]);
+    approxVec(b.bbox.min, [10, 0, 0], 0, 1e-9, 'unmoved bbox.min');
+    approxVec(b.bbox.max, [15, 5, 5], 0, 1e-9, 'unmoved bbox.max');
+    assert.deepEqual(b.notes, []);
+  });
+
+  test('mirrored instance next to a half turn and to an identity placement (fixtures)', (t) => {
+    // Box (2, 3, 4) + (6, 7, 8) mirrored through the XY plane (written as half a
+    // turn about z and a scale of -1), then through the origin; box (10, 0, 0) +
+    // (5, 5, 5) turned half a turn about z, then left in place.
+    const cases = {
+      'mirror_halfturn.step': [[[2, 3, -12], [8, 10, -4], [5, 6.5, -8]], [[-15, -5, 0], [-10, 0, 5], [-12.5, -2.5, 2.5]]],
+      'pointmirror_identity.step': [[[-8, -10, -12], [-2, -3, -4], [-5, -6.5, -8]], [[10, 0, 0], [15, 5, 5], [12.5, 2.5, 2.5]]],
+    };
+    // OpenCascade < 8 (cadquery-ocp 7.x running make_fixtures.py) writes the
+    // mirrored instance without its reflection: nothing to check then.
+    const mirroring = /CARTESIAN_TRANSFORMATION_OPERATOR_3D\s*\([^;]*,\s*-1\.\s*,[^,;]*\)\s*;/;
+    const written = Object.keys(cases).filter((name) => mirroring.test(new TextDecoder().decode(fixtureBytes(name))));
+    if (!written.length) {
+      t.skip('fixtures written without mirroring operators (OpenCascade < 8)');
+      return;
+    }
+    for (const [name, [mirrored, other]] of Object.entries(cases)) {
+      assert.ok(written.includes(name), `${name}: no mirroring operator`);
+      const { bodies } = timedAnalyze(t, name, undefined, undefined, `${name} (placements)`);
+      assert.deepEqual(bodies.map((b) => b.name), ['MirroredPart', 'OtherPart'], name);
+      bodies.forEach((b, i) => {
+        const [min, max, centroid] = [mirrored, other][i];
+        approxVec(b.bbox.min, min, 0, 1e-9, `${name} ${b.name} bbox.min`);
+        approxVec(b.bbox.max, max, 0, 1e-9, `${name} ${b.name} bbox.max`);
+        approxVec(b.centroid, centroid, 0, 1e-9, `${name} ${b.name} centroid`);
+        assert.deepEqual(b.notes, i ? [] : [NOTE_INVERTED], `${name} ${b.name} notes`);
+      });
+      approx(totalVolume({ bodies }), 6 * 7 * 8 + 125, 1e-12, 0, `${name} volume`);
+    }
+  });
+
+  test('NURBS solids: volume, area and centre of mass are exact', (t) => {
+    // Exact rational NURBS conversions of a torus (R 10, r 3), a cylinder (r 5,
+    // h 20) and a sphere (r 5). BRepGProp's default fixed-order integration was
+    // off by +0.21 %, +0.86 % and -0.04 % in volume (+0.50 %, +0.18 %, +0.37 % in area).
+    const sphere = new oc.BRepBuilderAPI_NurbsConvert_2(new oc.BRepPrimAPI_MakeSphere_1(5).Shape(), true).Shape();
+    const cases = [
+      ['nurbs_torus.step', null, 2 * Math.PI ** 2 * 10 * 9, 4 * Math.PI ** 2 * 10 * 3, [0, 0, 0]],
+      ['nurbs_cylinder.step', null, Math.PI * 25 * 20, 2 * Math.PI * 5 * 20 + 2 * Math.PI * 25, [0, 0, 10]],
+      ['nurbs_sphere.brep', brepBytes('nurbs_sphere.brep', sphere), (4 / 3) * Math.PI * 125, 4 * Math.PI * 25, [0, 0, 0]],
+    ];
+    for (const [name, bytes, volume, surface, centroid] of cases) {
+      const { bodies } = timedAnalyze(t, name, bytes, undefined, `${name} (NURBS)`);
+      assert.equal(bodies.length, 1, name);
+      const [b] = bodies;
+      assert.equal(b.closed, true, name);
+      assert.deepEqual(b.notes, [], name);
+      approx(b.volume, volume, NURBS, 0, `${name}: volume`);
+      approx(b.area, surface, NURBS, 0, `${name}: area`);
+      approxVec(b.centroid, centroid, 0, 1e-6, `${name}: centroid`);
+    }
+  });
+
+  test('a closed surface made of a single face becomes a solid', (t) => {
+    // Sewing leaves a lone closed face (sphere, torus) as a face, not a shell.
+    const sphereFace = timedAnalyze(t, 'sphere_face.step', undefined, undefined, 'sphere_face.step (single face)').bodies;
+    assert.equal(sphereFace.length, 1);
+    assert.equal(sphereFace[0].closed, true);
+    assert.deepEqual(sphereFace[0].notes, [NOTE_SEWN]);
+    approx(sphereFace[0].volume, (4 / 3) * Math.PI * 125, 1e-9, 0, 'sphere surface volume');
+    approx(sphereFace[0].area, 4 * Math.PI * 25, 1e-9, 0, 'sphere surface area');
+    approxVec(sphereFace[0].centroid, [0, 0, 0], 0, 1e-9, 'sphere surface centroid');
+
+    // A torus face, and an open face (side of a cylinder) that stays open.
+    const [torusFace] = faces(new oc.BRepPrimAPI_MakeTorus_1(10, 3).Shape());
+    const side = faces(new oc.BRepPrimAPI_MakeCylinder_1(2, 5).Shape()).find((f) => {
+      const surface = oc.BRep_Tool.Surface_2(f);
+      return surface.get().DynamicType().get().Name() === 'Geom_CylindricalSurface';
+    });
+    const moved = side.Moved(new oc.TopLoc_Location_2(translation(30, 0, 0)), false);
+    const { bodies } = analyzeCad(oc, brepBytes('faces.brep', assemble('Compound', [torusFace, moved])), 'faces.brep');
+    assert.deepEqual(bodies.map((b) => b.name), ['faces', 'faces (surfaces)']);
+    const [torus, open] = bodies;
+    assert.equal(torus.closed, true);
+    assert.deepEqual(torus.notes, [NOTE_SEWN]);
+    approx(torus.volume, 2 * Math.PI ** 2 * 10 * 9, 1e-9, 0, 'torus surface volume');
+    assert.equal(open.closed, false);
+    assert.equal(open.volume, null);
+    assert.deepEqual(open.notes, [NOTE_OPEN]);
+    approx(open.area, 2 * Math.PI * 2 * 5, 1e-9, 0, 'open face area');
+  });
 });
 
 /**
- * Rewrite the STEP text so that the instance placed at `origin` is placed by a
- * CARTESIAN_TRANSFORMATION_OPERATOR_3D with scale -1 and the same origin and
- * axes as its rigid placement, the way OpenCascade 8 writes a mirrored instance.
+ * Rewrite the STEP text so that the instance placed at `origin` (the one named
+ * `occurrence` if given) is placed by a CARTESIAN_TRANSFORMATION_OPERATOR_3D
+ * with scale -1 and the same origin and axes as its rigid placement, the way
+ * OpenCascade 8 writes a mirrored instance.
  */
-function mirrorStepInstance(text, origin) {
+function mirrorStepInstance(text, origin, occurrence = null) {
   const record = (id) => text.match(new RegExp(`${id}\\s*=\\s*(\\w+)\\s*\\(([^;]*)\\);`));
   const refs = (args) => args.match(/#\d+/g);
   const point = (args) => args.match(/\(([^()]*)\)\s*\)?$/)[1].split(',').map(Number);
+  // NEXT_ASSEMBLY_USAGE_OCCURRENCE <- PRODUCT_DEFINITION_SHAPE <- CONTEXT_DEPENDENT_SHAPE_REPRESENTATION
+  // -> representation relationship -> its ITEM_DEFINED_TRANSFORMATION.
+  const referrer = (pattern) => text.match(new RegExp(pattern))?.[1];
+  let only = null;
+  if (occurrence) {
+    const nauo = referrer(`(#\\d+)\\s*=\\s*NEXT_ASSEMBLY_USAGE_OCCURRENCE\\s*\\('[^']*','${occurrence}'`);
+    const shape = referrer(`(#\\d+)\\s*=\\s*PRODUCT_DEFINITION_SHAPE\\s*\\([^;]*${nauo}\\s*\\)`);
+    const rel = referrer(`CONTEXT_DEPENDENT_SHAPE_REPRESENTATION\\s*\\(\\s*(#\\d+)\\s*,\\s*${shape}\\s*\\)`);
+    only = referrer(`${rel}\\s*=[^;]*REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION\\s*\\(\\s*(#\\d+)`);
+    assert.ok(nauo && shape && rel && only, `occurrence ${occurrence} not found`);
+  }
   let found = null;
   for (const [all, id, args] of text.matchAll(/(#\d+)\s*=\s*ITEM_DEFINED_TRANSFORMATION\s*\(([^;]*)\);/g)) {
+    if (only && id !== only) continue;
     const target = refs(args)[1]; // AXIS2_PLACEMENT_3D(name, location, axis, ref_direction)
     const [loc, axis, refDir] = refs(record(target)[2]);
     if (point(record(loc)[2]).every((v, i) => v === origin[i])) found = { all, id, loc, axis, refDir };
@@ -538,7 +729,8 @@ describe('CAD state between analyses', () => {
   });
 
   test('the wasm heap does not grow from one analysis to the next', (t) => {
-    const files = ['as1_pe_203.stp', 'io1-cm-214.stp', 'surface_box.step'];
+    // mirror_halfturn.step: read with a work session of the engine's own.
+    const files = ['as1_pe_203.stp', 'io1-cm-214.stp', 'surface_box.step', 'mirror_halfturn.step', 'sphere_face.step'];
     const bytes = files.map((f) => fixtureBytes(f));
     const runAll = () => files.forEach((f, i) => analyzeCad(oc, bytes[i], f));
     runAll(); // warm-up: allocator caches and heap layout settle
@@ -612,8 +804,12 @@ describe('CAD envelopes through summary.js', { skip: !existsSync(summaryModule) 
       approxVec(s.bbox.min, e.bbox.min, 0, BBOX * size, 'bbox.min');
       approxVec(s.bbox.max, e.bbox.max, 0, BBOX * size, 'bbox.max');
       approx(s.bbox.volume, e.bbox.volume, BBOX * 3, 0, 'bbox.volume');
-      approxVec(s.obb.size, e.obb.size, MESH, 0, 'obb.size');
-      approx(s.obb.volume, e.obb.volume, MESH, 0, 'obb.volume');
+      // The oriented box encloses the display vertices: with another tessellation
+      // (see checkMeshVolume) it encloses other points (0.4 % apart on revolved_spline.step).
+      const tol = totalTriangles(result) === e.triangles ? OBB : OTHER_MESH;
+      approxVec(s.obb.size, e.obb.size, tol, 0, 'obb.size');
+      approx(s.obb.volume, e.obb.volume, tol, 0, 'obb.volume');
+      assert.ok(s.obb.volume <= s.bbox.volume * (1 + 1e-9), 'the oriented box is not larger than the axis-aligned one');
       approx(s.fill_ratio, e.fill_ratio, BBOX * 3, 0, 'fill_ratio');
     });
   }
@@ -625,14 +821,34 @@ describe('CAD envelopes through summary.js', { skip: !existsSync(summaryModule) 
     const near = analyzeCad(oc, brepBytes('near.brep', model()), 'near.brep');
     const moved = model().Moved(new oc.TopLoc_Location_2(translation(1e6, 1e6, 1e6)), false);
     const far = analyzeCad(oc, brepBytes('far.brep', moved), 'far.brep');
-    assert.ok(near.bodies.every((b) => b.mesh.positions64 === undefined), 'no float64 copy near the origin');
-    for (const b of far.bodies) {
-      assert.ok(b.mesh.positions64 instanceof Float64Array, 'float64 vertices far from the origin');
-      assert.equal(b.mesh.positions64.length, b.mesh.positions.length);
-    }
+    // (the box corners, 1e6 + integers, are exact in float32 and need no copy; the sphere's are not)
+    const sphere = far.bodies.find((b) => b.triangles > 12);
+    assert.ok(sphere.mesh.positions64 instanceof Float64Array, 'float64 vertices far from the origin');
+    assert.equal(sphere.mesh.positions64.length, sphere.mesh.positions.length);
     const [sNear, sFar] = [near, far].map((r) => summarize(r.bodies));
     approxVec(sFar.obb.size, sNear.obb.size, 1e-6, 0, 'oriented box size');
     approx(sFar.volume, sNear.volume, 1e-9, 0, 'volume');
+  });
+
+  test('near the origin too, the envelope uses double-precision vertices (R4)', () => {
+    // A thin plate (100 x 100 x 0.01 mm) placed with a rotation: float32 rounds its
+    // vertices by up to 4e-6 mm, which made its oriented envelope 1.8e-5 too large
+    // (the parity target is 1e-6); the Python engine measures double-precision vertices.
+    const [a, b] = [0.5, 0.3]; // rotation about z, then about x
+    const rotation = [
+      [Math.cos(a), -Math.sin(a), 0],
+      [Math.cos(b) * Math.sin(a), Math.cos(b) * Math.cos(a), -Math.sin(b)],
+      [Math.sin(b) * Math.sin(a), Math.sin(b) * Math.cos(a), Math.cos(b)],
+    ];
+    const plate = box(0, 0, 0, 100, 100, 0.01).Moved(placement(rotation, [0, 0, 0]), false);
+    const { bodies } = analyzeCad(oc, brepBytes('plate.brep', plate), 'plate.brep');
+    assert.ok(bodies[0].mesh.positions64 instanceof Float64Array, 'float64 vertices kept');
+    const s = summarize(bodies);
+    approx(s.obb.volume, 100, 1e-9, 0, 'oriented box volume');
+    approxVec(s.obb.size, [100, 100, 0.01], 1e-9, 0, 'oriented box size');
+    // Vertices that float32 holds exactly need no copy.
+    const exact = analyzeCad(oc, brepBytes('box.brep', box(0, 0, 0, 1, 2, 3)), 'box.brep');
+    assert.equal(exact.bodies[0].mesh.positions64, undefined, 'no float64 copy of exact vertices');
   });
 });
 

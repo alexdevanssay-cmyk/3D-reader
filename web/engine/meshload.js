@@ -9,7 +9,7 @@
 //     so models far from the origin keep their exact volume;
 //   - vertex order and polygon triangulation follow trimesh: they decide which vertex
 //     represents a welded group and which face starts the winding repair, hence the
-//     "normals pointed inwards" verdict and, with several shells, the volume;
+//     "normals pointed inwards" verdict;
 //   - node / item / component transforms are full 4x4 matrices (shear included), and a
 //     transform with a negative determinant reverses the triangles (apply_transform);
 //   - part names follow the scene graph of trimesh and the naming rule of mesh.py, and
@@ -799,12 +799,14 @@ function castTo(type, v) {
 function readPly(buffer) {
   const bytes = new Uint8Array(buffer);
   let pos = 0;
+  let headerLines = 0;
   const readLine = () => {
     if (pos >= bytes.length) throw new Error('Header not terminated properly!');
     let nl = bytes.indexOf(10, pos);
     if (nl < 0) nl = bytes.length;
     const line = new TextDecoder().decode(bytes.subarray(pos, nl));
     pos = nl + 1;
+    headerLines++;
     return line;
   };
   if (!readLine().toLowerCase().includes('ply')) throw new Error('Not a ply file!');
@@ -836,7 +838,7 @@ function readPly(buffer) {
       }
     }
   }
-  const data = ascii ? plyAscii(elements, bytes.subarray(pos)) : plyBinary(elements, buffer, pos, little);
+  const data = ascii ? plyAscii(elements, bytes.subarray(pos), headerLines + 1) : plyBinary(elements, buffer, pos, little);
 
   const vertex = data.get('vertex');
   if (!vertex || !vertex.length) return { parts: [], geometryCount: 0 };
@@ -919,31 +921,48 @@ function plyElement(spec) {
  * ASCII data (trimesh _ply_ascii): one line per element row (Python splitlines), in
  * header order. When all rows of an element have the same number of values and it has
  * at most one list, the list length of the first row is used for every row
- * (_load_element_single).
+ * (_load_element_single). Like numpy.fromstring (which trimesh runs on every line of
+ * the data), a value that is not a number fails, wherever it is; so does a vertex
+ * without all of its x, y, z values. `firstLine`: line number of the data's first line.
  */
-function plyAscii(elements, body) {
+function plyAscii(elements, body, firstLine) {
   const text = new TextDecoder().decode(body);
   const breaks = new RegExp(LINE_BREAK.source, 'g');
   let pos = 0;
+  let lineNumber = firstLine - 1; // of the last line read
   const nextLine = () => {
     if (pos >= text.length) return null;
     breaks.lastIndex = pos;
     const m = breaks.exec(text);
     const line = text.slice(pos, m ? m.index : text.length);
     pos = m ? m.index + m[0].length : text.length;
+    lineNumber++;
     return line;
+  };
+  const numbers = (line, visit) => {
+    for (const token of line.split(C_SPACE)) {
+      if (!token) continue;
+      const v = pyFloat(token);
+      if (v === undefined) {
+        const shown = token.length > 20 ? `${token.slice(0, 20)}...` : token;
+        throw new Error(`PLY file has a value that is not a number on line ${lineNumber}: '${shown}'`);
+      }
+      visit(v);
+    }
   };
   const out = new Map();
   for (const [name, spec] of elements) {
     if (!spec.length) continue;
     // all numbers of the element's rows, flat, with the start of every row
     const values = [];
+    const push = (v) => values.push(v);
     const starts = new Uint32Array(spec.length + 1);
+    const firstRow = lineNumber + 1;
     for (let i = 0; i < spec.length; i++) {
       const line = nextLine();
       if (line === null) throw new Error('PLY file is shorter than its header declares');
       starts[i] = values.length;
-      for (const v of fromString(line)) values.push(v);
+      numbers(line, push);
     }
     starts[spec.length] = values.length;
     const width = starts[1] - starts[0];
@@ -953,10 +972,12 @@ function plyAscii(elements, body) {
 
     const el = plyElement(spec);
     const fixed = []; // list lengths of the first row, used for every row when uniform
+    const coordinates = name === 'vertex' ? ['x', 'y', 'z'].filter((k) => spec.props.has(k) && !spec.props.get(k).countType) : [];
     for (let i = 0; i < spec.length; i++) {
       let at = starts[i];
       const end = starts[i + 1];
       let li = 0;
+      let read = 0; // coordinates of the row read
       for (const [prop, p] of spec.props) {
         if (at >= end) break;
         if (p.countType) {
@@ -970,12 +991,16 @@ function plyAscii(elements, body) {
           at += n + 1;
         } else {
           el.columns.get(prop)[i] = castTo(p.type, values[at]);
+          if (coordinates.includes(prop)) read++;
           at += 1;
         }
       }
+      if (read < coordinates.length) throw new Error(`PLY vertex on line ${firstRow + i} has fewer values than its coordinates`);
     }
     out.set(name, el);
   }
+  // trimesh parses every line of the data, also those after the last element
+  for (let line = nextLine(); line !== null; line = nextLine()) numbers(line, () => {});
   return out;
 }
 
@@ -1068,6 +1093,7 @@ async function readGltf(buffer) {
   checkGltfSupport(buffer);
   if (!isGlb(buffer)) buffer = embeddedGltfToGlb(JSON.parse(decodeText(buffer)));
   const json = glbJson(buffer);
+  checkGltfAccessors(json, buffer);
   const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js');
   const loader = new GLTFLoader();
   // Skip every texture, before the built-in texture plugins get a chance to load images.
@@ -1211,6 +1237,45 @@ const isGlb = (buffer) => buffer.byteLength >= 20 && decodeText(new Uint8Array(b
 function glbJson(buffer) {
   const length = new DataView(buffer).getUint32(12, true);
   return JSON.parse(decodeText(new Uint8Array(buffer, 20, length)));
+}
+
+/** Length of the BIN chunk of a GLB, or -1 when it has none. */
+function glbBinLength(buffer) {
+  const view = new DataView(buffer);
+  const at = 20 + view.getUint32(12, true);
+  if (at + 8 > buffer.byteLength || view.getUint32(at + 4, true) !== 0x004e4942) return -1;
+  return Math.min(view.getUint32(at, true), buffer.byteLength - at - 8);
+}
+
+const GLTF_COMPONENT_BYTES = { 5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4 };
+const GLTF_TYPE_COMPONENTS = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT2: 4, MAT3: 9, MAT4: 16 };
+
+/**
+ * The accessors must fit in the data of the file. GLTFLoader allocates whatever an
+ * accessor declares (one without buffer view is zero-filled), and glTF is decoded on
+ * the main thread: a 267-byte file declaring 60 million vertices froze the page for a
+ * minute. An accessor reading past its buffer view, or a view past its buffer, is
+ * refused, and so are accessors declaring, in all, far more data than the file holds.
+ */
+function checkGltfAccessors(json, buffer) {
+  const bin = glbBinLength(buffer);
+  const bufferBytes = (i) => (i === 0 && bin >= 0 ? bin : Number(json.buffers?.[i]?.byteLength ?? 0));
+  let declared = 0;
+  (json.accessors ?? []).forEach((accessor, i) => {
+    const size = GLTF_COMPONENT_BYTES[accessor.componentType] * GLTF_TYPE_COMPONENTS[accessor.type];
+    const count = accessor.count;
+    if (!(size > 0) || !Number.isSafeInteger(count) || count < 0) return; // malformed: the loader reports it
+    declared += count * size;
+    if (accessor.bufferView === undefined || count === 0) return; // zero-filled (sparse) data
+    const view = json.bufferViews?.[accessor.bufferView];
+    const end = (accessor.byteOffset ?? 0) + (count - 1) * (view?.byteStride ?? size) + size;
+    if (!view || end > view.byteLength || (view.byteOffset ?? 0) + view.byteLength > bufferBytes(view.buffer)) {
+      throw new Error(`The glTF file is damaged: accessor ${i} needs more data than its buffer holds`);
+    }
+  });
+  if (declared > Math.max(64 * buffer.byteLength, 2 ** 24)) {
+    throw new Error('The glTF file is damaged: its accessors declare far more data than the file holds');
+  }
 }
 
 /**

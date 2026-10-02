@@ -41,7 +41,7 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
 | Where it runs | in the visitor's browser (WebAssembly) | on your machine / a server |
 | CAD engine | OpenCascade compiled to WebAssembly (`opencascade.js`) | OpenCascade (`cadquery-ocp`) |
 | Mesh engine | three.js loaders + `web/engine/meshanalysis.js` | trimesh |
-| Install | nothing, open the URL | Python 3.10 – 3.12 |
+| Install | nothing, open the URL | Python 3.11 or newer |
 | Your files | never leave the browser | uploaded to the server you run |
 | Extras | — | command line, HTTP API, `.zae`, `.3dxml` |
 

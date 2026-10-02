@@ -1,4 +1,5 @@
 // Totals and envelopes (web/engine/summary.js), and the scale of the mesh engine.
+// Values marked "Python" were produced by reader3d/model.py on the same points.
 //
 //   node --test tests/js/summary.test.mjs
 import assert from 'node:assert/strict';
@@ -113,6 +114,33 @@ test('an empty body list is an error', () => {
   assert.throws(() => summarize([]), /No geometry found in file/);
 });
 
+test('the centroid weighs only the bodies that have one (FIX_SPEC R3)', () => {
+  const a = boxBody([10, 10, 10], rotation(0, 0, 0), [10, 0, 0], 'a');
+  // a body with a volume but no centre of mass (as an engine may report it)
+  const b = { ...boxBody([10, 10, 10], rotation(0, 0, 0), [30, 0, 0], 'b'), volume: 500, centroid: null };
+  const s = summarize([a, b]);
+  approx(s.volume, 1500, 1e-12, 0, 'the volume counts every body');
+  approxVec(s.centroid, [10, 0, 0], 1e-12, 1e-12, 'centroid of the body that has one'); // was 1000 * 10 / 1500
+});
+
+test('a total volume of (numerically) nothing has no centroid: never [0, 0, 0] nor NaN', () => {
+  // bodies whose tiny volumes have no centroid (an unwelded soup used to give [0, 0, 0])
+  const tiny = (name, volume, centroid = null) => ({ ...boxBody([10, 10, 10], rotation(0, 0, 0), [0, 0, 0], name), volume, centroid });
+  let s = summarize([tiny('a', 4.36e-13)]);
+  assert.equal(s.centroid, null, 'only null centroids');
+  // centroids whose volumes cancel out (|sum| <= 1e-12 * L^3)
+  s = summarize([tiny('a', 1e-9, [1, 2, 3]), tiny('b', -1e-9, [4, 5, 6])]);
+  assert.equal(s.centroid, null, 'volumes adding up to zero');
+  s = summarize([tiny('a', 1e-10, [1, 2, 3])]);
+  assert.equal(s.centroid, null, 'below 1e-12 of the envelope cube');
+  s = summarize([tiny('a', 1e-8, [1, 2, 3])]);
+  approxVec(s.centroid, [1, 2, 3], 1e-12, 0, 'a closed body keeps its centroid however small');
+  // no NaN nor Infinity anywhere, even for a body of zero size
+  const flat = { ...tiny('flat', 0, null), bbox: { min: [1, 1, 1], max: [1, 1, 1], size: [0, 0, 0] } };
+  const numbers = (v) => (typeof v === 'number' ? [v] : v && typeof v === 'object' ? Object.values(v).flatMap(numbers) : []);
+  for (const x of numbers(summarize([flat]))) assert.ok(Number.isFinite(x), `non-finite value ${x}`);
+});
+
 // ----------------------------------------------------------------------------- oriented box
 
 test('the oriented box of a rotated box is the box itself', () => {
@@ -140,9 +168,21 @@ test('a rotated box far from the origin keeps an exact oriented box (double-prec
   const s = summarize([body]);
   approxVec(s.obb.size, [3.1, 2.7, 1.3], 1e-6, 0, 'obb size');
   approx(s.obb.volume, 3.1 * 2.7 * 1.3, 1e-6, 0, 'obb volume');
-  // near the origin float32 is fine and nothing extra is kept
-  const near = boxVertices([2.7, 1.3, 3.1]).map((p) => apply(rot, p, [10, 20, 30]));
-  assert.equal(analyzeMesh('near', Float64Array.from(near.flat()), Uint32Array.from(BOX_F.flat())).mesh.positions64, undefined);
+  // coordinates that float32 holds exactly need no copy
+  const exact = boxVertices([2, 4, 6]).map((p) => p.map((x) => x + 10));
+  assert.equal(analyzeMesh('exact', Float64Array.from(exact.flat()), Uint32Array.from(BOX_F.flat())).mesh.positions64, undefined);
+});
+
+test('the envelope is measured on the analysed double-precision vertices, like the Python engine (R4)', () => {
+  // near the origin too: the float32 display vertices are ~1e-7 off the analysed ones,
+  // which the Python engine measures
+  const rot = rotation(0.4, 0.2, 0.9);
+  const near = boxVertices([10, 7, 3]).map((p) => apply(rot, p, [150, -80, 40]));
+  const body = analyzeMesh('near', Float64Array.from(near.flat()), Uint32Array.from(BOX_F.flat()));
+  assert.ok(body.mesh.positions64 instanceof Float64Array, 'the analysed float64 vertices are kept');
+  const s = summarize([body]);
+  approxVec(s.obb.size, [10, 7, 3], 1e-12, 0, 'obb size');
+  approx(s.obb.volume, 210, 1e-12, 0, 'obb volume');
 });
 
 test('an axis-aligned box keeps its axis-aligned envelope', () => {
@@ -186,14 +226,71 @@ test('the oriented box is never larger than the AABB on random point clouds', ()
   }
 });
 
-test('large point sets are searched on a subsample but measured on every point', () => {
+test('a large point set with a small hull gets the exact search', () => {
   const random = rng(3);
   const rot = rotation(0.2, 1.1, -0.4);
   const points = Array.from({ length: 60000 }, () => apply(rot, [random() * 30, random() * 20, random() * 10]));
   const box = minVolumeBox(Float64Array.from(points.flat()));
-  assertEncloses(box, points, 'subsampled');
-  // The best box of a filled 30x20x10 block is close to the block.
-  assert.ok(prod(box.extents) < 6000 * 1.02, `volume ${prod(box.extents)}`);
+  assertEncloses(box, points, 'block');
+  approx(prod(box.extents), 5999.327225641056, 1e-9, 0, 'Python'); // a subsample search gave 5999.93
+});
+
+test('a dense smooth point set is searched on a subsample, measured on every point', () => {
+  // every point is on the hull: the search runs on the hull of a subsample
+  const random = rng(9);
+  const points = Array.from({ length: 100000 }, () => {
+    const u = random() * 2 - 1, t = random() * 2 * Math.PI, r = Math.sqrt(1 - u * u);
+    return [30 * r * Math.cos(t) + 5, 20 * r * Math.sin(t) - 7, 10 * u + 1];
+  });
+  const box = minVolumeBox(Float64Array.from(points.flat()));
+  assertEncloses(box, points, 'ellipsoid');
+  assert.ok(prod(box.extents) < 60 * 40 * 20 * 1.001, `volume ${prod(box.extents)}`);
+  assert.ok(prod(box.extents) > 60 * 40 * 20 * 0.999, `volume ${prod(box.extents)}`);
+});
+
+/** Point clouds of the parity test (deterministic). */
+function parityClouds() {
+  const random = rng(2024);
+  const gauss = () => Math.sqrt(-2 * Math.log(random() + 1e-12)) * Math.cos(2 * Math.PI * random());
+  const shapes = {
+    gaussian: [300, () => [5 * gauss(), 2 * gauss(), 0.5 * gauss()]],
+    tetrahedron: [1000, () => {
+      let [a, b, c] = [random(), random(), random()];
+      if (a + b > 1) [a, b] = [1 - a, 1 - b];
+      if (b + c > 1) [b, c] = [1 - c, 1 - a - b];
+      else if (a + b + c > 1) [a, c] = [1 - b - c, a + b + c - 1];
+      return [10 * a, 7 * b, 3 * c];
+    }],
+    slab: [200, () => [random() * 50, random() * 3, random() * 0.2]],
+    prism: [14, (i) => [10 * Math.cos((2 * Math.PI * (i >> 1)) / 7), 6 * Math.sin((2 * Math.PI * (i >> 1)) / 7), 7 * (i & 1)]],
+  };
+  return Object.entries(shapes).map(([name, [n, sample]]) => {
+    const rot = rotation(random() * 6, random() * 6, random() * 6);
+    const offset = [random() * 100 - 50, random() * 100 - 50, random() * 100 - 50];
+    return { name, points: Array.from({ length: n }, (_, i) => apply(rot, sample(i), offset)) };
+  });
+}
+
+test('oriented boxes match the Python engine (same hull directions and rectangles, R4)', () => {
+  // reader3d.model._min_volume_box on the same points (centred on their box)
+  const python = { gaussian: 784.1817631971832, tetrahedron: 155.23944278908525, slab: 28.681938532578275, prism: 1556.7783919856702 };
+  for (const { name, points } of parityClouds()) {
+    const box = minVolumeBox(Float64Array.from(points.flat()));
+    approx(prod(box.extents), python[name], 1e-9, 0, name);
+    assertEncloses(box, points, name);
+  }
+});
+
+test('tight clusters of points (an unwelded soup with sub-1e-8 noise) still get the enclosing box', () => {
+  // three's QuickHull misses whole clusters of such points (by up to 90 mm here), which
+  // Qhull merges: the box is measured on every point and the search reruns on a coarser grid.
+  const random = rng(1);
+  const base = Array.from({ length: 40 }, () => [random() * 100 - 50, random() * 30 - 15, random() * 40 - 20]);
+  const points = [];
+  for (const p of base) for (let k = 0; k < 6; k++) points.push(p.map((x) => x + (random() - 0.5) * 1e-8));
+  const box = minVolumeBox(Float64Array.from(points.flat()));
+  assertEncloses(box, points, 'clusters');
+  approx(prod(box.extents), 102855.26133269821, 1e-9, 0, 'Python');
 });
 
 // ----------------------------------------------------------------------------- degenerate inputs
@@ -210,24 +307,21 @@ test('repeated points count once', () => {
   assert.deepEqual(s.obb.size, sortDesc(s.bbox.size));
 });
 
-test('coplanar points get a flat oriented box', () => {
-  const rot = rotation(0.4, -0.3, 1.2);
+test('coplanar points keep the axis-aligned box, like Qhull refusing a flat hull (R4)', () => {
+  // the plane x + y = 10, exactly
   const points = [];
-  for (let i = 0; i <= 8; i++) for (let j = 0; j <= 4; j++) points.push(apply(rot, [i / 2, j / 2, 0], [5, 5, 5]));
+  for (let i = 0; i <= 8; i++) for (let j = 0; j <= 4; j++) points.push([i, 10 - i, j]);
   const s = summarize([pointBody(points)]);
-  approx(s.obb.size[0], 4, 1e-6, 0, 'length');
-  approx(s.obb.size[1], 2, 1e-6, 0, 'width');
-  assert.ok(s.obb.size[2] < 1e-5, `thickness ${s.obb.size[2]}`);
-  assert.ok(s.obb.volume < 1e-4);
-  assert.ok(s.bbox.volume > 1, 'the tilted plane has a real axis-aligned box');
+  assert.deepEqual(s.obb.size, [8, 8, 4]);
+  assert.equal(s.obb.volume, s.bbox.volume);
+  assert.equal(minVolumeBox(Float64Array.from(points.flat())), null);
 });
 
-test('collinear points get a segment', () => {
-  const dir = [1, 2, 2].map((x) => x / 3);
-  const points = [0, 1, 2.5, 4, 6].map((t) => dir.map((d) => d * t));
+test('collinear points keep the axis-aligned box (R4)', () => {
+  const points = [0, 1, 2, 4, 6].map((t) => [t, 2 * t, 2 * t]);
   const s = summarize([pointBody(points)]);
-  approx(s.obb.size[0], 6, 1e-6, 0, 'length');
-  assert.ok(s.obb.size[1] < 1e-5 && s.obb.size[2] < 1e-5, `${s.obb.size}`);
+  assert.deepEqual(s.obb.size, [12, 12, 6]);
+  assert.equal(s.obb.volume, 864);
 });
 
 test('bodies without display mesh keep the axis-aligned box', () => {

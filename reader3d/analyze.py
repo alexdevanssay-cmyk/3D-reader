@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 
@@ -36,12 +37,26 @@ def analyze_file(path: str | Path, unit: str = "auto", quality: str = "normal", 
     else:
         raise ValueError(f"Unsupported file type '{ext}'. Supported: {', '.join(SUPPORTED_EXTENSIONS)}")
 
-    return {
-        "file": path.name,
-        "kind": kind,
-        "source_unit": unit_used,
-        "units": {"length": "mm", "area": "mm2", "volume": "mm3"},
-        "summary": summarize(bodies),
-        "bodies": [b.to_dict(include_mesh) for b in bodies],
-        "elapsed_s": round(time.perf_counter() - start, 3),
-    }
+    return _finite(
+        {
+            "file": path.name,
+            "kind": kind,
+            "source_unit": unit_used,
+            "units": {"length": "mm", "area": "mm2", "volume": "mm3"},
+            "summary": summarize(bodies),
+            "bodies": [b.to_dict(include_mesh) for b in bodies],
+            "elapsed_s": round(time.perf_counter() - start, 3),
+        }
+    )
+
+
+def _finite(value):
+    """The result with NaN and infinities replaced by None (null): JSON has no such
+    numbers, and a degenerate input must not make the whole answer unreadable."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    return value

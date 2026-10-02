@@ -4,8 +4,8 @@
 // This is a line-by-line port of reader3d/cad.py, the reference engine: same
 // quality presets, part naming and colour rules, sewing of loose surfaces and
 // note strings. Volumes, areas and centres of mass come from BRepGProp, which
-// integrates over the real NURBS/analytic surfaces of the solids; they do not
-// depend on the display tessellation.
+// integrates over the real NURBS/analytic surfaces of the solids (adaptively, see
+// GPROP_EPS); they do not depend on the display tessellation.
 //
 // Where it is not a line-by-line port:
 // - limits of WebAssembly: the model is tessellated one solid at a time (see
@@ -13,7 +13,7 @@
 //   instead of silently dropping the faces that could not be tessellated;
 // - the OpenCascade 7.6 of opencascade.js drops the mirror of mirrored STEP
 //   instances, which OpenCascade 8 (cad.py) keeps: it is restored, see
-//   mirrorOperators();
+//   mirroredOccurrences();
 // - a solid whose shell is open is treated as open surfaces (no volume), and
 //   a colour set on an assembly instance overrides the part's own colour,
 //   like OpenCascade's own presentation of XCAF documents.
@@ -56,6 +56,13 @@ const NOTE_INVERTED = 'Solid had inverted orientation; volume sign corrected';
 const NOTE_OPEN = 'Open surfaces (not a closed solid): no volume can be computed';
 
 const OUT_OF_MEMORY = 'Not enough memory to analyse this model in the browser';
+
+// Relative accuracy of BRepGProp's adaptive integration (GPROP_EPS in cad.py). The
+// default (fixed Gauss order) is exact on planes and quadrics but off by up to a
+// few tenths of a percent on rational NURBS surfaces; with Eps the integration is
+// refined until it converges. Eps is an estimate: 1e-9 still left 2e-7 on a NURBS
+// torus, 1e-10 leaves 2e-8 (for about 20 % more integration time).
+const GPROP_EPS = 1e-10;
 
 // Largest wasm heap of this build (emscripten getHeapMax(): 4 GiB - 64 kiB), and
 // the margin under it from which a failed allocation is put down to the heap
@@ -197,7 +204,7 @@ function indexOfAscii(bytes, text) {
 
 function readXcaf(ctx, path, fmt, bytes) {
   const { oc } = ctx;
-  const mirrors = fmt === 'step' ? mirrorOperators(bytes) : [];
+  const occurrences = fmt === 'step' ? mirroredOccurrences(bytes) : [];
   const FMT = fmt.toUpperCase();
   // The handle owns the document: deleting the handle (at dispose) frees it,
   // so the raw document object itself must never be deleted.
@@ -206,7 +213,9 @@ function readXcaf(ctx, path, fmt, bytes) {
   // Ask OpenCascade to convert everything to millimetres whatever the file unit.
   oc.XCAFDoc_DocumentTool.SetLengthUnit_2(hdoc, 1, oc.UnitsMethods_LengthUnit.UnitsMethods_LengthUnit_Millimeter);
 
-  const reader = fmt === 'step' ? new oc.STEPCAFControl_Reader_1() : new oc.IGESCAFControl_Reader_1();
+  const { reader, session } =
+    fmt === 'step' ? stepReader(oc, occurrences.length > 0) : { reader: new oc.IGESCAFControl_Reader_1(), session: null };
+  let mirrors = [];
   try {
     reader.SetNameMode(true);
     reader.SetColorMode(true);
@@ -216,8 +225,10 @@ function readXcaf(ctx, path, fmt, bytes) {
     const progress = ctx.keep(new oc.Message_ProgressRange_1());
     const ok = fmt === 'step' ? reader.Transfer_1(hdoc, progress) : reader.Transfer(hdoc, progress);
     if (!ok) throw new Error(`Unable to transfer ${FMT} geometry`);
+    if (session) mirrors = mirroredPlacements(ctx, session.get(), occurrences);
   } finally {
     reader.delete(); // releases the parsed file model, which can be large
+    session?.delete(); // (the work session holds it too)
   }
 
   const main = ctx.keep(doc.Main());
@@ -280,31 +291,94 @@ function readXcaf(ctx, path, fmt, bytes) {
 const LENGTH_UNITS_MM = [1e-6, 2.54e-5, 1e-3, 0.0254, 1, 10, 25.4, 100, 304.8, 914.4, 1e3, 1e6, 1609344];
 
 /**
- * Mirrored assembly placements of a STEP file: the CARTESIAN_TRANSFORMATION_OPERATOR_3D
- * entities with a scale of -1, which is how OpenCascade writes a mirrored instance.
+ * Mirrored assembly occurrences of a STEP file.
  *
- * cad.py (OpenCascade 8) places such an instance with the rigid placement
+ * OpenCascade writes a mirrored instance as a CARTESIAN_TRANSFORMATION_OPERATOR_3D
+ * with a scale of -1, which places one occurrence of a part:
+ *
+ *   operator <- [ITEM_DEFINED_TRANSFORMATION] <- REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION
+ *            <- CONTEXT_DEPENDENT_SHAPE_REPRESENTATION -> PRODUCT_DEFINITION_SHAPE
+ *            -> NEXT_ASSEMBLY_USAGE_OCCURRENCE
+ *
+ * cad.py (OpenCascade 8) places such an occurrence with the rigid placement
  * built from the operator's origin and axes, followed by a reflection through
  * the origin (scale -1). The OpenCascade 7.6 of opencascade.js ignores the
- * scale and keeps the rigid placement only. Returns, for each operator, that
- * rotation (row-major 3x3, built like StepToGeom::MakeTransformation3d: axis3
- * and axis1, axis2 ignored) and origin (file units), for restoreMirror().
- * Operators written as part of a complex entity are not recognised.
+ * scale and keeps the rigid placement only. Returns, for each occurrence
+ * reached from such an operator, its entity number (`id`), its rank among the
+ * entities of the file (`rank`) and that rotation (row-major 3x3, built like
+ * StepToGeom::MakeTransformation3d: axis3 and axis1, axis2 ignored) and origin
+ * (file units), for mirroredPlacements(). Operators written as part of a
+ * complex entity are not recognised.
  */
-function mirrorOperators(bytes) {
+function mirroredOccurrences(bytes) {
   if (indexOfAscii(bytes, 'CARTESIAN_TRANSFORMATION_OPERATOR_3D') < 0) return [];
   const text = new TextDecoder('latin1').decode(bytes);
-  const operators = [];
-  const header = /#\d+\s*=\s*CARTESIAN_TRANSFORMATION_OPERATOR_3D\s*\(/gi;
+  const operators = new Map(); // id -> {axis1, origin, axis3}, scale -1 only
+  const header = /#(\d+)\s*=\s*CARTESIAN_TRANSFORMATION_OPERATOR_3D\s*\(/gi;
   for (let m; (m = header.exec(text)); ) {
     // (name, [name, description,] axis1, axis2, local_origin, scale, axis3)
     const args = stepArguments(text, header.lastIndex).slice(-5);
-    if (args.length === 5 && Number(args[3]) === -1) operators.push({ axis1: args[0], origin: args[2], axis3: args[4] });
+    if (args.length === 5 && Number(args[3]) === -1) operators.set(`#${m[1]}`, { axis1: args[0], origin: args[2], axis3: args[4] });
   }
-  if (!operators.length) return [];
+  if (!operators.size) return [];
+
+  // What refers to them, down to the assembly occurrences.
+  const itemTransforms = new Map(); // ITEM_DEFINED_TRANSFORMATION id -> its two items
+  const relTransforms = new Map(); // representation relationship id -> its transformation
+  const contexts = []; // CONTEXT_DEPENDENT_SHAPE_REPRESENTATION: [relationship, product definition shape]
+  const definitions = new Map(); // PRODUCT_DEFINITION_SHAPE id -> definition
+  const ranks = new Map(); // NEXT_ASSEMBLY_USAGE_OCCURRENCE id -> rank
+  let rank = 0;
+  forEachStatement(text, (statement) => {
+    const m = /^\s*#(\d+)\s*=\s*/.exec(statement);
+    if (!m) return; // header or section keyword
+    rank++;
+    const id = `#${m[1]}`;
+    const body = statement.slice(m[0].length);
+    const type = /^(\w+)\s*\(/.exec(body);
+    if (!type) {
+      // Complex entity: ( REPRESENTATION_RELATIONSHIP(...) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#t) ... )
+      const t = /REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION\s*\(\s*(#\d+)\s*\)/i.exec(body);
+      if (t) relTransforms.set(id, t[1]);
+      return;
+    }
+    const args = () => stepArguments(body, type[0].length);
+    switch (type[1].toUpperCase()) {
+      case 'ITEM_DEFINED_TRANSFORMATION':
+        itemTransforms.set(id, args().slice(2, 4));
+        break;
+      case 'REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION':
+      case 'SHAPE_REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION':
+        relTransforms.set(id, args()[4]);
+        break;
+      case 'CONTEXT_DEPENDENT_SHAPE_REPRESENTATION':
+        contexts.push(args());
+        break;
+      case 'PRODUCT_DEFINITION_SHAPE':
+        definitions.set(id, args()[2]);
+        break;
+      case 'NEXT_ASSEMBLY_USAGE_OCCURRENCE':
+        ranks.set(id, rank);
+        break;
+    }
+  });
+
+  // Transformations that are, or refer to, a mirroring operator.
+  const mirroring = new Map(operators);
+  for (const [id, items] of itemTransforms) {
+    const op = items.map((item) => operators.get(item)).find(Boolean);
+    if (op) mirroring.set(id, op);
+  }
+  const found = [];
+  for (const [relationship, shapeDefinition] of contexts) {
+    const op = mirroring.get(relTransforms.get(relationship));
+    const occurrence = definitions.get(shapeDefinition);
+    if (op && ranks.has(occurrence)) found.push({ occurrence, op });
+  }
+  if (!found.length) return [];
 
   // Coordinates of the DIRECTION and CARTESIAN_POINT entities referenced.
-  const wanted = new Set(operators.flatMap((op) => [op.axis1, op.origin, op.axis3]).filter((a) => a.startsWith('#')));
+  const wanted = new Set(found.flatMap(({ op }) => [op.axis1, op.origin, op.axis3]).filter((a) => a?.startsWith('#')));
   const coords = new Map();
   const entity = /(#\d+)\s*=\s*(?:DIRECTION|CARTESIAN_POINT)\s*\(\s*'(?:[^']|'')*'\s*,\s*\(([^)]*)\)\s*\)/gi;
   for (let m; (m = entity.exec(text)); ) {
@@ -313,29 +387,119 @@ function mirrorOperators(bytes) {
   const vector = (ref, fallback) => (ref === '$' ? fallback : coords.get(ref));
 
   const out = [];
-  for (const op of operators) {
+  for (const { occurrence, op } of found) {
     const d1 = vector(op.axis1, [1, 0, 0]);
     const d3 = vector(op.axis3, [0, 0, 1]);
     const origin = coords.get(op.origin);
     if (![d1, d3, origin].every((v) => v?.length === 3 && v.every(Number.isFinite))) continue;
     // gp_Ax3(origin, d3, d1): Z = d3, X = d1 made orthogonal to Z, Y = Z x X.
     const z = unit(d3);
-    const x = unit(sub(d1, scale(z, dot(d1, z))));
+    const x = z && unit(sub(d1, scale(z, dot(d1, z))));
     if (!z || !x) continue;
     const y = cross(z, x);
-    out.push({ rotation: [x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]], origin });
+    out.push({
+      id: Number(occurrence.slice(1)),
+      rank: ranks.get(occurrence),
+      rotation: [x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]],
+      origin,
+    });
   }
   return out;
 }
 
 /**
+ * STEP reader, with a work session of our own when `withSession`: its transfer
+ * process tells where each occurrence was placed (see mirroredPlacements). A
+ * reader's own work session cannot be reached without copying the reader.
+ */
+function stepReader(oc, withSession) {
+  if (withSession) {
+    const session = new oc.Handle_XSControl_WorkSession_2(new oc.XSControl_WorkSession());
+    const reader = new oc.STEPCAFControl_Reader_2(session, true);
+    // The reader's constructor registers the STEP norm: select it, then attach the
+    // session again so that it gets a model and a transfer process.
+    if (session.get().SelectNorm('STEP')) {
+      reader.Init(session, true);
+      return { reader, session };
+    }
+    reader.delete();
+    session.delete();
+  }
+  return { reader: new oc.STEPCAFControl_Reader_1(), session: null };
+}
+
+/**
+ * Locations OpenCascade gave to the mirrored occurrences of mirroredOccurrences(),
+ * read from the transfer process of the STEP reader's work session.
+ *
+ * The STEP reader moves the shape of each occurrence by a location of its own,
+ * and the XCAF component made of it gets that very location: like
+ * STEPCAFControl_Reader::FindInstance, the component of an occurrence is the
+ * one whose location is equal (same TopLoc_Datum3D objects, not merely the same
+ * values) to that of the occurrence's shape. Another component placed by the
+ * same rotation and translation is thus not mistaken for the mirrored one, and
+ * an occurrence whose component cannot be found is left as it was read.
+ */
+function mirroredPlacements(ctx, session, occurrences) {
+  const { oc } = ctx;
+  const modelHandle = session.Model();
+  const readerHandle = session.TransferReader();
+  const processHandle = readerHandle.IsNull() ? null : readerHandle.get().TransientProcess();
+  const out = [];
+  try {
+    if (modelHandle.IsNull() || !processHandle || processHandle.IsNull()) return out;
+    const model = modelHandle.get();
+    const process = processHandle.get();
+    for (const { id, rank, rotation, origin } of occurrences) {
+      const entity = modelEntity(model, id, rank);
+      if (!entity) continue;
+      const binder = process.Find(entity);
+      try {
+        const result = binder.IsNull() ? null : binder.get(); // owned by the handle
+        if (!(result instanceof oc.TransferBRep_BinderOfShape) || !result.HasResult()) continue;
+        const shape = result.Result();
+        if (!shape.IsNull()) out.push({ loc: ctx.keep(shape.Location_1()), rotation, origin });
+        release(oc, shape);
+      } finally {
+        binder.delete();
+        entity.delete();
+      }
+    }
+  } finally {
+    processHandle?.delete();
+    readerHandle.delete();
+    modelHandle.delete();
+  }
+  return out;
+}
+
+/**
+ * Handle of the entity #id of a STEP model, or null. Entities are numbered in
+ * the order of the file: the rank found in the text is tried first, then the
+ * model is searched for the label.
+ */
+function modelEntity(model, id, rank) {
+  if (rank <= model.NbEntities()) {
+    const entity = model.Value(rank);
+    if (!entity.IsNull() && model.IdentLabel(entity) === id) return entity;
+    entity.delete();
+  }
+  const num = model.NextNumberForLabel(`#${id}`, 0, true);
+  return num > 0 ? model.Value(num) : null;
+}
+
+/**
  * The location of an assembly component, with the reflection that OpenCascade
- * 7.6 dropped (see mirrorOperators) restored when the location is exactly the
- * rigid part of a mirroring operator: same rotation, and a translation equal
- * to the operator's origin converted from a length unit to millimetres.
+ * 7.6 dropped (see mirroredOccurrences) restored when the component is a
+ * mirrored occurrence and its location is still the rigid part of the
+ * operator: same rotation, and a translation equal to the operator's origin
+ * converted from a length unit to millimetres. A location that already holds
+ * the reflection (an OpenCascade that keeps it) is left alone.
  */
 function restoreMirror(ctx, loc, mirrors) {
   const { oc } = ctx;
+  const mirror = mirrors.find((m) => m.loc.IsEqual(loc));
+  if (!mirror) return loc;
   const m = affine(oc, loc);
   const t = [m[3], m[7], m[11]];
   const tol = 1e-9;
@@ -347,15 +511,39 @@ function restoreMirror(ctx, loc, mirrors) {
     if (!LENGTH_UNITS_MM.some((f) => Math.abs(k - f) <= tol * f)) return false;
     return t.every((v, i) => Math.abs(v - k * origin[i]) <= tol * Math.max(1, Math.abs(v)));
   };
-  if (!mirrors.some(isPlacement)) return loc;
+  if (!isPlacement(mirror)) return loc;
 
   const reflection = new oc.gp_Trsf_1();
   const centre = new oc.gp_Pnt_1();
   reflection.SetScale(centre, -1);
-  const mirror = ctx.keep(new oc.TopLoc_Location_2(reflection));
+  const mirrored = ctx.keep(new oc.TopLoc_Location_2(reflection));
   centre.delete();
   reflection.delete();
-  return ctx.keep(mirror.Multiplied(loc));
+  return ctx.keep(mirrored.Multiplied(loc));
+}
+
+/**
+ * Call fn on each statement of a STEP file: the text up to each ';' that is
+ * not inside a quoted string. Linear in the size of the text, even when the
+ * file is malformed.
+ */
+function forEachStatement(text, fn) {
+  let start = 0;
+  let semicolon = text.indexOf(';');
+  let quote = text.indexOf("'");
+  while (semicolon >= 0) {
+    if (quote >= 0 && quote < semicolon) {
+      // A string: skip to its closing quote (a doubled quote closes it and opens another).
+      const close = text.indexOf("'", quote + 1);
+      if (close < 0) return; // unterminated
+      quote = text.indexOf("'", close + 1);
+      if (semicolon < close) semicolon = text.indexOf(';', close + 1);
+      continue;
+    }
+    fn(text.slice(start, semicolon));
+    start = semicolon + 1;
+    semicolon = text.indexOf(';', start);
+  }
 }
 
 /**
@@ -495,7 +683,8 @@ function solidBody(ctx, name, solid, color, notes) {
   let volume;
   let centroid;
   try {
-    oc.BRepGProp.VolumeProperties_1(solid, props, false, false, false);
+    // (shape, props, Eps, only closed = false, skip shared = false)
+    oc.BRepGProp.VolumeProperties_2(solid, props, GPROP_EPS, false, false);
     volume = props.Mass();
     centroid = pointXYZ(oc, props.CentreOfMass());
   } finally {
@@ -539,10 +728,12 @@ function openBody(ctx, name, shape, color) {
 /** Body object of the result contract (same fields as Body.to_dict in model.py). */
 function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], centroid, closed, color, notes, tri }) {
   const mesh = { positions: new Float32Array(tri.verts), indices: tri.indices };
-  // Float32 display coordinates cannot resolve a body far from the origin: its
-  // double-precision vertices are kept for the oriented envelope (summary.js),
-  // like meshanalysis.js does for mesh files.
-  if (float32IsCoarse(min, max)) mesh.positions64 = tri.verts;
+  // The display copy is float32. When that rounded the vertices, the double-precision
+  // ones are kept for the oriented envelope (summary.js), which the Python engine
+  // measures on its double-precision vertices (float32 made a thin plate's envelope
+  // 2e-5 too large; far from the origin it does not even resolve the body), like
+  // meshanalysis.js does for mesh files.
+  if (!sameValues(tri.verts, mesh.positions)) mesh.positions64 = tri.verts;
   return {
     name,
     volume,
@@ -559,11 +750,10 @@ function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], 
   };
 }
 
-/** True when rounding the coordinates to float32 moves them by more than 1e-6 of the body size. */
-function float32IsCoarse(min, max) {
-  const reach = Math.max(...min.map(Math.abs), ...max.map(Math.abs));
-  const size = Math.max(...max.map((v, i) => v - min[i]));
-  return reach * 2 ** -24 > 1e-6 * size;
+/** True when the float32 copy holds exactly the double-precision coordinates (NaN aside). */
+function sameValues(verts, copy) {
+  for (let i = 0; i < verts.length; i++) if (verts[i] !== copy[i] && verts[i] === verts[i]) return false;
+  return true;
 }
 
 function sewToSolids(ctx, shapes, deflection, ang) {
@@ -581,9 +771,15 @@ function sewToSolids(ctx, shapes, deflection, ang) {
     sewing.delete();
   }
 
+  // A closed surface made of a single face (sphere, torus...) is left by sewing as a
+  // free face: wrap it in a shell of its own, which may be closed like the others.
+  const shells = [
+    ...children(ctx, sewn, TopAbs_SHELL),
+    ...children(ctx, sewn, TopAbs_FACE, TopAbs_SHELL).map((face) => shellOf(ctx, face)),
+  ];
   const solids = [];
   const remaining = [];
-  for (const shell of children(ctx, sewn, TopAbs_SHELL)) {
+  for (const shell of shells) {
     if (oc.BRep_Tool.IsClosed_1(shell)) {
       const maker = new oc.BRepBuilderAPI_MakeSolid_3(ctx.keep(oc.TopoDS.Shell_1(shell)));
       try {
@@ -597,7 +793,6 @@ function sewToSolids(ctx, shapes, deflection, ang) {
     }
     remaining.push(shell);
   }
-  remaining.push(...children(ctx, sewn, TopAbs_FACE, TopAbs_SHELL));
   if (solids.length) {
     // Sewing creates new faces without triangulation: mesh them like the originals.
     meshEach(ctx, [...solids, ...remaining], deflection, ang);
@@ -779,10 +974,21 @@ function compound(ctx, shapes) {
   return comp;
 }
 
+/** Shell made of one face. */
+function shellOf(ctx, face) {
+  const shell = ctx.keep(new ctx.oc.TopoDS_Shell());
+  const builder = new ctx.oc.BRep_Builder();
+  builder.MakeShell(shell);
+  builder.Add(shell, face);
+  release(ctx.oc, builder);
+  return shell;
+}
+
 function area(ctx, shape) {
   const props = new ctx.oc.GProp_GProps_1();
   try {
-    ctx.oc.BRepGProp.SurfaceProperties_1(shape, props, false, false);
+    // (shape, props, Eps, skip shared = false)
+    ctx.oc.BRepGProp.SurfaceProperties_2(shape, props, GPROP_EPS, false);
     return props.Mass();
   } finally {
     props.delete();

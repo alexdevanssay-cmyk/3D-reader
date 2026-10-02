@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from pathlib import Path
 
 
 def main() -> None:
+    from .mesh import UNITS
+
     parser = argparse.ArgumentParser(prog="reader3d", description="3D model reader: viewer and real volume calculation")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -16,7 +20,7 @@ def main() -> None:
 
     an = sub.add_parser("analyze", help="print the volume and dimensions of a file")
     an.add_argument("file")
-    an.add_argument("--unit", default="auto", help="source unit of mesh files: auto, mm, cm, m, in, ft")
+    an.add_argument("--unit", default="auto", choices=["auto", *UNITS], help="source unit of mesh files (default: auto)")
     an.add_argument("--json", action="store_true", help="print the full JSON result")
 
     args = parser.parse_args()
@@ -25,13 +29,32 @@ def main() -> None:
 
         uvicorn.run("reader3d.server:app", host=args.host, port=args.port)
     else:
-        from .analyze import analyze_file
+        sys.exit(_analyze(args))
 
-        result = analyze_file(args.file, unit=args.unit, include_mesh=False)
-        if args.json:
-            print(json.dumps(result, indent=2))
-        else:
-            _print_report(result)
+
+def _analyze(args) -> int:
+    # Like the server, analyse in a child process: OpenCascade crashes on some
+    # malformed files, which then gives an error message instead of a segfault.
+    from .isolate import AnalysisCrashed, analyze_isolated
+
+    if not Path(args.file).is_file():
+        return _error(f"no such file: {args.file}")
+    try:
+        result = analyze_isolated(args.file, args.unit, include_mesh=False)
+    except (ValueError, AnalysisCrashed) as exc:
+        return _error(str(exc))
+    except KeyboardInterrupt:  # the child is killed on the way out
+        return 130
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        _print_report(result)
+    return 0
+
+
+def _error(message: str) -> int:
+    print(f"reader3d: error: {message}", file=sys.stderr)
+    return 1
 
 
 def _fmt(v, unit, scale=1.0, digits=3):

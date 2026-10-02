@@ -12,11 +12,13 @@
 //   work.is_watertight / is_winding_consistent -> buildEdges() + checks
 //   trimesh.repair.fix_winding        -> fixWinding()     BFS over face adjacency
 //   trimesh.repair.fill_holes         -> fillHoles()      boundary cycles of 3 or 4 edges
-//   work.volume / center_mass / area  -> massProperties() / meshArea()
+//   mesh.py _shell_volume / area      -> shellProperties() / meshArea()
 //
 // The volume of a closed mesh is the volume enclosed by its triangles (divergence
-// theorem, sum of signed tetrahedra). Open meshes get no volume unless a few
-// missing triangles can be filled, exactly like the Python engine.
+// theorem, sum of signed tetrahedra), every shell being oriented on its own: material
+// when it lies inside an even number of other shells, a void otherwise. Open meshes
+// get no volume unless a few missing triangles can be filled, exactly like the Python
+// engine.
 //
 // Everything runs in linear time on typed arrays (open-addressing hash tables keyed
 // on integers), so meshes with millions of triangles are fine.
@@ -27,6 +29,8 @@ const TOL_MERGE = 1e-8;
 const MERGE_SCALE = 1e8;
 // trimesh.util.TOL_ZERO: a triangle with a smaller cross product has no normal.
 const TOL_ZERO = 1e-13;
+
+const INWARDS = 'Normals pointed inwards; volume sign corrected';
 
 /**
  * Analyse the parts produced by meshload.js.
@@ -66,6 +70,7 @@ export function analyzeMesh(name, positions, indices = null, color = null) {
   const notes = [];
 
   const bbox = referencedBounds(pos, faces);
+  const size = Math.max(...bbox.size); // L of the volume and centroid thresholds (mesh.py)
   const work = buildWorkMesh(pos, faces);
   const area = meshArea(work.verts, work.faces);
 
@@ -79,25 +84,30 @@ export function analyzeMesh(name, positions, indices = null, color = null) {
       fixWinding(work.faces, work.nv, edges);
       notes.push('Inconsistent triangle orientation was repaired');
     }
-    let mp = massProperties(work.verts, work.faces);
-    if (mp.volume < 0) {
-      notes.push('Normals pointed inwards; volume sign corrected');
-      mp = { volume: -mp.volume, centroid: mp.centroid };
-    }
-    volume = mp.volume;
-    centroid = mp.centroid;
+    const shells = shellProperties(work.verts, work.faces, edges, size);
+    if (shells.flipped) notes.push(INWARDS);
+    volume = shells.volume;
+    centroid = shells.centroid;
   } else {
     const openEdges = countBoundaryEdges(edges);
     const repaired = openEdges ? fillHoles(work.verts, work.faces, work.nv, edges) : null;
     if (repaired) {
-      // Small holes (missing triangles) could be closed: give an estimate.
+      // Small holes (missing triangles) could be closed: give an estimate, unless the
+      // filling made up most of the surface (a soup of unwelded triangles "closed" by a
+      // reversed twin each) or encloses nothing.
       const repairedEdges = buildEdges(repaired, work.nv);
       if (!isWindingConsistent(repairedEdges, repaired)) fixWinding(repaired, work.nv, repairedEdges);
-      const mp = massProperties(work.verts, repaired);
-      volume = Math.abs(mp.volume);
-      centroid = mp.centroid;
-      notes.push(`Mesh was not closed (${openEdges} open edges); volume estimated after filling the holes`);
-    } else {
+      const filled = shellProperties(work.verts, repaired, repairedEdges, size);
+      const before = work.faces.length / 3;
+      const added = repaired.length / 3 - before;
+      if (added < before && Math.abs(filled.volume) > 1e-9 * size ** 3) {
+        volume = filled.volume;
+        centroid = filled.centroid;
+        if (filled.flipped) notes.push(INWARDS);
+        notes.push(`Mesh was not closed (${openEdges} open edges); volume estimated after filling the holes`);
+      }
+    }
+    if (volume === null) {
       notes.push(
         openEdges
           ? `Mesh is not closed (${openEdges} open edges): the enclosed volume is undefined`
@@ -107,9 +117,13 @@ export function analyzeMesh(name, positions, indices = null, color = null) {
   }
 
   const mesh = { positions: displayPositions, indices: faces };
-  // Float32 display coordinates cannot resolve a body far from the origin (georeferenced
-  // models): keep the analysed double-precision coordinates for its envelope (summary.js).
-  if (!(pos instanceof Float32Array) && float32IsCoarse(bbox)) mesh.positions64 = pos instanceof Float64Array ? pos : Float64Array.from(pos);
+  // The display copy is float32. When that rounded the analysed coordinates, they are
+  // kept for the oriented envelope (summary.js), which the Python engine measures on
+  // its double-precision vertices (far from the origin, float32 would not even resolve
+  // the body).
+  if (!(pos instanceof Float32Array) && !sameValues(pos, displayPositions)) {
+    mesh.positions64 = pos instanceof Float64Array ? pos : Float64Array.from(pos);
+  }
 
   return {
     name,
@@ -127,11 +141,10 @@ export function analyzeMesh(name, positions, indices = null, color = null) {
   };
 }
 
-/** True when rounding the coordinates to float32 moves them by more than 1e-6 of the body size. */
-function float32IsCoarse(bbox) {
-  const reach = Math.max(...bbox.min.map(Math.abs), ...bbox.max.map(Math.abs));
-  const size = Math.max(...bbox.size);
-  return reach * 2 ** -24 > 1e-6 * size;
+/** True when the float32 copy holds exactly the analysed coordinates (NaN aside). */
+function sameValues(pos, copy) {
+  for (let i = 0; i < pos.length; i++) if (pos[i] !== copy[i] && pos[i] === pos[i]) return false;
+  return true;
 }
 
 // --------------------------------------------------------------------------- input
@@ -485,8 +498,8 @@ function countBoundaryEdges(edges) {
  * edge in the same direction as the face it was reached from.
  *
  * The start face decides the orientation of its component, hence whether the
- * "normals pointed inwards" correction follows and, with several components, the
- * volume itself, so it is chosen exactly like trimesh/networkx do (see startFaces).
+ * "normals pointed inwards" correction follows, so it is chosen exactly like
+ * trimesh/networkx do (see startFaces).
  */
 function fixWinding(t, nv, edges) {
   const nf = t.length / 3;
@@ -851,11 +864,21 @@ function meshArea(v, t) {
 }
 
 /**
- * Signed volume and centre of mass of a closed triangle mesh (divergence theorem):
- * sum of the signed tetrahedra (c, p0, p1, p2) with c the centre of the vertex bounds,
- * which keeps the sums well conditioned for models far from the origin.
+ * mesh.py `_shell_volume`: volume and centre of mass of a closed, consistently wound
+ * triangle mesh (divergence theorem: signed tetrahedra (o, p0, p1, p2) with o the centre
+ * of the vertex bounds, which keeps the sums well conditioned far from the origin).
+ *
+ * Every shell (faces connected through their edges) is oriented on its own: the winding
+ * repair keeps whatever orientation each shell started with, so one inside-out shell
+ * would otherwise be subtracted from the others. A shell is material (positive volume)
+ * when it lies inside an even number of other shells and a void (negative) when the
+ * number is odd. The centroid is null when the volume is (numerically) zero compared
+ * with `size`, the largest side of the body's bounds.
+ *
+ * @returns {{volume: number, centroid: number[]|null, flipped: boolean}} flipped: some
+ *   shell had to be turned the other way
  */
-function massProperties(v, t) {
+function shellProperties(v, t, edges, size) {
   let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
   for (let i = 0; i < v.length; i += 3) {
     if (v[i] < minX) minX = v[i];
@@ -865,23 +888,181 @@ function massProperties(v, t) {
     if (v[i + 2] < minZ) minZ = v[i + 2];
     if (v[i + 2] > maxZ) maxZ = v[i + 2];
   }
-  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
-  let six = 0, mx = 0, my = 0, mz = 0;
-  for (let f = 0; f < t.length; f += 3) {
-    const a = 3 * t[f], b = 3 * t[f + 1], c = 3 * t[f + 2];
-    const ax = v[a] - cx, ay = v[a + 1] - cy, az = v[a + 2] - cz;
-    const bx = v[b] - cx, by = v[b + 1] - cy, bz = v[b + 2] - cz;
-    const qx = v[c] - cx, qy = v[c + 1] - cy, qz = v[c + 2] - cz;
-    const d = ax * (by * qz - bz * qy) + ay * (bz * qx - bx * qz) + az * (bx * qy - by * qx);
-    six += d;
-    mx += d * (ax + bx + qx);
-    my += d * (ay + by + qy);
-    mz += d * (az + bz + qz);
+  const o = [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2];
+  const { label, first } = faceComponents(t, edges);
+  const count = first.length;
+
+  // Per shell: signed volume and first moment about o, summed over the faces in the
+  // order and with the operations of mesh.py, numpy's included (einsum adds the three
+  // products of a . (b x c) as (x + z) + y): the sign of a shell of (nearly) zero
+  // volume, e.g. a triangle and its reversed twin, is decided by these roundings.
+  const vol = new Float64Array(count);
+  const moment = new Float64Array(3 * count);
+  for (let f = 0; f < t.length / 3; f++) {
+    const a = 3 * t[3 * f], b = 3 * t[3 * f + 1], c = 3 * t[3 * f + 2];
+    const ax = v[a] - o[0], ay = v[a + 1] - o[1], az = v[a + 2] - o[2];
+    const bx = v[b] - o[0], by = v[b + 1] - o[1], bz = v[b + 2] - o[2];
+    const qx = v[c] - o[0], qy = v[c + 1] - o[1], qz = v[c + 2] - o[2];
+    const tet = (ax * (by * qz - bz * qy) + az * (bx * qy - by * qx) + ay * (bz * qx - bx * qz)) / 6.0;
+    const k = label[f];
+    vol[k] += tet;
+    moment[3 * k] += (tet * (ax + bx + qx)) / 4.0;
+    moment[3 * k + 1] += (tet * (ay + by + qy)) / 4.0;
+    moment[3 * k + 2] += (tet * (az + bz + qz)) / 4.0;
   }
-  const volume = six / 6.0;
-  let centroid = [cx + mx / (4 * six), cy + my / (4 * six), cz + mz / (4 * six)];
+
+  const depth = count > 1 ? nestingDepth(v, t, o, label, first) : new Int32Array(1);
+  let flipped = false;
+  let volume = 0, mx = 0, my = 0, mz = 0;
+  for (let k = 0; k < count; k++) {
+    const wanted = depth[k] % 2 === 0 ? 1 : -1;
+    if (vol[k] !== 0 && Math.sign(vol[k]) !== wanted) {
+      vol[k] = -vol[k];
+      for (let j = 0; j < 3; j++) moment[3 * k + j] = -moment[3 * k + j];
+      flipped = true;
+    }
+    volume += vol[k];
+    mx += moment[3 * k];
+    my += moment[3 * k + 1];
+    mz += moment[3 * k + 2];
+  }
+  let centroid = [o[0] + mx / volume, o[1] + my / volume, o[2] + mz / volume];
   // A (numerically) zero volume has no centre of mass; trimesh would return 0/0 noise.
-  const scale = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
-  if (!(Math.abs(volume) > 1e-12 * scale ** 3) || !centroid.every(Number.isFinite)) centroid = null;
-  return { volume, centroid };
+  if (!(Math.abs(volume) > 1e-12 * size ** 3) || !centroid.every(Number.isFinite)) centroid = null;
+  return { volume, centroid, flipped };
+}
+
+/**
+ * Shells: faces connected through a shared edge (union-find over the edges), numbered
+ * in the order of their lowest face index. Returns the label of every face and the
+ * lowest face of every shell.
+ */
+function faceComponents(t, edges) {
+  const nf = t.length / 3;
+  const parent = new Int32Array(nf);
+  for (let f = 0; f < nf; f++) parent[f] = f;
+  const root = (f) => {
+    while (parent[f] !== f) {
+      parent[f] = parent[parent[f]];
+      f = parent[f];
+    }
+    return f;
+  };
+  for (let e = 0; e < edges.ne; e++) {
+    if (edges.count[e] < 2) continue;
+    const a = root((edges.occ0[e] / 3) | 0), b = root((edges.occ1[e] / 3) | 0);
+    if (a !== b) parent[a < b ? b : a] = a < b ? a : b;
+  }
+  const label = new Int32Array(nf);
+  const first = [];
+  const rootLabel = new Int32Array(nf).fill(-1);
+  for (let f = 0; f < nf; f++) {
+    const r = root(f);
+    if (rootLabel[r] < 0) {
+      rootLabel[r] = first.length;
+      first.push(f);
+    }
+    label[f] = rootLabel[r];
+  }
+  return { label, first };
+}
+
+// Direction of the rays of the inside test: neither along an axis nor a diagonal, so
+// that it rarely grazes the edges of axis-aligned meshes (mesh.py `_RAY`).
+const RAY = [1 / Math.sqrt(6), Math.sqrt(2) / Math.sqrt(6), Math.sqrt(3) / Math.sqrt(6)];
+
+/**
+ * mesh.py `_nesting_depth`: for every shell, the number of other shells containing its
+ * test point (the centroid of its lowest face): the point lies in the other shell's
+ * bounds (inclusive) and the ray p + t * RAY (t > 0) crosses an odd number of its
+ * triangles. Coordinates relative to `o`, like the volume sums.
+ */
+function nestingDepth(v, t, o, label, first) {
+  const count = first.length;
+  const nf = t.length / 3;
+  const corner = (f, j, k) => v[3 * t[3 * f + j] + k] - o[k];
+  const points = new Float64Array(3 * count);
+  for (let s = 0; s < count; s++) {
+    for (let k = 0; k < 3; k++) points[3 * s + k] = (corner(first[s], 0, k) + corner(first[s], 1, k) + corner(first[s], 2, k)) / 3;
+  }
+  const lo = new Float64Array(3 * count).fill(Infinity);
+  const hi = new Float64Array(3 * count).fill(-Infinity);
+  // faces grouped by shell (counting sort, face order kept)
+  const start = new Int32Array(count + 1);
+  for (let f = 0; f < nf; f++) start[label[f] + 1]++;
+  for (let s = 0; s < count; s++) start[s + 1] += start[s];
+  const fill = start.slice(0, count);
+  const order = new Int32Array(nf);
+  for (let f = 0; f < nf; f++) {
+    const s = label[f];
+    order[fill[s]++] = f;
+    for (let j = 0; j < 3; j++) {
+      for (let k = 0; k < 3; k++) {
+        const x = corner(f, j, k);
+        if (x < lo[3 * s + k]) lo[3 * s + k] = x;
+        if (x > hi[3 * s + k]) hi[3 * s + k] = x;
+      }
+    }
+  }
+
+  // test points sorted by x: the candidates of a shell are a range of this order
+  const byX = Array.from({ length: count }, (_, s) => s).sort((a, b) => points[3 * a] - points[3 * b] || a - b);
+  const xs = Float64Array.from(byX, (s) => points[3 * s]);
+  const lowerBound = (x, strict) => {
+    let a = 0, b = count;
+    while (a < b) {
+      const m = (a + b) >> 1;
+      if (strict ? xs[m] <= x : xs[m] < x) a = m + 1;
+      else b = m;
+    }
+    return a;
+  };
+  const depth = new Int32Array(count);
+  for (let j = 0; j < count; j++) {
+    const candidates = [];
+    for (let i = lowerBound(lo[3 * j], false); i < lowerBound(hi[3 * j], true); i++) {
+      const s = byX[i];
+      if (s === j) continue;
+      let inside = true;
+      for (let k = 1; k < 3 && inside; k++) inside = points[3 * s + k] >= lo[3 * j + k] && points[3 * s + k] <= hi[3 * j + k];
+      if (inside) candidates.push(s);
+    }
+    if (!candidates.length) continue;
+    const hits = rayCrossings(candidates.map((s) => [points[3 * s], points[3 * s + 1], points[3 * s + 2]]), order.subarray(start[j], start[j + 1]), corner);
+    candidates.forEach((s, i) => {
+      if (hits[i] % 2 === 1) depth[s]++;
+    });
+  }
+  return depth;
+}
+
+/**
+ * mesh.py `_ray_crossings`: number of the triangles `faces` crossed by the ray
+ * p + t * RAY (t > 0) of every point (Möller–Trumbore; triangles parallel to the ray
+ * are skipped, a crossing on an edge or a corner counts). The dot products that numpy
+ * computes with einsum add their terms in its order, (x + z) + y.
+ */
+function rayCrossings(points, faces, corner) {
+  const hits = new Int32Array(points.length);
+  const [rx, ry, rz] = RAY;
+  for (const f of faces) {
+    const ax = corner(f, 0, 0), ay = corner(f, 0, 1), az = corner(f, 0, 2);
+    const e1x = corner(f, 1, 0) - ax, e1y = corner(f, 1, 1) - ay, e1z = corner(f, 1, 2) - az;
+    const e2x = corner(f, 2, 0) - ax, e2y = corner(f, 2, 1) - ay, e2z = corner(f, 2, 2) - az;
+    const px = ry * e2z - rz * e2y, py = rz * e2x - rx * e2z, pz = rx * e2y - ry * e2x; // RAY x e2
+    const det = e1x * px + e1z * pz + e1y * py;
+    const n1 = Math.sqrt(e1x * e1x + e1y * e1y + e1z * e1z), n2 = Math.sqrt(e2x * e2x + e2y * e2y + e2z * e2z);
+    if (!(Math.abs(det) > 1e-12 * n1 * n2)) continue;
+    const inv = 1.0 / det;
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      const tx = p[0] - ax, ty = p[1] - ay, tz = p[2] - az;
+      const u = (tx * px + tz * pz + ty * py) * inv;
+      const qx = ty * e1z - tz * e1y, qy = tz * e1x - tx * e1z, qz = tx * e1y - ty * e1x; // tvec x e1
+      const w = (qx * rx + qy * ry + qz * rz) * inv;
+      const d = (qx * e2x + qz * e2z + qy * e2y) * inv;
+      if (d > 0 && u >= 0 && w >= 0 && u + w <= 1) hits[i]++;
+    }
+  }
+  return hits;
 }

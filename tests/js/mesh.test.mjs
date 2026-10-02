@@ -83,10 +83,10 @@ for (const name of meshFixtures) {
     approxPoint(s.bbox.max, e.bbox.max, size, 'summary.bbox.max');
     approx(s.bbox.volume, e.bbox.volume, REL, 0, 'summary.bbox.volume');
 
-    // Oriented envelope: trimesh searches hull directions on a 0.1 rad grid, we search
-    // all of them, so ours can only be (slightly) smaller; both never exceed the AABB.
-    assert.ok(s.obb.volume <= e.obb.volume * (1 + REL), `obb ${s.obb.volume} > python ${e.obb.volume}`);
-    assert.ok(s.obb.volume >= e.obb.volume * (1 - 2e-3), `obb ${s.obb.volume} << python ${e.obb.volume}`);
+    // Oriented envelope: both engines run the same search (FIX_SPEC R4) on the same
+    // double-precision vertices.
+    approx(s.obb.volume, e.obb.volume, REL, 0, 'summary.obb.volume');
+    approxVec(s.obb.size, e.obb.size, REL, 0, 'summary.obb.size');
     assert.ok(s.obb.volume <= s.bbox.volume * (1 + 1e-12), 'obb larger than the AABB');
     assert.deepEqual([...s.obb.size].sort((a, b) => b - a), s.obb.size, 'obb sizes sorted');
     approx(s.obb.volume, s.obb.size[0] * s.obb.size[1] * s.obb.size[2], 1e-12, 0, 'obb volume');
@@ -103,6 +103,35 @@ for (const name of meshFixtures) {
     if (py.analytic_volume !== null) approx(s.volume, py.analytic_volume, REL, 0, 'analytic volume');
   });
 }
+
+test('review fixtures have their analytic results, whatever expected.json holds', async () => {
+  // Several shells, one of them inside out (FIX_SPEC R1): the volumes add up.
+  for (const [name, volume, centroid, notes] of [
+    ['two_cubes_one_inverted.stl', 2000, [15, 0, 0], [INWARDS]],
+    ['small_cube_inverted.stl', 9000, [(8000 * 50) / 9000, 0, 0], [INWARDS]],
+    ['cube_with_void.stl', 7875, [0, 0, 0], []], // an inside-out box inside another: a void
+  ]) {
+    const { bodies, summary } = await analyzeFixture(name);
+    assert.equal(bodies.length, 1, name);
+    assert.equal(bodies[0].closed, true, `${name}: closed`);
+    assert.deepEqual(bodies[0].notes, notes, `${name}: notes`);
+    approx(summary.volume, volume, 1e-12, 0, `${name}: volume`);
+    approxVec(summary.centroid, centroid, 0, 1e-9, `${name}: centroid`);
+  }
+  // Facets that do not weld (R2): open, no volume, no centroid.
+  const soup = await analyzeFixture('unwelded_cube.stl');
+  assert.equal(soup.bodies[0].closed, false);
+  assert.deepEqual(soup.bodies[0].notes, ['Mesh is not closed (36 open edges): the enclosed volume is undefined']);
+  for (const key of ['volume', 'centroid']) assert.equal(soup.bodies[0][key], null, `body ${key}`);
+  for (const key of ['volume', 'centroid', 'fill_ratio']) assert.equal(soup.summary[key], null, `summary.${key}`);
+  assert.equal(soup.summary.solids, 0);
+  // A rotated 10 mm cube plus an unused vertex far away (R4): the envelope is the cube
+  // (float32 file coordinates: 1e-7 rounding).
+  const stray = await analyzeFixture('cube_stray_vertex.ply');
+  approxVec(stray.summary.obb.size, [10, 10, 10], 1e-6, 0, 'obb.size');
+  approx(stray.summary.obb.volume, 1000, 1e-6, 0, 'obb.volume');
+  approx(stray.summary.volume, 1000, 1e-6, 0, 'volume');
+});
 
 test('no format needs DOMParser (3MF and COLLADA have their own XML reader)', () => {
   assert.equal(typeof globalThis.DOMParser, 'undefined', 'these tests run without a DOM');
@@ -133,6 +162,15 @@ test('unit names declared by files', () => {
   assert.deepEqual(unitFromName('micron'), { name: 'micron', factor: 1e-3 });
   assert.equal(unitFromName('furlong'), null);
   assert.deepEqual(UNITS, { mm: 1, cm: 10, m: 1000, in: 25.4, ft: 304.8 });
+});
+
+test('a 3MF in microns is scaled to mm and its source unit is named "micron" (both engines)', async () => {
+  const v = BOX_V.map(([x, y, z]) => `<vertex x="${x}" y="${y}" z="${z}"/>`).join('');
+  const t = BOX_F.map(([a, b, c]) => `<triangle v1="${a}" v2="${b}" v3="${c}"/>`).join('');
+  const model = `<?xml version="1.0" encoding="UTF-8"?>\n<model unit="micron" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><resources><object id="1" type="model"><mesh><vertices>${v}</vertices><triangles>${t}</triangles></mesh></object></resources><build><item objectid="1"/></build></model>`;
+  const { parts, source_unit } = await loadMeshFile(threeMf(model), 'micron.3mf');
+  assert.equal(source_unit, 'micron');
+  approx(summarize(analyzeMeshParts(parts)).volume, 6000e-9, 1e-12, 0, 'volume in mm3');
 });
 
 // ----------------------------------------------------------------------------- loader edge cases
@@ -261,6 +299,31 @@ test('glTF files that need other files or decoders fail clearly', async () => {
   await assert.rejects(loadMeshFile(ascii(draco), 'bracket.gltf'), /Compressed glTF geometry/);
 });
 
+test('glTF accessors that need more data than the file holds fail at once (no frozen page)', async () => {
+  // 267 bytes declaring 60 million zero-filled vertices: GLTFLoader used to allocate them
+  // all, on the main thread.
+  const huge = JSON.stringify({
+    asset: { version: '2.0' }, scenes: [{ nodes: [0] }], scene: 0, nodes: [{ mesh: 0 }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+    accessors: [{ componentType: 5126, count: 60000000, type: 'VEC3', min: [0, 0, 0], max: [0, 0, 0] }],
+  });
+  assert.ok(huge.length < 300);
+  const start = performance.now();
+  await assert.rejects(loadMeshFile(ascii(huge), 'huge.gltf'), /The glTF file is damaged: its accessors declare far more data than the file holds/);
+  assert.ok(performance.now() - start < 1000, 'refused before decoding');
+  // An accessor reading past the end of its buffer view.
+  const past = bracketGltf({
+    accessors: [
+      { bufferView: 0, componentType: 5126, count: 9, type: 'VEC3' },
+      { bufferView: 1, componentType: 5123, count: 36, type: 'SCALAR' },
+    ],
+  });
+  await assert.rejects(loadMeshFile(ascii(past), 'past.gltf'), /accessor 0 needs more data than its buffer holds/);
+  // A buffer view past the end of the binary data.
+  const short = bracketGltf({ bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: 96 }, { buffer: 0, byteOffset: 96, byteLength: 80 }] });
+  await assert.rejects(loadMeshFile(ascii(short), 'short.gltf'), /accessor 1 needs more data than its buffer holds/);
+});
+
 // ----------------------------------------------------------------------------- analysis
 
 // trimesh.creation.box((10, 20, 30)): the reference results below were produced by
@@ -276,6 +339,9 @@ const BOX_F = [
 const flip = (faces, which) => faces.map((f, i) => (which.includes(i) ? [f[2], f[1], f[0]] : f));
 const without = (faces, which) => faces.filter((_, i) => !which.includes(i));
 const mesh = (v, f) => analyzeMesh('m', Float32Array.from(v.flat()), Uint32Array.from(f.flat()));
+
+const INWARDS = 'Normals pointed inwards; volume sign corrected';
+const REPAIRED = 'Inconsistent triangle orientation was repaired';
 
 const PYTHON_CASES = [
   {
@@ -350,6 +416,125 @@ test('analysis: a closed shell inside another one counts as a cavity (signed vol
   approx(b.volume, 6000 - 750, 1e-12, 0, 'hollow volume');
   approx(b.area, 2200 * 1.25, 1e-12, 0, 'area');
 });
+
+// ----------------------------------------------------------------------------- shells
+//
+// Every shell of a closed mesh is oriented on its own (FIX_SPEC R1) and hole filling is
+// only accepted when plausible (R2). Every expected value below was produced by
+// reader3d.mesh._mesh_body (Python engine) on the same vertices and faces.
+
+/** trimesh.creation.box(size) centred on `centre`, inside out with `inverted`. */
+function boxMesh(size, centre = [0, 0, 0], inverted = false) {
+  const v = [];
+  for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-1, 1]) v.push([0, 1, 2].map((k) => centre[k] + ([x, y, z][k] * size[k]) / 2));
+  return { v, f: inverted ? BOX_F.map(([a, b, c]) => [c, b, a]) : BOX_F };
+}
+
+/** Meshes appended in one vertex and face list (trimesh.util.concatenate). */
+function concat(...meshes) {
+  const v = [], f = [];
+  for (const m of meshes) {
+    f.push(...m.f.map((t) => t.map((i) => i + v.length)));
+    v.push(...m.v);
+  }
+  return { v, f };
+}
+
+/** The box's 12 triangles with every corner moved by up to 1e-6 (Park-Miller noise): nothing welds. */
+function unweldedSoup() {
+  const b = boxMesh([10, 10, 10]);
+  let seed = 7;
+  const noise = () => {
+    seed = (seed * 16807) % 2147483647;
+    return (seed / 2147483647 - 0.5) * 2e-6;
+  };
+  const v = [], f = [];
+  for (const t of b.f) {
+    f.push([v.length, v.length + 1, v.length + 2]);
+    for (const i of t) v.push(b.v[i].map((x) => x + noise()));
+  }
+  return { v, f };
+}
+
+const NESTED = [-0.21052631578947364, 0, 0]; // (64000 * 0 - 8000 * 2 + 1000 * 4) / 57000
+const SHELL_CASES = [
+  {
+    label: 'two separate boxes, the second inside out: the volumes add up',
+    mesh: () => concat(boxMesh([10, 20, 30]), boxMesh([10, 20, 30], [40, 0, 0], true)),
+    volume: 12000, area: 4400, centroid: [20, 0, 0], notes: [INWARDS],
+  },
+  {
+    label: 'a small inside-out box next to a big one',
+    mesh: () => concat(boxMesh([2, 2, 2], [-20, 0, 0], true), boxMesh([10, 20, 30])),
+    volume: 6008, area: 2224, centroid: [-0.026631158455392878, 0, 0], notes: [INWARDS],
+  },
+  // three shells nested in each other: material, void, material, whatever their winding
+  ...[0, 1, 2, 3, 4, 5, 6, 7].map((k) => ({
+    label: `three nested shells, orientation ${k}`,
+    mesh: () => concat(boxMesh([40, 40, 40], [0, 0, 0], !!(k & 1)), boxMesh([20, 20, 20], [2, 0, 0], !(k & 2)), boxMesh([10, 10, 10], [4, 0, 0], !!(k & 4))),
+    volume: 57000, area: 12600, centroid: NESTED, notes: k === 0 ? [] : [INWARDS],
+  })),
+  {
+    label: 'three nested shells listed from the inside, all facing outwards',
+    mesh: () => concat(boxMesh([10, 10, 10], [4, 0, 0]), boxMesh([20, 20, 20], [2, 0, 0]), boxMesh([40, 40, 40])),
+    volume: 57000, area: 12600, centroid: NESTED, notes: [INWARDS],
+  },
+  // shells touching each other without sharing an edge stay separate bodies of material
+  {
+    label: 'an inside-out box resting on a face of another one (+x side)',
+    mesh: () => concat(boxMesh([10, 10, 10], [5, 5, 5]), boxMesh([4, 4, 4], [12, 5, 5], true)),
+    volume: 1064, area: 696, centroid: [5.421052631578947, 5, 5], notes: [INWARDS],
+  },
+  {
+    label: 'an inside-out box resting on a face of another one (-x side)',
+    mesh: () => concat(boxMesh([10, 10, 10], [5, 5, 5]), boxMesh([4, 4, 4], [-2, 5, 5], true)),
+    volume: 1064, area: 696, centroid: [4.578947368421053, 5, 5], notes: [INWARDS],
+  },
+  {
+    label: 'an inside-out box resting on a face of another one, listed first',
+    mesh: () => concat(boxMesh([4, 4, 4], [-2, 5, 5], true), boxMesh([10, 10, 10], [5, 5, 5])),
+    volume: 1064, area: 696, centroid: [4.578947368421053, 5, 5], notes: [INWARDS],
+  },
+  {
+    label: 'two boxes sharing a corner vertex, one inside out',
+    mesh: () => concat(boxMesh([10, 10, 10], [5, 5, 5]), boxMesh([10, 10, 10], [15, 15, 15], true)),
+    volume: 2000, area: 1200, centroid: [10, 10, 10], notes: [INWARDS],
+  },
+  {
+    label: 'second shell with 3 flipped triangles: repaired, then turned outwards',
+    mesh: () => {
+      const m = concat(boxMesh([10, 10, 10]), boxMesh([10, 10, 10], [30, 0, 0]));
+      return { v: m.v, f: flip(m.f, [12, 13, 17]) };
+    },
+    volume: 2000, area: 1200, centroid: [15, 0, 0], notes: [REPAIRED, INWARDS],
+  },
+  // hole filling that makes up the surface or encloses nothing is refused
+  {
+    label: 'an unwelded triangle soup is open (each triangle would be capped by its twin)',
+    mesh: unweldedSoup,
+    volume: null, area: 599.9999991293178, centroid: null, closed: false,
+    notes: ['Mesh is not closed (36 open edges): the enclosed volume is undefined'],
+  },
+  {
+    label: 'a flat square whose border would be capped encloses nothing: open',
+    mesh: () => ({ v: [[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0], [5, 5, 0]], f: [[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]] }),
+    volume: null, area: 100, centroid: null, closed: false,
+    notes: ['Mesh is not closed (4 open edges): the enclosed volume is undefined'],
+  },
+];
+
+for (const c of SHELL_CASES) {
+  test(`analysis: ${c.label}`, () => {
+    const { v, f } = c.mesh();
+    const b = analyzeMesh('m', Float64Array.from(v.flat()), Uint32Array.from(f.flat()));
+    assert.equal(b.closed, c.closed ?? true, 'closed');
+    assert.deepEqual(b.notes, c.notes, 'notes');
+    approx(b.volume, c.volume, 1e-12, 0, 'volume');
+    approx(b.mesh_volume, c.volume, 1e-12, 0, 'mesh_volume');
+    approx(b.area, c.area, 1e-12, 0, 'area');
+    approxVec(b.centroid, c.centroid, 1e-12, 1e-12, 'centroid');
+  });
+}
 
 test('analysis: non-finite vertices and out-of-range indices are dropped', () => {
   const v = [...BOX_V, [NaN, 0, 0]];
@@ -467,10 +652,8 @@ function dae(primitives, nodes) {
 }
 const daeTriangles = (faces) => `<triangles count="${faces.length}"><input semantic="VERTEX" source="#verts" offset="0"/><p>${faces.flat().join(' ')}</p></triangles>`;
 
-const INWARDS = 'Normals pointed inwards; volume sign corrected';
 // Python oriented envelopes of the two far-off boxes (float32 display vertices cannot resolve them)
 const OBB_FAR = 6417.6210000006, OBB_UTM = 10.881000001140384;
-const REPAIRED = 'Inconsistent triangle orientation was repaired';
 const BOX = { volume: 6000, area: 2200, min: [-5, -10, -15] };
 /** Python body: [name, closed, triangles, volume, notes, color]. */
 const box = (name, notes = [], color = null) => [name, true, 12, 6000, notes, color];
@@ -643,10 +826,7 @@ for (const c of REGRESSIONS) {
     approx(s.area, py.area, REL, 0, 'summary.area');
     const size = Math.max(...s.bbox.size);
     approxVec(s.bbox.min, py.min, REL, REL * size, 'summary.bbox.min');
-    if (py.obb) {
-      assert.ok(s.obb.volume <= py.obb * (1 + REL), `obb ${s.obb.volume} > python ${py.obb}`);
-      assert.ok(s.obb.volume >= py.obb * (1 - 2e-3), `obb ${s.obb.volume} << python ${py.obb}`);
-    }
+    if (py.obb) approx(s.obb.volume, py.obb, REL, 0, 'summary.obb.volume');
     assert.deepEqual(bodies.map((b) => b.name).sort(), py.bodies.map((b) => b[0]).sort(), 'body names');
     for (const [name, closed, triangles, volume, notes, color] of py.bodies) {
       const b = bodies.find((x) => x.name === name);
@@ -658,6 +838,31 @@ for (const c of REGRESSIONS) {
     }
   });
 }
+
+test('reader: malformed ASCII PLY data fails like the Python engine (numpy.fromstring)', async () => {
+  const faceLine = (f) => `3 ${f.join(' ')}`;
+  const ply = (vertexLine, faceLines = BOX_F.map(faceLine), props = XYZ, tail = '') =>
+    ascii(plyHeader('ascii', 8, faceLines.length, props, ['list uchar int vertex_indices']) +
+      BOX_V.map(vertexLine).join('\n') + '\n' + faceLines.join('\n') + '\n' + tail);
+  const plain = (v) => v.join(' ');
+  // decimal commas (the header takes 9 lines)
+  const comma = ply((v) => v.map((x) => String(x / 2).replace('.', ',')).join(' '));
+  await assert.rejects(loadMeshFile(comma, 'comma.ply'), /PLY file has a value that is not a number on line 10: '-2,5'/);
+  // a word in a face row, text after the last element
+  const faces = BOX_F.map(faceLine);
+  faces[5] = '3 1 x 2';
+  await assert.rejects(loadMeshFile(ply(plain, faces), 'word.ply'), /not a number on line 23: 'x'/);
+  await assert.rejects(loadMeshFile(ply(plain, undefined, XYZ, 'the end\n'), 'tail.ply'), /not a number on line 30: 'the'/);
+  // a vertex without its z (or an empty row): no silent zero
+  const short = ply((v, i) => (i === 3 ? '1 2' : plain(v)));
+  await assert.rejects(loadMeshFile(short, 'short.ply'), /PLY vertex on line 13 has fewer values than its coordinates/);
+  // what trimesh accepts is still read: a missing colour value, extra values, nan
+  const rgb = [...XYZ, 'uchar red', 'uchar green', 'uchar blue'];
+  const color = ply((v, i) => `${plain(v)} ${i === 3 ? '1 2' : '1 2 3'}`, undefined, rgb);
+  approx(summarize(analyzeMeshParts((await loadMeshFile(color, 'color.ply')).parts)).volume, 6000, 1e-12, 0, 'colour value missing');
+  const extra = ply((v) => `${plain(v)} 7`);
+  approx(summarize(analyzeMeshParts((await loadMeshFile(extra, 'extra.ply')).parts)).volume, 6000, 1e-12, 0, 'extra value');
+});
 
 test('reader: coordinates reach the analysis in double precision', async () => {
   const { parts } = await loadMeshFile(objQuadBox([1.3, 2.7, 3.1], [650000.123, 6860000.456, 100.789]), 'utm.obj');

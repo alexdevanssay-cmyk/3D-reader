@@ -319,6 +319,13 @@ def main(out: Path):
         vol = result["summary"]["volume"]
         print(f"{path.name:24} volume={vol!r:>24}  analytic={ANALYTIC.get(path.name)!r}")
     (out / "expected.json").write_text(json.dumps(expected, indent=1, ensure_ascii=False))
+    wrong = [
+        name
+        for name, r in expected.items()
+        if r["analytic_volume"] is not None and not math.isclose(r["summary"]["volume"] or 0.0, r["analytic_volume"], rel_tol=1e-7)
+    ]
+    if wrong:
+        raise SystemExit(f"The Python engine misses the analytic volume of: {', '.join(wrong)}")
 
 
 if __name__ == "__main__":
