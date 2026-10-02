@@ -40,11 +40,13 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements-dev.txt
 
-      - name: Python engine tests
-        run: pytest
-
+      # Also checks every analytic volume (exits non-zero on a miss); some pytest
+      # tests and all the browser engine tests read these files.
       - name: Generate cross-engine fixtures (Python reference results)
         run: python tests/make_fixtures.py
+
+      - name: Python engine tests
+        run: pytest
 
       - uses: actions/setup-node@v7
         with:
