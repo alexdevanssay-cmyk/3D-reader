@@ -42,8 +42,14 @@ function getWorker() {
         return;
       }
       pending.delete(data.id);
-      if (data.fatal) resetWorker();
       job?.reject(new Error(data.message));
+      if (data.fatal) {
+        // The restarted worker has lost the jobs queued behind this one (their
+        // files were transferred to it), so they fail too.
+        for (const other of pending.values()) other.reject(new Error('The analysis engine was restarted: open the file again'));
+        pending.clear();
+        resetWorker();
+      }
     }
   };
   worker.onerror = (event) => {

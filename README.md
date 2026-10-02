@@ -4,8 +4,8 @@ A web application that opens 3D files (STEP and most other 3D formats), shows th
 in the browser, and computes the **real volume of material** of each part, not only
 the bounding envelope ("encombrement").
 
-**Online version:** https://alexdevanssay-cmyk.github.io/3D-reader/ (see
-[Publishing on GitHub Pages](#publishing-on-github-pages) for the one-time setup).
+**Online version** (once published, see [Publishing on GitHub Pages](#publishing-on-github-pages)):
+https://alexdevanssay-cmyk.github.io/3D-reader/
 
 ![Assembly with exact volumes](docs/screenshot.png)
 
@@ -58,6 +58,10 @@ cached by the browser). Mesh files do not need it.
 
 ### Installation
 
+On Linux without a desktop (servers, Docker slim images, WSL), install the OpenGL
+runtime OpenCascade links against first: `sudo apt-get install libgl1` (Debian/Ubuntu)
+or `sudo dnf install mesa-libGL` (Fedora).
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
@@ -100,15 +104,18 @@ mass) and `bodies` (per part, including the display mesh as base64 arrays).
 ## Publishing on GitHub Pages
 
 The workflow `.github/workflows/pages.yml` builds the static site (`npm run build` →
-`dist/`) and deploys it on every push to `main`. One-time setup:
+`dist/`) and publishes each commit of `main` once CI (`.github/workflows/ci.yml`: Python
+tests, browser engine against the Python results, end-to-end tests) has passed on it.
+One-time setup, by the owner of the repository:
 
-1. **Settings → Pages → Build and deployment → Source: GitHub Actions.**
-2. GitHub Pages on a **private** repository requires a paid plan (Pro, Team or
-   Enterprise). On a free account, make the repository public
+1. GitHub Pages on a **private** repository requires a paid plan (Pro, Team or
+   Enterprise). On a free account, make the repository public first
    (**Settings → General → Danger Zone → Change visibility**). The published site
    is public either way.
-3. Merge into `main` (or run the workflow manually from the **Actions** tab). The
-   URL is shown in the workflow run and under **Settings → Pages**.
+2. **Settings → Pages → Build and deployment → Source: GitHub Actions.**
+3. Merge this work into `main`. The deployment then runs after CI; it can also be
+   started by hand from the **Actions** tab (**Deploy to GitHub Pages → Run workflow**).
+   The URL is shown in the workflow run and under **Settings → Pages**.
 
 Build and preview the static site locally:
 
@@ -150,6 +157,7 @@ pip install -r requirements-dev.txt
 pytest                                   # Python engine
 python tests/make_fixtures.py            # reference files + Python results
 npm ci && npm test                       # browser engine vs Python results
+npx playwright install chromium          # once: the browser for the end-to-end tests
 npm run build && npm run test:e2e        # the built site in a headless browser
 ```
 

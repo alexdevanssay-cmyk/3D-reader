@@ -18,7 +18,7 @@
 <body>
   <header class="topbar">
     <div class="brand">3D Reader</div>
-    <label class="btn primary" for="file-input">Open file…</label>
+    <button id="open-file" class="btn primary" type="button">Open file…</button>
     <input id="file-input" type="file" hidden>
     <label class="field" title="Unit of mesh files (STL, OBJ...). CAD files (STEP, IGES) carry their own unit.">
       Mesh unit
@@ -80,6 +80,7 @@
         <div class="loading-box">
           <div class="spinner"></div>
           <span id="loading-text">Analysing…</span>
+          <span id="loading-file" class="muted small"></span>
           <progress id="loading-bar" max="1" hidden></progress>
           <button id="cancel" class="small" type="button">Cancel</button>
         </div>

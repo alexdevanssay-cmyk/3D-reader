@@ -17,6 +17,8 @@ function fmtNum(v, digits = 3) {
   if (v === null || v === undefined || !isFinite(v)) return "—";
   const abs = Math.abs(v);
   if (abs !== 0 && (abs < 1e-3 || abs >= 1e12)) return v.toExponential(4);
+  // Below 1, a fixed number of decimals would leave only one or two significant digits.
+  if (abs !== 0 && abs < 1) return v.toLocaleString(undefined, { maximumSignificantDigits: 4 });
   return v.toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: 0 });
 }
 
@@ -255,6 +257,7 @@ async function analyzeOnServer(file) {
   form.append("unit", $("unit").value);
   form.append("quality", $("quality").value);
   serverRequest = new AbortController();
+  // Aborting the request also stops the analysis on the server.
   const res = await fetch("api/analyze", { method: "POST", body: form, signal: serverRequest.signal });
   const data = await res.json().catch(() => ({ detail: res.statusText }));
   if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`);
@@ -269,31 +272,44 @@ async function analyzeInBrowser(file) {
     onProgress: (p) => {
       setLoading(...describeProgress(p));
       if (p.stage === "download" || p.stage === "compile") showEngineStatus(p);
-      if (p.stage === "analyze") showEngineStatus({ stage: "ready" });
+      if (p.stage === "analyze" && p.engine === "cad") showEngineStatus({ stage: "ready" });
     },
   });
 }
 
 let openSeq = 0;
 
+// Stop the analysis in progress, if any: a newer file was opened, or Cancel.
+async function stopAnalysis() {
+  serverRequest?.abort();
+  serverRequest = null;
+  if (engine.browserClient) (await engine.browserClient).cancelAll();
+}
+
 async function openFile(file) {
   if (!file) return;
-  const seq = ++openSeq; // a newer file may be opened while this one is analysed
-  $("file-name").textContent = file.name;
+  const seq = ++openSeq;
+  // The new file must not wait behind an abandoned one (the browser engine
+  // handles one file at a time, and server slots are limited).
+  await stopAnalysis();
+  if (seq !== openSeq) return;
   $("error").hidden = true;
   setLoading("Analysing…");
+  $("loading-file").textContent = file.name;
   $("loading").hidden = false;
-  state.file = file;
   try {
     const data = currentEngine() === "server" ? await analyzeOnServer(file) : await analyzeInBrowser(file);
     if (seq !== openSeq) return;
+    // Only now does the page show this file (a failed file leaves the previous one).
+    state.file = file;
     state.result = data;
+    $("file-name").textContent = file.name;
     $("drop-hint").hidden = true;
     buildModel(data);
     renderPanel();
   } catch (err) {
     const cancelled = err.cancelled || err.name === "AbortError";
-    if (seq === openSeq && !cancelled) showError(err.message || String(err));
+    if (seq === openSeq && !cancelled) showError(`${file.name}: ${err.message || err}`);
   } finally {
     if (seq === openSeq) $("loading").hidden = true;
   }
@@ -332,17 +348,20 @@ function renderPanel() {
 
   for (const id of ["summary-card", "mass-card", "bodies-card"]) $(id).hidden = false;
 
-  $("total-volume").textContent = fmtVol(s.volume);
+  // Meshes with holes get a volume estimated after filling them (not closed, but a volume).
+  const estimated = r.bodies.filter(isEstimate).length;
+  $("total-volume").textContent = (estimated ? "≈ " : "") + fmtVol(s.volume);
   const method = $("method");
-  method.classList.toggle("warn", s.open_bodies > 0 || s.volume == null);
+  method.classList.toggle("warn", s.open_bodies > 0 || s.volume == null || estimated > 0);
   const how = r.kind === "cad"
     ? "Exact volume computed on the CAD B-rep geometry (OpenCascade)."
     : `Volume enclosed by the closed triangle mesh. Source unit: ${r.source_unit}.`;
+  const notes = [];
+  if (estimated) notes.push(`${estimated} body/bodies had holes: volume estimated after filling them.`);
+  if (s.open_bodies > 0) notes.push(`${s.open_bodies} open body/bodies excluded from the volume.`);
   method.textContent = s.volume == null
     ? "No closed solid in this file: the volume cannot be computed."
-    : s.open_bodies > 0
-      ? `${how} ${s.open_bodies} open body/bodies excluded from the volume.`
-      : how;
+    : [how, ...notes].join(" ");
 
   $("total-area").textContent = fmtArea(s.area);
   $("bbox-size").textContent = fmtSize(s.bbox.size);
@@ -354,6 +373,10 @@ function renderPanel() {
 
   updateMass();
   renderBodies();
+}
+
+function isEstimate(body) {
+  return !body.closed && body.volume != null;
 }
 
 function updateMass() {
@@ -387,7 +410,7 @@ function renderBodies() {
     tr.insertAdjacentHTML(
       "beforeend",
       `<td class="name" title="${escapeHtml(b.name)}"><span class="swatch" style="background:#${color}"></span>${escapeHtml(b.name)}</td>` +
-        `<td class="num ${b.volume == null ? "open" : ""}">${b.volume == null ? "open" : fmtVol(b.volume)}</td>` +
+        `<td class="num ${b.volume == null || isEstimate(b) ? "open" : ""}">${b.volume == null ? "open" : (isEstimate(b) ? "≈ " : "") + fmtVol(b.volume)}</td>` +
         `<td class="num">${b.volume != null && total ? fmtNum((b.volume / total) * 100, 1) : ""}</td>`,
     );
     tr.addEventListener("click", () => select(i === state.selected ? -1 : i));
@@ -439,23 +462,29 @@ function select(i) {
   document.querySelector("#bodies tr.selected")?.scrollIntoView({ block: "nearest" });
 }
 
+// A CSV cell. Text starting with = + - @ would be run as a formula by spreadsheet
+// software (names come from the file, so they are not trusted).
+function csvText(text) {
+  const t = String(text);
+  return `"${(/^[=+\-@\t\r]/.test(t) ? "'" + t : t).replace(/"/g, '""')}"`;
+}
+
 function exportCsv() {
   const r = state.result;
   if (!r) return;
   const density = parseFloat($("density").value);
+  const mass = (v) => (v != null && Number.isFinite(density) && density >= 0 ? (v / 1000) * density : "");
   const head = ["name", "volume_mm3", "area_mm2", "size_x_mm", "size_y_mm", "size_z_mm", "cx_mm", "cy_mm", "cz_mm", "closed", "mass_g"];
   const lines = [head.join(",")];
   for (const b of r.bodies) {
     const c = b.centroid || ["", "", ""];
-    lines.push([
-      `"${b.name.replace(/"/g, '""')}"`, b.volume ?? "", b.area, ...b.bbox.size, ...c, b.closed,
-      b.volume != null ? (b.volume / 1000) * density : "",
-    ].join(","));
+    lines.push([csvText(b.name), b.volume ?? "", b.area, ...b.bbox.size, ...c, b.closed, mass(b.volume)].join(","));
   }
   const s = r.summary;
-  lines.push(["\"TOTAL\"", s.volume ?? "", s.area, ...s.bbox.size, ...(s.centroid || ["", "", ""]), s.open_bodies === 0,
-    s.volume != null ? (s.volume / 1000) * density : ""].join(","));
-  const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+  lines.push([csvText("TOTAL"), s.volume ?? "", s.area, ...s.bbox.size, ...(s.centroid || ["", "", ""]),
+    s.open_bodies === 0, mass(s.volume)].join(","));
+  // The BOM makes spreadsheet software read the names as UTF-8.
+  const blob = new Blob(["\ufeff" + lines.join("\r\n") + "\r\n"], { type: "text/csv;charset=utf-8" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = r.file.replace(/\.[^.]+$/, "") + "_volume.csv";
@@ -511,22 +540,24 @@ function updateSection() {
 
 // ---------------------------------------------------------------- events
 
+$("open-file").addEventListener("click", () => $("file-input").click());
 $("file-input").addEventListener("change", (e) => {
   openFile(e.target.files[0]);
   e.target.value = ""; // allow re-opening the same file
 });
 // Some malformed CAD files make OpenCascade run for a very long time.
-$("cancel").addEventListener("click", async () => {
+$("cancel").addEventListener("click", () => {
   openSeq++; // forget the file being analysed
   $("loading").hidden = true;
-  serverRequest?.abort();
-  if (engine.browserClient) (await engine.browserClient).cancelAll();
+  stopAnalysis();
 });
 $("engine").addEventListener("change", () => {
   showEngineStatus({ stage: "idle" });
   if (state.file) openFile(state.file);
 });
-for (const id of ["unit", "quality"]) $(id).addEventListener("change", () => state.file && openFile(state.file));
+// Mesh unit only applies to mesh files, display quality only to CAD files.
+$("unit").addEventListener("change", () => state.result?.kind === "mesh" && openFile(state.file));
+$("quality").addEventListener("change", () => state.result?.kind === "cad" && openFile(state.file));
 $("vol-unit").addEventListener("change", renderPanel);
 
 $("material").addEventListener("change", () => {

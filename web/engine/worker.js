@@ -60,7 +60,7 @@ self.onmessage = async (event) => {
     if (msg.kind === 'cad') {
       progressTarget = msg.id;
       const oc = await occt();
-      postMessage({ type: 'progress', id: msg.id, stage: 'analyze' });
+      postMessage({ type: 'progress', id: msg.id, stage: 'analyze', engine: 'cad' });
       result = analyzeCad(oc, new Uint8Array(msg.bytes), msg.name, { quality: msg.quality });
     } else if (msg.kind === 'meshfile') {
       postMessage({ type: 'progress', id: msg.id, stage: 'parse' });
