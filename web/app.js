@@ -89,8 +89,10 @@ renderer.setAnimationLoop(() => {
 
 // ---------------------------------------------------------------- loading
 
-function decode(b64, Type) {
-  const bin = atob(b64);
+// The Python server sends meshes as base64 strings, the browser engine as typed arrays.
+function decode(data, Type) {
+  if (typeof data !== "string") return data instanceof Type ? data : new Type(data);
+  const bin = atob(data);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return new Type(bytes.buffer);
@@ -119,7 +121,10 @@ function buildModel(result) {
     geom.setIndex(new THREE.BufferAttribute(decode(body.mesh.indices, Uint32Array), 1));
     geom.computeVertexNormals();
 
-    const color = body.color ? new THREE.Color(...body.color) : new THREE.Color(PALETTE[i % PALETTE.length]);
+    // CAD colours are sRGB values, like CSS colours.
+    const color = body.color
+      ? new THREE.Color().setRGB(...body.color, THREE.SRGBColorSpace)
+      : new THREE.Color(PALETTE[i % PALETTE.length]);
     const mat = new THREE.MeshStandardMaterial({
       color,
       metalness: 0.15,
@@ -167,28 +172,142 @@ function buildModel(result) {
   setView("iso");
 }
 
+// ---------------------------------------------------------------- engines
+
+// "server": the Python engine behind /api (python -m reader3d serve).
+// "browser": the WebAssembly engine, used on the static site (GitHub Pages).
+const engine = { server: false, browserClient: null };
+
+function currentEngine() {
+  return engine.server && $("engine").value === "server" ? "server" : "browser";
+}
+
+// config.json is a static file saying "no server" on the static site; the
+// Python server answers the same URL itself. (Probing /api would log a 404 in
+// the browser console of every visitor of the static site.)
+async function detectServer() {
+  try {
+    const res = await fetch("config.json", { cache: "no-store" });
+    return res.ok && (await res.json()).server === true;
+  } catch {
+    return false;
+  }
+}
+
+function browserClient() {
+  engine.browserClient ??= import("./engine/client.js");
+  return engine.browserClient;
+}
+
+function fmtMB(bytes) {
+  return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
+function setLoading(text, fraction = null) {
+  $("loading-text").textContent = text;
+  const bar = $("loading-bar");
+  bar.hidden = fraction === null;
+  if (fraction !== null) bar.value = fraction;
+}
+
+function describeProgress(p) {
+  switch (p.stage) {
+    case "download":
+      return p.total
+        ? [`Downloading the CAD engine… ${fmtMB(p.loaded)} / ${fmtMB(p.total)}`, p.loaded / p.total]
+        : [`Downloading the CAD engine… ${fmtMB(p.loaded)}`, null];
+    case "compile":
+      return ["Starting the CAD engine…", null];
+    case "parse":
+      return ["Reading the file…", null];
+    case "summary":
+      return ["Computing the envelope…", null];
+    default:
+      return ["Analysing…", null];
+  }
+}
+
+// Small status chip showing whether the CAD engine (WebAssembly) is ready.
+function showEngineStatus(p) {
+  const el = $("engine-status");
+  if (currentEngine() !== "browser") {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.classList.toggle("ready", p.stage === "ready");
+  el.classList.toggle("error", p.stage === "error");
+  if (p.stage === "download" && p.total) el.textContent = `CAD engine ${Math.round((p.loaded / p.total) * 100)} %`;
+  else if (p.stage === "download" || p.stage === "compile") el.textContent = "CAD engine loading…";
+  else if (p.stage === "ready") el.textContent = "CAD engine ready";
+  else if (p.stage === "idle") el.textContent = "CAD engine not loaded";
+  else if (p.stage === "error") {
+    el.textContent = "CAD engine unavailable";
+    el.title = p.message || "";
+  }
+}
+
+async function analyzeOnServer(file) {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("unit", $("unit").value);
+  form.append("quality", $("quality").value);
+  const res = await fetch("api/analyze", { method: "POST", body: form });
+  const data = await res.json().catch(() => ({ detail: res.statusText }));
+  if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`);
+  return data;
+}
+
+async function analyzeInBrowser(file) {
+  const client = await browserClient();
+  return client.analyzeInBrowser(file, {
+    unit: $("unit").value,
+    quality: $("quality").value,
+    onProgress: (p) => {
+      setLoading(...describeProgress(p));
+      if (p.stage === "download" || p.stage === "compile") showEngineStatus(p);
+      if (p.stage === "analyze") showEngineStatus({ stage: "ready" });
+    },
+  });
+}
+
+let openSeq = 0;
+
 async function openFile(file) {
   if (!file) return;
+  const seq = ++openSeq; // a newer file may be opened while this one is analysed
   $("file-name").textContent = file.name;
   $("error").hidden = true;
+  setLoading("Analysing…");
   $("loading").hidden = false;
   state.file = file;
   try {
-    const form = new FormData();
-    form.append("file", file);
-    form.append("unit", $("unit").value);
-    form.append("quality", $("quality").value);
-    const res = await fetch("/api/analyze", { method: "POST", body: form });
-    const data = await res.json().catch(() => ({ detail: res.statusText }));
-    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    const data = currentEngine() === "server" ? await analyzeOnServer(file) : await analyzeInBrowser(file);
+    if (seq !== openSeq) return;
     state.result = data;
     $("drop-hint").hidden = true;
     buildModel(data);
     renderPanel();
   } catch (err) {
-    showError(err.message);
+    if (seq === openSeq) showError(err.message || String(err));
   } finally {
-    $("loading").hidden = true;
+    if (seq === openSeq) $("loading").hidden = true;
+  }
+}
+
+async function initEngines() {
+  engine.server = await detectServer();
+  $("engine-field").hidden = !engine.server;
+  $("privacy-note").hidden = engine.server;
+  if (engine.server) return;
+
+  // Static site: start downloading the CAD engine while the visitor picks a file,
+  // unless they asked the browser to save data.
+  const client = await browserClient();
+  $("file-input").accept = client.SUPPORTED_EXTENSIONS.join(",");
+  if (!navigator.connection?.saveData) {
+    const start = () => client.preloadCadEngine(showEngineStatus);
+    "requestIdleCallback" in window ? requestIdleCallback(start, { timeout: 3000 }) : setTimeout(start, 1000);
   }
 }
 
@@ -388,7 +507,14 @@ function updateSection() {
 
 // ---------------------------------------------------------------- events
 
-$("file-input").addEventListener("change", (e) => openFile(e.target.files[0]));
+$("file-input").addEventListener("change", (e) => {
+  openFile(e.target.files[0]);
+  e.target.value = ""; // allow re-opening the same file
+});
+$("engine").addEventListener("change", () => {
+  showEngineStatus({ stage: "idle" });
+  if (state.file) openFile(state.file);
+});
 for (const id of ["unit", "quality"]) $(id).addEventListener("change", () => state.file && openFile(state.file));
 $("vol-unit").addEventListener("change", renderPanel);
 
@@ -459,3 +585,5 @@ window.addEventListener("drop", (e) => {
   if (state.result) hint.hidden = true;
   openFile(e.dataTransfer.files[0]);
 });
+
+initEngines();

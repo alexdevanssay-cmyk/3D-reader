@@ -23,6 +23,12 @@ def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/config.json")
+def config():
+    # Overrides web/config.json: tells the page that the Python engine is available.
+    return {"server": True, "extensions": SUPPORTED_EXTENSIONS}
+
+
 @app.get("/api/formats")
 def formats():
     return {"extensions": SUPPORTED_EXTENSIONS}

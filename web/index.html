@@ -4,12 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>3D Reader</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <meta name="description" content="Open STEP, IGES, STL, OBJ, GLB, 3MF… files in the browser and compute the real volume of material, the envelope and the mass.">
+  <link rel="stylesheet" href="style.css">
   <script type="importmap">
     {
       "imports": {
-        "three": "/static/vendor/three/three.module.js",
-        "three/addons/": "/static/vendor/three/addons/"
+        "three": "./vendor/three/three.module.js",
+        "three/addons/": "./vendor/three/addons/"
       }
     }
   </script>
@@ -38,7 +39,15 @@
         <option value="fine">fine</option>
       </select>
     </label>
+    <label class="field" id="engine-field" hidden title="Where the computation runs">
+      Engine
+      <select id="engine">
+        <option value="server">Python server</option>
+        <option value="browser">Browser (WebAssembly)</option>
+      </select>
+    </label>
     <span id="file-name" class="file-name"></span>
+    <span id="engine-status" class="engine-status" hidden></span>
   </header>
 
   <main class="layout">
@@ -64,9 +73,16 @@
           <h2>Drop a 3D file here</h2>
           <p>STEP · IGES · BREP · STL · OBJ · PLY · OFF · GLB/glTF · 3MF · DAE</p>
           <p class="muted">The real (material) volume is computed, not only the bounding envelope.</p>
+          <p class="muted small" id="privacy-note" hidden>Your file never leaves your computer: everything is computed in this browser tab.</p>
         </div>
       </div>
-      <div id="loading" class="loading" hidden><div class="spinner"></div><span>Analysing…</span></div>
+      <div id="loading" class="loading" hidden>
+        <div class="loading-box">
+          <div class="spinner"></div>
+          <span id="loading-text">Analysing…</span>
+          <progress id="loading-bar" max="1" hidden></progress>
+        </div>
+      </div>
       <div id="error" class="error" hidden></div>
     </section>
 
@@ -133,6 +149,6 @@
     </aside>
   </main>
 
-  <script type="module" src="/static/app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>

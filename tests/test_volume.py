@@ -148,6 +148,8 @@ def test_mesh_payload_roundtrip(tmp_path):
 def test_api(tmp_path):
     client = TestClient(app)
     assert client.get("/").status_code == 200
+    assert client.get("/app.js").status_code == 200
+    assert client.get("/config.json").json()["server"] is True
     assert ".step" in client.get("/api/formats").json()["extensions"]
 
     path = write_step(holed_block(), tmp_path / "block.step")
@@ -160,3 +162,27 @@ def test_api(tmp_path):
     assert res.status_code == 400
     res = client.post("/api/analyze", files={"file": ("broken.step", b"not a step file")})
     assert res.status_code == 422
+
+
+def test_surface_model_is_sewn_into_a_solid(tmp_path):
+    """A closed box exported as loose faces (one "part" per face after import)."""
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+
+    faces = []
+    exp = TopExp_Explorer(BRepPrimAPI_MakeBox(10.0, 20.0, 30.0).Shape(), TopAbs_FACE)
+    while exp.More():
+        faces.append(exp.Current())
+        exp.Next()
+    r = analyze_file(write_step(_compound(faces), tmp_path / "surfaces.step"))
+    assert r["summary"]["volume"] == pytest.approx(6000, rel=1e-9)
+    assert r["summary"]["open_bodies"] == 0
+    assert "sewing" in r["bodies"][0]["notes"][0]
+
+
+def test_oriented_envelope_never_exceeds_axis_aligned(tmp_path):
+    # An L-shaped assembly where a heuristic oriented box is worse than the AABB.
+    box = BRepPrimAPI_MakeBox(40.0, 30.0, 5.0).Shape()
+    pin = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(20, 15, 5), gp_Dir(0, 0, 1)), 4.0, 25.0).Shape()
+    s = analyze_file(write_step(_compound([box, pin]), tmp_path / "l.step"))["summary"]
+    assert s["obb"]["volume"] <= s["bbox"]["volume"] * (1 + 1e-9)
