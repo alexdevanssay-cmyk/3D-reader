@@ -69,13 +69,24 @@ def read_cad(path: str | Path, fmt: str | None = None, quality: str = "normal") 
 
     root = _compound([p.shape for p in parts])
     lin, ang = QUALITY.get(quality, QUALITY["normal"])
-    diag = _bbox_diagonal(root)
-    BRepMesh_IncrementalMesh(root, max(diag * lin, 1e-6), False, ang, True)
+    deflection = max(_bbox_diagonal(root) * lin, 1e-6)
+    BRepMesh_IncrementalMesh(root, deflection, False, ang, True)
 
     bodies: list[Body] = []
+    open_parts: list[tuple[_Part, list[TopoDS_Shape], bool]] = []
     for part in parts:
-        bodies.extend(_part_bodies(part))
-    return bodies
+        solids = _children(part.shape, TopAbs_SOLID)
+        for i, solid in enumerate(solids):
+            name = part.name if len(solids) == 1 else f"{part.name} [{i + 1}]"
+            bodies.append(_solid_body(name, solid, part.color, []))
+        open_shapes = _children(part.shape, TopAbs_SHELL, avoid=TopAbs_SOLID)
+        open_shapes += _children(part.shape, TopAbs_FACE, avoid=TopAbs_SHELL)
+        if open_shapes:
+            open_parts.append((part, open_shapes, bool(solids)))
+
+    if open_parts:
+        bodies.extend(_surface_bodies(open_parts, path.stem, deflection, ang))
+    return [b for b in bodies if len(b.faces)]
 
 
 # --------------------------------------------------------------------------- readers
@@ -172,31 +183,32 @@ def _rgb(col: Quantity_Color) -> tuple[float, float, float]:
 # --------------------------------------------------------------------------- bodies
 
 
-def _part_bodies(part: _Part) -> list[Body]:
-    solids = _children(part.shape, TopAbs_SOLID)
-    bodies: list[Body] = []
+def _surface_bodies(open_parts, file_name: str, deflection: float, ang: float) -> list[Body]:
+    """Bodies for the geometry that is not inside a solid.
 
-    open_shapes: list[TopoDS_Shape] = []
-    open_shapes += _children(part.shape, TopAbs_SHELL, avoid=TopAbs_SOLID)
-    open_shapes += _children(part.shape, TopAbs_FACE, avoid=TopAbs_SHELL)
+    Surface models are often exported with every face as its own "part", so the
+    loose surfaces of the whole file are sewn together; the closed shells that
+    result become solids whose volume can be computed.
+    """
+    all_open = [shape for _, shapes, _ in open_parts for shape in shapes]
+    sewn_solids, remaining = _sew_to_solids(all_open, deflection, ang)
+    if not sewn_solids:
+        bodies = []
+        for part, shapes, has_solids in open_parts:
+            name = f"{part.name} (surfaces)" if has_solids else part.name
+            bodies.append(_open_body(name, _compound(shapes), part.color))
+        return bodies
 
-    notes: list[str] = []
-    if open_shapes and not solids:
-        # Surface model: try to sew the faces into closed shells and make solids of them.
-        sewn_solids, remaining = _sew_to_solids(open_shapes)
-        if sewn_solids:
-            notes.append("Solid rebuilt by sewing the surfaces of the file")
-            solids = sewn_solids
-            open_shapes = remaining
-
-    for i, solid in enumerate(solids):
-        name = part.name if len(solids) == 1 else f"{part.name} [{i + 1}]"
-        bodies.append(_solid_body(name, solid, part.color, list(notes)))
-
-    if open_shapes:
-        name = part.name if not bodies else f"{part.name} (surfaces)"
-        bodies.append(_open_body(name, _compound(open_shapes), part.color))
-    return [b for b in bodies if len(b.faces)]
+    single = len(open_parts) == 1
+    base = open_parts[0][0].name if single else file_name
+    color = open_parts[0][0].color if single else None
+    bodies = []
+    for i, solid in enumerate(sewn_solids):
+        name = base if len(sewn_solids) == 1 else f"{base} [{i + 1}]"
+        bodies.append(_solid_body(name, solid, color, ["Solid rebuilt by sewing the surfaces of the file"]))
+    if remaining:
+        bodies.append(_open_body(f"{base} (surfaces)", _compound(remaining), color))
+    return bodies
 
 
 def _solid_body(name: str, solid: TopoDS_Shape, color, notes: list[str]) -> Body:
@@ -247,7 +259,7 @@ def _open_body(name: str, shape: TopoDS_Shape, color) -> Body:
     )
 
 
-def _sew_to_solids(shapes: list[TopoDS_Shape]):
+def _sew_to_solids(shapes: list[TopoDS_Shape], deflection: float, ang: float):
     sewing = BRepBuilderAPI_Sewing(1e-3)
     for s in shapes:
         sewing.Add(s)
@@ -263,9 +275,8 @@ def _sew_to_solids(shapes: list[TopoDS_Shape]):
         remaining.append(shell)
     remaining += _children(sewn, TopAbs_FACE, avoid=TopAbs_SHELL)
     if solids:
-        # The sewn shapes were never meshed; mesh them like the originals.
-        root = _compound(solids + remaining)
-        BRepMesh_IncrementalMesh(root, max(_bbox_diagonal(root) * QUALITY["normal"][0], 1e-6), False, QUALITY["normal"][1], True)
+        # Sewing creates new faces without triangulation: mesh them like the originals.
+        BRepMesh_IncrementalMesh(_compound(solids + remaining), deflection, False, ang, True)
     return solids, remaining
 
 

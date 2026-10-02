@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .analyze import SUPPORTED_EXTENSIONS, analyze_file
 
-STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR = Path(__file__).resolve().parent.parent / "web"
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 
 app = FastAPI(title="3D Reader")
@@ -56,4 +56,4 @@ async def analyze(
             raise HTTPException(422, f"Could not read the file: {exc}") from exc
 
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/", StaticFiles(directory=STATIC_DIR), name="web")

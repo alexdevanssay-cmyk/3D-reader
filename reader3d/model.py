@@ -85,22 +85,28 @@ def summarize(bodies: list[Body]) -> dict:
         "open_bodies": len(bodies) - len(solids),
         "triangles": int(sum(len(b.faces) for b in bodies)),
         "bbox": {"min": mins.tolist(), "max": maxs.tolist(), "size": size.tolist(), "volume": envelope_volume},
-        "obb": _oriented_box(bodies),
+        "obb": _oriented_box(bodies, size),
         # Share of the axis-aligned envelope actually filled with material.
         "fill_ratio": (volume / envelope_volume) if volume and envelope_volume > 0 else None,
     }
 
 
-def _oriented_box(bodies: list[Body]) -> dict | None:
-    """Minimum-volume oriented bounding box over all vertices."""
+def _oriented_box(bodies: list[Body], aabb_size: np.ndarray) -> dict | None:
+    """Smallest-volume oriented bounding box over all vertices.
+
+    trimesh's search is heuristic and can return a box larger than the
+    axis-aligned one, so the axis-aligned box is kept as a candidate.
+    """
+    best = np.sort(np.asarray(aabb_size, dtype=float))[::-1]
     try:
         import trimesh
 
         pts = np.vstack([b.vertices for b in bodies if len(b.vertices)])
-        if len(pts) < 4:
-            return None
-        transform, extents = trimesh.bounds.oriented_bounds(pts)
-        extents = np.sort(np.asarray(extents))[::-1]
-        return {"size": extents.tolist(), "volume": float(np.prod(extents))}
+        if len(pts) >= 4:
+            _, extents = trimesh.bounds.oriented_bounds(pts)
+            extents = np.sort(np.asarray(extents, dtype=float))[::-1]
+            if np.prod(extents) < np.prod(best):
+                best = extents
     except Exception:
-        return None
+        pass
+    return {"size": best.tolist(), "volume": float(np.prod(best))}

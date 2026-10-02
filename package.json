@@ -1,0 +1,22 @@
+{
+  "name": "3d-reader-web",
+  "private": true,
+  "version": "0.2.0",
+  "description": "Browser (WebAssembly) engine and static build of 3D Reader for GitHub Pages",
+  "type": "module",
+  "scripts": {
+    "vendor": "node scripts/build-web.mjs --vendor-only",
+    "build": "node scripts/build-web.mjs",
+    "serve": "node scripts/serve.mjs",
+    "test": "node --test tests/js/",
+    "test:e2e": "node --test tests/e2e/"
+  },
+  "devDependencies": {
+    "opencascade.js": "2.0.0-beta.b5ff984",
+    "playwright": "^1.56.1",
+    "three": "0.180.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
