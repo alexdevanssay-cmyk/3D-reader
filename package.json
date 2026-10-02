@@ -8,8 +8,8 @@
     "vendor": "node scripts/build-web.mjs --vendor-only",
     "build": "node scripts/build-web.mjs",
     "serve": "node scripts/serve.mjs",
-    "test": "node --test tests/js/",
-    "test:e2e": "node --test tests/e2e/"
+    "test": "node --test tests/js/*.test.mjs",
+    "test:e2e": "node --test tests/e2e/*.test.mjs"
   },
   "devDependencies": {
     "opencascade.js": "2.0.0-beta.b5ff984",

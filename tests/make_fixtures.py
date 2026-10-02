@@ -164,6 +164,8 @@ def make_meshes(out: Path):
     # XML-based formats (parsed with DOMParser in the browser engine: end-to-end tests only).
     trimesh.creation.box((10, 20, 30)).export(out / "box.3mf")  # 3MF default unit: millimetre
     trimesh.creation.box((10, 20, 30)).export(out / "box.dae")  # COLLADA default unit: metre
+    dae = (out / "box.dae").read_text()
+    (out / "box_cm.dae").write_text(dae.replace("<up_axis>", '<unit meter="0.01" name="centimeter"/><up_axis>', 1))
 
     trimesh.creation.box((10, 20, 30)).export(out / "box.off")
     trimesh.creation.box((10, 20, 30)).export(out / "box.ply")
@@ -192,6 +194,7 @@ ANALYTIC = {
     "box.off": 6000.0,
     "box.3mf": 6000.0,
     "box.dae": 6000.0 * 1e9,
+    "box_cm.dae": 6000.0 * 1e3,
     "box.ply": 6000.0,
     "rotated_box.stl": 2000.0,
 }

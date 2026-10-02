@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -10,10 +12,13 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .analyze import SUPPORTED_EXTENSIONS, analyze_file
+from .analyze import SUPPORTED_EXTENSIONS
+from .isolate import AnalysisCrashed, analyze_isolated
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "web"
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+# Each analysis runs in its own process (see isolate.py); bound how many run at once.
+_ANALYSIS_SLOTS = threading.BoundedSemaphore(max(1, min(4, os.cpu_count() or 1)))
 
 app = FastAPI(title="3D Reader")
 
@@ -55,11 +60,16 @@ async def analyze(
                     raise HTTPException(413, "File too large")
                 out.write(chunk)
         try:
-            return await run_in_threadpool(analyze_file, target, unit, quality)
+            return await run_in_threadpool(_analyze, target, unit, quality)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
-        except Exception as exc:  # reader crashes on malformed files
+        except AnalysisCrashed as exc:  # malformed files can crash or hang OpenCascade
             raise HTTPException(422, f"Could not read the file: {exc}") from exc
+
+
+def _analyze(path: Path, unit: str, quality: str) -> dict:
+    with _ANALYSIS_SLOTS:
+        return analyze_isolated(path, unit, quality)
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR), name="web")

@@ -247,12 +247,15 @@ function showEngineStatus(p) {
   }
 }
 
+let serverRequest = null; // AbortController of the request in progress
+
 async function analyzeOnServer(file) {
   const form = new FormData();
   form.append("file", file);
   form.append("unit", $("unit").value);
   form.append("quality", $("quality").value);
-  const res = await fetch("api/analyze", { method: "POST", body: form });
+  serverRequest = new AbortController();
+  const res = await fetch("api/analyze", { method: "POST", body: form, signal: serverRequest.signal });
   const data = await res.json().catch(() => ({ detail: res.statusText }));
   if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`);
   return data;
@@ -289,7 +292,8 @@ async function openFile(file) {
     buildModel(data);
     renderPanel();
   } catch (err) {
-    if (seq === openSeq) showError(err.message || String(err));
+    const cancelled = err.cancelled || err.name === "AbortError";
+    if (seq === openSeq && !cancelled) showError(err.message || String(err));
   } finally {
     if (seq === openSeq) $("loading").hidden = true;
   }
@@ -510,6 +514,13 @@ function updateSection() {
 $("file-input").addEventListener("change", (e) => {
   openFile(e.target.files[0]);
   e.target.value = ""; // allow re-opening the same file
+});
+// Some malformed CAD files make OpenCascade run for a very long time.
+$("cancel").addEventListener("click", async () => {
+  openSeq++; // forget the file being analysed
+  $("loading").hidden = true;
+  serverRequest?.abort();
+  if (engine.browserClient) (await engine.browserClient).cancelAll();
 });
 $("engine").addEventListener("change", () => {
   showEngineStatus({ stage: "idle" });

@@ -186,3 +186,92 @@ def test_oriented_envelope_never_exceeds_axis_aligned(tmp_path):
     pin = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(20, 15, 5), gp_Dir(0, 0, 1)), 4.0, 25.0).Shape()
     s = analyze_file(write_step(_compound([box, pin]), tmp_path / "l.step"))["summary"]
     assert s["obb"]["volume"] <= s["bbox"]["volume"] * (1 + 1e-9)
+
+
+def test_solid_with_missing_faces_has_no_volume(tmp_path):
+    """A SOLID whose shell is open (a face is missing) must not get an 'exact' volume."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid, BRepBuilderAPI_Sewing
+    from OCP.TopAbs import TopAbs_FACE, TopAbs_SHELL
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+
+    sewing = BRepBuilderAPI_Sewing(1e-6)
+    exp = TopExp_Explorer(BRepPrimAPI_MakeBox(10.0, 20.0, 30.0).Shape(), TopAbs_FACE)
+    for _ in range(5):  # leave one face out
+        sewing.Add(exp.Current())
+        exp.Next()
+    sewing.Perform()
+    shell = TopExp_Explorer(sewing.SewedShape(), TopAbs_SHELL).Current()
+    solid = BRepBuilderAPI_MakeSolid(TopoDS.Shell(shell)).Solid()
+    path = tmp_path / "open_solid.brep"
+    assert BRepTools.Write_s(solid, str(path))
+
+    r = analyze_file(path)
+    assert r["summary"]["volume"] is None
+    assert r["bodies"][0]["closed"] is False
+    assert r["bodies"][0]["area"] == pytest.approx(2 * (10 * 20 + 10 * 30 + 20 * 30) - 10 * 20, rel=1e-9)
+
+
+def test_instance_colour_overrides_part_colour(tmp_path):
+    from OCP.Quantity import Quantity_Color, Quantity_TOC_sRGB
+    from OCP.STEPCAFControl import STEPCAFControl_Writer
+    from OCP.TCollection import TCollection_ExtendedString
+    from OCP.TDocStd import TDocStd_Document
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.XCAFDoc import XCAFDoc_ColorType, XCAFDoc_DocumentTool
+
+    doc = TDocStd_Document(TCollection_ExtendedString("XmlOcaf"))
+    shapes = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
+    colors = XCAFDoc_DocumentTool.ColorTool_s(doc.Main())
+    assembly = shapes.NewShape()
+    part = shapes.AddShape(BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape(), False)
+    colors.SetColor(part, Quantity_Color(0.0, 0.0, 1.0, Quantity_TOC_sRGB), XCAFDoc_ColorType.XCAFDoc_ColorSurf)
+    instance = shapes.AddComponent(assembly, part, TopLoc_Location())
+    colors.SetColor(instance, Quantity_Color(1.0, 0.0, 0.0, Quantity_TOC_sRGB), XCAFDoc_ColorType.XCAFDoc_ColorSurf)
+    shapes.UpdateAssemblies()
+    writer = STEPCAFControl_Writer()
+    writer.SetColorMode(True)
+    assert writer.Transfer(doc, STEPControl_AsIs)
+    path = tmp_path / "coloured.step"
+    assert writer.Write(str(path)) == IFSelect_RetDone
+
+    body = analyze_file(path)["bodies"][0]
+    assert body["color"] == pytest.approx([1.0, 0.0, 0.0], abs=1e-3)
+
+
+def test_server_survives_a_crashing_file(tmp_path):
+    """Some truncated IGES files crash OpenCascade natively (segmentation fault):
+    the server isolates each analysis in a child process and answers 422."""
+    import subprocess
+    import sys
+
+    iges = tmp_path / "block.igs"
+    writer = IGESControl_Writer("MM", 1)
+    writer.AddShape(holed_block())
+    writer.ComputeModel()
+    assert writer.Write(str(iges))
+    data = iges.read_bytes()
+
+    # Find a truncation that crashes the reader when run in-process.
+    probe = "import sys; from reader3d.analyze import analyze_file\ntry: analyze_file(sys.argv[1])\nexcept Exception: pass"
+    crashing = None
+    for size in range(len(data) // 2, len(data), 491):
+        cut = tmp_path / f"cut_{size}.igs"
+        cut.write_bytes(data[:size])
+        proc = subprocess.run([sys.executable, "-c", probe, str(cut)], capture_output=True, timeout=120)
+        if proc.returncode < 0:  # killed by a signal
+            crashing = cut
+            break
+    if crashing is None:
+        pytest.skip("this OpenCascade build does not crash on truncated IGES files")
+
+    client = TestClient(app)
+    with crashing.open("rb") as f:
+        res = client.post("/api/analyze", files={"file": ("cut.igs", f)})
+    assert res.status_code == 422
+    assert "crashed" in res.json()["detail"]
+    # ...and the server still works afterwards.
+    with (tmp_path / "block.igs").open("rb") as f:
+        res = client.post("/api/analyze", files={"file": ("block.igs", f)})
+    assert res.status_code == 200
+    assert res.json()["summary"]["volume"] == pytest.approx(HOLED_VOLUME, rel=1e-6)

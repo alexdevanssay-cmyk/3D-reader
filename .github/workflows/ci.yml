@@ -1,0 +1,72 @@
+# Runs every test suite: the Python engine (pytest), the browser engine against
+# the Python results (node:test), and the built static site in headless Chromium.
+# A successful run on main triggers the GitHub Pages deployment (pages.yml).
+name: CI
+
+on:
+  push:
+  # Pull requests from forks (a branch of this repository is already tested by
+  # its push: see the job condition below).
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to a branch cancels its outdated run. Every commit of main is
+  # tested to the end (its own group, by run id): the deployment waits for
+  # that result.
+  group: ci-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    # Same-repository pull requests are already tested by the push of their branch.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Python engine tests
+        run: pytest
+
+      - name: Generate cross-engine fixtures (Python reference results)
+        run: python tests/make_fixtures.py
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Browser engine tests
+        run: npm test
+
+      - name: Build the static site
+        run: npm run build
+        env:
+          # Built below /<repository>/ as on GitHub Pages: the end-to-end tests
+          # serve it there (base_path in dist/version.json) and so check 404.html
+          # as it is published.
+          BASE_PATH: /${{ github.event.repository.name }}
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: End-to-end tests of the built site
+        run: npm run test:e2e

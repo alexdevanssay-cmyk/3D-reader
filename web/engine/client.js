@@ -1,15 +1,16 @@
 // Main-thread API of the in-browser engine.
 //
-// CAD files are sent to a Web Worker that runs OpenCascade (WebAssembly).
-// Mesh files are parsed here with the three.js loaders, which need the DOM for
-// some formats, then analysed in the worker. The totals and envelopes are
-// computed here too, because they use three.js and import maps (needed to
-// resolve "three") do not apply inside workers.
+// Files are read and analysed in a Web Worker: OpenCascade (WebAssembly) for
+// CAD files, plain JavaScript readers for meshes. glTF files are parsed here
+// with the three.js loader, and the totals and envelopes are computed here too,
+// because both import "three" and import maps (needed to resolve "three") do
+// not apply inside workers.
 
 import { summarize } from './summary.js';
+import { MESH_EXTENSIONS, needsMainThread } from './meshload.js';
 
+export { MESH_EXTENSIONS };
 export const CAD_EXTENSIONS = ['.step', '.stp', '.p21', '.iges', '.igs', '.brep', '.brp'];
-export const MESH_EXTENSIONS = ['.stl', '.obj', '.ply', '.off', '.glb', '.gltf', '.3mf', '.dae'];
 export const SUPPORTED_EXTENSIONS = [...CAD_EXTENSIONS, ...MESH_EXTENSIONS];
 
 let worker = null;
@@ -61,6 +62,17 @@ function resetWorker() {
   worker = null;
 }
 
+/** Stop the analyses in progress (the worker is restarted for the next file). */
+export function cancelAll() {
+  if (!pending.size) return;
+  const err = new Error('Cancelled');
+  err.cancelled = true;
+  for (const job of pending.values()) job.reject(err);
+  pending.clear();
+  resetWorker();
+  listeners.forEach((fn) => fn({ stage: 'idle' }));
+}
+
 function call(message, transfer, onProgress) {
   const id = nextId++;
   return new Promise((resolve, reject) => {
@@ -95,13 +107,20 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
       [bytes],
       onProgress,
     ));
+  } else if (!needsMainThread(file.name)) {
+    kind = 'mesh';
+    ({ bodies, source_unit: sourceUnit } = await call(
+      { type: 'analyze', kind: 'meshfile', name: file.name, bytes, unit },
+      [bytes],
+      onProgress,
+    ));
   } else {
     kind = 'mesh';
     onProgress?.({ stage: 'parse' });
     const { loadMeshFile } = await import('./meshload.js');
     const { parts, source_unit } = await loadMeshFile(bytes, file.name, { unit });
     sourceUnit = source_unit;
-    const transfer = parts.flatMap((p) => [p.positions.buffer, p.indices?.buffer].filter(Boolean));
+    const transfer = [...new Set(parts.flatMap((p) => [p.positions.buffer, p.indices?.buffer].filter(Boolean)))];
     ({ bodies } = await call({ type: 'analyze', kind, name: file.name, parts }, transfer, onProgress));
   }
 

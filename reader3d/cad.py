@@ -75,11 +75,19 @@ def read_cad(path: str | Path, fmt: str | None = None, quality: str = "normal") 
     bodies: list[Body] = []
     open_parts: list[tuple[_Part, list[TopoDS_Shape], bool]] = []
     for part in parts:
-        solids = _children(part.shape, TopAbs_SOLID)
+        solids, open_shapes = [], []
+        for solid in _children(part.shape, TopAbs_SOLID):
+            # A solid bounded by an open shell (faces missing) has no meaningful
+            # volume: its shells are handled like the loose surfaces of the file.
+            shells = _children(solid, TopAbs_SHELL)
+            if all(BRep_Tool.IsClosed_s(shell) for shell in shells):
+                solids.append(solid)
+            else:
+                open_shapes += shells
         for i, solid in enumerate(solids):
             name = part.name if len(solids) == 1 else f"{part.name} [{i + 1}]"
             bodies.append(_solid_body(name, solid, part.color, []))
-        open_shapes = _children(part.shape, TopAbs_SHELL, avoid=TopAbs_SOLID)
+        open_shapes += _children(part.shape, TopAbs_SHELL, avoid=TopAbs_SOLID)
         open_shapes += _children(part.shape, TopAbs_FACE, avoid=TopAbs_SHELL)
         if open_shapes:
             open_parts.append((part, open_shapes, bool(solids)))
@@ -116,8 +124,11 @@ def _read_xcaf(path: Path, fmt: str) -> list[_Part]:
     color_tool = XCAFDoc_DocumentTool.ColorTool_s(doc.Main())
     parts: list[_Part] = []
 
-    def walk(label: TDF_Label, loc: TopLoc_Location, inherited_name: str | None, inherited_color):
-        color = _label_color(label) or inherited_color
+    # Colour precedence of XCAF (as displayed by XCAFPrs_DocumentExplorer): the
+    # colour set on the instance (component), then the label's own colour, then
+    # the colour inherited from the enclosing assembly instance.
+    def walk(label: TDF_Label, loc: TopLoc_Location, inherited_name: str | None, inherited_color, instance_color=None):
+        color = instance_color or _label_color(label) or inherited_color
         own_name = _label_name(label)
         if XCAFDoc_ShapeTool.IsAssembly_s(label):
             # Assembly / product labels carry the meaningful part names (PLATE, BOLT...)
@@ -128,7 +139,7 @@ def _read_xcaf(path: Path, fmt: str) -> list[_Part]:
                 comp = comps.Value(i)
                 ref = TDF_Label()
                 XCAFDoc_ShapeTool.GetReferredShape_s(comp, ref)
-                walk(ref, loc.Multiplied(XCAFDoc_ShapeTool.GetLocation_s(comp)), _label_name(comp) or inherited_name, _label_color(comp) or color)
+                walk(ref, loc.Multiplied(XCAFDoc_ShapeTool.GetLocation_s(comp)), _label_name(comp) or inherited_name, color, _label_color(comp))
         else:
             shape = XCAFDoc_ShapeTool.GetShape_s(label)
             if shape.IsNull():

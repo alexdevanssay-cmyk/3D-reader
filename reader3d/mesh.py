@@ -61,13 +61,28 @@ def read_mesh(path: str | Path, unit: str = "auto") -> tuple[list[Body], str]:
 
 def _auto_unit(scene: trimesh.Scene, ext: str) -> tuple[str, float]:
     units = (scene.units or "").lower() if getattr(scene, "units", None) else ""
-    if units in _TRIMESH_UNITS:
-        factor = _TRIMESH_UNITS[units]
-        name = next((k for k, v in UNITS.items() if v == factor), units)
-        return name, factor
+    factor = _parse_units(units)
+    if factor is not None:
+        name = next((k for k, v in UNITS.items() if abs(v - factor) <= 1e-9 * v), None)
+        return name or f"{factor / 1000:g} m", factor
     if ext in (".glb", ".gltf"):
         return "m", UNITS["m"]  # glTF is metres by specification
     return "mm", 1.0  # STL/OBJ/PLY have no unit; mm is the usual CAD/3D-printing convention
+
+
+def _parse_units(units: str) -> float | None:
+    """mm per file unit for trimesh's unit strings: "millimeters", or "0.01 * meters"
+    for a COLLADA document declaring <unit meter="0.01"/>."""
+    if units in _TRIMESH_UNITS:
+        return _TRIMESH_UNITS[units]
+    scale, sep, base = units.partition("*")
+    if sep and base.strip() in _TRIMESH_UNITS:
+        try:
+            value = float(scale) * _TRIMESH_UNITS[base.strip()]
+        except ValueError:
+            return None
+        return value if value > 0 else None
+    return None
 
 
 def _mesh_body(name: str, mesh: trimesh.Trimesh, color) -> Body:
