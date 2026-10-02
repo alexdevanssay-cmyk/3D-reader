@@ -355,7 +355,7 @@ function renderPanel() {
   method.classList.toggle("warn", s.open_bodies > 0 || s.volume == null || estimated > 0);
   const how = r.kind === "cad"
     ? "Exact volume computed on the CAD B-rep geometry (OpenCascade)."
-    : `Volume enclosed by the closed triangle mesh. Source unit: ${r.source_unit}.`;
+    : `Volume enclosed by the triangle mesh. Source unit: ${r.source_unit}.`;
   const notes = [];
   if (estimated) notes.push(`${estimated} body/bodies had holes: volume estimated after filling them.`);
   if (s.open_bodies > 0) notes.push(`${s.open_bodies} open body/bodies excluded from the volume.`);
@@ -482,7 +482,7 @@ function exportCsv() {
   }
   const s = r.summary;
   lines.push([csvText("TOTAL"), s.volume ?? "", s.area, ...s.bbox.size, ...(s.centroid || ["", "", ""]),
-    s.open_bodies === 0, mass(s.volume)].join(","));
+    r.bodies.every((b) => b.closed), mass(s.volume)].join(","));
   // The BOM makes spreadsheet software read the names as UTF-8.
   const blob = new Blob(["\ufeff" + lines.join("\r\n") + "\r\n"], { type: "text/csv;charset=utf-8" });
   const a = document.createElement("a");
