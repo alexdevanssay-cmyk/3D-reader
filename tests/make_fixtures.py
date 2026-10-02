@@ -20,8 +20,17 @@ import trimesh
 from OCP.BRep import BRep_Builder
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeSphere
+from OCP.BRepBuilderAPI import (
+    BRepBuilderAPI_MakeEdge,
+    BRepBuilderAPI_MakeFace,
+    BRepBuilderAPI_MakeWire,
+    BRepBuilderAPI_NurbsConvert,
+    BRepBuilderAPI_Transform,
+)
+from OCP.BRepPrimAPI import BRepPrimAPI_MakeRevol, BRepPrimAPI_MakeTorus
 from OCP.BRepTools import BRepTools
-from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
+from OCP.GeomAPI import GeomAPI_PointsToBSpline
+from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.IGESControl import IGESControl_Writer
 from OCP.Interface import Interface_Static
@@ -35,6 +44,11 @@ from OCP.TopAbs import TopAbs_FACE
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS_Compound
+
+try:
+    from OCP.collections import Array1_gp_Pnt as TColgp_Array1OfPnt
+except ImportError:  # cadquery-ocp < 8
+    from OCP.TColgp import TColgp_Array1OfPnt
 from OCP.XCAFDoc import XCAFDoc_ColorType, XCAFDoc_DocumentTool
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -112,6 +126,45 @@ def write_surface_model(path):
     write_step(compound(faces), path)
 
 
+def write_mirror_assembly(path, mirror: gp_Trsf, other: gp_Trsf):
+    """A part placed with a mirror transformation next to a part placed rigidly."""
+    doc = TDocStd_Document(TCollection_ExtendedString("XmlOcaf"))
+    shapes = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
+    root = shapes.NewShape()
+    TDataStd_Name.Set_s(root, TCollection_ExtendedString("Asm", True))
+    a = shapes.AddShape(BRepPrimAPI_MakeBox(gp_Pnt(2, 3, 4), 6.0, 7.0, 8.0).Shape(), False)
+    TDataStd_Name.Set_s(a, TCollection_ExtendedString("MirroredPart", True))
+    b = shapes.AddShape(BRepPrimAPI_MakeBox(gp_Pnt(10, 0, 0), 5.0, 5.0, 5.0).Shape(), False)
+    TDataStd_Name.Set_s(b, TCollection_ExtendedString("OtherPart", True))
+    shapes.AddComponent(root, a, TopLoc_Location(mirror))
+    shapes.AddComponent(root, b, TopLoc_Location(other))
+    shapes.UpdateAssemblies()
+    writer = STEPCAFControl_Writer()
+    writer.SetNameMode(True)
+    assert writer.Transfer(doc, STEPControl_AsIs)
+    assert writer.Write(str(path)) == IFSelect_RetDone
+
+
+def revolved_spline():
+    """Solid of revolution of a wavy B-spline profile, placed off-axis: its faces are
+    surfaces of revolution, whose bounding box some OpenCascade versions get wrong."""
+    pts = [(0, 0, 0), (6, 0, 2), (9, 0, 7), (5, 0, 12), (8, 0, 17), (0, 0, 20)]
+    arr = TColgp_Array1OfPnt(1, len(pts))
+    for i, p in enumerate(pts):
+        arr.SetValue(i + 1, gp_Pnt(*p))
+    curve = GeomAPI_PointsToBSpline(arr).Curve()
+    wire = BRepBuilderAPI_MakeWire(
+        BRepBuilderAPI_MakeEdge(curve).Edge(), BRepBuilderAPI_MakeEdge(gp_Pnt(0, 0, 20), gp_Pnt(0, 0, 0)).Edge()
+    ).Wire()
+    face = BRepBuilderAPI_MakeFace(wire, True).Face()
+    solid = BRepPrimAPI_MakeRevol(face, gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), 2 * math.pi).Shape()
+    rot = gp_Trsf()
+    rot.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 1, 0.3)), 0.7)
+    move = gp_Trsf()
+    move.SetTranslation(gp_Vec(-20, -40, -10))
+    return BRepBuilderAPI_Transform(BRepBuilderAPI_Transform(solid, rot, True).Shape(), move, True).Shape()
+
+
 def make_cad(out: Path):
     write_step(holed_block(), out / "holed_block.step")
     write_step(BRepPrimAPI_MakeSphere(7.0).Shape(), out / "sphere.stp")
@@ -127,6 +180,23 @@ def make_cad(out: Path):
     w.ComputeModel()
     assert w.Write(str(out / "holed_block.igs"))
     assert BRepTools.Write_s(holed_block(), str(out / "holed_block.brep"))
+
+    # Exact rational NURBS versions of analytic solids (as exported by Rhino, Alias...).
+    write_step(BRepBuilderAPI_NurbsConvert(BRepPrimAPI_MakeTorus(10.0, 3.0).Shape(), True).Shape(), out / "nurbs_torus.step")
+    write_step(BRepBuilderAPI_NurbsConvert(BRepPrimAPI_MakeCylinder(5.0, 20.0).Shape(), True).Shape(), out / "nurbs_cylinder.step")
+    # A closed surface made of a single face (sphere surface model).
+    sphere_face = TopExp_Explorer(BRepPrimAPI_MakeSphere(5.0).Shape(), TopAbs_FACE).Current()
+    write_step(compound([sphere_face]), out / "sphere_face.step")
+    write_step(revolved_spline(), out / "revolved_spline.step")
+    # Mirrored instance next to a part turned half a turn / placed as is.
+    mirror = gp_Trsf()
+    mirror.SetMirror(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)))
+    half_turn = gp_Trsf()
+    half_turn.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), math.pi)
+    write_mirror_assembly(out / "mirror_halfturn.step", mirror, half_turn)
+    point_mirror = gp_Trsf()
+    point_mirror.SetMirror(gp_Pnt(0, 0, 0))
+    write_mirror_assembly(out / "pointmirror_identity.step", point_mirror, gp_Trsf())
 
     for sample in SAMPLES.glob("*.stp"):
         shutil.copy(sample, out / sample.name)
@@ -170,6 +240,31 @@ def make_meshes(out: Path):
     trimesh.creation.box((10, 20, 30)).export(out / "box.off")
     trimesh.creation.box((10, 20, 30)).export(out / "box.ply")
 
+    # Several shells in one mesh, some of them inside out: each shell must be oriented
+    # on its own (a shell inside another one is a void, the others are material).
+    cube = trimesh.creation.box((10, 10, 10))
+    inverted_cube = cube.copy()
+    inverted_cube.invert()
+    trimesh.util.concatenate([cube, inverted_cube.copy().apply_translation([30, 0, 0])]).export(out / "two_cubes_one_inverted.stl")
+    big = trimesh.creation.box((20, 20, 20))
+    trimesh.util.concatenate([inverted_cube, big.copy().apply_translation([50, 0, 0])]).export(out / "small_cube_inverted.stl")
+    void = trimesh.creation.box((5, 5, 5))
+    void.invert()
+    trimesh.util.concatenate([big, void]).export(out / "cube_with_void.stl")
+
+    # Facets that do not weld (corners jittered by 1e-6 mm): an unwelded triangle soup
+    # is open, not a closed solid of volume ~0.
+    rng = np.random.RandomState(0)
+    tris = cube.triangles + rng.uniform(-1e-6, 1e-6, cube.triangles.shape)
+    soup = trimesh.Trimesh(vertices=tris.reshape(-1, 3), faces=np.arange(len(tris) * 3).reshape(-1, 3), process=False)
+    (out / "unwelded_cube.stl").write_bytes(trimesh.exchange.stl.export_stl_ascii(soup).encode())
+
+    # Rotated cube plus one unused vertex far away: the envelope ignores it.
+    stray = trimesh.creation.box((10, 10, 10))
+    stray.apply_transform(trimesh.transformations.euler_matrix(0.4, 0.2, 0.9))
+    stray = trimesh.Trimesh(np.vstack([stray.vertices, [[40.0, 40.0, 40.0]]]), stray.faces, process=False)
+    stray.export(out / "cube_stray_vertex.ply")
+
     # A rotated box: its minimal oriented envelope is smaller than the axis-aligned one.
     rot = trimesh.creation.box((40, 10, 5))
     rot.apply_transform(trimesh.transformations.euler_matrix(0.3, 0.5, 0.7))
@@ -197,6 +292,15 @@ ANALYTIC = {
     "box_cm.dae": 6000.0 * 1e3,
     "box.ply": 6000.0,
     "rotated_box.stl": 2000.0,
+    "nurbs_torus.step": 2 * math.pi**2 * 10 * 3**2,
+    "nurbs_cylinder.step": math.pi * 25 * 20,
+    "sphere_face.step": 4 / 3 * math.pi * 5**3,
+    "mirror_halfturn.step": 6 * 7 * 8 + 125.0,
+    "pointmirror_identity.step": 6 * 7 * 8 + 125.0,
+    "two_cubes_one_inverted.stl": 2000.0,
+    "small_cube_inverted.stl": 9000.0,
+    "cube_with_void.stl": 8000.0 - 125.0,
+    "cube_stray_vertex.ply": 1000.0,
 }
 
 
