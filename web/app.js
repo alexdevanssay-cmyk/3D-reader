@@ -154,6 +154,7 @@ function buildModel(result) {
     const mesh = new THREE.Mesh(geom, mat);
     mesh.userData.index = i;
     mesh.userData.color = color.clone();
+    mesh.userData.look = { transparent: mat.transparent, opacity: mat.opacity, depthWrite: mat.depthWrite };
     modelGroup.add(mesh);
     state.meshes.push(mesh);
 
@@ -1058,11 +1059,27 @@ async function ensureThickness() {
   return run;
 }
 
+// Opacity of the rest of the body while a thickness is highlighted (or the
+// thinnest wall located): translucent, so that the highlighted walls show
+// through, even those inside or behind.
+const HIGHLIGHT_FADE = 0.15;
+
+/** Opaque or translucent material: its own look back, or see-through for a highlight. */
+function setSeeThrough(mesh, on) {
+  const m = mesh.material;
+  const look = mesh.userData.look;
+  const want = on ? { transparent: true, opacity: 1, depthWrite: false } : look;
+  if (m.transparent === want.transparent && m.opacity === want.opacity && m.depthWrite === want.depthWrite) return;
+  Object.assign(m, want);
+  m.needsUpdate = true;
+}
+
 /** Colour the meshes by thickness, or give them their own colour back. */
 function applyThickness() {
   const active = (thick.colors || thick.highlight) && thick.results;
   state.meshes.forEach((mesh, i) => {
     const values = thickValues(i);
+    setSeeThrough(mesh, active && thick.highlight);
     if (!active) {
       if (mesh.userData.indexed) {
         mesh.geometry = mesh.userData.indexed;
@@ -1072,18 +1089,18 @@ function applyThickness() {
       }
       return;
     }
-    // One colour per triangle: a geometry without shared vertices.
+    // One colour per triangle: a geometry without shared vertices (RGBA: the alpha fades the rest during a highlight).
     if (!mesh.userData.indexed) {
       mesh.userData.indexed = mesh.geometry;
       mesh.userData.flat = mesh.geometry.toNonIndexed();
-      mesh.userData.flat.setAttribute("color", new THREE.BufferAttribute(new Float32Array(mesh.userData.flat.attributes.position.count * 3), 3));
+      mesh.userData.flat.setAttribute("color", new THREE.BufferAttribute(new Float32Array(mesh.userData.flat.attributes.position.count * 4), 4));
     }
     const geom = mesh.userData.flat;
     const colors = geom.attributes.color.array;
     const color = new THREE.Color();
     const lo = thick.value - thick.tol;
     const hi = thick.value + thick.tol;
-    const triangles = colors.length / 9;
+    const triangles = colors.length / 12;
     for (let f = 0; f < triangles; f++) {
       const v = values ? values[f] : NaN;
       const inBand = thick.highlight && v >= lo && v <= hi;
@@ -1091,12 +1108,14 @@ function applyThickness() {
       else if (!Number.isFinite(v)) color.copy(NO_VALUE);
       else if (thick.colors) color.setHSL(scaleHue(v) / 360, 0.9, 0.5);
       else color.copy(mesh.userData.color);
-      // With a highlight, the rest of the model steps back.
+      // With a highlight, the rest of the model steps back and becomes translucent.
       if (thick.highlight && !inBand) color.lerp(NO_VALUE, thick.colors ? 0.55 : 0.6).multiplyScalar(0.8);
+      const alpha = thick.highlight && !inBand ? HIGHLIGHT_FADE : 1;
       for (let k = 0; k < 3; k++) {
-        colors[9 * f + 3 * k] = color.r;
-        colors[9 * f + 3 * k + 1] = color.g;
-        colors[9 * f + 3 * k + 2] = color.b;
+        colors[12 * f + 4 * k] = color.r;
+        colors[12 * f + 4 * k + 1] = color.g;
+        colors[12 * f + 4 * k + 2] = color.b;
+        colors[12 * f + 4 * k + 3] = alpha;
       }
     }
     geom.attributes.color.needsUpdate = true;
