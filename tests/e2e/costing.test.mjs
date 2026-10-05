@@ -79,6 +79,21 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.waitForFunction(() => /Détail du chiffrage — Pièce : CG3 Coquille gravité \(traditionnel\)/.test(document.getElementById('page-chiffrage').textContent));
     assert.match(await page.textContent('#page-chiffrage'), /300 s × 1 — TRS 75 %/);
 
+    // The in-house steel die, estimated from the part.
+    assert.match(await page.textContent('#page-chiffrage'), /Outillage — coquille acier réalisée sur place/);
+    assert.match(await page.textContent('#page-chiffrage'), /Fraisage CNC — ébauche des empreintes/);
+    assert.match(await page.textContent('#page-chiffrage'), /Montage, ajustage et assemblage du moule/);
+    // Heat treatment chosen in the list: a T5 costs less than a T6.
+    const pri = async () => Number((/PRI complet[^\d]*([\d\s\u202f]+,\d+)/.exec((await page.textContent('#page-chiffrage')).replace(/\u202f/g, ' ')) ?? [])[1]?.replace(/\s/g, '').replace(',', '.'));
+    const noTth = await pri();
+    await page.selectOption('#page-chiffrage [data-bind="p.tth"]', 'T6');
+    await page.waitForSelector('#page-chiffrage [data-bind="p.tthMode"]');
+    const t6 = await pri();
+    await page.selectOption('#page-chiffrage [data-bind="p.tth"]', 'T5');
+    await page.waitForFunction(() => /6 h à 200 °C/.test(document.getElementById('page-chiffrage').textContent));
+    const t5 = await pri();
+    assert.ok(t6 > t5 && t5 > noTth, `T6 ${t6}, T5 ${t5}, none ${noTth}`);
+
     // A prices file replaces the indices of the workbook.
     await page.setInputFiles('#page-chiffrage input[data-file="indices"]', join(dir, 'VALEURS MB LME.xlsx'));
     await page.waitForFunction(() => /Indices « VALEURS MB LME\.xlsx » importés/.test(document.getElementById('page-chiffrage').textContent));
@@ -114,7 +129,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const [download] = await Promise.all([page.waitForEvent('download'), page.click('#page-chiffrage [data-action="export-xlsx"]')]);
     const files = unzipSync(new Uint8Array(readFileSync(await download.path())));
     const workbook = strFromU8(files['xl/workbook.xml']);
-    for (const name of ['Synthèse', 'Gammes', 'Projection', 'Commande série', 'Solutions']) assert.match(workbook, new RegExp(`name="${name}"`));
+    for (const name of ['Synthèse', 'Gammes', 'Projection', 'Outillage', 'Commande série', 'Solutions']) assert.match(workbook, new RegExp(`name="${name}"`));
     const synthese = strFromU8(files['xl/worksheets/sheet1.xml']);
     assert.match(synthese, /CG3 — Coquille gravité \(traditionnel\)/);
     assert.match(synthese, /Mise au mille/);

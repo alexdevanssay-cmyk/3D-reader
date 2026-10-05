@@ -10,7 +10,8 @@ import { readCostingWorkbook, readIndicesWorkbook } from '../../web/chiffrage/wo
 import { centreRates, indexAverage, minimumMargin, quote, saleMetalPrice } from '../../web/chiffrage/model.js';
 import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, bestRoutes, buildRoute, estimateMiseAuMille, rankRoutes } from '../../web/chiffrage/routes.js';
 import { readWorkbook } from '../../web/chiffrage/xlsxread.js';
-import { programmeOf, readSeriesOrder } from '../../web/chiffrage/rfq.js';
+import { heatTreatmentOf, programmeOf, readSeriesOrder } from '../../web/chiffrage/rfq.js';
+import { DEFAULT_TOOLING, estimateTooling } from '../../web/chiffrage/tooling.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -311,5 +312,58 @@ describe('series order of a customer request', () => {
     const small = quote(rates, wb.base.lists, input(50)).years[0];
     assert.ok(small.miseEnRouteVendue > big.miseEnRouteVendue * 30, `${small.miseEnRouteVendue} vs ${big.miseEnRouteVendue}`);
     assert.ok(small.prixVente > big.prixVente);
+  });
+});
+
+describe('in-house gravity die and heat treatments', () => {
+  const part = { bboxSize: [200, 120, 60], volume: 400e3, area: 150e3, dimMax: 200, noyaux: false };
+
+  test('the die: steel of the blocks, milling, assembly, more with more cavities', () => {
+    const one = estimateTooling(part, 1);
+    const two = estimateTooling(part, 2);
+    // Blocks 320 x 240 x 160 mm of steel at 7.85: 96.5 kg.
+    close(one.block.kg, (320 * 240 * 160 * 7.85) / 1e6, 1e-9, 'value');
+    assert.ok(one.lines.some((l) => /Acier/.test(l.label)));
+    assert.ok(one.lines.some((l) => /Fraisage CNC — ébauche/.test(l.label)));
+    assert.ok(one.lines.some((l) => /Montage/.test(l.label)));
+    close(one.total, one.lines.reduce((s, l) => s + l.value, 0), 1e-9, 'value');
+    assert.ok(two.total > one.total * 1.3, `${two.total} vs ${one.total}`);
+    assert.ok(two.hours.cnc > one.hours.cnc);
+  });
+
+  test('gravity die islands get the estimate, the others their price', () => {
+    const settings = { processes: DEFAULT_PROCESSES, operations: DEFAULT_OPERATIONS, trs: DEFAULT_TRS, tooling: DEFAULT_TOOLING };
+    const p = { ...part, poids: 1, toileMini: 5, epaisseurMax: 10, moduleMm: 3, volumeAnnuel: 5000, volumeTotal: 25000 };
+    const cg = buildRoute('CG3', 'FTR', p, settings, null);
+    const bp = buildRoute('BPR', 'FTR', p, settings, null);
+    assert.ok(cg.tooling && cg.outillage === cg.tooling.total);
+    close(cg.outillagePiece, cg.outillage / 25000, 1e-9, 'value');
+    assert.equal(bp.tooling, null);
+    assert.equal(bp.outillage, DEFAULT_PROCESSES.BPR.outillage);
+    const off = buildRoute('CG3', 'FTR', p, { ...settings, tooling: { ...DEFAULT_TOOLING, actif: false } }, null);
+    assert.equal(off.outillage, DEFAULT_PROCESSES.CG3.outillage);
+  });
+
+  test('heat treatment of the customer request', () => {
+    assert.equal(heatTreatmentOf('A définir'), null);
+    assert.equal(heatTreatmentOf('TTH T6 + FSW'), 'T6');
+    assert.equal(heatTreatmentOf('Traitement thermique'), 'T6');
+    assert.equal(heatTreatmentOf('TTH T5'), 'T5');
+    assert.equal(heatTreatmentOf('T64'), 'T64');
+  });
+
+  test('the TTH line costs the T6 cost times the coefficient of the treatment', () => {
+    const wb = readCostingWorkbook(costingWorkbook());
+    const rates = centreRates(wb.base, {});
+    const tth = [...rates.values()].find((r) => r.uo === 'kgSold');
+    assert.ok(tth, 'a TTH centre in the fixture');
+    const input = (tthCoef) => ({
+      metal: { coursAchat: 2500, p1020Achat: 0, premiumAchat: 0, coursVente: 2500, p1020Vente: 0, premiumVente: 0, pafAchat: 0.06, pafVente: 0.08 },
+      poids: 2, miseAuMille: 1.5, tth: 'scie', tthCoef, operations: [{ code: tth.code }], coefDifficulte: 0, marge: 0.1, years: [2027], volumes: [1000],
+    });
+    const t6 = quote(rates, wb.base.lists, input(1)).lines.find((l) => l.code === tth.code);
+    const t5 = quote(rates, wb.base.lists, input(0.4)).lines.find((l) => l.code === tth.code);
+    close(t6.units, 2, 1e-12, 'value');
+    close(t5.cost, t6.cost * 0.4, 1e-9, 'value');
   });
 });

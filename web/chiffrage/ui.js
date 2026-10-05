@@ -5,6 +5,7 @@
 import { MODES, readCostingWorkbook, readIndicesWorkbook } from "./workbook.js";
 import { centreRates, indexAverage, quote, saleMetalPrice, solveMargin as minimumMargin } from "./model.js";
 import { bestRoutes, buildRoute, rankRoutes } from "./routes.js";
+import { estimateTooling } from "./tooling.js";
 import { programmeOf, readSeriesOrder } from "./rfq.js";
 import * as store from "./store.js";
 
@@ -53,11 +54,20 @@ const USER_FIELDS = ["client", "reference", "designation", "plan", "volumeAnnuel
 // Inputs of each piece (q.pieces[key]); null: from the 3D model or estimated.
 const PIECE_DEFAULTS = {
   poids: null, toileMini: null, epaisseurMax: null, moduleMm: null, dimMax: null,
-  tth: "none", noyaux: false, sableKg: 0, tribo: false, redressage: false,
+  tth: null, // heat treatment (code of settings.tth or "none"); null: the one of the customer request, else none
+  tthMode: "scie", // weight treated: the piece ("scie": feeders sawn off before) or the casting with its feeders
+  noyaux: false, sableKg: 0, tribo: false, redressage: false,
   procede: "auto", finition: "auto", mode: null, cycle: null, empreintes: null, miseAuMille: null,
+  outillagePrix: null, // € of the tooling; null: estimated
   composants: [],
 };
-const pieceInputs = (key) => ({ ...PIECE_DEFAULTS, ...q.pieces?.[key] });
+function pieceInputs(key) {
+  const i = { ...PIECE_DEFAULTS, ...q.pieces?.[key] };
+  // Saved by an earlier version: tth was "scie" / "masselotte" (a T6).
+  if (i.tth === "scie" || i.tth === "masselotte") [i.tth, i.tthMode] = ["T6", i.tth];
+  i.tth ??= q.serie?.tth ?? "none";
+  return i;
+}
 function pieceStore(key) {
   q.pieces ??= {};
   return (q.pieces[key] ??= {});
@@ -399,6 +409,10 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
     epaisseurMax: value("epaisseurMax") ?? 0,
     moduleMm: value("moduleMm") ?? 0,
     dimMax: value("dimMax") ?? 0,
+    // For the estimate of the tooling: the envelope, volume and surface of the 3D model.
+    bboxSize: piece.bboxSize ?? null,
+    volume: piece.volume ?? null,
+    area: piece.area ?? null,
     volumeAnnuel: q.volumeAnnuel || 0,
     volumeTotal,
     tth: inputs.tth !== "none",
@@ -421,7 +435,8 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
     evolution: settings.inflation,
     years,
     volumes,
-    tth: inputs.tth,
+    tth: inputs.tth === "none" ? "none" : inputs.tthMode,
+    tthCoef: settings.tth[inputs.tth]?.coef ?? 1,
   };
   const out = { piece, inputs, auto, part, density };
   if (!(part.poids > 0)) return out;
@@ -449,6 +464,14 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
     if (inputs.empreintes > 0) casting.parCycle = inputs.empreintes;
     if (inputs.cycle > 0) casting.cycle = inputs.cycle;
   }
+  // The in-house die for the number of cavities retained; or the price typed in.
+  const cavities = route.operations.find((o) => o.code === code)?.parCycle;
+  if (route.tooling && cavities !== route.tooling.cavities) {
+    route.tooling = estimateTooling(part, cavities, settings.tooling);
+    route.outillage = route.tooling.total;
+  }
+  route.outillageEstime = route.outillage;
+  if (inputs.outillagePrix > 0) route.outillage = inputs.outillagePrix;
   out.chosen = chosen;
   out.route = route;
   out.finalRates = finalRates;
@@ -457,13 +480,13 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
     poids: part.poids,
     miseAuMille: route.miseAuMille,
     sableKg: route.sableKg,
-    tth: part.tth ? (inputs.tth === "masselotte" ? "masselotte" : "scie") : "none",
+    tth: part.tth ? (inputs.tthMode === "masselotte" ? "masselotte" : "scie") : "none",
     operations: route.operations,
     changeover: [
       { code, heures: settings.heuresChangementCoulee },
       { code: finition, heures: settings.heuresChangementFinition },
     ],
-    outillages: [{ designation: `Outillage ${process.famille}`, qte: 1, prix: process.outillage }],
+    outillages: [{ designation: route.tooling ? "Coquille acier réalisée sur place" : `Outillage ${process.famille}`, qte: 1, prix: route.outillage }],
     margeOutillages: 0,
   };
   out.final = quote(finalRates, base.lists, out.finalInput);
@@ -629,6 +652,7 @@ function renderQuote() {
     </section>
 
     ${ensemble ? "" : castingCard(r)}
+    ${ensemble ? "" : toolingCard(r)}
   </div>
 
   ${ensemble ? ensembleCard(c) : solutionsCard(r)}
@@ -654,7 +678,8 @@ function pieceFields(r) {
       ${field("Épaisseur maxi / point chaud (mm)", input("p.epaisseurMax", i.epaisseurMax, { placeholder: a.epaisseurMax ? nf(a.epaisseurMax, 2) : "" }))}
       ${field("Module V/S (mm)", input("p.moduleMm", i.moduleMm, { placeholder: a.moduleMm ? nf(a.moduleMm, 2) : "" }), "fixe le temps de solidification")}
       ${field("Plus grande dimension (mm)", input("p.dimMax", i.dimMax, { placeholder: a.dimMax ? nf(a.dimMax, 0) : "" }))}
-      ${field("Traitement thermique", select("p.tth", i.tth, [["none", "Aucun"], ["scie", "Oui, pièce sciée"], ["masselotte", "Oui, avec masselotte"]]))}
+      ${field("Traitement thermique", select("p.tth", i.tth, [["none", "Aucun"], ...Object.entries(settings.tth).map(([code, t]) => [code, t.label])]), i.tth !== "none" ? esc(settings.tth[i.tth]?.cycle ?? "") : q.serie ? "selon la demande client" : "")}
+      ${i.tth !== "none" ? field("Poids traité", select("p.tthMode", i.tthMode, [["scie", "Pièce seule (masselottes sciées avant)"], ["masselotte", "Pièce avec masselottes (grappe)"]])) : ""}
       ${field("Noyaux sable", checkbox("p.noyaux", i.noyaux, "oui"))}
       ${i.noyaux ? field("Sable par pièce (kg)", input("p.sableKg", i.sableKg, { min: 0 })) : ""}
       ${field("Tribofinition", checkbox("p.tribo", i.tribo, "oui"))}
@@ -690,6 +715,30 @@ function castingCard(r) {
         ${field("TRS de l'îlot", `<output>${routeCode ? pct(settings.trs[routeCode] ?? 0, 0) : "—"}</output>`, "modifiable dans Paramètres")}
       </div>
       ${mamDetail}
+    </section>`;
+}
+
+/** Tooling of the route retained: the in-house steel die, line by line, or the price of the island. */
+function toolingCard(r) {
+  const route = r?.route;
+  if (!route) return "";
+  const t = route.tooling;
+  const total = c => eur(c, 0);
+  const amortised = r.final && r.part.volumeTotal > 0 ? route.outillage / r.part.volumeTotal : null;
+  const rows = t
+    ? t.lines.map((l) => `<tr><td>${esc(l.label)}</td><td class="muted small">${esc(l.detail)}</td><td class="num">${total(l.value)}</td></tr>`).join("")
+    : `<tr><td>Outillage ${esc(route.famille)}</td><td class="muted small">prix de l'îlot (Paramètres)</td><td class="num">${total(route.outillageEstime)}</td></tr>`;
+  return `<section class="ccard">
+      <h3>Outillage — ${t ? "coquille acier réalisée sur place" : esc(route.famille)}</h3>
+      <div class="cscroll"><table class="ctable">
+        <tbody>${rows}</tbody>
+        <tfoot><tr><td><strong>Total estimé</strong></td><td class="muted small">${t ? `${t.cavities} empreinte${t.cavities > 1 ? "s" : ""} — CNC ${nf(t.hours.cnc, 1)} h, FAO ${nf(t.hours.programmation, 1)} h, montage ${nf(t.hours.montage, 1)} h` : ""}</td><td class="num"><strong>${total(route.outillageEstime)}</strong></td></tr></tfoot>
+      </table></div>
+      <div class="cfields">
+        ${field("Prix d'outillage retenu (€)", input("p.outillagePrix", r.inputs.outillagePrix, { min: 0, placeholder: nf(route.outillageEstime, 0) }), "vide = estimation")}
+        ${field("Amorti par pièce", `<output>${amortised === null ? "—" : eur(amortised, 3)}</output>`, `sur ${nf(r.part.volumeTotal, 0)} pièces du programme`)}
+      </div>
+      ${t ? `<p class="small muted">Estimation à partir du modèle 3D : blocs = encombrement de la pièce + parois, ébauche = volume des empreintes, finition = leur surface (+ ${pct(settings.tooling.alimentation, 0)} pour l'alimentation). Taux, vitesses et temps de montage dans Paramètres.</p>` : ""}
     </section>`;
 }
 
@@ -880,7 +929,7 @@ function seriesCard(c) {
   const mismatch = s?.fonderie && prices ? prices.shown.filter((r) => r.route && !r.route.process.toUpperCase().startsWith(s.fonderie.toUpperCase())) : [];
   return `<section class="ccard">
     <h3>Commande série${c.selected === "ensemble" ? " — ensemble" : ""}</h3>
-    ${s ? `<p class="small">${[s.client, s.demande, s.offre && `offre ${s.offre}`, s.fonderie && `fonderie ${s.fonderie}`, s.usinage, s.references > 1 && `${s.references} références dans la demande`].filter(Boolean).map(esc).join(" — ")}</p>` : `<p class="small muted">Importez la demande client (onglet « 1- Données GO NO GO ») pour reprendre les volumes par année, les MOQ et le prix cible, ou saisissez-les ici.</p>`}
+    ${s ? `<p class="small">${[s.client, s.demande, s.offre && `offre ${s.offre}`, s.fonderie && `fonderie ${s.fonderie}`, s.usinage, s.tth && `TTH ${s.tth}`, s.references > 1 && `${s.references} références dans la demande`].filter(Boolean).map(esc).join(" — ")}</p>` : `<p class="small muted">Importez la demande client (onglet « 1- Données GO NO GO ») pour reprendre les volumes par année, les MOQ et le prix cible, ou saisissez-les ici.</p>`}
     <div class="cfields">
       ${field("Quantités commandées (MOQ)", input("q.moqs", q.moqs ?? [], { kind: "list", placeholder: "1000 ; 500 ; 50" }), "séparées par « ; »")}
       ${field("Prix cible client (€/pièce)", input("q.prixCible", q.prixCible, { min: 0 }))}
@@ -954,6 +1003,14 @@ function renderSettings() {
     .map(([a, d]) => field(a, input(`s.densities.${a}`, d, { width: "80px" })))
     .join("");
   const energy = { ...base?.energy, ...settings.energy };
+  const tthRows = Object.entries(settings.tth)
+    .map(
+      ([code, t]) => `<tr><td><strong>${esc(code)}</strong></td><td>${input(`s.tth.${code}.label`, t.label, { kind: "text", width: "320px" })}</td>
+      <td>${input(`s.tth.${code}.coef`, t.coef, { width: "70px" })}</td><td>${input(`s.tth.${code}.cycle`, t.cycle, { kind: "text", width: "300px" })}</td></tr>`,
+    )
+    .join("");
+  const tl = settings.tooling;
+  const tf = (label, path, value, hint = "", opts = {}) => field(label, input(`s.tooling.${path}`, value, opts), hint);
   return `<div class="cpage">${messageHtml()}
   <p class="cmsg ok">Les paramètres sont enregistrés automatiquement dans ce navigateur dès qu'ils sont saisis, et retrouvés à la prochaine ouverture de la page.</p>
   ${base ? "" : sourcesCard()}
@@ -995,6 +1052,40 @@ function renderSettings() {
     <table class="ctable compact"><thead><tr><th>Opération</th><th>Cycle : base (s)</th><th>+ s / kg pièce</th><th>Pièces par cycle / charge (kg)</th></tr></thead><tbody>${opRows}</tbody></table>
   </section>
   <section class="ccard">
+    <h3>Traitements thermiques</h3>
+    <table class="ctable compact"><thead><tr><th>Code</th><th>Désignation</th><th>Coût / T6</th><th>Cycle type</th></tr></thead><tbody>${tthRows}</tbody></table>
+    <p class="small muted">Le centre TTH du classeur est chiffré au kg pour un T6 : le coût d'un autre traitement = coût T6 × coefficient (surtout le temps de four). Le type est choisi pièce par pièce (menu « Traitement thermique ») ou repris de la demande client.</p>
+  </section>
+  <section class="ccard">
+    <h3>Outillage : coquille acier réalisée sur place</h3>
+    <div class="cfields">
+      ${field("Estimer les coquilles gravité", checkbox("s.tooling.actif", tl.actif, "îlots « Coquille gravité »"), "sinon : prix de l'îlot")}
+      ${tf("Nuance d'acier", "acier.nuance", tl.acier.nuance, "", { kind: "text" })}
+      ${tf("Prix de l'acier (€/kg)", "acier.prixKg", tl.acier.prixKg)}
+      ${tf("Densité de l'acier", "acier.densite", tl.acier.densite)}
+      ${tf("Traitement de l'acier (€/kg)", "acier.traitementKg", tl.acier.traitementKg, "trempe, revenu, nitruration")}
+      ${tf("Paroi autour des empreintes (mm)", "bloc.paroi", tl.bloc.paroi)}
+      ${tf("Fond de chaque demi-coquille (mm)", "bloc.fond", tl.bloc.fond)}
+      ${tf("Entre deux empreintes (mm)", "bloc.entreEmpreintes", tl.bloc.entreEmpreintes)}
+      ${tf("Alimentation (jets, masselottes, évents)", "alimentation", tl.alimentation, "% du volume et de la surface des empreintes", { kind: "pct" })}
+      ${tf("Taux horaire fraisage CNC (€/h)", "usinage.taux", tl.usinage.taux)}
+      ${tf("Dressage des blocs (cm²/h)", "usinage.dressage", tl.usinage.dressage)}
+      ${tf("Ébauche (cm³/min)", "usinage.ebauche", tl.usinage.ebauche, "débit de copeaux dans l'acier")}
+      ${tf("Finition des empreintes (cm²/h)", "usinage.finition", tl.usinage.finition, "fraise boule")}
+      ${tf("Taux horaire programmation FAO (€/h)", "usinage.tauxProgrammation", tl.usinage.tauxProgrammation)}
+      ${tf("Programmation : base (h)", "usinage.programmationBase", tl.usinage.programmationBase)}
+      ${tf("Programmation : h par dm² d'empreinte", "usinage.programmationParDm2", tl.usinage.programmationParDm2)}
+      ${tf("Taux horaire montage / ajustage (€/h)", "montage.taux", tl.montage.taux)}
+      ${tf("Montage et assemblage : base (h)", "montage.base", tl.montage.base, "ajustage, éjection, refroidissement, essais")}
+      ${tf("Montage : h par empreinte", "montage.parEmpreinte", tl.montage.parEmpreinte)}
+      ${tf("Montage : h si noyaux", "montage.parNoyau", tl.montage.parNoyau)}
+      ${tf("Composants standard : base (€)", "composants.base", tl.composants.base, "colonnes, bagues, éjecteurs, cartouches")}
+      ${tf("Composants standard : par empreinte (€)", "composants.parEmpreinte", tl.composants.parEmpreinte)}
+      ${tf("Aléas", "aleas", tl.aleas, "% du total", { kind: "pct" })}
+    </div>
+    <p class="small muted">Deux demi-coquilles : longueur = plus grande dimension de la pièce + 2 parois, largeur = empreintes côte à côte + parois, hauteur = plus petite dimension + 2 fonds. Ébauche = volume des empreintes (volume de la pièce × empreintes + alimentation) ; finition = leur surface ; programmation selon la surface. Valeurs de départ à ajuster à l'atelier.</p>
+  </section>
+  <section class="ccard">
     <h3>Densités des alliages (g/cm³)</h3>
     <div class="cfields">${densities}</div>
   </section>
@@ -1028,7 +1119,7 @@ async function exportXlsx() {
     ["Cours vente (€/t)", c.sale.cours], ["Premium vente (€/t)", q.premiumVente], ["Cours + P1020 + premium achat (€/t)", (q.coursAchat || 0) + (q.p1020Achat || 0) + (q.premiumAchat || 0)],
     ["Volume annuel", q.volumeAnnuel], ["Durée du programme (ans)", q.annees], ["Marge sur VA", P(q.marge ?? settings.marge)],
     [],
-    ["Pièce", "Poids (kg)", "Toile mini (mm)", "Écritures / détails fins", "Épaisseur maxi (mm)", "Îlot", "Finition", "Fonctionnement", "Cycle (s)", "Pièces / cycle", "TRS", "Mise au mille", "VA PRI (€)", "Matière + PAF (€)", "PRI complet (€)", "Prix de vente (€)", "Marge sur VA"].map(H),
+    ["Pièce", "Poids (kg)", "Toile mini (mm)", "Écritures / détails fins", "Épaisseur maxi (mm)", "Îlot", "Finition", "Fonctionnement", "Cycle (s)", "Pièces / cycle", "TRS", "Mise au mille", "Traitement thermique", "Outillage (€)", "VA PRI (€)", "Matière + PAF (€)", "PRI complet (€)", "Prix de vente (€)", "Marge sur VA"].map(H),
   ];
   for (const r of c.results) {
     const f = r.final;
@@ -1038,12 +1129,13 @@ async function exportXlsx() {
       r.piece.name, r.part.poids ?? null, r.part.toileMini || null, t?.details ? `(${nf(t.details.min, 2)} mm)` : null, r.part.epaisseurMax || null,
       r.route ? `${r.route.process} — ${r.route.famille}` : "non chiffrée", r.route ? settings.operations[r.route.finition]?.label ?? r.route.finition : null,
       r.route ? r.finalRates.get(r.route.process)?.mode ?? null : null, op?.cycle ?? null, op?.parCycle ?? null, P(op?.trs), r.route?.miseAuMille ?? null,
+      r.inputs.tth === "none" ? "aucun" : `${r.inputs.tth}${r.inputs.tthMode === "masselotte" ? " (avec masselottes)" : ""}`, r.route?.outillage ?? null,
       f?.va ?? null, f ? f.matiere + f.perteAuFeu : null, f?.pri ?? null, f?.years[0]?.prixVente ?? null, P(f?.years[0]?.margeVaPct),
     ]);
   }
   if (c.results.length > 1) {
     const e = aggregate(done, c.years);
-    synthese.push([T("TOTAL ensemble"), T(e.poids), null, null, null, null, null, null, null, null, null, null, T(e.va), T(e.matiere + e.perteAuFeu), T(e.pri), T(e.years[0]?.prixVente), P(e.years[0]?.margeVaPct)]);
+    synthese.push([T("TOTAL ensemble"), T(e.poids), null, null, null, null, null, null, null, null, null, null, null, T(done.reduce((n, r) => n + (r.route?.outillage || 0), 0)), T(e.va), T(e.matiere + e.perteAuFeu), T(e.pri), T(e.years[0]?.prixVente), P(e.years[0]?.margeVaPct)]);
   }
 
   const gammes = [["Pièce", "Centre", "Nom", "Fonctionnement", "Cycle (s)", "Pièces par cycle", "TRS", "Quantité (UO / pièce)", "Taux (€/UO)", "Coût (€/pièce)"]];
@@ -1058,6 +1150,15 @@ async function exportXlsx() {
   for (const y of scope.years) projection.push([y.year, y.volume, y.pri, y.prixVente, y.margeVaPct, y.ca, y.margeVaAnnuelle]);
   const solutions = [["Pièce", "Rang", "Îlot", "Finition", "Cycle (s)", "Pièces par cycle", "Mise au mille", "PRI (€)", "Outillage / pièce (€)", "Qualité /10", "Qualité / prix"]];
   for (const r of done) r.best.forEach((x, i) => solutions.push([r.piece.name, i + 1, `${x.process} — ${x.famille}`, x.finition, x.cycle, x.parCycle, x.miseAuMille, x.result.pri, x.outillagePiece, x.qualite, x.ratio * 100]));
+
+  const outillage = [["Pièce", "Poste", "Détail", "Montant (€)"].map(H)];
+  for (const r of done) {
+    const t = r.route.tooling;
+    if (t) for (const l of t.lines) outillage.push([r.piece.name, l.label, l.detail, l.value]);
+    else outillage.push([r.piece.name, `Outillage ${r.route.famille}`, "prix de l'îlot (Paramètres)", r.route.outillageEstime]);
+    if (r.inputs.outillagePrix > 0) outillage.push([r.piece.name, "Prix retenu (saisi)", null, r.inputs.outillagePrix]);
+    outillage.push([T(`Total ${r.piece.name}`), null, null, T(r.route.outillage)]);
+  }
 
   const prices = moqPrices(c);
   const serie = [
@@ -1074,9 +1175,10 @@ async function exportXlsx() {
   }
 
   const bytes = buildXlsx([
-    { name: "Synthèse", rows: synthese, widths: [32, 14, 14, 20, 16, 34, 22, 14, 10, 12, 8, 12, 12, 14, 14, 14, 12] },
+    { name: "Synthèse", rows: synthese, widths: [32, 14, 14, 20, 16, 34, 22, 14, 10, 12, 8, 12, 22, 14, 12, 14, 14, 14, 12] },
     { name: "Gammes", rows: gammes, header: true, widths: [28, 10, 34, 14, 12, 14, 10, 18, 14, 14] },
     { name: "Projection", rows: projection, header: true, widths: [10, 12, 14, 18, 16, 16, 22] },
+    { name: "Outillage", rows: outillage, widths: [28, 42, 60, 14] },
     { name: "Commande série", rows: serie, widths: [26, 24, 22, 14, 22, 12, 12, 12, 12, 12, 12, 12] },
     { name: "Solutions", rows: solutions, header: true, widths: [28, 8, 40, 10, 12, 14, 12, 12, 18, 12, 14] },
   ]);
