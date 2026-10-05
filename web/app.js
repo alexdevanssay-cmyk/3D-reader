@@ -123,6 +123,55 @@ function clearModel() {
   state.selected = -1;
 }
 
+/**
+ * Lines of the edges of a triangle mesh, each edge once (an index buffer for
+ * LineSegments sharing the mesh's positions). Typed-array hash of the edges:
+ * THREE.WireframeGeometry keys them by strings, far too slow on large meshes.
+ */
+function wireframeGeometry(geom) {
+  const index = geom.index.array;
+  let size = 16;
+  while (size < index.length * 2) size *= 2;
+  const mask = size - 1;
+  const keyA = new Int32Array(size).fill(-1);
+  const keyB = new Int32Array(size);
+  const lines = new Uint32Array(index.length * 2); // at most every edge of every triangle
+  let n = 0;
+  for (let t = 0; t < index.length; t += 3) {
+    for (let e = 0; e < 3; e++) {
+      const u = index[t + e], w = index[t + ((e + 1) % 3)];
+      const i = u < w ? u : w, j = u < w ? w : u;
+      let slot = (Math.imul(i, 0x9e3779b1) ^ Math.imul(j, 0x85ebca6b)) & mask;
+      while (keyA[slot] !== -1 && (keyA[slot] !== i || keyB[slot] !== j)) slot = (slot + 1) & mask;
+      if (keyA[slot] !== -1) continue;
+      keyA[slot] = i;
+      keyB[slot] = j;
+      lines[n++] = i;
+      lines[n++] = j;
+    }
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute("position", geom.getAttribute("position"));
+  out.setIndex(new THREE.BufferAttribute(lines.slice(0, n), 1));
+  return out;
+}
+
+/** Show or hide the wireframe of every body (built the first time it is shown). */
+function showWireframe(on) {
+  if (on && !state.edges.length) {
+    state.meshes.forEach((mesh) => {
+      const geom = mesh.userData.indexed ?? mesh.geometry;
+      const edges = new THREE.LineSegments(
+        wireframeGeometry(geom),
+        new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.25, clippingPlanes: [sectionPlane] }),
+      );
+      mesh.add(edges);
+      state.edges.push(edges);
+    });
+  }
+  state.edges.forEach((l) => (l.visible = on));
+}
+
 function buildModel(result) {
   clearModel();
   result.bodies.forEach((body, i) => {
@@ -158,14 +207,9 @@ function buildModel(result) {
     modelGroup.add(mesh);
     state.meshes.push(mesh);
 
-    const edges = new THREE.LineSegments(
-      new THREE.WireframeGeometry(geom),
-      new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.25, clippingPlanes: [sectionPlane] }),
-    );
-    edges.visible = $("toggle-wire").classList.contains("active");
-    mesh.add(edges);
-    state.edges.push(edges);
   });
+  // The wireframe is only built when shown (on a large model it takes longer than the rest of the view).
+  if ($("toggle-wire").classList.contains("active")) showWireframe(true);
 
   state.included = new Set(result.bodies.map((_, i) => i));
   state.subsetSummary = null;
@@ -885,10 +929,7 @@ $("density").addEventListener("input", () => {
 document.querySelectorAll("[data-view]").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
 $("fit").addEventListener("click", () => setView(null));
 
-$("toggle-wire").addEventListener("click", (e) => {
-  const on = e.currentTarget.classList.toggle("active");
-  state.edges.forEach((l) => (l.visible = on));
-});
+$("toggle-wire").addEventListener("click", (e) => showWireframe(e.currentTarget.classList.toggle("active")));
 $("toggle-box").addEventListener("click", (e) => {
   const on = e.currentTarget.classList.toggle("active");
   if (boxHelper) boxHelper.visible = on;

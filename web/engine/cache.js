@@ -65,43 +65,47 @@ function sizeOf(value, seen = new Set()) {
   return n;
 }
 
+// Each part of the results is a record of its own: the thickness, computed
+// later, is added without reading and writing again the (large) analysis.
+const PARTS = ['data', 'thickness'];
+const partKey = (key, part) => (part === 'data' ? key : `${key}#${part}`);
+
 /** The results kept for this key ({data, thickness}), or null. Never throws. */
 export async function loadResult(key) {
   if (!key) return null;
   try {
     const d = await db();
     const tx = d.transaction(['meta', 'data'], 'readwrite');
-    const record = await request(tx.objectStore('data').get(key));
+    const [data, thickness] = await Promise.all(PARTS.map((part) => request(tx.objectStore('data').get(partKey(key, part)))));
     const meta = await request(tx.objectStore('meta').get(key));
     if (meta) tx.objectStore('meta').put({ ...meta, usedAt: Date.now() });
     await done(tx);
-    return record ?? null;
+    // Kept by an earlier version: one record {data, thickness}.
+    if (data && 'data' in data && !thickness) return data;
+    return data ? { data, thickness: thickness ?? null } : null;
   } catch {
     return null;
   }
 }
 
 /**
- * Keep results (record: {data, thickness}); `patch` merges into the record
- * already kept (e.g. the thickness, computed later). Never throws: the cache
+ * Keep a part of the results: record {data} (the analysis, first) or
+ * {thickness} (added to the analysis already kept). Never throws: the cache
  * is an extra, a full disk or a private window just leave it out.
  */
-export async function saveResult(key, record, { patch = false, file = '' } = {}) {
+export async function saveResult(key, record, { file = '' } = {}) {
   if (!key) return;
   try {
     const d = await db();
-    let value = record;
-    if (patch) {
-      const old = await request(d.transaction('data').objectStore('data').get(key));
-      if (!old) return;
-      value = { ...old, ...record };
-    }
-    const bytes = sizeOf(value);
+    const [part] = Object.keys(record);
+    const bytes = sizeOf(record[part]);
     if (bytes > MAX_BYTES / 2) return; // one model would push out everything else
     const tx = d.transaction(['meta', 'data'], 'readwrite');
-    tx.objectStore('data').put(value, key);
-    const meta = (await request(tx.objectStore('meta').get(key))) ?? { key, file, savedAt: Date.now() };
-    tx.objectStore('meta').put({ ...meta, bytes, usedAt: Date.now() });
+    const meta = await request(tx.objectStore('meta').get(key));
+    if (part !== 'data' && !meta) return; // the analysis is no longer kept
+    tx.objectStore('data').put(record[part], partKey(key, part));
+    const parts = { ...meta?.parts, [part]: bytes };
+    tx.objectStore('meta').put({ key, file: meta?.file ?? file, savedAt: meta?.savedAt ?? Date.now(), parts, bytes: Object.values(parts).reduce((a, b) => a + b, 0), usedAt: Date.now() });
     await done(tx);
     await evict(d);
   } catch {
@@ -119,7 +123,7 @@ async function evict(d) {
   const tx = d.transaction(['meta', 'data'], 'readwrite');
   for (const m of drop) {
     tx.objectStore('meta').delete(m.key);
-    tx.objectStore('data').delete(m.key);
+    for (const part of PARTS) tx.objectStore('data').delete(partKey(m.key, part));
   }
   await done(tx);
 }
