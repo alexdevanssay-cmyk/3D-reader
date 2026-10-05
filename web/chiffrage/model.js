@@ -267,6 +267,8 @@ export function quote(rates, lists, q) {
       pri: pri + increases,
       vaPri,
       vaVendue,
+      vaVendueTotale,
+      vaPriTotale,
       miseEnRouteVendue,
       miseEnRoutePri,
       vmVendue,
@@ -317,17 +319,21 @@ export function quote(rates, lists, q) {
  * margin of the first year with a volume: the "Calcul mini" macro (goal seek).
  */
 export function minimumMargin(rates, lists, q, target) {
-  const first = (m) => {
+  return solveMargin((m) => {
     const r = quote(rates, lists, { ...q, marge: m });
     const y = r.years.find((x) => x.volume > 0) ?? r.years[0];
     return y?.margeVaPct ?? 0;
-  };
+  }, target);
+}
+
+/** The margin m for which evaluate(m) = target (increasing in m), by bisection; null if out of reach. */
+export function solveMargin(evaluate, target) {
   let lo = -0.9;
   let hi = 0.95;
-  if (first(hi) < target || first(lo) > target) return null;
+  if (evaluate(hi) < target || evaluate(lo) > target) return null;
   for (let i = 0; i < 80; i++) {
     const mid = (lo + hi) / 2;
-    if (first(mid) < target) lo = mid;
+    if (evaluate(mid) < target) lo = mid;
     else hi = mid;
   }
   return (lo + hi) / 2;

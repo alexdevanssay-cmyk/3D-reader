@@ -181,6 +181,7 @@
           <div class="thick-min">
             <span data-i18n="thick.min" data-i18n-title="thick.min.title" title="Thinnest wall found on at least 0.1 % of the surface">Thinnest wall detected</span>
             <strong id="thick-min">—</strong>
+            <span id="thick-details" class="muted small"></span>
             <button id="thick-locate" class="small" type="button" data-i18n="thick.locate" data-i18n-title="thick.locate.title" title="Highlight the thinnest walls on the model">Locate</button>
           </div>
           <canvas id="thick-scale" class="thick-scale" height="96" aria-describedby="thick-share"></canvas>
@@ -189,6 +190,10 @@
             <label class="check"><input type="checkbox" id="thick-highlight"> <span data-i18n="thick.highlight">Highlight</span></label>
             <input id="thick-value" type="number" min="0" step="0.1"> <span>±</span>
             <input id="thick-tol" type="number" min="0" step="0.1"> <span class="muted">mm</span>
+          </div>
+          <div class="row thick-controls">
+            <span class="muted" data-i18n="thick.floor" data-i18n-title="thick.floor.title" title="Thinner values are lettering or marks on the surface, not walls">Ignore below (lettering)</span>
+            <input id="thick-floor" type="number" min="0" step="0.1"> <span class="muted">mm</span>
           </div>
           <div class="row thick-controls">
             <span class="muted" data-i18n="thick.max">Scale up to</span>
@@ -210,7 +215,7 @@
           </div>
         </div>
         <table class="bodies">
-          <thead><tr><th></th><th data-i18n="bodies.name">Name</th><th class="num" data-i18n="bodies.volume">Volume</th><th class="num">%</th></tr></thead>
+          <thead><tr><th><input type="checkbox" id="bodies-all" data-i18n-title="bodies.all" title="Select all the bodies"></th><th data-i18n="bodies.name">Name</th><th class="num" data-i18n="bodies.volume">Volume</th><th class="num">%</th></tr></thead>
           <tbody id="bodies"></tbody>
         </table>
         <div id="body-detail" class="body-detail" hidden></div>

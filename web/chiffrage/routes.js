@@ -16,6 +16,7 @@ export const DEFAULT_PROCESSES = {
     toileMin: 1, toileMax: 8, poidsMax: 12, dimMax: 600, volumeMin: 5000,
     empreintesMax: 4, grappeMax: 15, miseAuMille: 1.3, qualite: 6,
     tth: false, noyaux: false, finitions: ["FSP"], outillage: 60000,
+    rendement: { base: 0.75, parDoublement: 0.03, petitePiece: 0.04 },
     cycle: { base: 25, parKg: 3, parModule2: 3 },
   },
   BPR: {
@@ -23,6 +24,7 @@ export const DEFAULT_PROCESSES = {
     toileMin: 3, toileMax: 25, poidsMax: 40, dimMax: 800, volumeMin: 2000,
     empreintesMax: 2, grappeMax: 60, miseAuMille: 1.25, qualite: 9,
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 35000,
+    rendement: { base: 0.88, parDoublement: 0.04, petitePiece: 0.03 },
     cycle: { base: 120, parKg: 4, parModule2: 12 },
   },
   CG1: {
@@ -30,6 +32,7 @@ export const DEFAULT_PROCESSES = {
     toileMin: 3.5, toileMax: 30, poidsMax: 25, dimMax: 600, volumeMin: 1000,
     empreintesMax: 2, grappeMax: 50, miseAuMille: 1.6, qualite: 8,
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 20000,
+    rendement: { base: 0.68, parDoublement: 0.06, petitePiece: 0.04 },
     cycle: { base: 90, parKg: 6, parModule2: 10 },
   },
   CG2: {
@@ -37,6 +40,7 @@ export const DEFAULT_PROCESSES = {
     toileMin: 3.5, toileMax: 30, poidsMax: 15, dimMax: 450, volumeMin: 2000,
     empreintesMax: 2, grappeMax: 30, miseAuMille: 1.6, qualite: 8,
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 20000,
+    rendement: { base: 0.68, parDoublement: 0.06, petitePiece: 0.04 },
     cycle: { base: 80, parKg: 6, parModule2: 10 },
   },
   CG4: {
@@ -44,6 +48,7 @@ export const DEFAULT_PROCESSES = {
     toileMin: 3.5, toileMax: 30, poidsMax: 15, dimMax: 450, volumeMin: 2000,
     empreintesMax: 2, grappeMax: 30, miseAuMille: 1.6, qualite: 8,
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 20000,
+    rendement: { base: 0.68, parDoublement: 0.06, petitePiece: 0.04 },
     cycle: { base: 80, parKg: 6, parModule2: 10 },
   },
   CG5: {
@@ -51,6 +56,7 @@ export const DEFAULT_PROCESSES = {
     toileMin: 3.5, toileMax: 30, poidsMax: 15, dimMax: 450, volumeMin: 2000,
     empreintesMax: 2, grappeMax: 30, miseAuMille: 1.6, qualite: 8,
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 20000,
+    rendement: { base: 0.68, parDoublement: 0.06, petitePiece: 0.04 },
     cycle: { base: 80, parKg: 6, parModule2: 10 },
   },
   CG3: {
@@ -58,6 +64,7 @@ export const DEFAULT_PROCESSES = {
     toileMin: 4, toileMax: 40, poidsMax: 60, dimMax: 1000, volumeMin: 0,
     empreintesMax: 1, grappeMax: 100, miseAuMille: 1.8, qualite: 7.5,
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 10000,
+    rendement: { base: 0.6, parDoublement: 0.06, petitePiece: 0.04 },
     cycle: { base: 150, parKg: 10, parModule2: 12 },
   },
 };
@@ -79,6 +86,36 @@ export const DEFAULT_TRS = {
   SSP: 0.8, BPR: 0.8, CG1: 0.8, CG2: 0.8, CG4: 0.8, CG5: 0.8, CG3: 0.75,
   ASN: 0.85, DEG: 0.9, FSP: 0.85, FCE: 0.85, FTR: 0.9, TRI: 0.9, RED: 0.9, GCV: 0.9,
 };
+
+// Weight below which a part is "small": its gating system weighs relatively more.
+const POIDS_REFERENCE = 2;
+
+/**
+ * Order of magnitude of the "mise au mille" (kg cast per kg of part) from the
+ * geometry: 1 / yield, the yield (part / cast weight) being the typical yield
+ * of the island,
+ *  - minus parDoublement for each doubling of the ratio thickest / thinnest
+ *    wall (hot spots to feed: more and bigger feeders),
+ *  - minus petitePiece times ln(2 kg / weight) for parts under 2 kg (runners
+ *    and overflows weigh relatively more),
+ * the yield kept between 30 % and 95 %. Without wall thickness (not computed),
+ * the island's default mise au mille. Returns {value, rendement, terms[]}.
+ */
+export function estimateMiseAuMille(p, part) {
+  const r = p.rendement;
+  if (!r || !(part.poids > 0) || !(part.toileMini > 0) || !(part.epaisseurMax > 0)) {
+    return { value: p.miseAuMille, rendement: 1 / p.miseAuMille, terms: [{ label: "valeur par défaut de l'îlot", value: null }], estimated: false };
+  }
+  const doublings = Math.max(0, Math.log2(part.epaisseurMax / part.toileMini));
+  const small = Math.max(0, Math.log(POIDS_REFERENCE / part.poids));
+  const terms = [
+    { label: "rendement type de l'îlot", value: r.base },
+    { label: `épaisseurs hétérogènes (point chaud ${fmt(part.epaisseurMax)} / toile ${fmt(part.toileMini)} mm)`, value: -r.parDoublement * doublings },
+    { label: `petite pièce (${fmt(part.poids)} kg < ${POIDS_REFERENCE} kg)`, value: -r.petitePiece * small },
+  ].filter((t) => t.value !== 0 || t.label.startsWith("rendement"));
+  const rendement = Math.min(0.95, Math.max(0.3, terms.reduce((a, t) => a + t.value, 0)));
+  return { value: 1 / rendement, rendement, terms, estimated: true };
+}
 
 /**
  * Operations and parameters of one route.
@@ -117,7 +154,8 @@ export function buildRoute(code, finition, part, settings, rates) {
     warnings.push("finition cellules peu rentable sur ce volume");
   }
 
-  const miseAuMille = p.miseAuMille;
+  const mam = estimateMiseAuMille(p, part);
+  const miseAuMille = mam.value;
   const kgCast = part.poids * miseAuMille;
   const parCycle = Math.max(1, Math.min(p.empreintesMax, Math.floor(p.grappeMax / Math.max(kgCast, 1e-9))));
   const cycle = p.cycle.base + p.cycle.parKg * kgCast * parCycle + p.cycle.parModule2 * (part.moduleMm || 0) ** 2;
@@ -150,6 +188,7 @@ export function buildRoute(code, finition, part, settings, rates) {
     finition,
     operations,
     miseAuMille,
+    miseAuMilleDetail: mam,
     parCycle,
     cycle,
     sableKg: part.noyaux ? part.sableKg || 0 : 0,

@@ -91,7 +91,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const total = rows[3][2].match(/<c r="B4"[^>]*><v>([^<]+)<\/v><\/c>/);
     assert.ok(total, rows[3][2]);
     approx(Number(total[1]), expected['named_assembly.step'].summary.volume, 1e-9, 0, 'total volume');
-    assert.match(sheet, /<autoFilter ref="A1:P4"\/>/);
+    assert.match(sheet, /<autoFilter ref="A1:Q4"\/>/);
     // Wall thickness, computed for the export: the bracket is a 5 mm plate, the pin 8 mm across.
     assert.match(rows[0][2], /Toile mini \(mm\)/);
     const cellL = (r) => Number(rows[r][2].match(new RegExp(`<c r="L${r + 1}"[^>]*><v>([^<]+)</v></c>`))?.[1]);

@@ -157,7 +157,21 @@ describe('wall thickness', () => {
   });
 
   test('statistics of nothing', () => {
-    assert.deepEqual(thicknessStats([]), { min: null, median: null, max: null, area: 0 });
+    assert.deepEqual(thicknessStats([]), { min: null, median: null, max: null, area: 0, details: null });
+  });
+
+  test('lettering thinner than the floor: reported apart, not as the thinnest wall', () => {
+    // An 8 mm plate and a 0.5 mm thin raised mark (a separate thin slab).
+    const plate = box(100, 60, 8);
+    const mark = box(20, 20, 0.5);
+    const parts = [plate, mark].map((m) => ({ positions: m.positions, indices: m.indices, values: wallThickness(m.positions, m.indices).wall }));
+    const raw = thicknessStats(parts);
+    near(raw.min, 0.5, 0.01, 'without floor, the mark is the thinnest wall');
+    assert.equal(raw.details, null);
+    const s = thicknessStats(parts, { floor: 1 });
+    near(s.min, 8, 0.05, 'thinnest wall above the floor');
+    near(s.details.min, 0.5, 0.01, 'lettering');
+    near(s.details.share, (2 * 20 * 20) / (2 * (100 * 60 + 100 * 8 + 60 * 8) + 2 * 20 * 20 + 4 * 20 * 0.5), 0.05, 'share of the surface');
   });
 
   test('histogram: area per thickness class', () => {

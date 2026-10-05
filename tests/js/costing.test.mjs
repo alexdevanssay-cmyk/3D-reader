@@ -8,7 +8,7 @@ import { describe, test } from 'node:test';
 
 import { readCostingWorkbook, readIndicesWorkbook } from '../../web/chiffrage/workbook.js';
 import { centreRates, indexAverage, minimumMargin, quote, saleMetalPrice } from '../../web/chiffrage/model.js';
-import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, bestRoutes, buildRoute, rankRoutes } from '../../web/chiffrage/routes.js';
+import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, bestRoutes, buildRoute, estimateMiseAuMille, rankRoutes } from '../../web/chiffrage/routes.js';
 import { readWorkbook } from '../../web/chiffrage/xlsxread.js';
 import {
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -205,6 +205,27 @@ describe('quote of a part', () => {
   });
 });
 
+describe('mise au mille from the geometry', () => {
+  const p = DEFAULT_PROCESSES.CG3;
+  test('thin and thick walls, small parts: lower yield, higher mise au mille', () => {
+    const plain = estimateMiseAuMille(p, { poids: 4, toileMini: 6, epaisseurMax: 6 });
+    close(plain.rendement, p.rendement.base, 1e-12, 'uniform walls, 4 kg: the typical yield');
+    close(plain.value, 1 / p.rendement.base, 1e-12, 'mise au mille');
+    const hot = estimateMiseAuMille(p, { poids: 4, toileMini: 5, epaisseurMax: 20 });
+    close(hot.rendement, p.rendement.base - 2 * p.rendement.parDoublement, 1e-12, 'two doublings of thickness');
+    const small = estimateMiseAuMille(p, { poids: 0.5, toileMini: 5, epaisseurMax: 5 });
+    close(small.rendement, p.rendement.base - p.rendement.petitePiece * Math.log(4), 1e-12, 'small part');
+    assert.ok(hot.value > plain.value && small.value > plain.value);
+  });
+
+  test('yield kept within 30 % .. 95 %, default without wall thickness', () => {
+    close(estimateMiseAuMille(p, { poids: 0.01, toileMini: 1, epaisseurMax: 1000 }).rendement, 0.3, 1e-12, 'floor');
+    const none = estimateMiseAuMille(p, { poids: 2, toileMini: 0, epaisseurMax: 0 });
+    assert.equal(none.estimated, false);
+    assert.equal(none.value, p.miseAuMille);
+  });
+});
+
 describe('manufacturing routes', () => {
   const rates = centreRates(base);
   const quoteBase = {
@@ -249,7 +270,7 @@ describe('manufacturing routes', () => {
     const p = DEFAULT_PROCESSES.CG3;
     const route = buildRoute('CG3', 'FTR', part, settings, rates);
     assert.equal(route.parCycle, 1);
-    close(route.cycle, p.cycle.base + p.cycle.parKg * part.poids * p.miseAuMille + p.cycle.parModule2 * 9, 1e-12, 'cycle');
+    close(route.cycle, p.cycle.base + p.cycle.parKg * part.poids * route.miseAuMille + p.cycle.parModule2 * 9, 1e-12, 'cycle');
     const ssp = buildRoute('SSP', 'FSP', { ...part, poids: 0.5 }, settings, rates);
     assert.equal(ssp.parCycle, 4); // limited by the number of cavities, not by the shot weight
     assert.equal(ssp.operations.find((o) => o.code === 'SSP').trs, DEFAULT_TRS.SSP);
