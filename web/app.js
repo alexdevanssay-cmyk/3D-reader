@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.js";
-import { thicknessHistogram } from "./engine/thickness.js";
+import { thicknessHistogram, thicknessStats } from "./engine/thickness.js";
 
 // ---------------------------------------------------------------- units
 
@@ -367,6 +367,12 @@ async function openFile(file) {
     buildModel(data);
     renderPanel();
     thicknessNewModel();
+    // Link mode: ?thickness=1 adds the wall thickness to the published results.
+    if (params.get("thickness")) {
+      $("loading").hidden = true;
+      await ensureThickness();
+      if (seq !== openSeq) return;
+    }
     publishResult(data);
     setStatus("done");
     afterAnalysisMemory();
@@ -542,9 +548,27 @@ function exportableResult(r) {
     engine: r.engine ?? "python",
     density,
     summary: { ...r.summary, mass: mass(r.summary.volume) },
-    bodies: r.bodies.map(({ mesh, ...b }) => ({ ...b, mass: mass(b.volume) })),
+    bodies: r.bodies.map(({ mesh, ...b }, i) => ({ ...b, mass: mass(b.volume), ...thicknessExport(r, [i]) })),
+    ...thicknessExport(r),
     elapsed_s: r.elapsed_s,
   };
+}
+
+/**
+ * Wall thickness of bodies of the result shown, for the exports:
+ * {thickness: {method, min, median, max}} (mm), or {} when not computed.
+ */
+function thicknessExport(r, indices) {
+  if (r !== state.result || !thick.results) return {};
+  const stats = thickStats(indices);
+  // The thinnest wall always by the "wall" method (see thickness.js).
+  const min = thickStats(indices, "wall").min;
+  return { thickness: { method: thickMethod(), min, median: stats.median, max: stats.max } };
+}
+
+/** Exports include the wall thickness: compute it first if needed (closed bodies only). */
+async function withThickness() {
+  if (state.result?.bodies.some((b) => b.closed)) await ensureThickness();
 }
 
 function download(name, blob) {
@@ -575,21 +599,25 @@ function cleanRows(rows, scale) {
 /** One row per body and one column per quantity; numbers stay numbers. */
 function tableRows(data) {
   const head = ["xlsx.name", "xlsx.volume", "xlsx.volumeCm3", "xlsx.area", "xlsx.bboxX", "xlsx.bboxY", "xlsx.bboxZ",
-    "xlsx.cx", "xlsx.cy", "xlsx.cz", "xlsx.mass", "xlsx.closed", "xlsx.notes"].map((k) => t(k));
+    "xlsx.cx", "xlsx.cy", "xlsx.cz", "xlsx.mass", "xlsx.thickMin", "xlsx.thickMedian", "xlsx.thickMax",
+    "xlsx.closed", "xlsx.notes"].map((k) => t(k));
   const yesNo = (v) => t(v ? "xlsx.yes" : "xlsx.no");
   const row = (name, x, notes) => [
     name, x.volume, x.volume == null ? null : x.volume / 1000, x.area, ...x.bbox.size,
-    ...(x.centroid ?? [null, null, null]), x.mass, yesNo(x.closed), notes,
+    ...(x.centroid ?? [null, null, null]), x.mass,
+    x.thickness?.min ?? null, x.thickness?.median ?? null, x.thickness?.max ?? null,
+    yesNo(x.closed), notes,
   ];
   const rows = data.bodies.map((b) => row(b.name, b, b.notes.map(tMessage).join(" ; ")));
   const s = data.summary;
-  rows.push(row(t("xlsx.total"), { ...s, closed: data.bodies.every((b) => b.closed) }, ""));
+  rows.push(row(t("xlsx.total"), { ...s, thickness: data.thickness, closed: data.bodies.every((b) => b.closed) }, ""));
   return [head, ...cleanRows(rows, Math.max(...s.bbox.size, 1e-12))];
 }
 
 async function exportXlsx() {
   const r = state.result;
   if (!r) return;
+  await withThickness();
   const { buildXlsx, STYLE } = await import("./xlsx.js");
   const data = exportableResult(r);
   const s = data.summary;
@@ -617,12 +645,16 @@ async function exportXlsx() {
     [t("xlsx.density"), Number.isFinite(data.density) ? data.density : null],
     [t("xlsx.mass"), s.mass],
     [t("xlsx.bodyCount"), { value: s.bodies, style: STYLE.text }],
+    [t("xlsx.thickMethod"), data.thickness ? t(`thick.${data.thickness.method}`) : "—"],
+    [t("xlsx.thickMin"), data.thickness?.min ?? null],
+    [t("xlsx.thickMedian"), data.thickness?.median ?? null],
+    [t("xlsx.thickMax"), data.thickness?.max ?? null],
   ].map(([k, v]) => [k, k === t("xlsx.fill") || k === t("xlsx.density") ? v : cleanRows([[v]], Math.max(...s.bbox.size, 1e-12))[0][0]]);
   const table = tableRows(data);
   const total = table.length - 1;
   table[total] = table[total].map((v, i) => (i === 0 ? { value: v, style: STYLE.totalText } : typeof v === "number" ? { value: v, style: STYLE.totalNumber } : v));
   const bytes = buildXlsx([
-    { name: t("xlsx.bodies"), rows: table, header: true, widths: [28, 18, 16, 18, 16, 16, 16, 18, 18, 18, 14, 12, 50] },
+    { name: t("xlsx.bodies"), rows: table, header: true, widths: [28, 18, 16, 18, 16, 16, 16, 18, 18, 18, 14, 16, 16, 16, 12, 50] },
     { name: t("xlsx.summary"), rows: summary, widths: [40, 28] },
   ]);
   download(`${baseName(r)}_volume.xlsx`, new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
@@ -635,9 +667,10 @@ function csvText(text) {
   return `"${(/^[=+\-@\t\r]/.test(t) ? "'" + t : t).replace(/"/g, '""')}"`;
 }
 
-function exportCsv() {
+async function exportCsv() {
   const r = state.result;
   if (!r) return;
+  await withThickness();
   // French spreadsheet software expects ";" between cells and a decimal comma.
   const fr = language() === "fr";
   const sep = fr ? ";" : ",";
@@ -647,9 +680,10 @@ function exportCsv() {
   download(`${baseName(r)}_volume.csv`, new Blob(["\ufeff" + lines.join("\r\n") + "\r\n"], { type: "text/csv;charset=utf-8" }));
 }
 
-function exportJson() {
+async function exportJson() {
   const r = state.result;
   if (!r) return;
+  await withThickness();
   download(`${baseName(r)}_volume.json`, new Blob([JSON.stringify(exportableResult(r), null, 2)], { type: "application/json" }));
 }
 
@@ -754,9 +788,9 @@ $("section-flip").addEventListener("click", () => {
   sectionFlip = !sectionFlip;
   updateSection();
 });
-$("export-csv").addEventListener("click", exportCsv);
+$("export-csv").addEventListener("click", () => exportCsv().catch((err) => showError(err.message)));
 $("export-xlsx").addEventListener("click", () => exportXlsx().catch((err) => showError(err.message)));
-$("export-json").addEventListener("click", exportJson);
+$("export-json").addEventListener("click", () => exportJson().catch((err) => showError(err.message)));
 
 // Click a body in the 3D view to select it.
 const raycaster = new THREE.Raycaster();
@@ -816,9 +850,27 @@ function thickMethod() {
   return $("thick-method").value;
 }
 
-/** Values (mm per triangle) of body i for the current method, or null. */
-function thickValues(i) {
-  return thick.results?.[i]?.[thickMethod()] ?? null;
+/** Values (mm per triangle) of body i for a method (default: the one chosen), or null. */
+function thickValues(i, method = thickMethod()) {
+  return thick.results?.[i]?.[method] ?? null;
+}
+
+/** Geometry of body i as analysed (the indexed mesh, also when the view shows the flat one). */
+function bodyGeometry(i) {
+  const mesh = state.meshes[i];
+  return mesh.userData.indexed ?? mesh.geometry;
+}
+
+/** Statistics (min, median, max in mm) of the bodies listed (default: all) for a method (default: the one chosen). */
+function thickStats(indices = state.meshes.map((_, i) => i), method = thickMethod()) {
+  const parts = [];
+  for (const i of indices) {
+    const values = thickValues(i, method);
+    if (!values) continue;
+    const geom = bodyGeometry(i);
+    parts.push({ positions: geom.attributes.position.array, indices: geom.index.array, values });
+  }
+  return thicknessStats(parts);
 }
 
 /** Colour of a thickness on the scale: blue (0) -> cyan -> green -> yellow -> red (max and above). */
@@ -902,6 +954,7 @@ async function ensureThickness() {
       if (!thick.userMax) thick.max = niceCeil(p99);
       thick.value ??= Number.isFinite(p50) ? Math.round(p50 * 10) / 10 : thick.max / 2;
       thick.tol ??= Math.max(0.1, Math.round(thick.max * 2) / 100);
+      updatePublished(result);
       return results;
     } catch (err) {
       if (!err.cancelled) showError(`${t("thick.title")} : ${tMessage(err.message || String(err))}`);
@@ -987,7 +1040,7 @@ function renderThickness() {
   $("thick-colors").checked = thick.colors;
   $("thick-highlight").checked = thick.highlight;
   $("toggle-thickness").classList.toggle("active", thick.colors);
-  $("thick-note").textContent = t(thickMethod() === "sphere" ? "thick.note.sphere" : "thick.note.ray");
+  $("thick-note").textContent = t(`thick.note.${thickMethod()}`);
   if (!ready) return;
 
   $("thick-max").value = thick.max;
@@ -1014,7 +1067,10 @@ function renderThickness() {
   });
   drawScale(area, total);
 
-  const [p1, p50, p99] = thickQuantiles([0.01, 0.5, 0.99]) ?? [NaN, NaN, NaN];
+  const stats = thickStats();
+  const thinnest = thickStats(undefined, "wall").min;
+  $("thick-min").textContent = fmtMm(thinnest ?? NaN);
+  $("thick-locate").disabled = thinnest == null;
   let mode = 0;
   for (let k = 1; k < BINS; k++) if (area[k] > area[mode]) mode = k;
   $("thick-share").textContent = total
@@ -1022,8 +1078,8 @@ function renderThickness() {
     : t("thick.none");
   const rows = [
     [t("thick.dominant"), total ? `${fmtNum(mode * width, 2)} – ${fmtNum((mode + 1) * width, 2)} mm` : "—"],
-    [t("thick.median"), fmtMm(p50)],
-    [t("thick.range"), Number.isFinite(p1) ? `${fmtNum(p1, 2)} – ${fmtNum(p99, 2)} mm` : "—"],
+    [t("thick.median"), fmtMm(stats.median ?? NaN)],
+    [t("thick.maxValue"), fmtMm(stats.max ?? NaN)],
   ];
   $("thick-stats").innerHTML = rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join("");
 }
@@ -1103,6 +1159,16 @@ async function setThickness(changes) {
 }
 
 $("thick-compute").addEventListener("click", () => setThickness({ colors: true }));
+// Highlight the thinnest walls: from the thinnest value up to the detected minimum.
+// (The thinnest wall is measured with the "wall" method, shown for this.)
+$("thick-locate").addEventListener("click", () => {
+  const { min } = thickStats(undefined, "wall");
+  if (min == null) return;
+  $("thick-method").value = "wall";
+  if (!thick.userMax) thick.max = niceCeil((thickQuantiles([0.99]) ?? [1])[0]);
+  const tol = Math.max(0.05, Math.round(min * 5) / 100);
+  setThickness({ value: Math.round(min * 100) / 100, tol, highlight: true });
+});
 $("toggle-thickness").addEventListener("click", () => setThickness({ colors: !thick.colors }));
 $("thick-colors").addEventListener("change", (e) => setThickness({ colors: e.target.checked }));
 $("thick-highlight").addEventListener("change", (e) => setThickness({ highlight: e.target.checked }));
@@ -1280,6 +1346,9 @@ function plainReport(data) {
     `centre_of_mass: ${s.centroid ? s.centroid.map((x) => +x.toPrecision(10)).join(", ") + " mm" : "—"}`,
     `mass: ${n(s.mass, "g")} (density ${data.density} g/cm3)`,
     `bodies: ${s.bodies} (${s.open_bodies} open)`,
+    ...(data.thickness
+      ? [`wall_thickness (${data.thickness.method}): min ${n(data.thickness.min, "mm")}, median ${n(data.thickness.median, "mm")}, max ${n(data.thickness.max, "mm")}`]
+      : []),
     "",
     "name | volume_mm3 | area_mm2 | size_x_mm | size_y_mm | size_z_mm | closed",
     ...data.bodies.map((b) => [b.name, b.volume ?? "—", b.area, ...b.bbox.size, b.closed].map((v) => (typeof v === "number" ? +v.toPrecision(10) : v)).join(" | ")),
@@ -1288,6 +1357,15 @@ function plainReport(data) {
 }
 
 function publishResult(r) {
+  updatePublished(r);
+  const format = params.get("export");
+  if (format === "json") exportJson().catch((err) => showError(err.message));
+  else if (format === "xlsx") exportXlsx().catch((err) => showError(err.message));
+  else if (format === "csv") exportCsv().catch((err) => showError(err.message));
+}
+
+/** The machine-readable result in the page (and the text report), kept up to date. */
+function updatePublished(r) {
   const data = exportableResult(r);
   // "<" escaped so that a part name cannot close the script element.
   $("reader3d-result").textContent = JSON.stringify(data).replace(/</g, "\\u003c");
@@ -1301,10 +1379,6 @@ function publishResult(r) {
     }
     pre.textContent = plainReport(data);
   }
-  const format = params.get("export");
-  if (format === "json") exportJson();
-  else if (format === "xlsx") exportXlsx().catch((err) => showError(err.message));
-  else if (format === "csv") exportCsv();
 }
 
 async function openUrl(url) {

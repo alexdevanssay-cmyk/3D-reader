@@ -185,7 +185,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
  *
  * bodies -- per body {positions, indices} (copied, the caller keeps its arrays)
  *           or null to skip it (open bodies: no inside, no thickness)
- * Resolves to, per body, {ray, sphere} (Float32Array per triangle, mm) or null.
+ * Resolves to, per body, {ray, sphere, wall} (Float32Array per triangle, mm) or null.
  */
 export function computeThickness(bodies, { onProgress } = {}) {
   const copies = bodies.map((b) => b && { positions: Float32Array.from(b.positions), indices: Uint32Array.from(b.indices) });

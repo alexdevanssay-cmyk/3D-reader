@@ -233,3 +233,7 @@ table.bodies .open { color: var(--warn); }
 .thick-controls input[type="number"] { width: 72px; }
 #thick-compute { margin-top: 8px; }
 #thick-share { margin: 8px 0 4px; }
+.thick-min { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.thick-min span { color: var(--muted); }
+.thick-min strong { font-size: 20px; font-variant-numeric: tabular-nums; }
+.thick-min button { margin-left: auto; }

@@ -58,6 +58,7 @@ reader3d analyze part.step --json</pre>
     <tr><td><code>name</code></td><td>File name to use when the URL does not end with one (its extension selects the format).</td></tr>
     <tr><td><code>report=1</code></td><td>Show the results as plain text at the top of the results panel.</td></tr>
     <tr><td><code>export</code></td><td><code>json</code>, <code>xlsx</code> or <code>csv</code>: download the results when done.</td></tr>
+    <tr><td><code>thickness=1</code></td><td>Also compute the wall thickness of the closed bodies (inscribed-sphere method): <code>thickness</code> {method, min, median, max} in mm in the JSON, per body and for the whole model, and a <code>wall_thickness</code> line in the report. The exports always include it.</td></tr>
     <tr><td><code>unit</code></td><td>Unit of mesh files: <code>mm</code>, <code>cm</code>, <code>m</code>, <code>in</code>, <code>ft</code> (default: auto).</td></tr>
     <tr><td><code>quality</code></td><td>Display tessellation of CAD files: <code>coarse</code>, <code>normal</code>, <code>fine</code> (does not change the volume).</td></tr>
     <tr><td><code>lang</code></td><td><code>fr</code> or <code>en</code>.</td></tr>
