@@ -79,6 +79,7 @@ const REQUIRED_DIST_FILES = [
   'engine/thickworker.js',
   'engine/thickpool.js',
   'engine/cache.js',
+  'coi-sw.js',
   'vendor/three/three.module.js',
   'vendor/opencascade/opencascade.full.js',
   'vendor/opencascade/opencascade.full.wasm.gz',

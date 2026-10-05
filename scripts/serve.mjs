@@ -2,7 +2,7 @@
 // Zero-dependency static file server, to preview the built site locally.
 //
 //   node scripts/serve.mjs [DIR] [--port 8080] [--host 127.0.0.1] [--base-path /]
-//                          [--quiet]
+//                          [--quiet] [--no-isolation]
 //
 // DIR defaults to dist/ (run `npm run build` first); `node scripts/serve.mjs web`
 // serves the sources directly. --port 0 picks a free port. The server prints
@@ -180,13 +180,24 @@ function redirect(res, status, location) {
  * basePath ("/" or e.g. "/3D-reader/", as GitHub Pages does for a project site).
  * log(req, status) is called once per request; pass null for silence.
  */
-export function createStaticServer(root, { log = null, basePath = '/' } = {}) {
+/**
+ * isolate -- send the cross-origin isolation headers (default); false to
+ *            serve like GitHub Pages (the page's service worker adds them).
+ */
+export function createStaticServer(root, { log = null, basePath = '/', isolate = true } = {}) {
+
   root = realpathSync(resolve(root));
   basePath = normalizeBasePath(basePath);
   const notFound = join(root, '404.html');
 
   return createServer((req, res) => {
     res.on('finish', () => log?.(req, res.statusCode));
+    // Cross-origin isolation (SharedArrayBuffer for the wall thickness workers).
+    // GitHub Pages cannot send these headers: there, web/coi-sw.js adds them.
+    if (isolate) {
+      res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+      res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+    }
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       sendText(req, res, 405, 'Method not allowed\n', { Allow: 'GET, HEAD' });
       return;
@@ -246,8 +257,9 @@ function parseArgs(argv) {
     else if (name === '--host') options.host = value();
     else if (name === '--base-path') options.basePath = value() ?? '';
     else if (name === '--quiet' || name === '-q') options.quiet = true;
+    else if (name === '--no-isolation') options.isolate = false;
     else if (name === '--help' || name === '-h') {
-      console.log('usage: node scripts/serve.mjs [DIR] [--port 8080] [--host 127.0.0.1] [--base-path /] [--quiet]');
+      console.log('usage: node scripts/serve.mjs [DIR] [--port 8080] [--host 127.0.0.1] [--base-path /] [--quiet] [--no-isolation]');
       process.exit(0);
     } else if (!name.startsWith('-')) options.dir = resolve(name);
     else throw new Error(`Unknown option ${arg}`);
@@ -274,7 +286,7 @@ function main() {
   const basePath = normalizeBasePath(options.basePath ?? builtBasePath(dir));
 
   const log = quiet ? null : (req, status) => console.log(`${status} ${req.method} ${req.url}`);
-  const server = createStaticServer(dir, { log, basePath });
+  const server = createStaticServer(dir, { log, basePath, isolate: options.isolate !== false });
   server.on('error', (err) => {
     console.error(err.code === 'EADDRINUSE' ? `Port ${port} is already in use: choose another one with --port` : err.message);
     process.exit(1);
