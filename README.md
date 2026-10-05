@@ -33,7 +33,8 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   column per quantity, plus a summary sheet), CSV (`;` and decimal comma in French)
   and JSON.
 - Interface in **English or French** (button in the top bar, or `?lang=fr`).
-- Progress of the analysis in percent, and a **memory gauge** (criticality in %, memory
+- Progress of the analysis in percent, updated live during each step (reading,
+  conversion, meshing, volumes: measured from the work OpenCascade does), and a **memory gauge** (criticality in %, memory
   of the CAD engine, of the page and of the device) that warns before a file that could
   make the browser stop the page; the CAD engine gives its memory back after a large file.
 - **AI assistants and scripts** can use the online reader by link

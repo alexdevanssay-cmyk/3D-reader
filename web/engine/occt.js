@@ -17,6 +17,61 @@ let browserPromise = null;
 let nodePromise = null;
 
 /**
+ * Work meter of the OpenCascade module (`oc.work`).
+ *
+ * The long OpenCascade calls (parsing a STEP file, converting it to shapes,
+ * meshing a large solid) give no callback to JavaScript: a progress indicator
+ * cannot be written in JavaScript with this build. But the compiled C++ calls
+ * back into the emscripten glue all the time: each call through a function
+ * pointer that may throw goes through an `invoke_*` import. Counting the calls
+ * of the most frequent one, `invoke_vi`, measures the work done so far, in
+ * stable units for a given kind of work (parsing a STEP file: ~100 per entity).
+ *
+ * count   -- calls so far (never reset; callers take differences)
+ * onBeat  -- if set, called from inside the long call, at most every `interval`
+ *            ms, so the caller can report progress while OpenCascade runs
+ */
+// invoke_ii dominates while a STEP file is tokenized, invoke_vi afterwards.
+const METERED = new Set(['invoke_vi', 'invoke_ii']);
+const CHECK_EVERY = 32768; // ~5 ms of OpenCascade work between two clock reads
+const work = { count: 0, onBeat: null, interval: 200, next: CHECK_EVERY, lastBeat: 0, enabled: false };
+
+function checkBeat() {
+  work.next = work.count + CHECK_EVERY;
+  if (!work.onBeat) return;
+  const now = performance.now();
+  if (now - work.lastBeat < work.interval) return;
+  work.lastBeat = now;
+  try {
+    work.onBeat();
+  } catch (err) {
+    console.warn('progress callback failed', err);
+  }
+}
+
+/** Wrap the `invoke_vi` import of the wasm module to feed the work meter. */
+function meterImports(imports) {
+  for (const table of Object.values(imports)) {
+    if (!table || typeof table !== 'object') continue;
+    for (const [key, fn] of Object.entries(table)) {
+      // The glue is minified: the import keys are short, the function names are not.
+      if (typeof fn !== 'function' || !METERED.has(fn.name)) continue;
+      table[key] = function (index, a1) {
+        if (++work.count >= work.next) checkBeat();
+        return fn(index, a1);
+      };
+      work.enabled = true;
+    }
+  }
+  return imports;
+}
+
+function withWork(oc) {
+  if (work.enabled) oc.work = work;
+  return oc;
+}
+
+/**
  * Load OpenCascade once and resolve to the emscripten module (`oc`).
  *
  * baseUrl    -- URL of the site root, i.e. the directory holding vendor/.
@@ -46,7 +101,18 @@ export function loadOcctNode() {
       // A variable specifier keeps static analysers and browsers away from it.
       const entry = 'opencascade.js/dist/node.js';
       const { default: initOpenCascade } = await import(entry);
-      return initOpenCascade();
+      const fs = 'node:fs/promises';
+      const { readFile } = await import(fs);
+      const wasm = await readFile(new URL(import.meta.resolve('opencascade.js/dist/opencascade.full.wasm')));
+      const oc = await initOpenCascade({
+        module: {
+          instantiateWasm(imports, receiveInstance) {
+            WebAssembly.instantiate(wasm, meterImports(imports)).then(({ instance, module }) => receiveInstance(instance, module));
+            return {};
+          },
+        },
+      });
+      return withWork(oc);
     })().catch((err) => {
       nodePromise = null;
       throw err;
@@ -98,14 +164,14 @@ function instantiate(factory, wasmBinary, dir) {
       print: (text) => console.debug(text),
       printErr: (text) => console.warn(text),
       instantiateWasm(imports, receiveInstance) {
-        WebAssembly.instantiate(bytes, imports).then(
+        WebAssembly.instantiate(bytes, meterImports(imports)).then(
           ({ instance, module }) => receiveInstance(instance, module),
           (err) => reject(new Error(`Unable to start OpenCascade: ${err.message || err}`)),
         );
         bytes = null;
         return {}; // the exports are delivered asynchronously through receiveInstance
       },
-    }).then(resolve, reject);
+    }).then((oc) => resolve(withWork(oc)), reject);
   });
 }
 

@@ -97,6 +97,7 @@ export function analyzeCad(oc, bytes, fileName, { quality = 'normal', onProgress
   const path = `/cad-input-${++fileCounter}${ext}`;
   const ctx = new Context(oc, onProgress);
   const stack = oc.stackSave();
+  if (oc.work && onProgress) oc.work.onBeat = () => ctx.beat();
   try {
     oc.FS.writeFile(path, data);
     return { bodies: readCad(ctx, path, data, fmt, stem(base), quality), source_unit: 'mm' };
@@ -107,6 +108,7 @@ export function analyzeCad(oc, bytes, fileName, { quality = 'normal', onProgress
     oc.stackRestore(stack);
     throw readableError(oc, err);
   } finally {
+    if (oc.work) oc.work.onBeat = null;
     ctx.dispose();
     try {
       oc.FS.unlink(path);
@@ -119,13 +121,10 @@ export function analyzeCad(oc, bytes, fileName, { quality = 'normal', onProgress
 function readCad(ctx, path, bytes, fmt, fileStem, quality) {
   const { oc } = ctx;
   // Progress, weighted by the times measured on a 35 MB STEP file of 2000 solids:
-  // parsing the text (0 -> 15 %) and converting it to shapes (15 -> 50 %) are each
-  // one OpenCascade call; the tessellation (50 -> 65 %) and the exact integrals
-  // (65 -> 100 %) go solid by solid.
-  ctx.progress(0, 'read');
+  // parsing the text (0 -> 15 %), converting it to shapes (15 -> 50 %), the
+  // tessellation (50 -> 65 %) and the exact integrals (65 -> 100 %).
   const parts = fmt === 'brep' ? readBrep(ctx, path, fileStem, bytes) : readXcaf(ctx, path, fmt, bytes);
   if (!parts.length) throw new Error('The file does not contain any geometry');
-  ctx.progress(0.5, 'mesh');
 
   const shapes = parts.map((p) => p.shape);
   const [lin, ang] = Object.hasOwn(QUALITY, quality) ? QUALITY[quality] : QUALITY.normal;
@@ -135,9 +134,10 @@ function readCad(ctx, path, bytes, fmt, fileStem, quality) {
   const { TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE } = oc.TopAbs_ShapeEnum;
   const bodies = [];
   const openParts = [];
-  const totalSolids = Math.max(1, parts.reduce((n, p) => n + countChildren(ctx, p.shape, TopAbs_SOLID), 0));
-  let doneSolids = 0;
-  ctx.progress(0.65, 'measure');
+  // Measuring a solid takes a time about proportional to its number of faces.
+  let totalFaces = 0;
+  for (const p of parts) forEachChild(ctx, p.shape, TopAbs_SOLID, oc.TopAbs_ShapeEnum.TopAbs_SHAPE, (solid) => (totalFaces += countChildren(ctx, solid, TopAbs_FACE)));
+  ctx.step('measure', 0.65, 1, { totalWeight: Math.max(1, totalFaces) });
   for (const part of parts) {
     const solids = [];
     const openShapes = [];
@@ -150,8 +150,7 @@ function readCad(ctx, path, bytes, fmt, fileStem, quality) {
     }
     solids.forEach((solid, i) => {
       const name = solids.length === 1 ? part.name : `${part.name} [${i + 1}]`;
-      bodies.push(solidBody(ctx, name, solid, part.color, []));
-      ctx.progress(0.65 + (0.3 * ++doneSolids) / totalSolids, 'measure');
+      ctx.item(countChildren(ctx, solid, TopAbs_FACE), () => bodies.push(solidBody(ctx, name, solid, part.color, [])));
     });
     openShapes.push(
       ...children(ctx, part.shape, TopAbs_SHELL, TopAbs_SOLID),
@@ -162,6 +161,7 @@ function readCad(ctx, path, bytes, fmt, fileStem, quality) {
 
   if (openParts.length) bodies.push(...surfaceBodies(ctx, openParts, fileStem, deflection, ang));
   ctx.progress(1, 'measure');
+  ctx.current = null;
   // Faces left without triangulation are dropped like in cad.py, unless the
   // mesher ran out of memory: the result would then be silently incomplete.
   if (ctx.untriangulatedFaces && heapExhausted(oc)) throw new Error(OUT_OF_MEMORY);
@@ -170,11 +170,30 @@ function readCad(ctx, path, bytes, fmt, fileStem, quality) {
 
 // --------------------------------------------------------------------------- readers
 
+// Work (in units of the work meter, oc.work) of the long OpenCascade calls,
+// measured on the test files and on STEP files of up to 35 MB. Parsing a STEP
+// file costs 170 to 200 units per entity; converting it to shapes 300 to 1400
+// (600 typical: it depends on the kind of geometry).
+const WORK = {
+  stepParsePerEntity: 180,
+  stepTransferPerEntity: 600,
+  igesParsePerByte: 0.8,
+  igesTransferPerByte: 17,
+  brepPerByte: 3.2,
+};
+
+function countByte(bytes, value) {
+  let n = 0;
+  for (let i = bytes.indexOf(value); i >= 0; i = bytes.indexOf(value, i + 1)) n++;
+  return n;
+}
+
 function readBrep(ctx, path, fileStem, bytes) {
   const { oc } = ctx;
   if (!brepLooksComplete(bytes)) throw new Error('Unable to read BREP file');
   const shape = ctx.keep(new oc.TopoDS_Shape());
   const builder = ctx.keep(new oc.BRep_Builder());
+  ctx.step('read', 0, 0.5, { expected: WORK.brepPerByte * bytes.length, approximate: true });
   const ok = oc.BRepTools.Read_2(shape, path, builder, ctx.keep(new oc.Message_ProgressRange_1()));
   if (!ok) throw new Error('Unable to read BREP file');
   return [{ name: fileStem, shape, color: null }];
@@ -230,10 +249,15 @@ function readXcaf(ctx, path, fmt, bytes) {
   try {
     reader.SetNameMode(true);
     reader.SetColorMode(true);
+    // Work expected from the size of the file (see WORK): exact enough for the
+    // parsing, only a typical value for the conversion to shapes.
+    const entities = fmt === 'step' ? countByte(bytes, 0x3b) : 0; // one ';' per STEP entity
+    const expected = (kind) => (fmt === 'step' ? WORK[`step${kind}PerEntity`] * entities : WORK[`iges${kind}PerByte`] * bytes.length);
+    ctx.step('read', 0, 0.15, { expected: expected('Parse'), approximate: fmt !== 'step' });
     if (reader.ReadFile(path) !== oc.IFSelect_ReturnStatus.IFSelect_RetDone) {
       throw new Error(`Unable to read ${FMT} file`);
     }
-    ctx.progress(0.15, 'transfer'); // parsed: OpenCascade now converts the entities to shapes
+    ctx.step('transfer', 0.15, 0.5, { expected: expected('Transfer'), approximate: true });
     const progress = ctx.keep(new oc.Message_ProgressRange_1());
     const ok = fmt === 'step' ? reader.Transfer_1(hdoc, progress) : reader.Transfer(hdoc, progress);
     if (!ok) throw new Error(`Unable to transfer ${FMT} geometry`);
@@ -820,6 +844,7 @@ class Context {
     this.oc = oc;
     this.onProgress = onProgress;
     this.lastProgress = -1;
+    this.current = null; // step in progress, see step()
     this.objects = [];
     this.matrices = new Map(); // TopLoc_Location hash -> [{loc, matrix}]
     this.meshed = new Set(); // TShape addresses of the shapes already tessellated
@@ -828,12 +853,72 @@ class Context {
   }
 
   /** Report the fraction (0..1) of the analysis done, at most once per percent. */
-  progress(fraction, step) {
+  progress(fraction, step, approximate = false, beat = false) {
     if (!this.onProgress) return;
     const percent = Math.min(100, Math.floor(fraction * 100));
-    if (percent === this.lastProgress && fraction < 1) return;
+    if (percent === this.lastProgress && fraction < 1 && !beat) return;
     this.lastProgress = percent;
-    this.onProgress({ percent, step });
+    this.onProgress({ percent, step, approximate, beat });
+  }
+
+  /**
+   * Start a step covering [from, to] of the analysis. Inside it, progress is
+   * measured with the work meter of the module (oc.work, see occt.js) and
+   * reported while OpenCascade runs:
+   * - `expected` work units: fraction = units done / expected. With
+   *   `approximate`, the expected total is only a typical value: the fraction
+   *   then slows down past 80 % so as never to reach the end of the step.
+   * - or items (solids...) of known weights, see item(): fraction = weight of
+   *   the items done, plus the part of the current item estimated from the
+   *   work per weight unit measured on the previous items.
+   */
+  step(step, from, to, { expected = 0, approximate = false, totalWeight = 0 } = {}) {
+    this.current = { step, from, to, expected, approximate, totalWeight, base: this.workCount(), doneWeight: 0, item: null, units: 0, weight: 0 };
+    this.progress(from, step, approximate && expected > 0);
+  }
+
+  /** Inside a step with items: run fn, the work of an item of this weight. */
+  item(weight, fn) {
+    const cur = this.current;
+    cur.item = { weight, base: this.workCount() };
+    try {
+      return fn();
+    } finally {
+      cur.units += this.workCount() - cur.item.base;
+      cur.weight += weight;
+      cur.doneWeight += weight;
+      cur.item = null;
+      this.progress(this.stepFraction(), cur.step);
+    }
+  }
+
+  workCount() {
+    return this.oc.work?.count ?? 0;
+  }
+
+  /** Fraction of the whole analysis done, from the current step's measures. */
+  stepFraction() {
+    const cur = this.current;
+    if (!cur) return 0;
+    let f = 0;
+    if (cur.totalWeight > 0) {
+      let done = cur.doneWeight;
+      if (cur.item && cur.weight > 0 && cur.units > 0) {
+        const expected = (cur.units / cur.weight) * cur.item.weight;
+        done += cur.item.weight * Math.min(0.95, soften((this.workCount() - cur.item.base) / expected));
+      }
+      f = Math.min(1, done / cur.totalWeight);
+    } else if (cur.expected > 0) {
+      const ratio = (this.workCount() - cur.base) / cur.expected;
+      f = cur.approximate ? soften(ratio) : Math.min(0.99, ratio);
+    }
+    return cur.from + (cur.to - cur.from) * f;
+  }
+
+  /** Called by the work meter while OpenCascade runs (at most every 200 ms). */
+  beat() {
+    const cur = this.current;
+    if (cur) this.progress(this.stepFraction(), cur.step, cur.approximate && cur.expected > 0, true);
   }
 
   /** Register an embind object to release once the analysis is over. */
@@ -864,6 +949,16 @@ class Context {
     this.objects = [];
     this.matrices.clear();
   }
+}
+
+/**
+ * Fraction of a step done when `ratio` of its typical work is done: equal up
+ * to 0.8, then slowing down towards 0.99 (same slope at 0.8) for the files
+ * that need more work than the typical value.
+ */
+function soften(ratio) {
+  if (ratio <= 0.8) return Math.max(0, ratio);
+  return 0.8 + 0.19 * (1 - Math.exp(-(ratio - 0.8) / 0.19));
 }
 
 // Classes without resources of their own: releasing the block is their whole destructor.
@@ -946,21 +1041,38 @@ function heapExhausted(oc) {
 function meshEach(ctx, shapes, deflection, ang, report = true) {
   const { oc } = ctx;
   const { TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE, TopAbs_SHAPE } = oc.TopAbs_ShapeEnum;
-  const mesh = (shape) => {
+  const tshapeKey = (shape) => {
     const tshape = shape.TShape_1();
     const key = tshape.get().$$.ptr;
     tshape.delete();
+    return key;
+  };
+  const mesh = (shape) => {
+    const key = tshapeKey(shape);
     if (ctx.meshed.has(key)) return;
     ctx.meshed.add(key);
     // (shape, linear deflection, relative = false, angular deflection, parallel = true)
     new oc.BRepMesh_IncrementalMesh_2(shape, deflection, false, ang, true).delete();
   };
-  // Progress (50 -> 65 % of the analysis), solid by solid.
-  const total = report ? Math.max(1, shapes.reduce((n, s) => n + countChildren(ctx, s, TopAbs_SOLID), 0)) : 1;
-  let done = 0;
+  // Progress (50 -> 65 % of the analysis), solid by solid, weighted by their
+  // number of faces. The solids already meshed (other instances) count for nothing.
+  if (report) {
+    const seen = new Set();
+    let faces = 0;
+    for (const shape of shapes) {
+      forEachChild(ctx, shape, TopAbs_SOLID, TopAbs_SHAPE, (solid) => {
+        const key = tshapeKey(solid);
+        if (!ctx.meshed.has(key) && !seen.has(key)) {
+          seen.add(key);
+          faces += countChildren(ctx, solid, TopAbs_FACE);
+        }
+      });
+    }
+    ctx.step('mesh', 0.5, 0.65, { totalWeight: Math.max(1, faces) });
+  }
   const meshSolid = (solid) => {
-    mesh(solid);
-    if (report) ctx.progress(0.5 + (0.15 * ++done) / total, 'mesh');
+    if (!report || ctx.meshed.has(tshapeKey(solid))) mesh(solid);
+    else ctx.item(countChildren(ctx, solid, TopAbs_FACE), () => mesh(solid));
   };
   for (const shape of shapes) {
     forEachChild(ctx, shape, TopAbs_SOLID, TopAbs_SHAPE, meshSolid);
