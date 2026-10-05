@@ -19,6 +19,11 @@
 <body>
   <header class="topbar">
     <div class="brand">3D Reader</div>
+    <nav class="tabs" role="tablist" aria-label="Pages">
+      <button type="button" role="tab" class="tab active" data-page="viewer" aria-selected="true" data-i18n="tab.viewer">3D analysis</button>
+      <button type="button" role="tab" class="tab" data-page="chiffrage" aria-selected="false" data-i18n="tab.costing">Costing</button>
+      <button type="button" role="tab" class="tab" data-page="parametres" aria-selected="false" data-i18n="tab.settings">Settings</button>
+    </nav>
     <button id="open-file" class="btn primary" type="button" data-i18n="top.open">Open file…</button>
     <input id="file-input" type="file" hidden>
     <label class="field" data-i18n-title="top.unit.title" title="Unit of mesh files (STL, OBJ...). CAD files (STEP, IGES) carry their own unit.">
@@ -63,7 +68,7 @@
     <span id="engine-status" class="engine-status" hidden></span>
   </header>
 
-  <main class="layout">
+  <main class="layout" id="page-viewer">
     <section class="viewport" id="viewport">
       <div class="toolbar">
         <button data-view="iso" data-i18n="view.iso.label" data-i18n-title="view.iso" title="Isometric view">Iso</button>
@@ -222,6 +227,10 @@
       </section>
     </aside>
   </main>
+
+  <!-- Costing of the part (web/chiffrage/): filled when the page is first opened. -->
+  <section class="page" id="page-chiffrage" hidden></section>
+  <section class="page" id="page-parametres" hidden></section>
 
   <!-- Machine-readable results of the last analysis (for AI assistants and scripts). -->
   <script type="application/json" id="reader3d-result"></script>
