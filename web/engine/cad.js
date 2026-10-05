@@ -180,6 +180,8 @@ const WORK = {
   igesParsePerByte: 0.8,
   igesTransferPerByte: 17,
   brepPerByte: 3.2,
+  // Meshing a face: 7 000 units for planes, up to 750 000 for large NURBS.
+  meshPerFace: 20000,
 };
 
 function countByte(bytes, value) {
@@ -715,16 +717,65 @@ function surfaceBodies(ctx, openParts, fileStem, deflection, ang) {
 
 function solidBody(ctx, name, solid, color, notes) {
   const { oc } = ctx;
+  // Face by face, so that the progress moves inside a large solid. This is
+  // the loop of BRepGProp::VolumeProperties: one integral per face between the
+  // face and a reference point common to all the faces (the mean of the
+  // vertices of the solid), accumulated with GProp_GProps::Add.
+  const { TopAbs_FACE, TopAbs_VERTEX, TopAbs_SHAPE } = oc.TopAbs_ShapeEnum;
+  const { TopAbs_FORWARD, TopAbs_REVERSED } = oc.TopAbs_Orientation;
+  const sum = [0, 0, 0];
+  let vertices = 0;
+  forEachChild(ctx, solid, TopAbs_VERTEX, TopAbs_SHAPE, (vertex) => {
+    const v = oc.TopoDS.Vertex_1(vertex);
+    const p = oc.BRep_Tool.Pnt(v);
+    sum[0] += p.X();
+    sum[1] += p.Y();
+    sum[2] += p.Z();
+    release(oc, p);
+    release(oc, v);
+    vertices++;
+  });
+  const apex = new oc.gp_Pnt_3(...sum.map((x) => (vertices ? x / vertices : 0)));
   const props = new oc.GProp_GProps_1();
-  let volume;
-  let centroid;
+  let volume = 0;
+  let centroid = null;
+  let surfaceArea = 0;
   try {
-    // (shape, props, Eps, only closed = false, skip shared = false)
-    oc.BRepGProp.VolumeProperties_2(solid, props, GPROP_EPS, false, false);
+    const faces = Math.max(1, countChildren(ctx, solid, TopAbs_FACE));
+    let done = 0;
+    forEachChild(ctx, solid, TopAbs_FACE, TopAbs_SHAPE, (shape) => {
+      const face = oc.TopoDS.Face_1(shape);
+      try {
+        const orientation = face.Orientation_1();
+        if (orientation === TopAbs_FORWARD || orientation === TopAbs_REVERSED) {
+          const bf = new oc.BRepGProp_Face_2(face, false);
+          const wires = new oc.TopoDS_Iterator_2(face, true, true);
+          const naturalRestriction = !wires.More();
+          wires.delete();
+          const domain = naturalRestriction ? null : new oc.BRepGProp_Domain_2(face);
+          const vinert = new oc.BRepGProp_Vinert_1();
+          try {
+            vinert.SetLocation(apex);
+            if (domain) vinert.Perform_8(bf, domain, GPROP_EPS);
+            else vinert.Perform_2(bf, GPROP_EPS);
+            props.Add(vinert, 1);
+          } finally {
+            vinert.delete();
+            domain?.delete();
+            bf.delete();
+          }
+        }
+        surfaceArea += area(ctx, face);
+      } finally {
+        release(oc, face);
+      }
+      ctx.itemProgress(++done / faces);
+    });
     volume = props.Mass();
     centroid = pointXYZ(oc, props.CentreOfMass());
   } finally {
     props.delete();
+    release(oc, apex);
   }
   if (volume < 0) {
     notes.push(NOTE_INVERTED);
@@ -736,7 +787,7 @@ function solidBody(ctx, name, solid, color, notes) {
     name,
     volume,
     mesh_volume: tri.triangles ? Math.abs(tri.signedVolume) : null,
-    area: area(ctx, solid),
+    area: surfaceArea,
     bbox: bbox(ctx, solid),
     centroid,
     closed: true,
@@ -869,18 +920,27 @@ class Context {
    *   `approximate`, the expected total is only a typical value: the fraction
    *   then slows down past 80 % so as never to reach the end of the step.
    * - or items (solids...) of known weights, see item(): fraction = weight of
-   *   the items done, plus the part of the current item estimated from the
-   *   work per weight unit measured on the previous items.
+   *   the items done, plus the part of the current item: as reported by the
+   *   item itself (itemProgress), else estimated from the work per weight
+   *   unit measured on the previous items, or `unitsPerWeight` for the first.
    */
-  step(step, from, to, { expected = 0, approximate = false, totalWeight = 0 } = {}) {
-    this.current = { step, from, to, expected, approximate, totalWeight, base: this.workCount(), doneWeight: 0, item: null, units: 0, weight: 0 };
+  step(step, from, to, { expected = 0, approximate = false, totalWeight = 0, unitsPerWeight = 0 } = {}) {
+    this.current = { step, from, to, expected, approximate, totalWeight, unitsPerWeight, base: this.workCount(), doneWeight: 0, item: null, units: 0, weight: 0 };
     this.progress(from, step, approximate && expected > 0);
+  }
+
+  /** Inside an item, the fraction (0..1) of it done, when the item can tell. */
+  itemProgress(fraction) {
+    const cur = this.current;
+    if (!cur?.item) return;
+    cur.item.fraction = fraction;
+    this.progress(this.stepFraction(), cur.step);
   }
 
   /** Inside a step with items: run fn, the work of an item of this weight. */
   item(weight, fn) {
     const cur = this.current;
-    cur.item = { weight, base: this.workCount() };
+    cur.item = { weight, base: this.workCount(), fraction: null };
     try {
       return fn();
     } finally {
@@ -903,9 +963,12 @@ class Context {
     let f = 0;
     if (cur.totalWeight > 0) {
       let done = cur.doneWeight;
-      if (cur.item && cur.weight > 0 && cur.units > 0) {
-        const expected = (cur.units / cur.weight) * cur.item.weight;
-        done += cur.item.weight * Math.min(0.95, soften((this.workCount() - cur.item.base) / expected));
+      if (cur.item?.fraction != null) {
+        done += cur.item.weight * cur.item.fraction;
+      } else if (cur.item) {
+        // Work per weight unit measured on the items done, or a typical value.
+        const rate = cur.weight > 0 && cur.units > 0 ? cur.units / cur.weight : cur.unitsPerWeight;
+        if (rate > 0) done += cur.item.weight * Math.min(0.95, soften((this.workCount() - cur.item.base) / (rate * cur.item.weight)));
       }
       f = Math.min(1, done / cur.totalWeight);
     } else if (cur.expected > 0) {
@@ -1068,7 +1131,7 @@ function meshEach(ctx, shapes, deflection, ang, report = true) {
         }
       });
     }
-    ctx.step('mesh', 0.5, 0.65, { totalWeight: Math.max(1, faces) });
+    ctx.step('mesh', 0.5, 0.65, { totalWeight: Math.max(1, faces), unitsPerWeight: WORK.meshPerFace });
   }
   const meshSolid = (solid) => {
     if (!report || ctx.meshed.has(tshapeKey(solid))) mesh(solid);

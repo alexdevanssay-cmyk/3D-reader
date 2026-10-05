@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
-import { thicknessHistogram, valueRange, wallThickness } from '../../web/engine/thickness.js';
+import { thicknessHistogram, thicknessStats, valueRange, wallThickness } from '../../web/engine/thickness.js';
 
 /** Closed mesh of an extruded polygon (counter-clockwise, star-shaped from `kernel`), z from 0 to h. */
 function extrude(polygon, h, kernel, { divisions = 1 } = {}) {
@@ -134,6 +134,32 @@ describe('wall thickness', () => {
     near(max, 7.5, 0.15, 'hot spot');
   });
 
+  test('thinnest wall: the ends of a bar do not count as thin walls', () => {
+    // A 10 x 10 bar, 100 long: near its end faces no ball fits (sphere < 10),
+    // but the wall between opposite faces is 10 everywhere.
+    const bar = box(10, 10, 100);
+    const { sphere, wall } = wallThickness(bar.positions, bar.indices);
+    const parts = (values) => [{ positions: bar.positions, indices: bar.indices, values }];
+    const s = thicknessStats(parts(sphere));
+    const w = thicknessStats(parts(wall));
+    near(w.min, 10, 0.05, 'wall min');
+    near(w.median, 10, 0.05, 'wall median');
+    near(s.median, 10, 0.05, 'sphere median');
+    assert.ok(s.area > 0 && Math.abs(s.area - w.area) < 1e-9);
+  });
+
+  test('thinnest wall of a T junction: the walls, not the junction', () => {
+    const T = [[-30, 0], [-3, 0], [-3, -30], [3, -30], [3, 0], [30, 0], [30, 6], [-30, 6]];
+    const mesh = extrude(T, 100, [0, 3], { divisions: 20 });
+    const { wall } = wallThickness(mesh.positions, mesh.indices);
+    const stats = thicknessStats([{ positions: mesh.positions, indices: mesh.indices, values: wall }]);
+    near(stats.min, 6, 0.05, 'thinnest wall');
+  });
+
+  test('statistics of nothing', () => {
+    assert.deepEqual(thicknessStats([]), { min: null, median: null, max: null, area: 0 });
+  });
+
   test('histogram: area per thickness class', () => {
     const plate = box(100, 60, 8);
     const { ray } = wallThickness(plate.positions, plate.indices);
@@ -153,8 +179,9 @@ describe('wall thickness', () => {
   });
 
   test('an empty mesh gives empty results', () => {
-    const { sphere, ray } = wallThickness(new Float32Array(0), new Uint32Array(0));
+    const { sphere, ray, wall } = wallThickness(new Float32Array(0), new Uint32Array(0));
     assert.equal(sphere.length, 0);
     assert.equal(ray.length, 0);
+    assert.equal(wall.length, 0);
   });
 });

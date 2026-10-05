@@ -37,14 +37,15 @@ const COVER = Math.cos((60 * Math.PI) / 180);
  * indices   -- Uint32Array, 3 per triangle
  * onProgress(fraction) -- optional, called about every 1 % of the work
  *
- * Returns {ray, sphere}: Float32Array per triangle (NaN where undefined, e.g.
- * a ray leaving an open mesh).
+ * Returns {ray, sphere, wall}: Float32Array per triangle (NaN where undefined,
+ * e.g. a ray leaving an open mesh).
  * - ray: from the centre of the triangle along its inward normal.
  * - sphere: largest of the balls tangent at the centre of the triangle and at
  *   the middle of its edges inside a smooth surface. A CAD face is often cut
  *   into long triangles along its edges: their centres are close to the edge
  *   of the face, where a ball has no room, but the middle of the diagonal of
  *   a rectangle, or of the chords of a disc, is well inside.
+ * - wall: the larger of the two (see below), for the thinnest wall of a part.
  * The normals are oriented outwards from the sign of the enclosed volume: the
  * mesh must be closed and consistently oriented (any body with a volume).
  */
@@ -53,7 +54,7 @@ export function wallThickness(positions, indices, { onProgress = null } = {}) {
   const nt = indices.length / 3;
   const ray = new Float32Array(nt).fill(NaN);
   const sphere = new Float32Array(nt).fill(NaN);
-  if (!nt) return { ray, sphere };
+  if (!nt) return { ray, sphere, wall: new Float32Array(0) };
 
   const normals = triangleNormals(positions, indices);
   const bvh = buildBvh(positions, indices);
@@ -168,8 +169,16 @@ export function wallThickness(positions, indices, { onProgress = null } = {}) {
       !(sphere[f] >= value) && normals[3 * f] * samples[k + 3] + normals[3 * f + 1] * samples[k + 4] + normals[3 * f + 2] * samples[k + 5] > COVER;
     query.within(samples, k, radius * radius, want, (f) => (sphere[f] = value));
   }
+  // Wall: the larger of the two. Each method underestimates where the other
+  // does not: the sphere near convex edges and at the ends of bars (no room for
+  // a ball), the ray at concave corners (it meets the next wall early).
+  const wall = new Float32Array(nt);
+  for (let f = 0; f < nt; f++) {
+    const a = ray[f], b = sphere[f];
+    wall[f] = Number.isFinite(a) ? (Number.isFinite(b) ? Math.max(a, b) : a) : b;
+  }
   onProgress?.(1);
-  return { ray, sphere };
+  return { ray, sphere, wall };
 }
 
 /** Smallest and largest finite values. */
@@ -181,6 +190,35 @@ export function valueRange(values) {
     if (x > max) max = x;
   }
   return min <= max ? [min, max] : [NaN, NaN];
+}
+
+// Share of the surface below which the thinnest (or thickest) values are not
+// reported: a few tiny triangles along the edges of the faces should not set
+// the minimum wall of a part.
+export const STATS_SHARE = 0.001;
+
+/**
+ * Area-weighted statistics of the thickness of one or more meshes:
+ * {min, median, max, area} in mm (mm² for area): min is the thinnest wall
+ * found on at least STATS_SHARE of the surface, max the thickest likewise.
+ * parts: [{positions, indices, values}] (values per triangle; NaN skipped).
+ */
+export function thicknessStats(parts) {
+  const items = [];
+  for (const { positions, indices, values } of parts) {
+    for (let f = 0; f < values.length; f++) {
+      if (Number.isFinite(values[f])) items.push([values[f], triangleArea(positions, indices[3 * f], indices[3 * f + 1], indices[3 * f + 2])]);
+    }
+  }
+  if (!items.length) return { min: null, median: null, max: null, area: 0 };
+  items.sort((x, y) => x[0] - y[0]);
+  const total = items.reduce((n, it) => n + it[1], 0);
+  const quantile = (fraction) => {
+    let acc = 0;
+    for (const [value, area] of items) if ((acc += area) >= fraction * total) return value;
+    return items.at(-1)[0];
+  };
+  return { min: quantile(STATS_SHARE), median: quantile(0.5), max: quantile(1 - STATS_SHARE), area: total };
 }
 
 /**

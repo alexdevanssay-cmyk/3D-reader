@@ -166,12 +166,18 @@
           <label class="field"><span data-i18n="thick.method">Method</span>
             <select id="thick-method">
               <option value="sphere" data-i18n="thick.sphere">Inscribed sphere (hot spots)</option>
-              <option value="ray" data-i18n="thick.ray">Ray (wall to wall)</option>
+              <option value="wall" data-i18n="thick.wall">Wall (thinnest walls)</option>
+              <option value="ray" data-i18n="thick.ray">Ray (along the normal)</option>
             </select>
           </label>
         </div>
         <button id="thick-compute" class="small" type="button" data-i18n="thick.compute">Analyse the thicknesses</button>
         <div id="thick-body" hidden>
+          <div class="thick-min">
+            <span data-i18n="thick.min" data-i18n-title="thick.min.title" title="Thinnest wall found on at least 0.1 % of the surface">Thinnest wall detected</span>
+            <strong id="thick-min">—</strong>
+            <button id="thick-locate" class="small" type="button" data-i18n="thick.locate" data-i18n-title="thick.locate.title" title="Highlight the thinnest walls on the model">Locate</button>
+          </div>
           <canvas id="thick-scale" class="thick-scale" height="96" aria-describedby="thick-share"></canvas>
           <input id="thick-slider" class="thick-slider" type="range" min="0" max="1000" value="500" data-i18n-title="thick.slider" title="Thickness to highlight">
           <div class="row thick-controls">

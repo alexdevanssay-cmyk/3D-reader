@@ -87,7 +87,7 @@ self.onmessage = async (event) => {
         done += size;
         return result;
       });
-      const buffers = results.flatMap((r) => (r ? [r.ray.buffer, r.sphere.buffer] : []));
+      const buffers = results.flatMap((r) => (r ? [r.ray.buffer, r.sphere.buffer, r.wall.buffer] : []));
       postMessage({ type: 'result', id: msg.id, result: results }, buffers);
       return;
     }

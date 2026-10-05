@@ -91,7 +91,13 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const total = rows[3][2].match(/<c r="B4"[^>]*><v>([^<]+)<\/v><\/c>/);
     assert.ok(total, rows[3][2]);
     approx(Number(total[1]), expected['named_assembly.step'].summary.volume, 1e-9, 0, 'total volume');
-    assert.match(sheet, /<autoFilter ref="A1:M4"\/>/);
+    assert.match(sheet, /<autoFilter ref="A1:P4"\/>/);
+    // Wall thickness, computed for the export: the bracket is a 5 mm plate, the pin 8 mm across.
+    assert.match(rows[0][2], /Toile mini \(mm\)/);
+    const cellL = (r) => Number(rows[r][2].match(new RegExp(`<c r="L${r + 1}"[^>]*><v>([^<]+)</v></c>`))?.[1]);
+    approx(cellL(1), 5, 0.02, 0, 'thinnest wall of the bracket');
+    approx(cellL(2), 8, 0.02, 0, 'thinnest wall of the pin');
+    approx(cellL(3), 5, 0.02, 0, 'thinnest wall of the model');
     await page.context().close();
   });
 
@@ -108,6 +114,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.isChecked('#thick-colors'), true);
     // The block is 20 mm thick: the scale goes up to a round value above it.
     assert.match(await page.textContent('#thick-stats'), /Médiane \(en surface\)20 mm/);
+    assert.equal(await page.textContent('#thick-min'), '20 mm');
     assert.equal(await page.inputValue('#thick-max'), '25');
     // Highlight 20 ± 0.5 mm: the whole surface.
     await page.fill('#thick-tol', '0.5');
@@ -119,6 +126,18 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // Moving the slider highlights another thickness: nothing at 5 mm.
     await page.fill('#thick-slider', '200');
     assert.match(await page.textContent('#thick-share'), /^0 % de la surface entre 4,5 et 5,5 mm/);
+    // "Locate" highlights the thinnest walls, with the "wall" measure (the
+    // large faces of the block; its sides read its length or width).
+    await page.click('#thick-locate');
+    assert.equal(await page.inputValue('#thick-method'), 'wall');
+    assert.equal(await page.inputValue('#thick-value'), '20');
+    assert.match(await page.textContent('#thick-share'), /^\d+(,\d)? % de la surface entre 19 et 21 mm/);
+    // The JSON export carries the thickness.
+    const [json] = await Promise.all([page.waitForEvent('download'), page.click('#export-json')]);
+    const exported = JSON.parse(readFileSync(await json.path(), 'utf8'));
+    approx(exported.thickness.min, 20, 0.01, 0, 'JSON thinnest wall');
+    assert.equal(exported.thickness.method, 'wall');
+    approx(exported.bodies[0].thickness.median, 20, 0.01, 0, 'JSON body median');
     // The colour filter can be switched off, the highlight stays.
     await page.click('#toggle-thickness');
     assert.equal(await page.isChecked('#thick-colors'), false);
@@ -129,12 +148,13 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
 
   test('link for AI assistants: ?url=…&report=1, JSON and window.reader3d', { timeout: CAD_TIMEOUT }, async () => {
     const { page, errors } = await newPage();
-    await page.goto(`${base}?url=e2e-samples/named_assembly.step&report=1&lang=en`);
+    await page.goto(`${base}?url=e2e-samples/named_assembly.step&report=1&thickness=1&lang=en`);
     await page.waitForFunction(() => ['done', 'error'].includes(document.body.dataset.status), null, { timeout: CAD_TIMEOUT });
     assert.equal(await page.evaluate(() => document.body.dataset.status), 'done');
     const report = await page.textContent('#reader3d-report');
     assert.match(report, /^file: named_assembly\.step$/m);
     assert.match(report, /^volume: 7256\.63706\d* mm3$/m);
+    assert.match(report, /^wall_thickness \(sphere\): min 5(\.\d+)? mm, median /m);
     const json = JSON.parse(await page.textContent('#reader3d-result'));
     approx(json.summary.volume, expected['named_assembly.step'].summary.volume, 1e-9, 0, 'JSON volume');
     assert.deepEqual(json.bodies.map((b) => b.name), ['Équerre', 'Pin']);
