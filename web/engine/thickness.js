@@ -199,26 +199,39 @@ export const STATS_SHARE = 0.001;
 
 /**
  * Area-weighted statistics of the thickness of one or more meshes:
- * {min, median, max, area} in mm (mm² for area): min is the thinnest wall
- * found on at least STATS_SHARE of the surface, max the thickest likewise.
+ * {min, median, max, area, details} in mm (mm² for area).
+ * - min: the thinnest wall found on at least STATS_SHARE of the surface;
+ *   max: the thickest likewise.
+ * - floor (option): thinner values are details of the surface (lettering,
+ *   marks), not walls: they are left out of min / median / max and reported
+ *   apart as details: {min, share of the surface}, or null when there are
+ *   none (on less than STATS_SHARE of the surface).
  * parts: [{positions, indices, values}] (values per triangle; NaN skipped).
  */
-export function thicknessStats(parts) {
+export function thicknessStats(parts, { floor = 0 } = {}) {
   const items = [];
   for (const { positions, indices, values } of parts) {
     for (let f = 0; f < values.length; f++) {
       if (Number.isFinite(values[f])) items.push([values[f], triangleArea(positions, indices[3 * f], indices[3 * f + 1], indices[3 * f + 2])]);
     }
   }
-  if (!items.length) return { min: null, median: null, max: null, area: 0 };
+  if (!items.length) return { min: null, median: null, max: null, area: 0, details: null };
   items.sort((x, y) => x[0] - y[0]);
-  const total = items.reduce((n, it) => n + it[1], 0);
-  const quantile = (fraction) => {
+  const areaOf = (list) => list.reduce((n, it) => n + it[1], 0);
+  const quantile = (list, fraction) => {
+    const total = areaOf(list);
     let acc = 0;
-    for (const [value, area] of items) if ((acc += area) >= fraction * total) return value;
-    return items.at(-1)[0];
+    for (const [value, area] of list) if ((acc += area) >= fraction * total) return value;
+    return list.at(-1)[0];
   };
-  return { min: quantile(STATS_SHARE), median: quantile(0.5), max: quantile(1 - STATS_SHARE), area: total };
+  const total = areaOf(items);
+  const thin = floor > 0 ? items.filter(([v]) => v < floor) : [];
+  const thinShare = thin.length ? areaOf(thin) / total : 0;
+  const kept = floor > 0 ? items.filter(([v]) => v >= floor) : items;
+  const stats = kept.length
+    ? { min: quantile(kept, STATS_SHARE), median: quantile(kept, 0.5), max: quantile(kept, 1 - STATS_SHARE) }
+    : { min: null, median: null, max: null };
+  return { ...stats, area: total, details: thinShare >= STATS_SHARE ? { min: quantile(thin, 0.01), share: thinShare } : null };
 }
 
 /**

@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.js";
 import { thicknessHistogram, thicknessStats } from "./engine/thickness.js";
+import { summarize } from "./engine/summary.js";
 
 // ---------------------------------------------------------------- units
 
@@ -75,6 +76,7 @@ const state = {
   meshes: [], // THREE.Mesh per body
   edges: [], // wireframe overlays
   selected: -1,
+  included: new Set(), // bodies checked in the list: the volume, the exports and the costing are theirs
   bounds: new THREE.Box3(),
 };
 
@@ -152,6 +154,7 @@ function buildModel(result) {
     const mesh = new THREE.Mesh(geom, mat);
     mesh.userData.index = i;
     mesh.userData.color = color.clone();
+    mesh.userData.look = { transparent: mat.transparent, opacity: mat.opacity, depthWrite: mat.depthWrite };
     modelGroup.add(mesh);
     state.meshes.push(mesh);
 
@@ -164,6 +167,8 @@ function buildModel(result) {
     state.edges.push(edges);
   });
 
+  state.included = new Set(result.bodies.map((_, i) => i));
+  state.subsetSummary = null;
   const s = result.summary.bbox;
   state.bounds.set(new THREE.Vector3(...s.min), new THREE.Vector3(...s.max));
 
@@ -420,12 +425,13 @@ function showError(msg) {
 function renderPanel() {
   const r = state.result;
   if (!r) return;
-  const s = r.summary;
+  const s = currentSummary() ?? { volume: null, area: null, centroid: null, bodies: 0, solids: 0, open_bodies: 0, bbox: { size: [NaN, NaN, NaN], volume: null }, obb: null, fill_ratio: null };
+  const partial = s !== r.summary;
 
   for (const id of ["summary-card", "mass-card", "bodies-card"]) $(id).hidden = false;
 
   // Meshes with holes get a volume estimated after filling them (not closed, but a volume).
-  const estimated = r.bodies.filter(isEstimate).length;
+  const estimated = r.bodies.filter((b, i) => state.included.has(i) && isEstimate(b)).length;
   $("total-volume").textContent = (estimated ? "≈ " : "") + fmtVol(s.volume);
   const method = $("method");
   method.classList.toggle("warn", s.open_bodies > 0 || s.volume == null || estimated > 0);
@@ -436,15 +442,58 @@ function renderPanel() {
   method.textContent = s.volume == null ? t("method.none") : [how, ...notes].join(" ");
 
   $("total-area").textContent = fmtArea(s.area);
-  $("bbox-size").textContent = fmtSize(s.bbox.size);
+  $("bbox-size").textContent = s.bodies ? fmtSize(s.bbox.size) : "—";
   $("bbox-volume").textContent = fmtVol(s.bbox.volume);
   $("obb-size").textContent = s.obb ? fmtSize(s.obb.size) : "—";
   $("fill").textContent = s.fill_ratio == null ? "—" : `${fmtNum(s.fill_ratio * 100, 2)} %`;
   $("centroid").textContent = fmtPoint(s.centroid);
-  $("body-count").textContent = s.open_bodies ? t("summary.bodiesOpen", { bodies: s.bodies, open: s.open_bodies }) : `${s.bodies}`;
+  const count = s.open_bodies ? t("summary.bodiesOpen", { bodies: s.bodies, open: s.open_bodies }) : `${s.bodies}`;
+  $("body-count").textContent = partial ? t("summary.bodiesSelected", { count, total: r.bodies.length }) : count;
 
   updateMass();
   renderBodies();
+}
+
+/** Indices of the bodies checked in the list. */
+function includedIndices() {
+  return state.result ? state.result.bodies.map((_, i) => i).filter((i) => state.included.has(i)) : [];
+}
+
+/**
+ * Totals of the bodies checked in the list (all of them: the file's summary).
+ * Null when none is checked. The oriented envelope of a part of the bodies is
+ * computed from their display meshes.
+ */
+function currentSummary() {
+  const r = state.result;
+  if (!r) return null;
+  const indices = includedIndices();
+  if (indices.length === r.bodies.length) return r.summary;
+  if (!indices.length) return null;
+  if (state.subsetSummary?.key === indices.join(",")) return state.subsetSummary.summary;
+  const bodies = indices.map((i) => {
+    const b = r.bodies[i];
+    const geom = state.meshes[i].userData.indexed ?? state.meshes[i].geometry;
+    const mesh = { positions: geom.attributes.position.array, indices: geom.index.array };
+    if (b.mesh?.positions64 && typeof b.mesh.positions64 !== "string") mesh.positions64 = b.mesh.positions64;
+    return { ...b, mesh };
+  });
+  let summary;
+  try {
+    summary = summarize(bodies);
+  } catch {
+    summary = { ...summarize(bodies.map((b) => ({ ...b, mesh: null }))), obb: null };
+  }
+  state.subsetSummary = { key: indices.join(","), summary };
+  return summary;
+}
+
+/** Check exactly these bodies (from the list, or from the costing page). */
+function setIncluded(indices) {
+  state.included = new Set(indices);
+  state.meshes.forEach((m, i) => (m.visible = state.included.has(i)));
+  renderPanel();
+  updatePublished(state.result);
 }
 
 function isEstimate(body) {
@@ -454,7 +503,10 @@ function isEstimate(body) {
 function updateMass() {
   const r = state.result;
   if (!r) return;
-  $("mass").textContent = fmtMass(r.summary.volume, parseFloat($("density").value));
+  $("mass").textContent = fmtMass(currentSummary()?.volume ?? null, parseFloat($("density").value));
+  const all = $("bodies-all");
+  all.checked = state.included.size === r.bodies.length;
+  all.indeterminate = state.included.size > 0 && state.included.size < r.bodies.length;
   renderBodyDetail();
 }
 
@@ -462,7 +514,7 @@ function renderBodies() {
   const r = state.result;
   const tbody = $("bodies");
   tbody.innerHTML = "";
-  const total = r.summary.volume || 0;
+  const total = currentSummary()?.volume || 0;
   r.bodies.forEach((b, i) => {
     const tr = document.createElement("tr");
     tr.dataset.index = i;
@@ -471,10 +523,15 @@ function renderBodies() {
 
     const vis = document.createElement("input");
     vis.type = "checkbox";
-    vis.checked = state.meshes[i].visible;
+    vis.checked = state.included.has(i);
     vis.title = t("bodies.showHide");
     vis.addEventListener("click", (e) => e.stopPropagation());
-    vis.addEventListener("change", () => (state.meshes[i].visible = vis.checked));
+    vis.addEventListener("change", () => {
+      const set = new Set(state.included);
+      if (vis.checked) set.add(i);
+      else set.delete(i);
+      setIncluded([...set]);
+    });
 
     const td0 = document.createElement("td");
     td0.appendChild(vis);
@@ -547,9 +604,12 @@ function exportableResult(r) {
     units: { length: "mm", area: "mm2", volume: "mm3", mass: "g", density: "g/cm3" },
     engine: r.engine ?? "python",
     density,
-    summary: { ...r.summary, mass: mass(r.summary.volume) },
-    bodies: r.bodies.map(({ mesh, ...b }, i) => ({ ...b, mass: mass(b.volume), ...thicknessExport(r, [i]) })),
-    ...thicknessExport(r),
+    summary: { ...(currentSummary() ?? r.summary), mass: mass((currentSummary() ?? r.summary).volume) },
+    bodies: includedIndices().map((i) => {
+      const { mesh, ...b } = r.bodies[i];
+      return { ...b, mass: mass(b.volume), ...thicknessExport(r, [i]) };
+    }),
+    ...thicknessExport(r, includedIndices()),
     elapsed_s: r.elapsed_s,
   };
 }
@@ -562,8 +622,17 @@ function thicknessExport(r, indices) {
   if (r !== state.result || !thick.results) return {};
   const stats = thickStats(indices);
   // The thinnest wall always by the "wall" method (see thickness.js).
-  const min = thickStats(indices, "wall").min;
-  return { thickness: { method: thickMethod(), min, median: stats.median, max: stats.max } };
+  const wall = thickStats(indices, "wall");
+  return {
+    thickness: {
+      method: thickMethod(),
+      min: wall.min,
+      median: stats.median,
+      max: stats.max,
+      floor: thick.floor,
+      details: wall.details,
+    },
+  };
 }
 
 /** Exports include the wall thickness: compute it first if needed (closed bodies only). */
@@ -599,13 +668,13 @@ function cleanRows(rows, scale) {
 /** One row per body and one column per quantity; numbers stay numbers. */
 function tableRows(data) {
   const head = ["xlsx.name", "xlsx.volume", "xlsx.volumeCm3", "xlsx.area", "xlsx.bboxX", "xlsx.bboxY", "xlsx.bboxZ",
-    "xlsx.cx", "xlsx.cy", "xlsx.cz", "xlsx.mass", "xlsx.thickMin", "xlsx.thickMedian", "xlsx.thickMax",
+    "xlsx.cx", "xlsx.cy", "xlsx.cz", "xlsx.mass", "xlsx.thickMin", "xlsx.thickDetails", "xlsx.thickMedian", "xlsx.thickMax",
     "xlsx.closed", "xlsx.notes"].map((k) => t(k));
   const yesNo = (v) => t(v ? "xlsx.yes" : "xlsx.no");
   const row = (name, x, notes) => [
     name, x.volume, x.volume == null ? null : x.volume / 1000, x.area, ...x.bbox.size,
     ...(x.centroid ?? [null, null, null]), x.mass,
-    x.thickness?.min ?? null, x.thickness?.median ?? null, x.thickness?.max ?? null,
+    x.thickness?.min ?? null, x.thickness?.details ? `(${fmtNum(x.thickness.details.min, 2)} mm)` : null, x.thickness?.median ?? null, x.thickness?.max ?? null,
     yesNo(x.closed), notes,
   ];
   const rows = data.bodies.map((b) => row(b.name, b, b.notes.map(tMessage).join(" ; ")));
@@ -647,6 +716,7 @@ async function exportXlsx() {
     [t("xlsx.bodyCount"), { value: s.bodies, style: STYLE.text }],
     [t("xlsx.thickMethod"), data.thickness ? t(`thick.${data.thickness.method}`) : "—"],
     [t("xlsx.thickMin"), data.thickness?.min ?? null],
+    [t("xlsx.thickDetails"), data.thickness?.details ? `(${fmtNum(data.thickness.details.min, 2)} mm)` : "—"],
     [t("xlsx.thickMedian"), data.thickness?.median ?? null],
     [t("xlsx.thickMax"), data.thickness?.max ?? null],
   ].map(([k, v]) => [k, k === t("xlsx.fill") || k === t("xlsx.density") ? v : cleanRows([[v]], Math.max(...s.bbox.size, 1e-12))[0][0]]);
@@ -654,7 +724,7 @@ async function exportXlsx() {
   const total = table.length - 1;
   table[total] = table[total].map((v, i) => (i === 0 ? { value: v, style: STYLE.totalText } : typeof v === "number" ? { value: v, style: STYLE.totalNumber } : v));
   const bytes = buildXlsx([
-    { name: t("xlsx.bodies"), rows: table, header: true, widths: [28, 18, 16, 18, 16, 16, 16, 18, 18, 18, 14, 16, 16, 16, 12, 50] },
+    { name: t("xlsx.bodies"), rows: table, header: true, widths: [28, 18, 16, 18, 16, 16, 16, 18, 18, 18, 14, 16, 20, 16, 16, 12, 50] },
     { name: t("xlsx.summary"), rows: summary, widths: [40, 28] },
   ]);
   download(`${baseName(r)}_volume.xlsx`, new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
@@ -788,6 +858,9 @@ $("section-flip").addEventListener("click", () => {
   sectionFlip = !sectionFlip;
   updateSection();
 });
+$("bodies-all").addEventListener("change", (e) => {
+  if (state.result) setIncluded(e.target.checked ? state.result.bodies.map((_, i) => i) : []);
+});
 $("export-csv").addEventListener("click", () => exportCsv().catch((err) => showError(err.message)));
 $("export-xlsx").addEventListener("click", () => exportXlsx().catch((err) => showError(err.message)));
 $("export-json").addEventListener("click", () => exportJson().catch((err) => showError(err.message)));
@@ -832,7 +905,19 @@ window.addEventListener("drop", (e) => {
 // in the engine worker (engine/thickness.js), one value per triangle of the
 // display mesh. The model can be coloured with a scale (thin: blue, thick:
 // red), and the triangles of one thickness (± a tolerance) highlighted.
+// Thinner values are lettering or marks on the surface, not walls (kept in this browser).
+const FLOOR_KEY = "reader3d.thickness.floor";
+function loadFloor() {
+  try {
+    const v = parseFloat(localStorage.getItem(FLOOR_KEY));
+    return Number.isFinite(v) && v >= 0 ? v : 1;
+  } catch {
+    return 1;
+  }
+}
+
 const thick = {
+  floor: loadFloor(), // mm
   results: null, // per body {ray, sphere} (Float32Array per triangle) or null
   pending: null, // promise of the computation in progress
   colors: false,
@@ -870,7 +955,7 @@ function thickStats(indices = state.meshes.map((_, i) => i), method = thickMetho
     const geom = bodyGeometry(i);
     parts.push({ positions: geom.attributes.position.array, indices: geom.index.array, values });
   }
-  return thicknessStats(parts);
+  return thicknessStats(parts, { floor: thick.floor });
 }
 
 /** Colour of a thickness on the scale: blue (0) -> cyan -> green -> yellow -> red (max and above). */
@@ -974,11 +1059,27 @@ async function ensureThickness() {
   return run;
 }
 
+// Opacity of the rest of the body while a thickness is highlighted (or the
+// thinnest wall located): translucent, so that the highlighted walls show
+// through, even those inside or behind.
+const HIGHLIGHT_FADE = 0.15;
+
+/** Opaque or translucent material: its own look back, or see-through for a highlight. */
+function setSeeThrough(mesh, on) {
+  const m = mesh.material;
+  const look = mesh.userData.look;
+  const want = on ? { transparent: true, opacity: 1, depthWrite: false } : look;
+  if (m.transparent === want.transparent && m.opacity === want.opacity && m.depthWrite === want.depthWrite) return;
+  Object.assign(m, want);
+  m.needsUpdate = true;
+}
+
 /** Colour the meshes by thickness, or give them their own colour back. */
 function applyThickness() {
   const active = (thick.colors || thick.highlight) && thick.results;
   state.meshes.forEach((mesh, i) => {
     const values = thickValues(i);
+    setSeeThrough(mesh, active && thick.highlight);
     if (!active) {
       if (mesh.userData.indexed) {
         mesh.geometry = mesh.userData.indexed;
@@ -988,18 +1089,18 @@ function applyThickness() {
       }
       return;
     }
-    // One colour per triangle: a geometry without shared vertices.
+    // One colour per triangle: a geometry without shared vertices (RGBA: the alpha fades the rest during a highlight).
     if (!mesh.userData.indexed) {
       mesh.userData.indexed = mesh.geometry;
       mesh.userData.flat = mesh.geometry.toNonIndexed();
-      mesh.userData.flat.setAttribute("color", new THREE.BufferAttribute(new Float32Array(mesh.userData.flat.attributes.position.count * 3), 3));
+      mesh.userData.flat.setAttribute("color", new THREE.BufferAttribute(new Float32Array(mesh.userData.flat.attributes.position.count * 4), 4));
     }
     const geom = mesh.userData.flat;
     const colors = geom.attributes.color.array;
     const color = new THREE.Color();
     const lo = thick.value - thick.tol;
     const hi = thick.value + thick.tol;
-    const triangles = colors.length / 9;
+    const triangles = colors.length / 12;
     for (let f = 0; f < triangles; f++) {
       const v = values ? values[f] : NaN;
       const inBand = thick.highlight && v >= lo && v <= hi;
@@ -1007,12 +1108,14 @@ function applyThickness() {
       else if (!Number.isFinite(v)) color.copy(NO_VALUE);
       else if (thick.colors) color.setHSL(scaleHue(v) / 360, 0.9, 0.5);
       else color.copy(mesh.userData.color);
-      // With a highlight, the rest of the model steps back.
+      // With a highlight, the rest of the model steps back and becomes translucent.
       if (thick.highlight && !inBand) color.lerp(NO_VALUE, thick.colors ? 0.55 : 0.6).multiplyScalar(0.8);
+      const alpha = thick.highlight && !inBand ? HIGHLIGHT_FADE : 1;
       for (let k = 0; k < 3; k++) {
-        colors[9 * f + 3 * k] = color.r;
-        colors[9 * f + 3 * k + 1] = color.g;
-        colors[9 * f + 3 * k + 2] = color.b;
+        colors[12 * f + 4 * k] = color.r;
+        colors[12 * f + 4 * k + 1] = color.g;
+        colors[12 * f + 4 * k + 2] = color.b;
+        colors[12 * f + 4 * k + 3] = alpha;
       }
     }
     geom.attributes.color.needsUpdate = true;
@@ -1023,6 +1126,12 @@ function applyThickness() {
       mesh.material.needsUpdate = true;
     }
   });
+}
+
+/** Lettering / fine details below the floor, in brackets: "(0,6 mm : écritures…)". */
+function detailsText(details) {
+  if (!details) return "";
+  return t("thick.details", { value: fmtNum(details.min, 2), share: `${(details.share * 100).toLocaleString(locale(), { maximumFractionDigits: 1 })} %` });
 }
 
 function fmtMm(v) {
@@ -1068,8 +1177,11 @@ function renderThickness() {
   drawScale(area, total);
 
   const stats = thickStats();
-  const thinnest = thickStats(undefined, "wall").min;
+  const wall = thickStats(undefined, "wall");
+  const thinnest = wall.min;
   $("thick-min").textContent = fmtMm(thinnest ?? NaN);
+  $("thick-details").textContent = detailsText(wall.details);
+  $("thick-floor").value = thick.floor;
   $("thick-locate").disabled = thinnest == null;
   let mode = 0;
   for (let k = 1; k < BINS; k++) if (area[k] > area[mode]) mode = k;
@@ -1159,6 +1271,18 @@ async function setThickness(changes) {
 }
 
 $("thick-compute").addEventListener("click", () => setThickness({ colors: true }));
+$("thick-floor").addEventListener("change", (e) => {
+  const v = parseFloat(e.target.value);
+  if (!(v >= 0)) return renderThickness();
+  thick.floor = v;
+  try {
+    localStorage.setItem(FLOOR_KEY, String(v));
+  } catch {
+    // kept for this visit only
+  }
+  renderThickness();
+  if (state.result) updatePublished(state.result);
+});
 // Highlight the thinnest walls: from the thinnest value up to the detected minimum.
 // (The thinnest wall is measured with the "wall" method, shown for this.)
 $("thick-locate").addEventListener("click", () => {
@@ -1371,7 +1495,7 @@ function plainReport(data) {
     `mass: ${n(s.mass, "g")} (density ${data.density} g/cm3)`,
     `bodies: ${s.bodies} (${s.open_bodies} open)`,
     ...(data.thickness
-      ? [`wall_thickness (${data.thickness.method}): min ${n(data.thickness.min, "mm")}, median ${n(data.thickness.median, "mm")}, max ${n(data.thickness.max, "mm")}`]
+      ? [`wall_thickness (${data.thickness.method}): min ${n(data.thickness.min, "mm")}, median ${n(data.thickness.median, "mm")}, max ${n(data.thickness.max, "mm")}${data.thickness.details ? `, lettering below ${data.thickness.floor} mm: (${n(data.thickness.details.min, "mm")})` : ""}`]
       : []),
     "",
     "name | volume_mm3 | area_mm2 | size_x_mm | size_y_mm | size_z_mm | closed",
@@ -1445,6 +1569,11 @@ window.reader3d = {
   part() {
     return partFeatures();
   },
+  /** Check these bodies (indices into result.bodies): the volume and the costing become theirs. */
+  setSelection(indices) {
+    if (state.result) setIncluded(indices.filter((i) => i >= 0 && i < state.result.bodies.length));
+    return partFeatures();
+  },
   /** Compute the wall thickness of the part shown (with progress), then return part(). */
   async computeThickness() {
     if (state.result?.bodies.some((b) => b.closed)) await ensureThickness();
@@ -1455,14 +1584,13 @@ window.reader3d = {
 function partFeatures() {
   const r = state.result;
   if (!r) return null;
-  const s = r.summary;
-  const thickness = thick.results
-    ? {
-        min: thickStats(undefined, "wall").min,
-        median: thickStats(undefined, "sphere").median,
-        max: thickStats(undefined, "sphere").max,
-      }
-    : null;
+  const s = currentSummary() ?? { volume: null, area: null, bbox: { size: [0, 0, 0] }, bodies: 0, open_bodies: 0 };
+  const thicknessOf = (indices) => {
+    if (!thick.results) return null;
+    const wall = thickStats(indices, "wall");
+    const sphere = thickStats(indices, "sphere");
+    return { min: wall.min, details: wall.details, floor: thick.floor, median: sphere.median, max: sphere.max };
+  };
   return {
     file: r.file,
     volume: s.volume,
@@ -1470,7 +1598,19 @@ function partFeatures() {
     bboxSize: s.bbox.size,
     bodies: s.bodies,
     openBodies: s.open_bodies,
-    thickness,
+    thickness: includedIndices().length ? thicknessOf(includedIndices()) : null,
+    // The bodies checked in the list of the 3D page: what is quoted.
+    selected: includedIndices(),
+    // Every body of the file: the costing page can quote them one by one.
+    parts: r.bodies.map((b, i) => ({
+      index: i,
+      name: b.name,
+      closed: b.closed,
+      volume: b.volume,
+      area: b.area,
+      bboxSize: b.bbox.size,
+      thickness: b.closed ? thicknessOf([i]) : null,
+    })),
   };
 }
 

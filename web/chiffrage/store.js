@@ -80,7 +80,7 @@ export function loadSettings(base) {
   for (const key of ["trs", "modes", "densities", "inflation"]) merged[key] = { ...defaults[key], ...saved[key] };
   for (const key of ["processes", "operations"]) {
     merged[key] = { ...defaults[key] };
-    for (const [code, value] of Object.entries(saved[key] ?? {})) merged[key][code] = { ...defaults[key][code], ...value, cycle: { ...defaults[key][code]?.cycle, ...value.cycle } };
+    for (const [code, value] of Object.entries(saved[key] ?? {})) merged[key][code] = { ...defaults[key][code], ...value, cycle: { ...defaults[key][code]?.cycle, ...value.cycle }, rendement: { ...defaults[key][code]?.rendement, ...value.rendement } };
   }
   return merged;
 }
@@ -147,6 +147,10 @@ export function defaultQuote(base, indices) {
     tailleSerie: d.tailleSerie || 1000,
     marge: null, // null: the setting
     composants: [],
+    serie: null, // series order of the customer request (rfq.js)
+    moqs: [], // order quantities, largest first
+    prixCible: null,
+    serieEnergie: true, // energy prices of the request in place of the settings
   };
 }
 

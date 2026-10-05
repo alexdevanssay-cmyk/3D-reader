@@ -186,3 +186,32 @@ export function costingWorkbookSheets() {
 
 export const costingWorkbook = () => writeWorkbook(costingWorkbookSheets());
 export const indicesWorkbook = (offset = 100) => writeWorkbook({ Notes: { A1: 'cours' }, 'Suivi indice': indicesSheet(offset) });
+
+/** A made-up customer request (RFQ / GO NO GO workbook): volumes 2027-2030, three MOQ, target price. */
+export function seriesOrderWorkbook() {
+  const go = {
+    H7: 'Année', H8: 'Volume série', H9: 'Volume proto',
+    A20: 'Nom du client *', B20: 'ACME RAIL',
+    A25: 'Référence de la demande client  *', B25: 'Castings 2027',
+    A26: 'Référence & Désignation pièce *', B26: 'AB-123 - SUPPORT PLATE',
+    A46: 'Target Price (communiqué par le client)\n(Prix + commentaire', B46: 30,
+    A47: 'MOQ 1 (par taille décroissante) ', B47: 2000,
+    A48: 'MOQ 2 (par taille décroissante) ', B48: 500,
+    A49: 'MOQ 3 (par taille décroissante) ', B49: 50,
+    A54: 'Alliage', B54: 'AS7G06',
+    A58: 'Nombre total de référence à chiffrer dans RFQ *', B58: 1,
+    A60: 'Fonderie', B60: 'CG',
+    A73: 'Plan 2D', B73: 'Brut', C73: 'AB-123 ind A',
+  };
+  const vols = { 2026: 0, 2027: 1000, 2028: 1500, 2029: 1500, 2030: 800, 2031: 0 };
+  Object.keys(vols).forEach((y, i) => {
+    const c = String.fromCharCode(73 + i); // I..N
+    go[`${c}7`] = Number(y);
+    go[`${c}8`] = vols[y];
+  });
+  return writeWorkbook({
+    'Mode opératoire': { A1: 'Template Go No Go' },
+    '1- Données GO NO GO': go,
+    '3- Données de chiffrages': { A24: 'Electricité (/Mwh) : ', B24: 150, A25: 'Gaz (/Mwh) :', B25: 60, A45: 'N° Offre :', B45: 'GTEST-CG-2026-00' },
+  });
+}
