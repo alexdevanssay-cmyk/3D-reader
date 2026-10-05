@@ -94,6 +94,18 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const t5 = await pri();
     assert.ok(t6 > t5 && t5 > noTth, `T6 ${t6}, T5 ${t5}, none ${noTth}`);
 
+    // The tooling: amortised in the piece price, or sold apart.
+    const salePrice = async () => Number((/Prix de vente complet[^\d]*([\d\s\u202f]+,\d+)/.exec((await page.textContent('#page-chiffrage')).replace(/\u202f/g, ' ')) ?? [])[1]?.replace(/\s/g, '').replace(',', '.'));
+    assert.match(await page.textContent('#page-chiffrage'), /Outillage amorti \(/);
+    assert.match(await page.textContent('#page-chiffrage'), /Prix de vente complet[\d\s\u202f,€]+\(outillage compris\)/);
+    const withTooling = await salePrice();
+    await page.uncheck('#page-chiffrage [data-bind="q.outillageInclus"]');
+    await page.waitForFunction(() => /Outillage chiffré à part : [\d\s\u202f]+ € HT/.test(document.getElementById('page-chiffrage').textContent));
+    const withoutTooling = await salePrice();
+    assert.ok(withoutTooling < withTooling, `${withoutTooling} < ${withTooling}`);
+    await page.check('#page-chiffrage [data-bind="q.outillageInclus"]');
+    await page.waitForFunction(() => /\(outillage compris\)/.test(document.getElementById('page-chiffrage').textContent));
+
     // A prices file replaces the indices of the workbook.
     await page.setInputFiles('#page-chiffrage input[data-file="indices"]', join(dir, 'VALEURS MB LME.xlsx'));
     await page.waitForFunction(() => /Indices « VALEURS MB LME\.xlsx » importés/.test(document.getElementById('page-chiffrage').textContent));

@@ -206,7 +206,8 @@ export function quote(rates, lists, q) {
   const changeoverPiece = q.tailleSerie > 0 ? changeoverSeries / q.tailleSerie : 0;
 
   // Specific investments (tooling), components, subcontracting, packaging.
-  const outillagesPiece = q.nombrePieces > 0 ? sum((q.outillages ?? []).map((o) => (o.qte || 0) * (o.prix || 0))) / q.nombrePieces : 0;
+  const outillagesTotal = sum((q.outillages ?? []).map((o) => (o.qte || 0) * (o.prix || 0)));
+  const outillagesPiece = q.nombrePieces > 0 ? outillagesTotal / q.nombrePieces : 0;
   const outillages = outillagesPiece * (1 + (q.margeOutillages || 0));
   const list = (items) => ({
     cost: sum((items ?? []).map((i) => (i.qte || 0) * (i.prix || 0))),
@@ -305,7 +306,8 @@ export function quote(rates, lists, q) {
     changeoverLines,
     changeoverSeries,
     changeoverPiece,
-    outillages,
+    outillages, // tooling amortised per piece (in the value added: it carries its margin)
+    outillagesTotal,
     composants,
     sousTraitance,
     emballage,

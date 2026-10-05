@@ -158,6 +158,8 @@ export function defaultQuote(base, indices) {
     moqs: [], // order quantities, largest first
     prixCible: null,
     serieEnergie: true, // energy prices of the request in place of the settings
+    outillageInclus: true, // tooling amortised in the piece price; false: sold apart
+    margeOutillage: 0, // margin on the tooling sold apart
   };
 }
 
