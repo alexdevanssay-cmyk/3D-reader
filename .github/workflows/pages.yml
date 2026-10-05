@@ -1,0 +1,124 @@
+# Publishes the online version (static site built into dist/) on GitHub Pages.
+#
+# One-time setup, in the repository on github.com:
+#   Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
+# Without it the deploy job fails with "Get Pages site failed" / "Not Found".
+#
+# GitHub Pages on a private repository needs a paid plan (Pro, Team or
+# Enterprise). On a free account make the repository public (Settings ->
+# General -> Danger Zone -> Change visibility). The published site is public
+# in every case.
+#
+# The site is then at https://<owner>.github.io/<repository>/ ; the URL is also
+# shown in the summary of each run and under Settings -> Pages.
+#
+# A commit of main is published once the CI workflow (ci.yml: Python, browser
+# engine and end-to-end tests) has passed on it, so a commit that breaks the
+# tests is never published. Everything the site computes runs in the visitor's
+# browser (WebAssembly), so this build needs Node only, not Python.
+name: Deploy to GitHub Pages
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  # Actions tab -> Deploy to GitHub Pages -> Run workflow: publishes the chosen
+  # branch at once, without the tests (e.g. to retry a failed deployment).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time. A deployment that has started is allowed to finish
+# (cancelling it midway can leave Pages in a broken state); a newer one waits.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  # Which commit to publish, if any.
+  select:
+    # CI must have passed on a push (or manual run) of main in this repository.
+    # The branch filter above is not enough on its own: a pull request from a
+    # fork whose branch is also named "main" passes it.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       contains(fromJSON('["push", "workflow_dispatch"]'), github.event.workflow_run.event))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.select.outputs.sha }}
+    steps:
+      - name: Skip a commit that is no longer the head of main
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The commit CI tested. (github.sha of a workflow_run event is the head
+          # of main when this run started, which may be newer and untested.)
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          # CI runs of main all finish, in any order: an older commit whose tests
+          # end last must not replace a newer one already published.
+          if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
+            head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+            if [ "$head" != "$SHA" ]; then
+              echo "::notice::Not published: $SHA is no longer the head of main ($head), which CI publishes once it passes."
+              exit 0
+            fi
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: select
+    if: needs.select.outputs.sha != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.select.outputs.sha }}
+
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+        env:
+          # The playwright dev dependency is only used by the end-to-end tests.
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+
+      - name: Build the static site
+        run: npm run build
+        env:
+          # e.g. "/3D-reader": lets dist/404.html load the app from any URL depth.
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist/
+          # Keep dist/.nojekyll (dot files are left out by default).
+          include-hidden-files: true
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
