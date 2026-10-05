@@ -72,11 +72,13 @@ self.onmessage = async (event) => {
     let result;
     // Progress of the analysis itself, in percent (the CAD engine download has its own).
     let last = -1;
-    const progress = (percent, step) => {
+    // A beat (sent while OpenCascade runs, every 200 ms) is posted even when the
+    // percentage has not changed: it carries the current memory of the engine.
+    const progress = (percent, step, { approximate = false, beat = false } = {}) => {
       percent = Math.min(100, Math.max(0, Math.floor(percent)));
-      if (percent === last) return;
+      if (percent === last && !beat) return;
       last = percent;
-      postMessage({ type: 'progress', id: msg.id, stage: 'analyze', engine: msg.kind === 'cad' ? 'cad' : 'mesh', percent, step, memory: memory() });
+      postMessage({ type: 'progress', id: msg.id, stage: 'analyze', engine: msg.kind === 'cad' ? 'cad' : 'mesh', percent, step, approximate, memory: memory() });
     };
     if (msg.kind === 'cad') {
       progressTarget = msg.id;
@@ -84,7 +86,7 @@ self.onmessage = async (event) => {
       progress(0, 'read');
       result = analyzeCad(oc, new Uint8Array(msg.bytes), msg.name, {
         quality: msg.quality,
-        onProgress: (p) => progress(p.percent * 0.95, p.step), // the last 5 %: envelopes, on the page
+        onProgress: (p) => progress(p.percent * 0.95, p.step, p), // the last 5 %: envelopes, on the page
       });
     } else if (msg.kind === 'meshfile') {
       progress(0, 'read');

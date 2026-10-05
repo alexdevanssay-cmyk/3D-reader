@@ -621,6 +621,34 @@ function mirrorStepInstance(text, origin, occurrence = null) {
 
 // --------------------------------------------------------------------------- errors
 
+describe('CAD progress', () => {
+  test('progress is reported while OpenCascade reads and converts the file', () => {
+    assert.ok(oc.work, 'the work meter is installed');
+    const reports = [];
+    const interval = oc.work.interval;
+    oc.work.interval = 0; // a beat at every check, so that a small file gives several
+    try {
+      analyzeCad(oc, fixtureBytes('as1_pe_203.stp'), 'as1_pe_203.stp', { onProgress: (p) => reports.push(p) });
+    } finally {
+      oc.work.interval = interval;
+    }
+    assert.equal(oc.work.onBeat, null, 'the beat callback is removed after the analysis');
+    const steps = [...new Set(reports.map((p) => p.step))];
+    assert.deepEqual(steps, ['read', 'transfer', 'mesh', 'measure']);
+    for (let i = 1; i < reports.length; i++) {
+      assert.ok(reports[i].percent >= reports[i - 1].percent, `progress never goes back: ${reports.map((p) => p.percent)}`);
+    }
+    assert.equal(reports[0].percent, 0);
+    assert.equal(reports.at(-1).percent, 100);
+    // Inside the two long OpenCascade calls, not only at their ends.
+    const inside = (step, from, to) => reports.filter((p) => p.step === step && p.beat && p.percent > from && p.percent < to);
+    assert.ok(inside('read', 0, 15).length >= 3, `parsing: ${reports.map((p) => p.step + p.percent)}`);
+    assert.ok(inside('transfer', 15, 50).length >= 3, `conversion: ${reports.map((p) => p.step + p.percent)}`);
+    assert.ok(reports.filter((p) => p.step === 'transfer').every((p) => p.approximate), 'the conversion is marked approximate');
+    assert.ok(reports.filter((p) => p.step === 'read').every((p) => !p.approximate), 'the STEP parsing is measured');
+  });
+});
+
 describe('CAD errors', () => {
   // Deterministic pseudo-random bytes.
   const garbage = new Uint8Array(4096).map((_, i) => (Math.imul(i + 1, 2654435761) >>> 13) & 0xff);

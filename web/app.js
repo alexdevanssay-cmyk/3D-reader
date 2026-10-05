@@ -228,38 +228,24 @@ const STEP_TEXT = {
   summary: "loading.summary",
 };
 
-// Reading and converting a CAD file are each one long OpenCascade call that
-// cannot report its progress: in between real reports the page advances an
-// estimate from the file size (seconds per MB measured on a 35 MB STEP file),
-// marked as such, slowing down so as never to reach the next real step.
-const BLOCKING_STEPS = {
-  read: { secondsPerMB: 0.6, end: 15 },
-  transfer: { secondsPerMB: 1.6, end: 50 },
-};
-const progressState = { timer: null, started: 0, fileMB: 0, phase: null, last: null };
+// The engine reports its progress while it works, several times per second
+// (measured work, see engine/occt.js); the page also shows the time elapsed.
+const progressState = { timer: null, started: 0, last: null };
 
-function startProgress(file) {
+function startProgress() {
   progressState.started = performance.now();
-  progressState.fileMB = file.size / 1048576;
-  progressState.phase = null;
   progressState.last = null;
   clearInterval(progressState.timer);
-  progressState.timer = setInterval(tickProgress, 250);
+  progressState.timer = setInterval(tickProgress, 500);
 }
 
 function stopProgress() {
   clearInterval(progressState.timer);
   progressState.timer = null;
-  progressState.phase = null;
 }
 
-/** A progress report from the engine: real values, and the start of an estimate. */
 function showProgress(p) {
   progressState.last = p;
-  const blocking = p.stage === "analyze" && BLOCKING_STEPS[p.step];
-  progressState.phase = blocking
-    ? { from: p.percent ?? 0, to: blocking.end * 0.95, since: performance.now(), tau: Math.max(0.5, blocking.secondsPerMB * progressState.fileMB) }
-    : null;
   tickProgress();
 }
 
@@ -269,15 +255,8 @@ function tickProgress() {
   $("loading-elapsed").textContent = elapsed >= 2 ? t("loading.elapsed", { seconds: elapsed }) : "";
   if (!p) return;
   let [text, fraction] = describeProgress(p);
-  const phase = progressState.phase;
-  if (phase) {
-    const age = (performance.now() - phase.since) / 1000;
-    const estimate = phase.from + (phase.to - phase.from) * (1 - Math.exp(-age / phase.tau));
-    if (age > 1) {
-      text = t("loading.estimate", { text });
-      fraction = estimate / 100;
-    }
-  }
+  // The total work of this step is only known approximately (typical value).
+  if (p.stage === "analyze" && p.approximate) text = t("loading.estimate", { text });
   setLoading(text, fraction);
   renderMemory();
 }
@@ -370,7 +349,7 @@ async function openFile(file) {
   $("loading-file").textContent = file.name;
   $("loading").hidden = false;
   setStatus("analysing");
-  startProgress(file);
+  startProgress();
   try {
     const data = currentEngine() === "server" ? await analyzeOnServer(file) : await analyzeInBrowser(file);
     if (seq !== openSeq) return;
@@ -859,10 +838,8 @@ function renderMemory() {
   $("memory-level").dataset.level = level;
 
   const of = (used, limit) => t("memory.of", { used: fmtMB(used), limit: fmtMB(limit), percent: Math.round((used / limit) * 100) });
-  // While OpenCascade is in a long call the worker cannot answer: say that the
-  // value is the last measure, and let the estimate carry the gauge.
-  const busy = progressState.phase !== null;
-  const cad = !memory.loaded ? t("memory.notLoaded") : busy ? t("memory.busy", { value: of(memory.heap, budget) }) : of(memory.heap, budget);
+  // Measured by the engine while it works (several times per second).
+  const cad = !memory.loaded ? t("memory.notLoaded") : of(memory.heap, budget);
   const rows = [
     [t("memory.cad"), cad],
     [t("memory.budget"), fmtMB(budget)],
@@ -872,8 +849,7 @@ function renderMemory() {
   if (memory.estimate) rows.push([t("memory.estimate", { file: memory.estimate.file }), of(memory.estimate.bytes, budget)]);
   $("memory-stats").innerHTML = rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join("");
   $("memory-advice").textContent = (memory.restarted ? t("memory.restarted") + " " : "") + t(`memory.advice.${level}`);
-  const shown = Math.max(memory.heap, js?.used ?? 0, busy && memory.estimate ? memory.estimate.bytes : 0);
-  $("loading-memory").textContent = `${t("memory.short")} : ${of(shown, budget)}${busy && memory.estimate ? " ≈" : ""}`;
+  $("loading-memory").textContent = `${t("memory.short")} : ${of(Math.max(memory.heap, js?.used ?? 0), budget)}`;
   $("memory-card").hidden = false;
 }
 
