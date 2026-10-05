@@ -32,7 +32,7 @@ export function onMemory(fn) {
 export function releaseMemory() {
   if (pending.size || !worker) return false;
   resetWorker();
-  memoryListeners.forEach((fn) => fn({ heap: 0, heap_max: 0, restarted: true }));
+  memoryListeners.forEach((fn) => fn({ heap: 0, heap_max: 0, loaded: false, restarted: true }));
   listeners.forEach((fn) => fn({ stage: 'idle' }));
   return true;
 }
@@ -86,6 +86,7 @@ function getWorker() {
 function resetWorker() {
   worker?.terminate();
   worker = null;
+  memoryListeners.forEach((fn) => fn({ heap: 0, heap_max: 0, loaded: false }));
 }
 
 /** Stop the analyses in progress (the worker is restarted for the next file). */

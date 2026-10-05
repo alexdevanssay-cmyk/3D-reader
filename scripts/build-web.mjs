@@ -330,6 +330,28 @@ function copySite() {
 }
 
 /**
+ * Add ?v=<tag> to the URLs of the site's own modules and stylesheet. GitHub
+ * Pages lets browsers cache files for 10 minutes: right after a deployment a
+ * visitor could otherwise run the new app.js with the old worker.js. Every
+ * reference to a module gets the same tag, so each module is still loaded once.
+ * (vendor/ files change only with their package version and keep plain URLs.)
+ */
+function versionUrls(tag) {
+  const relativeJs = /(['"])(\.{1,2}\/(?!vendor\/)[^'"?\s]+\.js)\1/g;
+  for (const file of listFiles(DIST, (full) => !isInside(full, join(DIST, 'vendor')))) {
+    if (/\.m?js$/.test(file)) {
+      const source = readFileSync(file, 'utf8');
+      writeFileSync(file, source.replace(relativeJs, `$1$2?v=${tag}$1`));
+    } else if (/\.html$/.test(file)) {
+      const html = readFileSync(file, 'utf8')
+        .replace(/(<script type="module" src=")([^"?]+\.js)(")/g, `$1$2?v=${tag}$3`)
+        .replace(/(<link rel="stylesheet" href=")([^"?]+\.css)(")/g, `$1$2?v=${tag}$3`);
+      writeFileSync(file, html);
+    }
+  }
+}
+
+/**
  * Check that every module the app imports with a static specifier exists in
  * dist/ (relative imports, and "three" / "three/addons/..." through the import
  * map), so a missing file fails the build instead of the published page.
@@ -342,7 +364,7 @@ function checkImports() {
       let target;
       if (spec === 'three') target = join(DIST, 'vendor', 'three', 'three.module.js');
       else if (spec.startsWith('three/addons/')) target = join(DIST, 'vendor', 'three', 'addons', ...spec.slice(13).split('/'));
-      else if (spec.startsWith('./') || spec.startsWith('../')) target = resolve(dirname(file), ...spec.split('/'));
+      else if (spec.startsWith('./') || spec.startsWith('../')) target = resolve(dirname(file), ...spec.split('?')[0].split('/'));
       else continue; // a URL, or a Node-only module loaded through a variable
       if (!existsSync(target)) problems.push(`${toPosix(relative(DIST, file))} imports '${spec}', missing from dist/`);
     }
@@ -373,6 +395,7 @@ async function build(options) {
   writeFileSync(join(DIST, '404.html'), notFoundPage(readFileSync(join(DIST, 'index.html'), 'utf8'), options.basePath));
   const version = { commit: gitCommit(), built_at: new Date().toISOString(), base_path: options.basePath };
   writeFileSync(join(DIST, 'version.json'), `${JSON.stringify(version, null, 2)}\n`);
+  versionUrls((version.commit ?? version.built_at.replace(/\D/g, '')).slice(0, 12));
   console.log(
     `\nCopied ${count} files from ${rel(WEB)}/ to ${rel(DIST)}/ ` +
       `(commit ${version.commit ?? 'unknown'}, base path ${options.basePath})`,

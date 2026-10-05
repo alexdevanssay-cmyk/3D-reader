@@ -220,7 +220,67 @@ function setLoading(text, fraction = null) {
   $("loading-percent").textContent = fraction === null ? "" : `${Math.floor(fraction * 100)} %`;
 }
 
-const STEP_TEXT = { read: "loading.read", mesh: "loading.mesh", measure: "loading.measure", summary: "loading.summary" };
+const STEP_TEXT = {
+  read: "loading.read",
+  transfer: "loading.transfer",
+  mesh: "loading.mesh",
+  measure: "loading.measure",
+  summary: "loading.summary",
+};
+
+// Reading and converting a CAD file are each one long OpenCascade call that
+// cannot report its progress: in between real reports the page advances an
+// estimate from the file size (seconds per MB measured on a 35 MB STEP file),
+// marked as such, slowing down so as never to reach the next real step.
+const BLOCKING_STEPS = {
+  read: { secondsPerMB: 0.6, end: 15 },
+  transfer: { secondsPerMB: 1.6, end: 50 },
+};
+const progressState = { timer: null, started: 0, fileMB: 0, phase: null, last: null };
+
+function startProgress(file) {
+  progressState.started = performance.now();
+  progressState.fileMB = file.size / 1048576;
+  progressState.phase = null;
+  progressState.last = null;
+  clearInterval(progressState.timer);
+  progressState.timer = setInterval(tickProgress, 250);
+}
+
+function stopProgress() {
+  clearInterval(progressState.timer);
+  progressState.timer = null;
+  progressState.phase = null;
+}
+
+/** A progress report from the engine: real values, and the start of an estimate. */
+function showProgress(p) {
+  progressState.last = p;
+  const blocking = p.stage === "analyze" && BLOCKING_STEPS[p.step];
+  progressState.phase = blocking
+    ? { from: p.percent ?? 0, to: blocking.end * 0.95, since: performance.now(), tau: Math.max(0.5, blocking.secondsPerMB * progressState.fileMB) }
+    : null;
+  tickProgress();
+}
+
+function tickProgress() {
+  const p = progressState.last;
+  const elapsed = Math.floor((performance.now() - progressState.started) / 1000);
+  $("loading-elapsed").textContent = elapsed >= 2 ? t("loading.elapsed", { seconds: elapsed }) : "";
+  if (!p) return;
+  let [text, fraction] = describeProgress(p);
+  const phase = progressState.phase;
+  if (phase) {
+    const age = (performance.now() - phase.since) / 1000;
+    const estimate = phase.from + (phase.to - phase.from) * (1 - Math.exp(-age / phase.tau));
+    if (age > 1) {
+      text = t("loading.estimate", { text });
+      fraction = estimate / 100;
+    }
+  }
+  setLoading(text, fraction);
+  renderMemory();
+}
 
 function describeProgress(p) {
   switch (p.stage) {
@@ -281,7 +341,7 @@ async function analyzeInBrowser(file) {
     unit: $("unit").value,
     quality: $("quality").value,
     onProgress: (p) => {
-      setLoading(...describeProgress(p));
+      showProgress(p);
       if (p.stage === "download" || p.stage === "compile") showEngineStatus(p);
       if (p.stage === "analyze" && p.engine === "cad" && engineStage !== "ready") showEngineStatus({ stage: "ready" });
     },
@@ -310,6 +370,7 @@ async function openFile(file) {
   $("loading-file").textContent = file.name;
   $("loading").hidden = false;
   setStatus("analysing");
+  startProgress(file);
   try {
     const data = currentEngine() === "server" ? await analyzeOnServer(file) : await analyzeInBrowser(file);
     if (seq !== openSeq) return;
@@ -331,7 +392,10 @@ async function openFile(file) {
       setStatus("error", message);
     }
   } finally {
-    if (seq === openSeq) $("loading").hidden = true;
+    if (seq === openSeq) {
+      $("loading").hidden = true;
+      stopProgress();
+    }
   }
 }
 
@@ -660,6 +724,7 @@ $("file-input").addEventListener("change", (e) => {
 $("cancel").addEventListener("click", () => {
   openSeq++; // forget the file being analysed
   $("loading").hidden = true;
+  stopProgress();
   stopAnalysis();
 });
 $("engine").addEventListener("change", () => {
@@ -749,7 +814,7 @@ window.addEventListener("drop", (e) => {
 // use, estimated from the file size) with what it can safely get.
 const GiB = 2 ** 30;
 const WASM_MAX = 4294901760;
-const memory = { heap: 0, estimate: null, restarted: false };
+const memory = { heap: 0, loaded: false, estimate: null, restarted: false };
 
 /** Bytes the analysis can use without risking a crash. */
 function memoryBudget() {
@@ -794,8 +859,12 @@ function renderMemory() {
   $("memory-level").dataset.level = level;
 
   const of = (used, limit) => t("memory.of", { used: fmtMB(used), limit: fmtMB(limit), percent: Math.round((used / limit) * 100) });
+  // While OpenCascade is in a long call the worker cannot answer: say that the
+  // value is the last measure, and let the estimate carry the gauge.
+  const busy = progressState.phase !== null;
+  const cad = !memory.loaded ? t("memory.notLoaded") : busy ? t("memory.busy", { value: of(memory.heap, budget) }) : of(memory.heap, budget);
   const rows = [
-    [t("memory.cad"), of(memory.heap, budget)],
+    [t("memory.cad"), cad],
     [t("memory.budget"), fmtMB(budget)],
     [t("memory.device"), navigator.deviceMemory ? t("memory.deviceValue", { gb: navigator.deviceMemory }) : t("memory.unknown")],
   ];
@@ -803,12 +872,14 @@ function renderMemory() {
   if (memory.estimate) rows.push([t("memory.estimate", { file: memory.estimate.file }), of(memory.estimate.bytes, budget)]);
   $("memory-stats").innerHTML = rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join("");
   $("memory-advice").textContent = (memory.restarted ? t("memory.restarted") + " " : "") + t(`memory.advice.${level}`);
-  $("loading-memory").textContent = `${t("memory.short")} : ${of(Math.max(memory.heap, js?.used ?? 0), budget)}`;
+  const shown = Math.max(memory.heap, js?.used ?? 0, busy && memory.estimate ? memory.estimate.bytes : 0);
+  $("loading-memory").textContent = `${t("memory.short")} : ${of(shown, budget)}${busy && memory.estimate ? " ≈" : ""}`;
   $("memory-card").hidden = false;
 }
 
 function onEngineMemory(m) {
   memory.heap = m.heap;
+  memory.loaded = Boolean(m.loaded ?? m.heap > 0);
   if (m.restarted) memory.restarted = true;
   renderMemory();
 }

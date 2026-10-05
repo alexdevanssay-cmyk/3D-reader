@@ -118,12 +118,14 @@ export function analyzeCad(oc, bytes, fileName, { quality = 'normal', onProgress
 
 function readCad(ctx, path, bytes, fmt, fileStem, quality) {
   const { oc } = ctx;
-  // Progress: reading the file is one OpenCascade call (0 -> 30 %), then the
-  // tessellation (30 -> 65 %) and the exact integrals (65 -> 100 %) go solid by solid.
+  // Progress, weighted by the times measured on a 35 MB STEP file of 2000 solids:
+  // parsing the text (0 -> 15 %) and converting it to shapes (15 -> 50 %) are each
+  // one OpenCascade call; the tessellation (50 -> 65 %) and the exact integrals
+  // (65 -> 100 %) go solid by solid.
   ctx.progress(0, 'read');
   const parts = fmt === 'brep' ? readBrep(ctx, path, fileStem, bytes) : readXcaf(ctx, path, fmt, bytes);
   if (!parts.length) throw new Error('The file does not contain any geometry');
-  ctx.progress(0.3, 'mesh');
+  ctx.progress(0.5, 'mesh');
 
   const shapes = parts.map((p) => p.shape);
   const [lin, ang] = Object.hasOwn(QUALITY, quality) ? QUALITY[quality] : QUALITY.normal;
@@ -231,6 +233,7 @@ function readXcaf(ctx, path, fmt, bytes) {
     if (reader.ReadFile(path) !== oc.IFSelect_ReturnStatus.IFSelect_RetDone) {
       throw new Error(`Unable to read ${FMT} file`);
     }
+    ctx.progress(0.15, 'transfer'); // parsed: OpenCascade now converts the entities to shapes
     const progress = ctx.keep(new oc.Message_ProgressRange_1());
     const ok = fmt === 'step' ? reader.Transfer_1(hdoc, progress) : reader.Transfer(hdoc, progress);
     if (!ok) throw new Error(`Unable to transfer ${FMT} geometry`);
@@ -952,12 +955,12 @@ function meshEach(ctx, shapes, deflection, ang, report = true) {
     // (shape, linear deflection, relative = false, angular deflection, parallel = true)
     new oc.BRepMesh_IncrementalMesh_2(shape, deflection, false, ang, true).delete();
   };
-  // Progress (30 -> 65 % of the analysis), solid by solid.
+  // Progress (50 -> 65 % of the analysis), solid by solid.
   const total = report ? Math.max(1, shapes.reduce((n, s) => n + countChildren(ctx, s, TopAbs_SOLID), 0)) : 1;
   let done = 0;
   const meshSolid = (solid) => {
     mesh(solid);
-    if (report) ctx.progress(0.3 + (0.35 * ++done) / total, 'mesh');
+    if (report) ctx.progress(0.5 + (0.15 * ++done) / total, 'mesh');
   };
   for (const shape of shapes) {
     forEachChild(ctx, shape, TopAbs_SOLID, TopAbs_SHAPE, meshSolid);
