@@ -50,7 +50,7 @@ const monthLabel = (m) => {
 };
 const dateLabel = (iso) => (iso ? new Date(iso).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" }) : "—");
 // Inputs of the user (the others are defaults from the workbook).
-const USER_FIELDS = ["client", "reference", "designation", "plan", "volumeAnnuel", "annees", "premiereAnnee", "volumes", "pieces", "pieceFile", "serie", "moqs", "prixCible", "serieEnergie"];
+const USER_FIELDS = ["client", "reference", "designation", "plan", "volumeAnnuel", "annees", "premiereAnnee", "volumes", "pieces", "pieceFile", "serie", "moqs", "prixCible", "serieEnergie", "outillageInclus", "margeOutillage"];
 // Inputs of each piece (q.pieces[key]); null: from the 3D model or estimated.
 const PIECE_DEFAULTS = {
   poids: null, toileMini: null, epaisseurMax: null, moduleMm: null, dimMax: null,
@@ -486,7 +486,8 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
       { code, heures: settings.heuresChangementCoulee },
       { code: finition, heures: settings.heuresChangementFinition },
     ],
-    outillages: [{ designation: route.tooling ? "Coquille acier réalisée sur place" : `Outillage ${process.famille}`, qte: 1, prix: route.outillage }],
+    // Tooling amortised in the piece price, or sold apart (q.outillageInclus).
+    outillages: q.outillageInclus === false ? [] : [{ designation: route.tooling ? "Coquille acier réalisée sur place" : `Outillage ${process.famille}`, qte: 1, prix: route.outillage }],
     margeOutillages: 0,
   };
   out.final = quote(finalRates, base.lists, out.finalInput);
@@ -519,6 +520,8 @@ function aggregate(results, years) {
     matiere: total((r) => r.final.matiere),
     perteAuFeu: total((r) => r.final.perteAuFeu),
     pri: total((r) => r.final.pri),
+    outillage: total((r) => r.route?.outillage),
+    outillagesPiece: total((r) => r.final.outillages),
     autresVendus: total((r) => r.final.composants.sold + r.final.sousTraitance.sold + r.final.emballage.sold),
     years: ys,
   };
@@ -736,7 +739,9 @@ function toolingCard(r) {
       </table></div>
       <div class="cfields">
         ${field("Prix d'outillage retenu (€)", input("p.outillagePrix", r.inputs.outillagePrix, { min: 0, placeholder: nf(route.outillageEstime, 0) }), "vide = estimation")}
-        ${field("Amorti par pièce", `<output>${amortised === null ? "—" : eur(amortised, 3)}</output>`, `sur ${nf(r.part.volumeTotal, 0)} pièces du programme`)}
+        ${q.outillageInclus === false
+          ? field("Vendu à part", `<output>${eur(route.outillage * (1 + (q.margeOutillage || 0)), 0)} HT</output>`, "non compris dans le prix pièce (voir le détail du chiffrage)")
+          : field("Amorti par pièce", `<output>${amortised === null ? "—" : eur(amortised, 3)}</output>`, `sur ${nf(r.part.volumeTotal, 0)} pièces du programme, compris dans le prix pièce`)}
       </div>
       ${t ? `<p class="small muted">Estimation à partir du modèle 3D : blocs = encombrement de la pièce + parois, ébauche = volume des empreintes, finition = leur surface (+ ${pct(settings.tooling.alimentation, 0)} pour l'alimentation). Taux, vitesses et temps de montage dans Paramètres.</p>` : ""}
     </section>`;
@@ -825,15 +830,18 @@ function ensembleDetailCard(c) {
     <dl class="cstats">
       <dt>VA PRI</dt><dd>${eur(e.va)}</dd>
       <dt>Matière + perte au feu</dt><dd>${eur(e.matiere + e.perteAuFeu)}</dd>
-      <dt>PRI complet</dt><dd>${eur(e.pri)}</dd>
+      ${e.outillagesPiece ? `<dt>Outillages amortis</dt><dd>${eur(e.outillagesPiece)}</dd>` : ""}
+      <dt>PRI complet${e.outillagesPiece ? " (outillages compris)" : ""}</dt><dd>${eur(e.pri + e.outillagesPiece)}</dd>
       <dt>Matière vendue (VM)</dt><dd>${eur(y.vmVendue)}</dd>
-      <dt>VA vendue</dt><dd>${eur(y.vaVendue)}</dd>
+      <dt>VA vendue</dt><dd>${eur(y.vaVendue)}${e.outillagesPiece ? ` <span class="muted small">dont outillages ${eur(e.outillagesPiece / (1 - marge))}</span>` : ""}</dd>
       <dt>Frais de mise en route</dt><dd>${eur(y.miseEnRouteVendue)}</dd>
       <dt>Composants, sous-traitance, emballages</dt><dd>${eur(e.autresVendus)}</dd>
-      <dt><strong>Prix de vente complet</strong></dt><dd><strong>${eur(y.prixVente)}</strong></dd>
+      <dt><strong>Prix de vente complet</strong></dt><dd><strong>${eur(y.prixVente)}</strong>${e.outillagesPiece ? " (outillages compris)" : ""}</dd>
+      ${q.outillageInclus === false ? `<dt>Outillages (chiffrés à part)</dt><dd>${eur(e.outillage * (1 + (q.margeOutillage || 0)), 0)} HT</dd>` : ""}
       <dt>Marge sur VA</dt><dd>${eur(y.margeVa)} (${pct(y.margeVaPct)})</dd>
       <dt>Marge totale</dt><dd>${eur(y.margeTotale)} (${pct(y.margeTotalePct)} du prix)</dd>
     </dl>
+    ${toolingChoice(c.results)}
     <div class="cfields">
       ${field("VA d'usinage par pièce (€)", input("q.vaUsinage", q.vaUsinage))}
       ${field("Taux de rebut fonderie détecté à l'usinage", input("q.rebutUsinage", q.rebutUsinage, { kind: "pct" }), "%")}
@@ -841,6 +849,31 @@ function ensembleDetailCard(c) {
       ${field("Marge sur VA", input("q.marge", marge, { kind: "pct" }), `<button type="button" class="small" data-action="marge-mini">Marge mini (${pct(settings.tauxMini, 0)})</button>`)}
     </div>
   </section>`;
+}
+
+/**
+ * The tooling in the price: amortised in the piece price (in the value added,
+ * with its margin) or sold apart, for the pieces shown.
+ */
+function toolingChoice(results) {
+  const done = results.filter((r) => r.final && r.route);
+  if (!done.length) return "";
+  const cost = done.reduce((n, r) => n + (r.route.outillage || 0), 0);
+  const amortised = done.reduce((n, r) => n + (r.final.outillages || 0), 0);
+  const pieces = done[0].part.volumeTotal;
+  const marge = q.marge ?? settings.marge;
+  const inclus = q.outillageInclus !== false;
+  const sale = cost * (1 + (q.margeOutillage || 0));
+  return `<h4>Outillage</h4>
+    <div class="cfields">
+      ${field("Prix de l'outillage", checkbox("q.outillageInclus", inclus, "inclus dans le prix pièce"), inclus ? "amorti sur les pièces du programme" : "décoché : chiffré à part")}
+      ${inclus ? "" : field("Marge sur l'outillage", input("q.margeOutillage", q.margeOutillage ?? 0, { kind: "pct" }), "%")}
+    </div>
+    <p class="small">${
+      inclus
+        ? `Outillage ${eur(cost, 0)} amorti sur ${nf(pieces, 0)} pièces : <strong>${eur(amortised, 3)} par pièce</strong> en PRI (dans la VA), soit <strong>${eur(amortised / (1 - marge), 3)}</strong> dans le prix de vente avec la marge sur VA.`
+        : `<strong>Outillage chiffré à part : ${eur(sale, 0)} HT</strong> (coût ${eur(cost, 0)}${q.margeOutillage ? `, marge ${pct(q.margeOutillage)}` : ""}), non compris dans le prix pièce.`
+    }</p>`;
 }
 
 function detailCard(r) {
@@ -870,7 +903,8 @@ function detailCard(r) {
         <tr><td colspan="5">Sable</td><td class="num">${eur(f.sable)}</td></tr>
         <tr><td colspan="5">Coef de difficulté (${esc(q.coefDifficulte)})</td><td class="num">${eur(f.difficulte)}</td></tr>
         <tr><td colspan="5">Rebuts détectés à l'usinage (${eur(q.vaUsinage, 2)} × ${pct(q.rebutUsinage)})</td><td class="num">${eur(f.usinage)}</td></tr>
-        <tr class="total"><td colspan="5">PRI complet</td><td class="num">${eur(f.pri)}</td></tr>
+        ${f.outillages ? `<tr><td colspan="5">Outillage amorti (${eur(f.outillagesTotal, 0)} / ${nf(r.part.volumeTotal, 0)} pièces)</td><td class="num">${eur(f.outillages)}</td></tr>` : ""}
+        <tr class="total"><td colspan="5">PRI complet${f.outillages ? " (outillage compris)" : ""}</td><td class="num">${eur(f.pri + f.outillages)}</td></tr>
       </tbody></table></div>
     <div class="cfields">
       ${field("VA d'usinage (€)", input("q.vaUsinage", q.vaUsinage))}
@@ -887,13 +921,15 @@ function detailCard(r) {
         )
         .join("")}</tbody></table></div>
     <p><button type="button" class="small" data-action="add-component">Ajouter un composant</button></p>
+    ${toolingChoice([r])}
     <h4>Prix de vente (${y?.year ?? ""})</h4>
     <dl class="cstats">
       <dt>Matière vendue (VM)</dt><dd>${eur(y?.vmVendue)}</dd>
-      <dt>VA vendue</dt><dd>${eur(y?.vaVendue)}</dd>
+      <dt>VA vendue</dt><dd>${eur(y?.vaVendue)}${f.outillages ? ` <span class="muted small">dont outillage ${eur(f.outillages / (1 - marge))}</span>` : ""}</dd>
       <dt>Frais de mise en route</dt><dd>${eur(y?.miseEnRouteVendue)}</dd>
       <dt>Composants, sous-traitance, emballages</dt><dd>${eur(f.composants.sold + f.sousTraitance.sold + f.emballage.sold)}</dd>
-      <dt><strong>Prix de vente complet</strong></dt><dd><strong>${eur(y?.prixVente)}</strong></dd>
+      <dt><strong>Prix de vente complet</strong></dt><dd><strong>${eur(y?.prixVente)}</strong>${f.outillages ? " (outillage compris)" : ""}</dd>
+      ${q.outillageInclus === false ? `<dt>Outillage (chiffré à part)</dt><dd>${eur(r.route.outillage * (1 + (q.margeOutillage || 0)), 0)} HT</dd>` : ""}
       <dt>Prix complet PRI</dt><dd>${eur(y?.prixPri)}</dd>
       <dt>Marge sur VA</dt><dd>${eur(y?.margeVa)} (${pct(y?.margeVaPct)})</dd>
       <dt>Marge matière</dt><dd>${eur(y?.margeMatiere)}</dd>
@@ -1118,8 +1154,9 @@ async function exportXlsx() {
     ["Alliage", q.alliage], ["Date d'application des cours", q.month ? monthLabel(q.month) : "—"], ["Typologie de la moyenne", q.typologie], ["Cours utilisé", q.cours],
     ["Cours vente (€/t)", c.sale.cours], ["Premium vente (€/t)", q.premiumVente], ["Cours + P1020 + premium achat (€/t)", (q.coursAchat || 0) + (q.p1020Achat || 0) + (q.premiumAchat || 0)],
     ["Volume annuel", q.volumeAnnuel], ["Durée du programme (ans)", q.annees], ["Marge sur VA", P(q.marge ?? settings.marge)],
+    ["Outillage", q.outillageInclus === false ? "chiffré à part (non compris dans le prix pièce)" : "inclus dans le prix pièce (amorti sur le programme)"],
     [],
-    ["Pièce", "Poids (kg)", "Toile mini (mm)", "Écritures / détails fins", "Épaisseur maxi (mm)", "Îlot", "Finition", "Fonctionnement", "Cycle (s)", "Pièces / cycle", "TRS", "Mise au mille", "Traitement thermique", "Outillage (€)", "VA PRI (€)", "Matière + PAF (€)", "PRI complet (€)", "Prix de vente (€)", "Marge sur VA"].map(H),
+    ["Pièce", "Poids (kg)", "Toile mini (mm)", "Écritures / détails fins", "Épaisseur maxi (mm)", "Îlot", "Finition", "Fonctionnement", "Cycle (s)", "Pièces / cycle", "TRS", "Mise au mille", "Traitement thermique", "Outillage (€)", "Outillage amorti / pièce (€)", "VA PRI (€)", "Matière + PAF (€)", "PRI complet (€)", "Prix de vente (€)", "Marge sur VA"].map(H),
   ];
   for (const r of c.results) {
     const f = r.final;
@@ -1129,13 +1166,17 @@ async function exportXlsx() {
       r.piece.name, r.part.poids ?? null, r.part.toileMini || null, t?.details ? `(${nf(t.details.min, 2)} mm)` : null, r.part.epaisseurMax || null,
       r.route ? `${r.route.process} — ${r.route.famille}` : "non chiffrée", r.route ? settings.operations[r.route.finition]?.label ?? r.route.finition : null,
       r.route ? r.finalRates.get(r.route.process)?.mode ?? null : null, op?.cycle ?? null, op?.parCycle ?? null, P(op?.trs), r.route?.miseAuMille ?? null,
-      r.inputs.tth === "none" ? "aucun" : `${r.inputs.tth}${r.inputs.tthMode === "masselotte" ? " (avec masselottes)" : ""}`, r.route?.outillage ?? null,
+      r.inputs.tth === "none" ? "aucun" : `${r.inputs.tth}${r.inputs.tthMode === "masselotte" ? " (avec masselottes)" : ""}`, r.route?.outillage ?? null, f?.outillages ?? null,
       f?.va ?? null, f ? f.matiere + f.perteAuFeu : null, f?.pri ?? null, f?.years[0]?.prixVente ?? null, P(f?.years[0]?.margeVaPct),
     ]);
   }
   if (c.results.length > 1) {
     const e = aggregate(done, c.years);
-    synthese.push([T("TOTAL ensemble"), T(e.poids), null, null, null, null, null, null, null, null, null, null, null, T(done.reduce((n, r) => n + (r.route?.outillage || 0), 0)), T(e.va), T(e.matiere + e.perteAuFeu), T(e.pri), T(e.years[0]?.prixVente), P(e.years[0]?.margeVaPct)]);
+    synthese.push([T("TOTAL ensemble"), T(e.poids), null, null, null, null, null, null, null, null, null, null, null, T(done.reduce((n, r) => n + (r.route?.outillage || 0), 0)), T(e.outillagesPiece), T(e.va), T(e.matiere + e.perteAuFeu), T(e.pri), T(e.years[0]?.prixVente), P(e.years[0]?.margeVaPct)]);
+  }
+  if (q.outillageInclus === false) {
+    const cost = done.reduce((n, r) => n + (r.route?.outillage || 0), 0);
+    synthese.push([], [T("Outillage chiffré à part (€ HT)"), T(cost * (1 + (q.margeOutillage || 0)))], ["dont coût", cost], ["Marge sur l'outillage", P(q.margeOutillage || 0)]);
   }
 
   const gammes = [["Pièce", "Centre", "Nom", "Fonctionnement", "Cycle (s)", "Pièces par cycle", "TRS", "Quantité (UO / pièce)", "Taux (€/UO)", "Coût (€/pièce)"]];
@@ -1175,7 +1216,7 @@ async function exportXlsx() {
   }
 
   const bytes = buildXlsx([
-    { name: "Synthèse", rows: synthese, widths: [32, 14, 14, 20, 16, 34, 22, 14, 10, 12, 8, 12, 22, 14, 12, 14, 14, 14, 12] },
+    { name: "Synthèse", rows: synthese, widths: [32, 14, 14, 20, 16, 34, 22, 14, 10, 12, 8, 12, 22, 14, 16, 12, 14, 14, 14, 12] },
     { name: "Gammes", rows: gammes, header: true, widths: [28, 10, 34, 14, 12, 14, 10, 18, 14, 14] },
     { name: "Projection", rows: projection, header: true, widths: [10, 12, 14, 18, 16, 16, 22] },
     { name: "Outillage", rows: outillage, widths: [28, 42, 60, 14] },

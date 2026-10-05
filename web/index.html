@@ -7,6 +7,26 @@
   <meta name="description" content="Open STEP, IGES, STL, OBJ, GLB, 3MF… files in the browser and compute the real volume of material, the envelope and the mass.">
   <link rel="stylesheet" href="style.css">
   <link rel="help" href="ai.html" title="Use 3D Reader from AI assistants and scripts">
+  <script>
+    // Cross-origin isolation, for the wall thickness on all the cores
+    // (SharedArrayBuffer): GitHub Pages cannot send the headers, the service
+    // worker coi-sw.js adds them. The first visit reloads the page once.
+    (() => {
+      if (window.crossOriginIsolated || !window.isSecureContext || !navigator.serviceWorker) return;
+      let reloaded = false;
+      try { reloaded = sessionStorage.getItem("coi-reload") === "1"; } catch {}
+      navigator.serviceWorker.register(new URL("coi-sw.js", document.baseURI)).then((registration) => {
+        // Already controlled and still not isolated: this browser does not allow it.
+        if (!registration || navigator.serviceWorker.controller || reloaded) return;
+        const reload = () => {
+          try { sessionStorage.setItem("coi-reload", "1"); } catch {}
+          location.reload();
+        };
+        if (registration.active) reload();
+        else navigator.serviceWorker.addEventListener("controllerchange", reload, { once: true });
+      }, () => {});
+    })();
+  </script>
   <script type="importmap">
     {
       "imports": {

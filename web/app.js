@@ -280,8 +280,12 @@ function describeProgress(p) {
         : [t("loading.downloadNoTotal", { loaded: fmtMB(p.loaded) }), null];
     case "compile":
       return [t("loading.compile"), null];
-    case "analyze":
-      return [t(STEP_TEXT[p.step] ?? "loading.analysing"), p.percent == null ? null : p.percent / 100];
+    case "analyze": {
+      const text = t(STEP_TEXT[p.step] ?? "loading.analysing");
+      // The wall thickness: on how many processors (calculations in parallel).
+      const where = p.step === "thickness" && p.workers ? ` ${t("loading.workers", { n: p.workers })}` : "";
+      return [text + where, p.percent == null ? null : p.percent / 100];
+    }
     default:
       return [t("loading.analysing"), null];
   }

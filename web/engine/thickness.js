@@ -64,32 +64,60 @@ export function wallThickness(positions, indices, { onProgress = null } = {}) {
   return { ray: first.ray, sphere, wall: wallOf(first.ray, sphere) };
 }
 
-/** What both passes need of a mesh: normals, bounding volume hierarchy, queries. */
-export function prepareMesh(positions, indices) {
-  const normals = triangleNormals(positions, indices);
-  const bvh = buildBvh(positions, indices);
+/**
+ * What both passes need of a mesh: normals, bounding volume hierarchy, the
+ * neighbour across each edge. Plain typed arrays, made with alloc(Type,
+ * length): in SharedArrayBuffers, the workers of the pool share one copy
+ * (see thickpool.js). Then withQueries() adds the search functions.
+ */
+export function prepareMesh(positions, indices, alloc = (Type, n) => new Type(n)) {
+  const normals = triangleNormals(positions, indices, alloc);
+  const bvh = buildBvh(positions, indices, alloc);
+  const neighbours = edgeNeighbours(positions.length / 3, indices, alloc);
   const diag = Math.hypot(bvh.max[0] - bvh.min[0], bvh.max[1] - bvh.min[1], bvh.max[2] - bvh.min[2]);
-  return { positions, indices, normals, query: makeQueries(bvh), diag, edges: null };
+  return withQueries({ positions, indices, normals, bvh, neighbours, diag });
 }
 
-/** Edges inside a smooth surface: shared by exactly two triangles (key -> [triangle, other or -1]; -2 if more). */
-function smoothEdges(mesh) {
-  if (mesh.edges) return mesh.edges;
-  const { indices } = mesh;
-  const nv = mesh.positions.length / 3;
+/** The prepared mesh with its search functions (each worker makes its own: they keep a stack). */
+export function withQueries({ query, ...data }) {
+  return { ...data, query: makeQueries(data.bvh) };
+}
+
+/**
+ * The triangle on the other side of each edge (3 per triangle, edge e from
+ * vertex e to vertex e + 1): -1 on a free edge, -2 on an edge shared by more
+ * than two triangles. Found with an open-addressing hash of the edges.
+ */
+function edgeNeighbours(nv, indices, alloc) {
   const nt = indices.length / 3;
-  const edges = new Map();
-  for (let f = 0; f < nt; f++) {
-    for (let e = 0; e < 3; e++) {
-      const i = indices[3 * f + e], j = indices[3 * f + ((e + 1) % 3)];
-      const key = i < j ? i * nv + j : j * nv + i;
-      const entry = edges.get(key);
-      if (!entry) edges.set(key, [f, -1]);
-      else if (entry[1] === -1) entry[1] = f;
-      else entry[0] = -2;
+  const out = alloc(Int32Array, 3 * nt).fill(-1);
+  let size = 16;
+  while (size < 3 * nt * 2) size *= 2;
+  const mask = size - 1;
+  const keyA = new Int32Array(size).fill(-1);
+  const keyB = new Int32Array(size);
+  const first = new Int32Array(size); // half-edge (3 f + e) seen first
+  const second = new Int32Array(size).fill(-1); // and second
+  for (let h = 0; h < 3 * nt; h++) {
+    const f = (h / 3) | 0;
+    const e = h - 3 * f;
+    const u = indices[h], w = indices[3 * f + ((e + 1) % 3)];
+    const i = u < w ? u : w, j = u < w ? w : u;
+    let slot = (Math.imul(i, 0x9e3779b1) ^ Math.imul(j, 0x85ebca6b)) & mask;
+    while (keyA[slot] !== -1 && (keyA[slot] !== i || keyB[slot] !== j)) slot = (slot + 1) & mask;
+    if (keyA[slot] === -1) {
+      keyA[slot] = i;
+      keyB[slot] = j;
+      first[slot] = h;
+    } else if (second[slot] === -1) {
+      second[slot] = h;
+      out[first[slot]] = f;
+      out[h] = (first[slot] / 3) | 0;
+    } else {
+      out[first[slot]] = out[second[slot]] = out[h] = -2;
     }
   }
-  return (mesh.edges = edges);
+  return out;
 }
 
 /**
@@ -97,14 +125,15 @@ function smoothEdges(mesh) {
  * tangent at their centres and at the middle of their smooth edges.
  * Returns {ray, sphere} (Float32Array of all the triangles, NaN outside the
  * range; sphere can also be set on a neighbour) and the balls found, for the
- * second pass: samples, Float64Array of [x, y, z, outward nx, ny, nz, diameter].
+ * second pass: samples, Float32Array of [x, y, z, outward nx, ny, nz, diameter].
  */
-export function ballPass(mesh, from, to, onProgress = null) {
-  const { positions, indices, normals, query, diag } = mesh;
+export function ballPass(mesh, from, to, onProgress = null, store = null) {
+  const { positions, indices, normals, neighbours, query, diag } = mesh;
   const nt = indices.length / 3;
-  const nv = positions.length / 3;
-  const ray = new Float32Array(nt).fill(NaN);
-  const sphere = new Float32Array(nt).fill(NaN);
+  // Where the values go: arrays of this range, or the arrays shared by the workers.
+  const ray = store?.ray ?? new Float32Array(nt).fill(NaN);
+  const sphere = store?.sphere ?? new Float32Array(nt).fill(NaN);
+  const raiseTo = store?.raiseTo ?? ((f, value) => (sphere[f] = value));
   const eps = diag * 1e-7;
   const tMin = diag * 1e-5; // hits right at the start point (its own or the next face) do not count
   const p = [0, 0, 0];
@@ -138,17 +167,30 @@ export function ballPass(mesh, from, to, onProgress = null) {
     return 2 * r;
   };
   const keepMax = (f, value) => {
-    if (Number.isFinite(value) && !(sphere[f] >= value)) sphere[f] = value;
+    if (Number.isFinite(value) && !(sphere[f] >= value)) raiseTo(f, value);
   };
-  // Every ball, for the second pass: [x, y, z, outward nx, ny, nz, diameter] each.
-  const samples = [];
+  // Every ball, for the second pass: [x, y, z, outward nx, ny, nz, diameter] each
+  // (single precision, like the mesh: half the memory).
+  let samples = new Float32Array(7 * Math.max(16, Math.ceil((to - from) * 1.5)));
+  let used = 0;
   const addSample = (value) => {
-    if (Number.isFinite(value)) samples.push(p[0], p[1], p[2], -n[0], -n[1], -n[2], value);
+    if (!Number.isFinite(value)) return;
+    if (used + 7 > samples.length) {
+      const grown = new Float32Array(samples.length * 2);
+      grown.set(samples);
+      samples = grown;
+    }
+    samples[used++] = p[0];
+    samples[used++] = p[1];
+    samples[used++] = p[2];
+    samples[used++] = -n[0];
+    samples[used++] = -n[1];
+    samples[used++] = -n[2];
+    samples[used++] = value;
   };
 
   // Edges inside a smooth surface: shared by exactly two triangles at less
   // than 30° (the edges of a CAD face belong to one triangle of its vertices).
-  const edges = smoothEdges(mesh);
 
   const every = Math.max(1, Math.floor((to - from) / 100));
   for (let f = from; f < to; f++) {
@@ -167,8 +209,8 @@ export function ballPass(mesh, from, to, onProgress = null) {
 
     for (let e = 0; e < 3; e++) {
       const i = indices[3 * f + e], j = indices[3 * f + ((e + 1) % 3)];
-      const [first, second] = edges.get(i < j ? i * nv + j : j * nv + i);
-      if (first < 0 || second < 0 || first !== f) continue; // not smooth, or done from the other triangle
+      const second = neighbours[3 * f + e];
+      if (second < f) continue; // free or shared by more than two triangles (< 0), or done from the other triangle
       const g = 3 * second;
       let dot = 0;
       for (let k = 0; k < 3; k++) dot += normals[3 * f + k] * normals[g + k];
@@ -188,7 +230,7 @@ export function ballPass(mesh, from, to, onProgress = null) {
       for (let k = 0; k < 3; k++) n[k] = -normals[3 * f + k]; // back to this triangle
     }
   }
-  return { ray, sphere, samples: Float64Array.from(samples) };
+  return { ray, sphere, samples: samples.subarray(0, used) };
 }
 
 /**
@@ -202,8 +244,9 @@ export function ballPass(mesh, from, to, onProgress = null) {
  *           returned. Each triangle ends with the largest value that reaches
  *           it, whatever the order of the balls: the ranges can be merged.
  */
-export function coverPass(mesh, samples, sphere, from, to, onProgress = null) {
+export function coverPass(mesh, samples, sphere, from, to, onProgress = null, raiseTo = null) {
   const { normals, query } = mesh;
+  const set = raiseTo ?? ((f, value) => (sphere[f] = value));
   const every = Math.max(1, Math.floor((to - from) / 20));
   for (let s = from; s < to; s++) {
     if (onProgress && (s - from) % every === 0) onProgress((s - from) / (to - from));
@@ -212,7 +255,7 @@ export function coverPass(mesh, samples, sphere, from, to, onProgress = null) {
     const value = samples[k + 6];
     const want = (f) =>
       !(sphere[f] >= value) && normals[3 * f] * samples[k + 3] + normals[3 * f + 1] * samples[k + 4] + normals[3 * f + 2] * samples[k + 5] > COVER;
-    query.within(samples, k, radius * radius, want, (f) => (sphere[f] = value));
+    query.within(samples, k, radius * radius, want, (f) => set(f, value));
   }
   return sphere;
 }
@@ -318,8 +361,8 @@ function triangleArea(pos, a, b, c) {
 }
 
 /** Unit normals of the triangles, oriented outwards (flipped if the enclosed volume is negative). */
-function triangleNormals(pos, idx) {
-  const normals = new Float64Array(idx.length);
+function triangleNormals(pos, idx, alloc = (Type, n) => new Type(n)) {
+  const normals = alloc(Float64Array, idx.length);
   let volume = 0;
   for (let i = 0; i < idx.length; i += 3) {
     const a = 3 * idx[i], b = 3 * idx[i + 1], c = 3 * idx[i + 2];
@@ -349,9 +392,9 @@ function triangleNormals(pos, idx) {
  * each); node i has bounds box[6i..6i+5] and either two children (left = i+1,
  * right = right[i]) or a leaf range [start[i], start[i] + count[i]).
  */
-function buildBvh(pos, idx) {
+function buildBvh(pos, idx, alloc = (Type, n) => new Type(n)) {
   const nt = idx.length / 3;
-  const order = new Uint32Array(nt);
+  const order = alloc(Uint32Array, nt);
   const centre = new Float64Array(3 * nt);
   for (let t = 0; t < nt; t++) {
     order[t] = t;
@@ -360,10 +403,10 @@ function buildBvh(pos, idx) {
     }
   }
   const maxNodes = 2 * Math.ceil(nt / (LEAF_SIZE / 2)) + 1;
-  const box = new Float64Array(6 * maxNodes);
-  const right = new Int32Array(maxNodes);
-  const start = new Int32Array(maxNodes);
-  const count = new Int32Array(maxNodes);
+  const box = alloc(Float64Array, 6 * maxNodes);
+  const right = alloc(Int32Array, maxNodes);
+  const start = alloc(Int32Array, maxNodes);
+  const count = alloc(Int32Array, maxNodes);
   let nodes = 0;
 
   const tri = (t, k, axis) => pos[3 * idx[3 * t + k] + axis];
@@ -405,10 +448,11 @@ function buildBvh(pos, idx) {
   };
   build(0, nt);
 
-  const tris = new Float64Array(9 * nt);
+  // The corners in the type of the positions: as exact, half the memory for Float32 positions.
+  const tris = alloc(pos instanceof Float32Array ? Float32Array : Float64Array, 9 * nt);
   // Plane of each triangle (unit normal, offset): the distance to the plane is
   // a cheap lower bound of the distance to the triangle.
-  const planes = new Float64Array(4 * nt);
+  const planes = alloc(Float64Array, 4 * nt);
   for (let i = 0; i < nt; i++) {
     const t = order[i];
     for (let k = 0; k < 3; k++) for (let axis = 0; axis < 3; axis++) tris[9 * i + 3 * k + axis] = tri(t, k, axis);
