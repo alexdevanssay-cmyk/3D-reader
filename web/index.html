@@ -75,6 +75,7 @@
         <button id="toggle-wire" class="toggle" data-i18n="view.wire.label" data-i18n-title="view.wire" title="Show triangle edges">Wireframe</button>
         <button id="toggle-box" class="toggle" data-i18n="view.box.label" data-i18n-title="view.box" title="Show the bounding box">Envelope</button>
         <button id="toggle-section" class="toggle" data-i18n="view.section.label" data-i18n-title="view.section" title="Section plane">Section</button>
+        <button id="toggle-thickness" class="toggle" data-i18n="view.thickness.label" data-i18n-title="view.thickness" title="Colour the wall thickness">Thickness</button>
         <span id="section-controls" class="section-controls" hidden>
           <select id="section-axis"><option>X</option><option>Y</option><option selected>Z</option></select>
           <input id="section-pos" type="range" min="0" max="1000" value="500">
@@ -154,6 +155,38 @@
           <input id="density" type="number" step="0.01" min="0" value="2.70"> <span class="muted">g/cm³</span>
         </div>
         <div class="big" id="mass">—</div>
+      </section>
+
+      <section class="card" id="thickness-card" hidden>
+        <div class="card-head">
+          <h3 data-i18n="thick.title">Wall thickness</h3>
+          <label class="check"><input type="checkbox" id="thick-colors"> <span data-i18n="thick.colors">Colour scale</span></label>
+        </div>
+        <div class="row">
+          <label class="field"><span data-i18n="thick.method">Method</span>
+            <select id="thick-method">
+              <option value="sphere" data-i18n="thick.sphere">Inscribed sphere (hot spots)</option>
+              <option value="ray" data-i18n="thick.ray">Ray (wall to wall)</option>
+            </select>
+          </label>
+        </div>
+        <button id="thick-compute" class="small" type="button" data-i18n="thick.compute">Analyse the thicknesses</button>
+        <div id="thick-body" hidden>
+          <canvas id="thick-scale" class="thick-scale" height="96" aria-describedby="thick-share"></canvas>
+          <input id="thick-slider" class="thick-slider" type="range" min="0" max="1000" value="500" data-i18n-title="thick.slider" title="Thickness to highlight">
+          <div class="row thick-controls">
+            <label class="check"><input type="checkbox" id="thick-highlight"> <span data-i18n="thick.highlight">Highlight</span></label>
+            <input id="thick-value" type="number" min="0" step="0.1"> <span>±</span>
+            <input id="thick-tol" type="number" min="0" step="0.1"> <span class="muted">mm</span>
+          </div>
+          <div class="row thick-controls">
+            <span class="muted" data-i18n="thick.max">Scale up to</span>
+            <input id="thick-max" type="number" min="0.1" step="1"> <span class="muted">mm</span>
+          </div>
+          <p class="small" id="thick-share"></p>
+          <dl class="stats" id="thick-stats"></dl>
+          <p class="muted small" id="thick-note"></p>
+        </div>
       </section>
 
       <section class="card" id="bodies-card" hidden>

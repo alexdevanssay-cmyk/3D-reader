@@ -224,3 +224,12 @@ table.bodies .open { color: var(--warn); }
 .memory-gauge:not([hidden]) ~ .engine-status { margin-left: 0; }
 #memory-stats { grid-template-columns: 1fr auto; }
 #memory-stats dd { white-space: nowrap; }
+
+/* Wall thickness */
+.check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.thick-scale { display: block; width: 100%; height: 96px; margin-top: 10px; cursor: crosshair; touch-action: none; }
+.thick-slider { width: 100%; margin: 4px 0 0; }
+.thick-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.thick-controls input[type="number"] { width: 72px; }
+#thick-compute { margin-top: 8px; }
+#thick-share { margin: 8px 0 4px; }
