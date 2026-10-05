@@ -1,0 +1,2 @@
+[console_scripts]
+reader3d = reader3d.__main__:main

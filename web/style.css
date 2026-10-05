@@ -195,3 +195,32 @@ table.bodies .open { color: var(--warn); }
   .layout { grid-template-columns: 1fr; grid-template-rows: 60vh auto; height: auto; }
   .panel { border-left: none; border-top: 1px solid var(--border); }
 }
+
+/* Analysis progress */
+.progress-row { display: flex; align-items: center; gap: 8px; width: 100%; }
+.progress-row progress { flex: 1; }
+.progress-percent { font-variant-numeric: tabular-nums; font-weight: 600; min-width: 3.5em; text-align: right; }
+
+/* Memory gauge (criticality) */
+.memory-gauge {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; padding: 3px 8px; border-radius: 999px; white-space: nowrap;
+}
+.memory-gauge .memory-track { width: 60px; }
+.memory-track { position: relative; height: 8px; border-radius: 4px; background: var(--border); overflow: hidden; display: inline-block; }
+.memory-track.big-track { display: block; width: 100%; height: 12px; margin: 6px 0 10px; }
+.memory-fill { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--ok); transition: width .3s; }
+.memory-fill[data-level="warn"] { background: #e0a100; }
+.memory-fill[data-level="critical"] { background: #d23c3c; }
+.memory-gauge[data-level="critical"] { border-color: #d23c3c; color: #d23c3c; }
+.memory-level { font-size: 12px; font-weight: 600; color: var(--ok); }
+.memory-level[data-level="warn"] { color: #c08a00; }
+.memory-level[data-level="critical"] { color: #d23c3c; }
+
+/* Export buttons, plain-text report */
+.exports { display: flex; gap: 6px; }
+.report { white-space: pre-wrap; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; overflow-x: auto; }
+.memory-gauge { margin-left: auto; }
+.memory-gauge:not([hidden]) ~ .engine-status { margin-left: 0; }
+#memory-stats { grid-template-columns: 1fr auto; }
+#memory-stats dd { white-space: nowrap; }

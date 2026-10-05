@@ -1,0 +1,386 @@
+// Interface languages. Texts of index.html carry data-i18n="key" (text),
+// data-i18n-title="key" (tooltip) or data-i18n-html="key"; app.js uses t().
+
+const STRINGS = {
+  en: {
+    "app.description": "Open STEP, IGES, STL, OBJ, GLB, 3MF… files in the browser and compute the real volume of material, the envelope and the mass.",
+    "top.open": "Open file…",
+    "top.unit": "Mesh unit",
+    "top.unit.title": "Unit of mesh files (STL, OBJ...). CAD files (STEP, IGES) carry their own unit.",
+    "top.quality": "Display quality",
+    "top.quality.title": "Display tessellation of CAD files. Does not change the computed volume.",
+    "top.engine": "Engine",
+    "top.engine.title": "Where the computation runs",
+    "top.language": "Language",
+    "unit.inch": "inch",
+    "unit.foot": "foot",
+    "quality.coarse": "coarse",
+    "quality.normal": "normal",
+    "quality.fine": "fine",
+    "engine.server": "Python server",
+    "engine.browser": "Browser (WebAssembly)",
+    "view.iso": "Isometric view",
+    "view.iso.label": "Iso",
+    "view.front": "Front view (−Y)",
+    "view.front.label": "Front",
+    "view.top": "Top view (+Z)",
+    "view.top.label": "Top",
+    "view.right": "Right view (+X)",
+    "view.right.label": "Right",
+    "view.fit": "Fit to view",
+    "view.fit.label": "Fit",
+    "view.wire": "Show triangle edges",
+    "view.wire.label": "Wireframe",
+    "view.box": "Show the bounding box",
+    "view.box.label": "Envelope",
+    "view.section": "Section plane",
+    "view.section.label": "Section",
+    "view.flip": "Flip section side",
+    "drop.title": "Drop a 3D file here",
+    "drop.real": "The real (material) volume is computed, not only the bounding envelope.",
+    "drop.privacy": "Your file never leaves your computer: everything is computed in this browser tab.",
+    "drop.ai": "For AI assistants and scripts: see <a href=\"ai.html\">ai.html</a>.",
+    "loading.cancel": "Cancel",
+    "loading.analysing": "Analysing…",
+    "loading.download": "Downloading the CAD engine… {loaded} / {total}",
+    "loading.downloadNoTotal": "Downloading the CAD engine… {loaded}",
+    "loading.compile": "Starting the CAD engine…",
+    "loading.read": "Reading the file…",
+    "loading.mesh": "Tessellating the parts…",
+    "loading.measure": "Computing volumes…",
+    "loading.summary": "Computing the envelope…",
+    "loading.upload": "Sending the file to the server…",
+    "status.loading": "CAD engine loading…",
+    "status.percent": "CAD engine {percent} %",
+    "status.ready": "CAD engine ready",
+    "status.idle": "CAD engine not loaded",
+    "status.error": "CAD engine unavailable",
+    "summary.volume": "Real volume",
+    "summary.area": "Surface area",
+    "summary.bbox": "Envelope (L × W × H)",
+    "summary.bboxVolume": "Envelope volume",
+    "summary.obb": "Min. oriented envelope",
+    "summary.fill": "Material fill of envelope",
+    "summary.centroid": "Centre of mass (mm)",
+    "summary.bodies": "Bodies",
+    "summary.bodiesOpen": "{bodies} ({open} open)",
+    "method.cad": "Exact volume computed on the CAD B-rep geometry (OpenCascade).",
+    "method.mesh": "Volume enclosed by the triangle mesh. Source unit: {unit}.",
+    "method.none": "No closed solid in this file: the volume cannot be computed.",
+    "method.estimated": "{n} body/bodies had holes: volume estimated after filling them.",
+    "method.open": "{n} open body/bodies excluded from the volume.",
+    "mass.title": "Mass",
+    "material.steel": "Steel",
+    "material.stainless": "Stainless steel",
+    "material.castIron": "Cast iron",
+    "material.aluminium": "Aluminium",
+    "material.titanium": "Titanium Ti-6Al-4V",
+    "material.copper": "Copper",
+    "material.brass": "Brass",
+    "material.nylon": "Nylon PA6",
+    "material.resin": "Resin SLA",
+    "material.wood": "Wood, oak-ish",
+    "material.custom": "Custom…",
+    "bodies.title": "Bodies",
+    "bodies.name": "Name",
+    "bodies.volume": "Volume",
+    "bodies.open": "open",
+    "bodies.showHide": "Show / hide",
+    "export.excel": "Excel",
+    "export.excel.title": "Download the results as an Excel workbook (.xlsx)",
+    "export.csv": "CSV",
+    "export.csv.title": "Download the results as CSV",
+    "export.json": "JSON",
+    "export.json.title": "Download the full results as JSON (for scripts and AI assistants)",
+    "detail.volume": "Real volume",
+    "detail.mass": "Mass",
+    "detail.area": "Surface area",
+    "detail.envelope": "Envelope",
+    "detail.centroid": "Centre of mass (mm)",
+    "detail.triangles": "Triangles (display)",
+    "detail.meshVolume": "Display mesh volume",
+    "memory.short": "Memory",
+    "memory.title": "Memory load",
+    "memory.cad": "CAD engine (WebAssembly)",
+    "memory.tab": "Page (JavaScript)",
+    "memory.device": "Device RAM",
+    "memory.deviceValue": "≈ {gb} GB",
+    "memory.unknown": "not reported by this browser",
+    "memory.budget": "Usable by the analysis",
+    "memory.estimate": "Estimate for {file}",
+    "memory.of": "{used} / {limit} ({percent} %)",
+    "memory.level.ok": "OK",
+    "memory.level.warn": "High",
+    "memory.level.critical": "Critical",
+    "memory.advice.ok": "Enough memory for this analysis.",
+    "memory.advice.warn": "Memory is getting high: close other tabs before opening a bigger file.",
+    "memory.advice.critical": "Risk of crash: the browser may stop the page. Close other tabs, or use the Python version for this file.",
+    "memory.confirm": "{file} may need about {need} of memory, {percent} % of what this browser can give the analysis ({limit}). The page may crash.\n\nAnalyse it anyway?",
+    "memory.restarted": "The CAD engine was restarted to free its memory.",
+    "error.loadUrl": "Could not download {url}: {reason}",
+    // Spreadsheet export
+    "xlsx.summary": "Summary",
+    "xlsx.bodies": "Bodies",
+    "xlsx.file": "File",
+    "xlsx.kind": "Type",
+    "xlsx.kind.cad": "CAD (exact B-rep)",
+    "xlsx.kind.mesh": "Mesh",
+    "xlsx.sourceUnit": "Source unit",
+    "xlsx.date": "Analysed on",
+    "xlsx.engine": "Engine",
+    "xlsx.volume": "Real volume (mm³)",
+    "xlsx.volumeCm3": "Real volume (cm³)",
+    "xlsx.area": "Surface area (mm²)",
+    "xlsx.bboxX": "Envelope X (mm)",
+    "xlsx.bboxY": "Envelope Y (mm)",
+    "xlsx.bboxZ": "Envelope Z (mm)",
+    "xlsx.bboxVolume": "Envelope volume (mm³)",
+    "xlsx.obb": "Min. oriented envelope (mm)",
+    "xlsx.obbVolume": "Min. oriented envelope volume (mm³)",
+    "xlsx.fill": "Material fill of envelope (%)",
+    "xlsx.cx": "Centre of mass X (mm)",
+    "xlsx.cy": "Centre of mass Y (mm)",
+    "xlsx.cz": "Centre of mass Z (mm)",
+    "xlsx.density": "Density (g/cm³)",
+    "xlsx.mass": "Mass (g)",
+    "xlsx.bodyCount": "Bodies",
+    "xlsx.name": "Name",
+    "xlsx.closed": "Closed solid",
+    "xlsx.yes": "yes",
+    "xlsx.no": "no",
+    "xlsx.notes": "Notes",
+    "xlsx.total": "TOTAL",
+  },
+  fr: {
+    "app.description": "Ouvrez des fichiers STEP, IGES, STL, OBJ, GLB, 3MF… dans le navigateur et calculez le volume réel de matière, l'encombrement et la masse.",
+    "top.open": "Ouvrir un fichier…",
+    "top.unit": "Unité du maillage",
+    "top.unit.title": "Unité des fichiers maillés (STL, OBJ…). Les fichiers CAO (STEP, IGES) portent leur propre unité.",
+    "top.quality": "Qualité d'affichage",
+    "top.quality.title": "Finesse du maillage d'affichage des fichiers CAO. Ne change pas le volume calculé.",
+    "top.engine": "Moteur",
+    "top.engine.title": "Où le calcul est effectué",
+    "top.language": "Langue",
+    "unit.inch": "pouce",
+    "unit.foot": "pied",
+    "quality.coarse": "grossière",
+    "quality.normal": "normale",
+    "quality.fine": "fine",
+    "engine.server": "Serveur Python",
+    "engine.browser": "Navigateur (WebAssembly)",
+    "view.iso": "Vue isométrique",
+    "view.iso.label": "Iso",
+    "view.front": "Vue de face (−Y)",
+    "view.front.label": "Face",
+    "view.top": "Vue de dessus (+Z)",
+    "view.top.label": "Dessus",
+    "view.right": "Vue de droite (+X)",
+    "view.right.label": "Droite",
+    "view.fit": "Recadrer",
+    "view.fit.label": "Recadrer",
+    "view.wire": "Afficher les arêtes des triangles",
+    "view.wire.label": "Filaire",
+    "view.box": "Afficher la boîte englobante",
+    "view.box.label": "Encombrement",
+    "view.section": "Plan de coupe",
+    "view.section.label": "Coupe",
+    "view.flip": "Inverser le côté de la coupe",
+    "drop.title": "Déposez un fichier 3D ici",
+    "drop.real": "Le volume réel de matière est calculé, pas seulement l'encombrement.",
+    "drop.privacy": "Votre fichier ne quitte pas votre ordinateur : tout est calculé dans cet onglet du navigateur.",
+    "drop.ai": "Pour les assistants IA et les scripts : voir <a href=\"ai.html\">ai.html</a>.",
+    "loading.cancel": "Annuler",
+    "loading.analysing": "Analyse…",
+    "loading.download": "Téléchargement du moteur CAO… {loaded} / {total}",
+    "loading.downloadNoTotal": "Téléchargement du moteur CAO… {loaded}",
+    "loading.compile": "Démarrage du moteur CAO…",
+    "loading.read": "Lecture du fichier…",
+    "loading.mesh": "Maillage des pièces…",
+    "loading.measure": "Calcul des volumes…",
+    "loading.summary": "Calcul de l'encombrement…",
+    "loading.upload": "Envoi du fichier au serveur…",
+    "status.loading": "Chargement du moteur CAO…",
+    "status.percent": "Moteur CAO {percent} %",
+    "status.ready": "Moteur CAO prêt",
+    "status.idle": "Moteur CAO non chargé",
+    "status.error": "Moteur CAO indisponible",
+    "summary.volume": "Volume réel",
+    "summary.area": "Surface",
+    "summary.bbox": "Encombrement (L × l × H)",
+    "summary.bboxVolume": "Volume d'encombrement",
+    "summary.obb": "Encombrement orienté min.",
+    "summary.fill": "Remplissage de l'encombrement",
+    "summary.centroid": "Centre de gravité (mm)",
+    "summary.bodies": "Corps",
+    "summary.bodiesOpen": "{bodies} ({open} ouvert(s))",
+    "method.cad": "Volume exact calculé sur la géométrie CAO B-rep (OpenCascade).",
+    "method.mesh": "Volume enfermé par le maillage triangulaire. Unité source : {unit}.",
+    "method.none": "Aucun solide fermé dans ce fichier : le volume ne peut pas être calculé.",
+    "method.estimated": "{n} corps avai(en)t des trous : volume estimé après les avoir bouchés.",
+    "method.open": "{n} corps ouvert(s) exclu(s) du volume.",
+    "mass.title": "Masse",
+    "material.steel": "Acier",
+    "material.stainless": "Acier inoxydable",
+    "material.castIron": "Fonte",
+    "material.aluminium": "Aluminium",
+    "material.titanium": "Titane Ti-6Al-4V",
+    "material.copper": "Cuivre",
+    "material.brass": "Laiton",
+    "material.nylon": "Nylon PA6",
+    "material.resin": "Résine SLA",
+    "material.wood": "Bois (chêne)",
+    "material.custom": "Personnalisée…",
+    "bodies.title": "Corps",
+    "bodies.name": "Nom",
+    "bodies.volume": "Volume",
+    "bodies.open": "ouvert",
+    "bodies.showHide": "Afficher / masquer",
+    "export.excel": "Excel",
+    "export.excel.title": "Télécharger les résultats dans un classeur Excel (.xlsx)",
+    "export.csv": "CSV",
+    "export.csv.title": "Télécharger les résultats en CSV",
+    "export.json": "JSON",
+    "export.json.title": "Télécharger tous les résultats en JSON (pour les scripts et les assistants IA)",
+    "detail.volume": "Volume réel",
+    "detail.mass": "Masse",
+    "detail.area": "Surface",
+    "detail.envelope": "Encombrement",
+    "detail.centroid": "Centre de gravité (mm)",
+    "detail.triangles": "Triangles (affichage)",
+    "detail.meshVolume": "Volume du maillage d'affichage",
+    "memory.short": "Mémoire",
+    "memory.title": "Charge mémoire",
+    "memory.cad": "Moteur CAO (WebAssembly)",
+    "memory.tab": "Page (JavaScript)",
+    "memory.device": "RAM de l'appareil",
+    "memory.deviceValue": "≈ {gb} Go",
+    "memory.unknown": "non communiquée par ce navigateur",
+    "memory.budget": "Utilisable par l'analyse",
+    "memory.estimate": "Estimation pour {file}",
+    "memory.of": "{used} / {limit} ({percent} %)",
+    "memory.level.ok": "Normale",
+    "memory.level.warn": "Élevée",
+    "memory.level.critical": "Critique",
+    "memory.advice.ok": "Mémoire suffisante pour cette analyse.",
+    "memory.advice.warn": "La mémoire devient élevée : fermez d'autres onglets avant d'ouvrir un fichier plus gros.",
+    "memory.advice.critical": "Risque de plantage : le navigateur peut arrêter la page. Fermez d'autres onglets, ou utilisez la version Python pour ce fichier.",
+    "memory.confirm": "{file} peut demander environ {need} de mémoire, soit {percent} % de ce que ce navigateur peut accorder à l'analyse ({limit}). La page risque de planter.\n\nL'analyser quand même ?",
+    "memory.restarted": "Le moteur CAO a été redémarré pour libérer sa mémoire.",
+    "error.loadUrl": "Impossible de télécharger {url} : {reason}",
+    "xlsx.summary": "Synthèse",
+    "xlsx.bodies": "Corps",
+    "xlsx.file": "Fichier",
+    "xlsx.kind": "Type",
+    "xlsx.kind.cad": "CAO (B-rep exact)",
+    "xlsx.kind.mesh": "Maillage",
+    "xlsx.sourceUnit": "Unité source",
+    "xlsx.date": "Analysé le",
+    "xlsx.engine": "Moteur",
+    "xlsx.volume": "Volume réel (mm³)",
+    "xlsx.volumeCm3": "Volume réel (cm³)",
+    "xlsx.area": "Surface (mm²)",
+    "xlsx.bboxX": "Encombrement X (mm)",
+    "xlsx.bboxY": "Encombrement Y (mm)",
+    "xlsx.bboxZ": "Encombrement Z (mm)",
+    "xlsx.bboxVolume": "Volume d'encombrement (mm³)",
+    "xlsx.obb": "Encombrement orienté min. (mm)",
+    "xlsx.obbVolume": "Volume de l'encombrement orienté min. (mm³)",
+    "xlsx.fill": "Remplissage de l'encombrement (%)",
+    "xlsx.cx": "Centre de gravité X (mm)",
+    "xlsx.cy": "Centre de gravité Y (mm)",
+    "xlsx.cz": "Centre de gravité Z (mm)",
+    "xlsx.density": "Masse volumique (g/cm³)",
+    "xlsx.mass": "Masse (g)",
+    "xlsx.bodyCount": "Nombre de corps",
+    "xlsx.name": "Nom",
+    "xlsx.closed": "Solide fermé",
+    "xlsx.yes": "oui",
+    "xlsx.no": "non",
+    "xlsx.notes": "Remarques",
+    "xlsx.total": "TOTAL",
+  },
+};
+
+// Notes and errors produced by the engines (in English), translated by pattern.
+const MESSAGES_FR = [
+  [/^Solid rebuilt by sewing the surfaces of the file$/, "Solide reconstitué en cousant les surfaces du fichier"],
+  [/^Solid had inverted orientation; volume sign corrected$/, "Solide d'orientation inversée : signe du volume corrigé"],
+  [/^Open surfaces \(not a closed solid\): no volume can be computed$/, "Surfaces ouvertes (pas un solide fermé) : aucun volume ne peut être calculé"],
+  [/^Inconsistent triangle orientation was repaired$/, "Orientation incohérente des triangles corrigée"],
+  [/^Normals pointed inwards; volume sign corrected$/, "Normales tournées vers l'intérieur : signe du volume corrigé"],
+  [/^Mesh was not closed \((\d+) open edges\); volume estimated after filling the holes$/, "Maillage non fermé ($1 arêtes libres) : volume estimé après avoir bouché les trous"],
+  [/^Mesh is not closed \((\d+) open edges\): the enclosed volume is undefined$/, "Maillage non fermé ($1 arêtes libres) : le volume enfermé n'est pas défini"],
+  [/^Mesh has non-manifold edges: the enclosed volume is undefined$/, "Maillage avec arêtes non-manifold : le volume enfermé n'est pas défini"],
+  [/^Unable to read (\w+) file$/, "Impossible de lire le fichier $1"],
+  [/^Unable to transfer (\w+) geometry$/, "Impossible de convertir la géométrie $1"],
+  [/^The file does not contain any geometry$/, "Le fichier ne contient aucune géométrie"],
+  [/^The file does not contain any triangle geometry$/, "Le fichier ne contient aucun triangle"],
+  [/^Unsupported file type '([^']*)'(.*)$/, "Type de fichier non pris en charge '$1'$2"],
+  [/^Cancelled$/, "Annulé"],
+  [/^Not enough memory/, "Mémoire insuffisante pour analyser ce modèle dans le navigateur"],
+];
+
+export const LANGUAGES = { en: "English", fr: "Français" };
+const LOCALES = { en: "en-US", fr: "fr-FR" };
+const STORAGE_KEY = "reader3d.lang";
+
+let lang = initialLanguage();
+
+function initialLanguage() {
+  const fromUrl = new URLSearchParams(location.search).get("lang");
+  if (fromUrl && STRINGS[fromUrl]) return fromUrl;
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved && STRINGS[saved]) return saved;
+  } catch {
+    // storage unavailable (private window, blocked site data)
+  }
+  return (navigator.language || "en").toLowerCase().startsWith("fr") ? "fr" : "en";
+}
+
+export function language() {
+  return lang;
+}
+
+/** Locale for number formatting ("fr-FR" uses a decimal comma). */
+export function locale() {
+  return LOCALES[lang];
+}
+
+/** Text of `key` in the current language, with {name} placeholders filled in. */
+export function t(key, params = {}) {
+  const text = STRINGS[lang][key] ?? STRINGS.en[key] ?? key;
+  return text.replace(/\{(\w+)\}/g, (m, name) => (name in params ? String(params[name]) : m));
+}
+
+/** An engine note or error message (English) in the current language. */
+export function tMessage(message) {
+  if (lang !== "fr") return message;
+  for (const [pattern, replacement] of MESSAGES_FR) {
+    if (pattern.test(message)) return message.replace(pattern, replacement);
+  }
+  return message;
+}
+
+/** Translate the static texts of the page (data-i18n attributes). */
+export function applyToPage(root = document) {
+  document.documentElement.lang = lang;
+  for (const el of root.querySelectorAll("[data-i18n]")) el.textContent = t(el.dataset.i18n);
+  for (const el of root.querySelectorAll("[data-i18n-html]")) el.innerHTML = t(el.dataset.i18nHtml);
+  for (const el of root.querySelectorAll("[data-i18n-title]")) el.title = t(el.dataset.i18nTitle);
+  // Materials: "<name> (<density>)"
+  for (const el of root.querySelectorAll("[data-i18n-material]")) el.textContent = `${t(el.dataset.i18nMaterial)} (${el.value})`;
+  const meta = document.querySelector('meta[name="description"]');
+  if (meta) meta.content = t("app.description");
+}
+
+export function setLanguage(next) {
+  if (!STRINGS[next]) return;
+  lang = next;
+  try {
+    localStorage.setItem(STORAGE_KEY, next);
+  } catch {
+    // not remembered: fine
+  }
+  applyToPage();
+}

@@ -1,3 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reader3d"
+version = "0.3.0"
+description = "3D model reader: real volume of material, envelope, area, centre of mass (STEP, IGES, BREP, STL, OBJ, PLY, glTF, 3MF, DAE)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cadquery-ocp>=8.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "python-multipart>=0.0.9",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "trimesh>=4.0",
+    "networkx>=3.0",
+    "lxml>=5.0",
+    "pycollada>=0.8",
+    "charset-normalizer>=3",
+]
+
+[project.scripts]
+reader3d = "reader3d.__main__:main"
+
+[tool.setuptools]
+packages = ["reader3d"]
+
 [tool.pytest.ini_options]
 # Make `pytest` (not only `python -m pytest`) find the reader3d package.
 pythonpath = ["."]

@@ -86,7 +86,7 @@ let fileCounter = 0;
  * always converted to millimetres. Throws an Error with the same messages as
  * cad.py when the file cannot be read.
  */
-export function analyzeCad(oc, bytes, fileName, { quality = 'normal' } = {}) {
+export function analyzeCad(oc, bytes, fileName, { quality = 'normal', onProgress = null } = {}) {
   const base = String(fileName).split(/[\\/]/).pop();
   const ext = suffix(base);
   const fmt = CAD_EXTENSIONS[ext];
@@ -95,7 +95,7 @@ export function analyzeCad(oc, bytes, fileName, { quality = 'normal' } = {}) {
   const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   // OpenCascade's readers work on files: use the in-memory emscripten FS.
   const path = `/cad-input-${++fileCounter}${ext}`;
-  const ctx = new Context(oc);
+  const ctx = new Context(oc, onProgress);
   const stack = oc.stackSave();
   try {
     oc.FS.writeFile(path, data);
@@ -118,8 +118,12 @@ export function analyzeCad(oc, bytes, fileName, { quality = 'normal' } = {}) {
 
 function readCad(ctx, path, bytes, fmt, fileStem, quality) {
   const { oc } = ctx;
+  // Progress: reading the file is one OpenCascade call (0 -> 30 %), then the
+  // tessellation (30 -> 65 %) and the exact integrals (65 -> 100 %) go solid by solid.
+  ctx.progress(0, 'read');
   const parts = fmt === 'brep' ? readBrep(ctx, path, fileStem, bytes) : readXcaf(ctx, path, fmt, bytes);
   if (!parts.length) throw new Error('The file does not contain any geometry');
+  ctx.progress(0.3, 'mesh');
 
   const shapes = parts.map((p) => p.shape);
   const [lin, ang] = Object.hasOwn(QUALITY, quality) ? QUALITY[quality] : QUALITY.normal;
@@ -129,6 +133,9 @@ function readCad(ctx, path, bytes, fmt, fileStem, quality) {
   const { TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE } = oc.TopAbs_ShapeEnum;
   const bodies = [];
   const openParts = [];
+  const totalSolids = Math.max(1, parts.reduce((n, p) => n + countChildren(ctx, p.shape, TopAbs_SOLID), 0));
+  let doneSolids = 0;
+  ctx.progress(0.65, 'measure');
   for (const part of parts) {
     const solids = [];
     const openShapes = [];
@@ -142,6 +149,7 @@ function readCad(ctx, path, bytes, fmt, fileStem, quality) {
     solids.forEach((solid, i) => {
       const name = solids.length === 1 ? part.name : `${part.name} [${i + 1}]`;
       bodies.push(solidBody(ctx, name, solid, part.color, []));
+      ctx.progress(0.65 + (0.3 * ++doneSolids) / totalSolids, 'measure');
     });
     openShapes.push(
       ...children(ctx, part.shape, TopAbs_SHELL, TopAbs_SOLID),
@@ -151,6 +159,7 @@ function readCad(ctx, path, bytes, fmt, fileStem, quality) {
   }
 
   if (openParts.length) bodies.push(...surfaceBodies(ctx, openParts, fileStem, deflection, ang));
+  ctx.progress(1, 'measure');
   // Faces left without triangulation are dropped like in cad.py, unless the
   // mesher ran out of memory: the result would then be silently incomplete.
   if (ctx.untriangulatedFaces && heapExhausted(oc)) throw new Error(OUT_OF_MEMORY);
@@ -795,7 +804,7 @@ function sewToSolids(ctx, shapes, deflection, ang) {
   }
   if (solids.length) {
     // Sewing creates new faces without triangulation: mesh them like the originals.
-    meshEach(ctx, [...solids, ...remaining], deflection, ang);
+    meshEach(ctx, [...solids, ...remaining], deflection, ang, false);
   }
   return { solids, remaining };
 }
@@ -804,13 +813,24 @@ function sewToSolids(ctx, shapes, deflection, ang) {
 
 /** State of one analysis: embind objects to release at the end, caches, counters. */
 class Context {
-  constructor(oc) {
+  constructor(oc, onProgress = null) {
     this.oc = oc;
+    this.onProgress = onProgress;
+    this.lastProgress = -1;
     this.objects = [];
     this.matrices = new Map(); // TopLoc_Location hash -> [{loc, matrix}]
     this.meshed = new Set(); // TShape addresses of the shapes already tessellated
     this.identity = null;
     this.untriangulatedFaces = 0;
+  }
+
+  /** Report the fraction (0..1) of the analysis done, at most once per percent. */
+  progress(fraction, step) {
+    if (!this.onProgress) return;
+    const percent = Math.min(100, Math.floor(fraction * 100));
+    if (percent === this.lastProgress && fraction < 1) return;
+    this.lastProgress = percent;
+    this.onProgress({ percent, step });
   }
 
   /** Register an embind object to release once the analysis is over. */
@@ -920,7 +940,7 @@ function heapExhausted(oc) {
  * in the shared geometry (TShape): the other instances of an assembly part
  * are not meshed again.
  */
-function meshEach(ctx, shapes, deflection, ang) {
+function meshEach(ctx, shapes, deflection, ang, report = true) {
   const { oc } = ctx;
   const { TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE, TopAbs_SHAPE } = oc.TopAbs_ShapeEnum;
   const mesh = (shape) => {
@@ -932,8 +952,15 @@ function meshEach(ctx, shapes, deflection, ang) {
     // (shape, linear deflection, relative = false, angular deflection, parallel = true)
     new oc.BRepMesh_IncrementalMesh_2(shape, deflection, false, ang, true).delete();
   };
+  // Progress (30 -> 65 % of the analysis), solid by solid.
+  const total = report ? Math.max(1, shapes.reduce((n, s) => n + countChildren(ctx, s, TopAbs_SOLID), 0)) : 1;
+  let done = 0;
+  const meshSolid = (solid) => {
+    mesh(solid);
+    if (report) ctx.progress(0.3 + (0.35 * ++done) / total, 'mesh');
+  };
   for (const shape of shapes) {
-    forEachChild(ctx, shape, TopAbs_SOLID, TopAbs_SHAPE, mesh);
+    forEachChild(ctx, shape, TopAbs_SOLID, TopAbs_SHAPE, meshSolid);
     forEachChild(ctx, shape, TopAbs_SHELL, TopAbs_SOLID, mesh);
     forEachChild(ctx, shape, TopAbs_FACE, TopAbs_SHELL, mesh);
   }
@@ -949,6 +976,12 @@ function children(ctx, shape, kind, avoid = ctx.oc.TopAbs_ShapeEnum.TopAbs_SHAPE
 }
 
 /** Call fn on each sub-shape of a kind (outside `avoid` ones), released right after. */
+function countChildren(ctx, shape, kind) {
+  let n = 0;
+  forEachChild(ctx, shape, kind, ctx.oc.TopAbs_ShapeEnum.TopAbs_SHAPE, () => n++);
+  return n;
+}
+
 function forEachChild(ctx, shape, kind, avoid, fn) {
   const exp = new ctx.oc.TopExp_Explorer_2(shape, kind, avoid);
   try {

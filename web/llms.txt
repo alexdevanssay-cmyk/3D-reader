@@ -1,0 +1,6 @@
+# 3D Reader
+
+> Measures 3D models in the browser: real volume of material (exact for STEP/IGES/BREP), surface area, envelope (axis-aligned and minimum oriented), fill ratio, centre of mass, mass, per body. Formats: STEP, IGES, BREP, STL, OBJ, PLY, OFF, GLB/glTF, 3MF, DAE. Results in mm, mm², mm³, g.
+
+- [Instructions for AI assistants and scripts](ai.html): open `?url=<public CORS-enabled URL of the model>&report=1`, wait for `body[data-status="done"]`, read `#reader3d-report` (text) or `#reader3d-result` (JSON); or call `await reader3d.analyze(file)` in the page; or `pip install "git+https://github.com/alexdevanssay-cmyk/3D-reader"` then `reader3d analyze FILE --json`.
+- [Reader](./)
