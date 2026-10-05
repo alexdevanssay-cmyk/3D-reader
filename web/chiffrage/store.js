@@ -4,7 +4,8 @@
 // every change, so they are back when the page is opened again. Nothing is
 // sent anywhere.
 
-import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS } from "./routes.js";
+import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, DEFAULT_TTH } from "./routes.js";
+import { DEFAULT_TOOLING } from "./tooling.js";
 import { indexAverage } from "./model.js";
 
 const KEYS = {
@@ -55,6 +56,8 @@ export function defaultSettings(base) {
     processes: clone(DEFAULT_PROCESSES),
     operations: clone(DEFAULT_OPERATIONS),
     densities: { ...DEFAULT_DENSITIES },
+    tooling: clone(DEFAULT_TOOLING), // in-house gravity dies (tooling.js)
+    tth: clone(DEFAULT_TTH), // heat treatments: cost relative to T6
     inflation: {
       salaires: d.evolutionSalaires ?? 0.015,
       conso: d.evolutionConso ?? 0.02,
@@ -78,6 +81,10 @@ export function loadSettings(base) {
   if (!saved) return defaults;
   const merged = { ...defaults, ...saved };
   for (const key of ["trs", "modes", "densities", "inflation"]) merged[key] = { ...defaults[key], ...saved[key] };
+  merged.tth = { ...defaults.tth };
+  for (const [code, value] of Object.entries(saved.tth ?? {})) merged.tth[code] = { ...defaults.tth[code], ...value };
+  merged.tooling = { ...defaults.tooling, ...saved.tooling };
+  for (const [k, v] of Object.entries(defaults.tooling)) if (v && typeof v === "object") merged.tooling[k] = { ...v, ...saved.tooling?.[k] };
   for (const key of ["processes", "operations"]) {
     merged[key] = { ...defaults[key] };
     for (const [code, value] of Object.entries(saved[key] ?? {})) merged[key][code] = { ...defaults[key][code], ...value, cycle: { ...defaults[key][code]?.cycle, ...value.cycle }, rendement: { ...defaults[key][code]?.rendement, ...value.rendement } };

@@ -8,6 +8,7 @@
 // adjusted to the real islands of the foundry.
 
 import { quote } from "./model.js";
+import { estimateTooling, isGravityDie } from "./tooling.js";
 
 // Casting islands (codes of the profit centres of the workbook).
 export const DEFAULT_PROCESSES = {
@@ -69,6 +70,18 @@ export const DEFAULT_PROCESSES = {
   },
 };
 
+// Heat treatments: the TTH centre of the workbook is costed per kg for the
+// reference treatment (T6); coef = cost of the treatment / cost of a T6
+// (mostly the time in the furnaces). Starting values, settings of the page.
+export const DEFAULT_TTH = {
+  T6: { label: "T6 — mise en solution, trempe, revenu", coef: 1, cycle: "≈ 8 h à 535 °C, trempe eau, 6 h à 160 °C" },
+  T64: { label: "T64 — mise en solution, trempe, sous-revenu", coef: 0.95, cycle: "≈ 8 h à 535 °C, trempe eau, 4 h à 150 °C" },
+  T7: { label: "T7 — mise en solution, trempe, sur-revenu", coef: 1.1, cycle: "≈ 8 h à 535 °C, trempe eau, 8 h à 200 °C" },
+  T4: { label: "T4 — mise en solution, trempe, maturation", coef: 0.75, cycle: "≈ 8 h à 535 °C, trempe eau, maturation à l'ambiante" },
+  T5: { label: "T5 — revenu seul (vieillissement artificiel)", coef: 0.4, cycle: "≈ 6 h à 200 °C" },
+  STAB: { label: "Stabilisation / détensionnement", coef: 0.3, cycle: "≈ 4 h à 250 °C" },
+};
+
 // Other operations: cycle = base + parKg * piece weight (s), pieces per cycle.
 export const DEFAULT_OPERATIONS = {
   ASN: { label: "Noyautage", base: 40, parKg: 10, parCycle: 1 },
@@ -120,10 +133,12 @@ export function estimateMiseAuMille(p, part) {
 /**
  * Operations and parameters of one route.
  *   part: {poids, moduleMm (volume / area), toileMini, epaisseurMax, dimMax,
- *          volumeAnnuel, tth, noyaux, tribo, redressage, sableKg}
- *   settings: {processes, operations, trs}
+ *          volumeAnnuel, tth, noyaux, tribo, redressage, sableKg;
+ *          bboxSize, volume, area: for the estimate of a gravity die}
+ *   settings: {processes, operations, trs, tooling}
  * Returns {process, finition, operations, miseAuMille, parCycle, cycle, sableKg,
- *          feasible, reasons[], warnings[], qualite, outillagePiece}.
+ *          feasible, reasons[], warnings[], qualite, outillage (€), tooling
+ *          (estimate of the in-house die, or null), outillagePiece}.
  */
 export function buildRoute(code, finition, part, settings, rates) {
   const p = settings.processes[code];
@@ -182,6 +197,9 @@ export function buildRoute(code, finition, part, settings, rates) {
   if (missing.length) reasons.push(`centre absent du classeur : ${missing.join(", ")}`);
 
   const total = part.volumeTotal > 0 ? part.volumeTotal : part.volumeAnnuel > 0 ? part.volumeAnnuel * 5 : 0;
+  // Gravity dies made in-house: estimated from the part; other tools: the price of the island.
+  const tooling = settings.tooling?.actif && isGravityDie(p) ? estimateTooling(part, parCycle, settings.tooling) : null;
+  const outillage = tooling ? tooling.total : p.outillage;
   return {
     process: code,
     famille: p.famille,
@@ -196,7 +214,9 @@ export function buildRoute(code, finition, part, settings, rates) {
     reasons,
     warnings,
     qualite: Math.max(0, Math.min(10, qualite)),
-    outillagePiece: total > 0 ? p.outillage / total : 0,
+    outillage,
+    tooling,
+    outillagePiece: total > 0 ? outillage / total : 0,
   };
 }
 

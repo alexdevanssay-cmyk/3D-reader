@@ -142,7 +142,8 @@ export function unitsPerPiece(rate, op, kg) {
  *
  * q (quote): {
  *   poids (kg, piece as sold), miseAuMille (kg cast per kg of piece), sableKg,
- *   tth: "none" | "scie" | "masselotte",
+ *   tth: "none" | "scie" | "masselotte" (weight treated: the piece, or the piece with its feeder),
+ *   tthCoef: cost of the heat treatment chosen / the reference one (T6) of the TTH centre (default 1),
  *   operations: [{code, cycle, parCycle, trs}],
  *   metal: {coursAchat, p1020Achat, premiumAchat, coursVente, p1020Vente, premiumVente, pafAchat, pafVente},
  *   coefDifficulte, vaUsinage, rebutUsinage,
@@ -162,7 +163,8 @@ export function quote(rates, lists, q) {
   for (const op of q.operations) {
     const rate = rates.get(op.code);
     if (!rate) continue;
-    const units = unitsPerPiece(rate, op, kg);
+    // The TTH centre is costed for the reference treatment (T6): others cost more or less.
+    const units = unitsPerPiece(rate, op, kg) * (rate.uo === "kgSold" ? q.tthCoef ?? 1 : 1);
     if (!(units > 0)) continue;
     lines.push({
       code: op.code,

@@ -325,11 +325,12 @@ async function analyzeOnServer(file) {
   return data;
 }
 
-async function analyzeInBrowser(file) {
+async function analyzeInBrowser(file, { refresh = false } = {}) {
   const client = await browserClient();
   return client.analyzeInBrowser(file, {
     unit: $("unit").value,
     quality: $("quality").value,
+    cache: !refresh,
     onProgress: (p) => {
       showProgress(p);
       if (p.stage === "download" || p.stage === "compile") showEngineStatus(p);
@@ -347,7 +348,13 @@ async function stopAnalysis() {
   if (engine.browserClient) (await engine.browserClient).cancelAll();
 }
 
-async function openFile(file) {
+/**
+ * Analyse a file and show it.
+ * refresh -- computed again, without the results kept in this browser
+ * handle  -- its FileSystemFileHandle when known: "Refresh" reads the file
+ *            again from the disk (it may have changed)
+ */
+async function openFile(file, { refresh = false, handle = null } = {}) {
   if (!file) return;
   const seq = ++openSeq;
   // The new file must not wait behind an abandoned one (the browser engine
@@ -362,16 +369,20 @@ async function openFile(file) {
   setStatus("analysing");
   startProgress();
   try {
-    const data = currentEngine() === "server" ? await analyzeOnServer(file) : await analyzeInBrowser(file);
+    const data = currentEngine() === "server" ? await analyzeOnServer(file) : await analyzeInBrowser(file, { refresh });
     if (seq !== openSeq) return;
     // Only now does the page show this file (a failed file leaves the previous one).
+    state.handle = handle ?? (file === state.file ? state.handle : null);
     state.file = file;
     state.result = data;
     $("file-name").textContent = file.name;
     $("drop-hint").hidden = true;
     buildModel(data);
     renderPanel();
-    thicknessNewModel();
+    thicknessNewModel(data.cachedThickness?.length === data.bodies.length ? data.cachedThickness : null);
+    $("refresh").disabled = false;
+    // The wall thickness workers start now, while the model is looked at.
+    if (data.bodies.some((b) => b.closed)) browserClient().then((client) => client.warmThicknessPool());
     // Link mode: ?thickness=1 adds the wall thickness to the published results.
     if (params.get("thickness")) {
       $("loading").hidden = true;
@@ -439,6 +450,7 @@ function renderPanel() {
   const notes = [];
   if (estimated) notes.push(t("method.estimated", { n: estimated }));
   if (s.open_bodies > 0) notes.push(t("method.open", { n: s.open_bodies }));
+  if (r.cached) notes.push(t("method.cached"));
   method.textContent = s.volume == null ? t("method.none") : [how, ...notes].join(" ");
 
   $("total-area").textContent = fmtArea(s.area);
@@ -805,7 +817,36 @@ function updateSection() {
 
 // ---------------------------------------------------------------- events
 
-$("open-file").addEventListener("click", () => $("file-input").click());
+// With the File System Access API (Chrome, Edge) the page keeps a handle on
+// the file: "Refresh" then reads it again from the disk.
+$("open-file").addEventListener("click", async () => {
+  if (typeof window.showOpenFilePicker !== "function" || !engine.browserClient) return $("file-input").click();
+  try {
+    const client = await engine.browserClient;
+    const [handle] = await window.showOpenFilePicker({
+      types: [{ description: t("top.open"), accept: { "application/octet-stream": client.SUPPORTED_EXTENSIONS } }],
+      excludeAcceptAllOption: false,
+    });
+    openFile(await handle.getFile(), { handle });
+  } catch (err) {
+    if (err?.name !== "AbortError") $("file-input").click();
+  }
+});
+// Refresh the model without reloading the page: the file is read again (from
+// the disk when the page has a handle on it) and analysed again, without the
+// results kept in this browser.
+$("refresh").addEventListener("click", async () => {
+  if (!state.file) return;
+  let file = state.file;
+  try {
+    if (state.handle) file = await state.handle.getFile();
+    else await file.slice(0, 1).arrayBuffer(); // a file changed on the disk can no longer be read
+  } catch {
+    showError(t("refresh.reopen", { file: state.file.name }));
+    return;
+  }
+  openFile(file, { refresh: true, handle: state.handle });
+});
 $("file-input").addEventListener("change", (e) => {
   openFile(e.target.files[0]);
   e.target.value = ""; // allow re-opening the same file
@@ -896,7 +937,11 @@ window.addEventListener("drop", (e) => {
   e.preventDefault();
   hint.classList.remove("dragging");
   if (state.result) hint.hidden = true;
-  openFile(e.dataTransfer.files[0]);
+  const item = [...(e.dataTransfer.items ?? [])].find((i) => i.kind === "file");
+  const handle = item?.getAsFileSystemHandle?.();
+  const file = e.dataTransfer.files[0];
+  if (!handle) return openFile(file);
+  handle.then((h) => openFile(file, { handle: h?.kind === "file" ? h : null }), () => openFile(file));
 });
 
 // ---------------------------------------------------------------- wall thickness
@@ -1005,13 +1050,27 @@ function thickQuantiles(fractions) {
 }
 
 /** A new model is shown: forget the previous thicknesses, recompute if in use. */
-function thicknessNewModel() {
+function thicknessNewModel(kept = null) {
   thick.results = null;
   thick.pending = null;
   thick.userMax = false;
   thick.value = null;
+  // Kept from an earlier opening of the same file: shown at once.
+  if (kept) return adoptThickness(kept);
   renderThickness();
   if (thick.colors || thick.highlight) ensureThickness();
+}
+
+/** Thicknesses of the model shown, computed or kept from an earlier opening. */
+function adoptThickness(results) {
+  thick.results = results;
+  const [p50, p99] = thickQuantiles([0.5, 0.99]) ?? [NaN, NaN];
+  if (!thick.userMax) thick.max = niceCeil(p99);
+  thick.value ??= Number.isFinite(p50) ? Math.round(p50 * 10) / 10 : thick.max / 2;
+  thick.tol ??= Math.max(0.1, Math.round(thick.max * 2) / 100);
+  updatePublished(state.result);
+  applyThickness();
+  renderThickness();
 }
 
 /** Compute the thicknesses of the model shown (once), with progress. */
@@ -1034,12 +1093,8 @@ async function ensureThickness() {
     try {
       const results = await client.computeThickness(bodies, { onProgress: showProgress });
       if (state.result !== result) return null; // another file was opened meanwhile
-      thick.results = results;
-      const [p50, p99] = thickQuantiles([0.5, 0.99]) ?? [NaN, NaN];
-      if (!thick.userMax) thick.max = niceCeil(p99);
-      thick.value ??= Number.isFinite(p50) ? Math.round(p50 * 10) / 10 : thick.max / 2;
-      thick.tol ??= Math.max(0.1, Math.round(thick.max * 2) / 100);
-      updatePublished(result);
+      adoptThickness(results);
+      client.saveThickness(result.cacheKey, results);
       return results;
     } catch (err) {
       if (!err.cancelled) showError(`${t("thick.title")} : ${tMessage(err.message || String(err))}`);

@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
-import { thicknessHistogram, thicknessStats, valueRange, wallThickness } from '../../web/engine/thickness.js';
+import { ballPass, coverPass, mergeMax, prepareMesh, thicknessHistogram, thicknessStats, valueRange, wallOf, wallThickness } from '../../web/engine/thickness.js';
 
 /** Closed mesh of an extruded polygon (counter-clockwise, star-shaped from `kernel`), z from 0 to h. */
 function extrude(polygon, h, kernel, { divisions = 1 } = {}) {
@@ -119,6 +119,26 @@ describe('wall thickness', () => {
     // Along the normal of the cylinders (2/3 of the surface: outside and inside).
     const qr = areaWeighted(mesh, ray);
     near(qr(0.3), 6, 0.1, 'ray');
+  });
+
+  test('shared out in ranges (several workers), the result is the same', () => {
+    const T = [[-30, 0], [-3, 0], [-3, -30], [3, -30], [3, 0], [30, 0], [30, 6], [-30, 6]];
+    const mesh = extrude(T, 100, [0, 3], { divisions: 20 });
+    const whole = wallThickness(mesh.positions, mesh.indices);
+    const nt = mesh.indices.length / 3;
+    const ray = new Float32Array(nt).fill(NaN);
+    const sphere = new Float32Array(nt).fill(NaN);
+    for (const [from, to] of [[0, 37], [37, 200], [200, nt]]) {
+      // Each range as a worker computes it: its own prepared mesh, both passes.
+      const m = prepareMesh(mesh.positions, mesh.indices);
+      const part = ballPass(m, from, to);
+      coverPass(m, part.samples, part.sphere, 0, part.samples.length / 7);
+      ray.set(part.ray.slice(from, to), from);
+      mergeMax(sphere, part.sphere);
+    }
+    assert.deepEqual(ray, whole.ray);
+    assert.deepEqual(sphere, whole.sphere);
+    assert.deepEqual(wallOf(ray, sphere), whole.wall);
   });
 
   test('a T junction of 6 mm walls shows a hot spot larger than the walls', () => {

@@ -48,20 +48,65 @@ const COVER = Math.cos((60 * Math.PI) / 180);
  * - wall: the larger of the two (see below), for the thinnest wall of a part.
  * The normals are oriented outwards from the sign of the enclosed volume: the
  * mesh must be closed and consistently oriented (any body with a volume).
+ *
+ * The work is done in two passes over ranges, so that it can be shared out
+ * between workers (see thickpool.js): ballPass() over the triangles, then
+ * coverPass() over the balls found; the results of the ranges are merged with
+ * mergeMax() (largest value of each triangle), the wall with wallOf().
  */
 export function wallThickness(positions, indices, { onProgress = null } = {}) {
-  const nv = positions.length / 3;
   const nt = indices.length / 3;
-  const ray = new Float32Array(nt).fill(NaN);
-  const sphere = new Float32Array(nt).fill(NaN);
-  if (!nt) return { ray, sphere, wall: new Float32Array(0) };
+  if (!nt) return { ray: new Float32Array(0), sphere: new Float32Array(0), wall: new Float32Array(0) };
+  const mesh = prepareMesh(positions, indices);
+  const first = ballPass(mesh, 0, nt, onProgress && ((f) => onProgress(0.8 * f)));
+  const sphere = coverPass(mesh, first.samples, first.sphere, 0, first.samples.length / 7, onProgress && ((f) => onProgress(0.8 + 0.2 * f)));
+  onProgress?.(1);
+  return { ray: first.ray, sphere, wall: wallOf(first.ray, sphere) };
+}
 
+/** What both passes need of a mesh: normals, bounding volume hierarchy, queries. */
+export function prepareMesh(positions, indices) {
   const normals = triangleNormals(positions, indices);
   const bvh = buildBvh(positions, indices);
   const diag = Math.hypot(bvh.max[0] - bvh.min[0], bvh.max[1] - bvh.min[1], bvh.max[2] - bvh.min[2]);
+  return { positions, indices, normals, query: makeQueries(bvh), diag, edges: null };
+}
+
+/** Edges inside a smooth surface: shared by exactly two triangles (key -> [triangle, other or -1]; -2 if more). */
+function smoothEdges(mesh) {
+  if (mesh.edges) return mesh.edges;
+  const { indices } = mesh;
+  const nv = mesh.positions.length / 3;
+  const nt = indices.length / 3;
+  const edges = new Map();
+  for (let f = 0; f < nt; f++) {
+    for (let e = 0; e < 3; e++) {
+      const i = indices[3 * f + e], j = indices[3 * f + ((e + 1) % 3)];
+      const key = i < j ? i * nv + j : j * nv + i;
+      const entry = edges.get(key);
+      if (!entry) edges.set(key, [f, -1]);
+      else if (entry[1] === -1) entry[1] = f;
+      else entry[0] = -2;
+    }
+  }
+  return (mesh.edges = edges);
+}
+
+/**
+ * First pass, over the triangles from..to-1: the ray thickness and the balls
+ * tangent at their centres and at the middle of their smooth edges.
+ * Returns {ray, sphere} (Float32Array of all the triangles, NaN outside the
+ * range; sphere can also be set on a neighbour) and the balls found, for the
+ * second pass: samples, Float64Array of [x, y, z, outward nx, ny, nz, diameter].
+ */
+export function ballPass(mesh, from, to, onProgress = null) {
+  const { positions, indices, normals, query, diag } = mesh;
+  const nt = indices.length / 3;
+  const nv = positions.length / 3;
+  const ray = new Float32Array(nt).fill(NaN);
+  const sphere = new Float32Array(nt).fill(NaN);
   const eps = diag * 1e-7;
   const tMin = diag * 1e-5; // hits right at the start point (its own or the next face) do not count
-  const query = makeQueries(bvh);
   const p = [0, 0, 0];
   const n = [0, 0, 0];
   const c = [0, 0, 0];
@@ -103,21 +148,11 @@ export function wallThickness(positions, indices, { onProgress = null } = {}) {
 
   // Edges inside a smooth surface: shared by exactly two triangles at less
   // than 30° (the edges of a CAD face belong to one triangle of its vertices).
-  const edges = new Map(); // key -> [triangle, other triangle or -1]; -2 if more
-  for (let f = 0; f < nt; f++) {
-    for (let e = 0; e < 3; e++) {
-      const i = indices[3 * f + e], j = indices[3 * f + ((e + 1) % 3)];
-      const key = i < j ? i * nv + j : j * nv + i;
-      const entry = edges.get(key);
-      if (!entry) edges.set(key, [f, -1]);
-      else if (entry[1] === -1) entry[1] = f;
-      else entry[0] = -2;
-    }
-  }
+  const edges = smoothEdges(mesh);
 
-  const every = Math.max(1, Math.floor(nt / 100));
-  for (let f = 0; f < nt; f++) {
-    if (onProgress && f % every === 0) onProgress((0.8 * f) / nt);
+  const every = Math.max(1, Math.floor((to - from) / 100));
+  for (let f = from; f < to; f++) {
+    if (onProgress && (f - from) % every === 0) onProgress((f - from) / (to - from));
     n[0] = -normals[3 * f];
     n[1] = -normals[3 * f + 1];
     n[2] = -normals[3 * f + 2];
@@ -153,32 +188,56 @@ export function wallThickness(positions, indices, { onProgress = null } = {}) {
       for (let k = 0; k < 3; k++) n[k] = -normals[3 * f + k]; // back to this triangle
     }
   }
+  return { ray, sphere, samples: Float64Array.from(samples) };
+}
 
-  // Local thickness: a ball tangent at a point of a wall gives its diameter to
-  // the surface around that point, up to its radius, on the same side of the
-  // wall (normals less than 60° apart). Close to a convex edge no ball fits,
-  // but the balls of the middle of the wall reach it: a 6 mm rib reads 6 mm up
-  // to its edges, and a hot spot shows over the area its ball touches.
-  const count = samples.length / 7;
-  const everySample = Math.max(1, Math.floor(count / 20));
-  for (let k = 0; k < samples.length; k += 7) {
-    if (onProgress && (k / 7) % everySample === 0) onProgress(0.8 + (0.2 * k) / samples.length);
+/**
+ * Second pass, over the balls from..to-1 of samples: local thickness. A ball
+ * tangent at a point of a wall gives its diameter to the surface around that
+ * point, up to its radius, on the same side of the wall (normals less than 60°
+ * apart). Close to a convex edge no ball fits, but the balls of the middle of
+ * the wall reach it: a 6 mm rib reads 6 mm up to its edges, and a hot spot
+ * shows over the area its ball touches.
+ * sphere -- the sphere values so far (all the triangles): changed in place and
+ *           returned. Each triangle ends with the largest value that reaches
+ *           it, whatever the order of the balls: the ranges can be merged.
+ */
+export function coverPass(mesh, samples, sphere, from, to, onProgress = null) {
+  const { normals, query } = mesh;
+  const every = Math.max(1, Math.floor((to - from) / 20));
+  for (let s = from; s < to; s++) {
+    if (onProgress && (s - from) % every === 0) onProgress((s - from) / (to - from));
+    const k = 7 * s;
     const radius = samples[k + 6] / 2;
     const value = samples[k + 6];
     const want = (f) =>
       !(sphere[f] >= value) && normals[3 * f] * samples[k + 3] + normals[3 * f + 1] * samples[k + 4] + normals[3 * f + 2] * samples[k + 5] > COVER;
     query.within(samples, k, radius * radius, want, (f) => (sphere[f] = value));
   }
-  // Wall: the larger of the two. Each method underestimates where the other
-  // does not: the sphere near convex edges and at the ends of bars (no room for
-  // a ball), the ray at concave corners (it meets the next wall early).
-  const wall = new Float32Array(nt);
-  for (let f = 0; f < nt; f++) {
+  return sphere;
+}
+
+/** Into target, the largest of the two values of each triangle (NaN: no value). */
+export function mergeMax(target, values) {
+  for (let f = 0; f < target.length; f++) {
+    const v = values[f];
+    if (Number.isFinite(v) && !(target[f] >= v)) target[f] = v;
+  }
+  return target;
+}
+
+/**
+ * Wall: the larger of the two. Each method underestimates where the other
+ * does not: the sphere near convex edges and at the ends of bars (no room for
+ * a ball), the ray at concave corners (it meets the next wall early).
+ */
+export function wallOf(ray, sphere) {
+  const wall = new Float32Array(ray.length);
+  for (let f = 0; f < ray.length; f++) {
     const a = ray[f], b = sphere[f];
     wall[f] = Number.isFinite(a) ? (Number.isFinite(b) ? Math.max(a, b) : a) : b;
   }
-  onProgress?.(1);
-  return { ray, sphere, wall };
+  return wall;
 }
 
 /** Smallest and largest finite values. */

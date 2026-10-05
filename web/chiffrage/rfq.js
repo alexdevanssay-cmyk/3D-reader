@@ -55,6 +55,7 @@ export function readSeriesOrder(bytes, fileName = "") {
   const data = wb.sheet(DATA);
   const dataValue = (re) => (data ? rowOf(data, re)?.at("B") : undefined);
   const refDes = str(value(/^reference & designation piece/));
+  const autres = str(value(/^autres/));
   return {
     fileName,
     importedAt: new Date().toISOString(),
@@ -66,6 +67,8 @@ export function readSeriesOrder(bytes, fileName = "") {
     alliage: str(value(/^alliage/)),
     fonderie: str(value(/^fonderie/)),
     usinage: str(value(/^usinage/)),
+    autres,
+    tth: heatTreatmentOf(autres),
     references: num(value(/^nombre total de reference/)),
     years,
     moqs: [...new Set(moqs)].sort((a, b) => b - a),
@@ -83,4 +86,18 @@ export function programmeOf(order) {
   const last = active.at(-1).year;
   const volumes = order.years.filter((y) => y.year >= first && y.year <= last).map((y) => y.volume);
   return { premiereAnnee: first, annees: volumes.length, volumes, pic: Math.max(...volumes) };
+}
+
+/**
+ * Heat treatment asked in the "Autres (TTH, FSW...)" field: the code of the
+ * treatment (T4, T5, T6, T64, T7), "T6" when only "TTH" / "traitement
+ * thermique" is written, null when none ("A définir", "Non"...).
+ */
+export function heatTreatmentOf(text) {
+  const t = norm(text ?? "");
+  const code = /\bt\s?(64|4|5|6|7)\b/.exec(t);
+  if (code) return `T${code[1]}`;
+  if (/stabilis|detension/.test(t)) return "STAB";
+  if (/\btth\b|traitement thermique|heat treat/.test(t)) return "T6";
+  return null;
 }

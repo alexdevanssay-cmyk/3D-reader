@@ -146,6 +146,40 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.context().close();
   });
 
+  test('results kept in the browser, refresh without reloading the page', { timeout: CAD_TIMEOUT }, async () => {
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    const open = async () => {
+      await page.evaluate(() => (document.body.dataset.status = ''));
+      await page.setInputFiles('#file-input', fixturePath('holed_block.step'));
+      await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    };
+    await open();
+    assert.doesNotMatch(await page.textContent('#method'), /mémorisés/);
+    const volume = await page.textContent('#total-volume');
+    await page.evaluate(() => window.reader3d.computeThickness());
+    const min = await page.textContent('#thick-min');
+    // Kept results are written in the background.
+    await page.waitForTimeout(500);
+
+    // Opened again after a reload of the page: the same results, at once, thickness included.
+    await page.reload();
+    await open();
+    assert.match(await page.textContent('#method'), /Résultats mémorisés/);
+    assert.equal(await page.textContent('#total-volume'), volume);
+    assert.equal(await page.textContent('#thick-min'), min);
+    assert.equal(await page.isVisible('#thick-body'), true);
+
+    // "Refresh": analysed again, without the kept results.
+    await page.evaluate(() => (document.body.dataset.status = ''));
+    await page.click('#refresh');
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    assert.doesNotMatch(await page.textContent('#method'), /mémorisés/);
+    assert.equal(await page.textContent('#total-volume'), volume);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
   test('link for AI assistants: ?url=…&report=1, JSON and window.reader3d', { timeout: CAD_TIMEOUT }, async () => {
     const { page, errors } = await newPage();
     await page.goto(`${base}?url=e2e-samples/named_assembly.step&report=1&thickness=1&lang=en`);
