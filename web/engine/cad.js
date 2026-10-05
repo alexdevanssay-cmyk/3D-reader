@@ -63,6 +63,9 @@ const OUT_OF_MEMORY = 'Not enough memory to analyse this model in the browser';
 // refined until it converges. Eps is an estimate: 1e-9 still left 2e-7 on a NURBS
 // torus, 1e-10 leaves 2e-8 (for about 20 % more integration time).
 const GPROP_EPS = 1e-10;
+// Planes, cylinders, cones and spheres: the fixed Gauss order is already exact
+// there, the adaptive integration only costs time (40 % of the measure on
+// typical parts). It is kept for the other surfaces (NURBS, tori...).
 
 // Largest wasm heap of this build (emscripten getHeapMax(): 4 GiB - 64 kiB), and
 // the margin under it from which a failed allocation is put down to the heap
@@ -756,8 +759,9 @@ function solidBody(ctx, name, solid, color, notes) {
           const vinert = new oc.BRepGProp_Vinert_1();
           try {
             vinert.SetLocation(apex);
-            if (domain) vinert.Perform_8(bf, domain, GPROP_EPS);
-            else vinert.Perform_2(bf, GPROP_EPS);
+            const exact = analyticFace(oc, face);
+            if (domain) exact ? vinert.Perform_7(bf, domain) : vinert.Perform_8(bf, domain, GPROP_EPS);
+            else exact ? vinert.Perform_1(bf) : vinert.Perform_2(bf, GPROP_EPS);
             props.Add(vinert, 1);
           } finally {
             vinert.delete();
@@ -795,6 +799,18 @@ function solidBody(ctx, name, solid, color, notes) {
     notes,
     tri,
   });
+}
+
+/** A plane, cylinder, cone or sphere (see GPROP_EPS). */
+function analyticFace(oc, face) {
+  const { GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Sphere } = oc.GeomAbs_SurfaceType;
+  const surface = new oc.BRepAdaptor_Surface_2(face, true);
+  try {
+    const type = surface.GetType();
+    return type === GeomAbs_Plane || type === GeomAbs_Cylinder || type === GeomAbs_Cone || type === GeomAbs_Sphere;
+  } finally {
+    surface.delete();
+  }
 }
 
 function openBody(ctx, name, shape, color) {

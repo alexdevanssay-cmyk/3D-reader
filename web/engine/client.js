@@ -8,6 +8,10 @@
 
 import { summarize } from './summary.js';
 import { MESH_EXTENSIONS, needsMainThread } from './meshload.js';
+import { cacheKey, loadResult, saveResult } from './cache.js';
+import { cancelThickness, thicknessOnAllCores, warmThicknessPool } from './thickpool.js';
+
+export { warmThicknessPool };
 
 export { MESH_EXTENSIONS };
 export const CAD_EXTENSIONS = ['.step', '.stp', '.p21', '.iges', '.igs', '.brep', '.brp'];
@@ -91,6 +95,7 @@ function resetWorker() {
 
 /** Stop the analyses in progress (the worker is restarted for the next file). */
 export function cancelAll() {
+  cancelThickness();
   if (!pending.size) return;
   const err = new Error('Cancelled');
   err.cancelled = true;
@@ -133,13 +138,24 @@ export function estimateMemory(file, currentHeap = 0) {
  * Analyse a File in the browser. Resolves to the same structure as the Python
  * server's /api/analyze response (with typed arrays instead of base64 meshes).
  */
-export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal', onProgress } = {}) {
+export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal', onProgress, cache = true } = {}) {
   const start = performance.now();
   const ext = extensionOf(file.name);
   if (!SUPPORTED_EXTENSIONS.includes(ext)) {
     throw new Error(`Unsupported file type '${ext}'. Supported: ${SUPPORTED_EXTENSIONS.join(', ')}`);
   }
   const bytes = await file.arrayBuffer();
+
+  // Results kept from an earlier opening of the same content (cache = false:
+  // computed again, and the kept results replaced).
+  const isCad = CAD_EXTENSIONS.includes(ext);
+  const key = await cacheKey(bytes, isCad ? { ext, quality } : { ext, unit }).catch(() => null);
+  if (cache && key) {
+    const kept = await loadResult(key);
+    if (kept?.data) {
+      return { ...kept.data, file: file.name, cacheKey: key, cached: true, cachedThickness: kept.thickness ?? null, elapsed_s: Math.round(performance.now() - start) / 1000 };
+    }
+  }
 
   let kind, sourceUnit, bodies;
   if (CAD_EXTENSIONS.includes(ext)) {
@@ -168,7 +184,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
 
   onProgress?.({ stage: 'analyze', percent: 96, step: 'summary' });
   await new Promise((resolve) => setTimeout(resolve, 0)); // let the page show it before the envelope search
-  return {
+  const data = {
     file: file.name,
     kind,
     source_unit: sourceUnit,
@@ -178,17 +194,25 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
     bodies,
     elapsed_s: Math.round(performance.now() - start) / 1000,
   };
+  // Kept for the next opening of the same file (in the background).
+  saveResult(key, { data }, { file: file.name });
+  return { ...data, cacheKey: key, cached: false, cachedThickness: null };
 }
 
+/** Keep the wall thickness of a model with its results (see analyzeInBrowser). */
+export function saveThickness(key, results) {
+  return saveResult(key, { thickness: results }, { patch: true });
+}
+
+export { clearCache, cacheInfo } from './cache.js';
+
 /**
- * Wall thickness of bodies, in the worker (see thickness.js).
+ * Wall thickness of bodies, on all the cores (see thickpool.js).
  *
  * bodies -- per body {positions, indices} (copied, the caller keeps its arrays)
  *           or null to skip it (open bodies: no inside, no thickness)
  * Resolves to, per body, {ray, sphere, wall} (Float32Array per triangle, mm) or null.
  */
 export function computeThickness(bodies, { onProgress } = {}) {
-  const copies = bodies.map((b) => b && { positions: Float32Array.from(b.positions), indices: Uint32Array.from(b.indices) });
-  const transfer = copies.flatMap((b) => (b ? [b.positions.buffer, b.indices.buffer] : []));
-  return call({ type: 'thickness', bodies: copies }, transfer, onProgress);
+  return thicknessOnAllCores(bodies, { onProgress });
 }
