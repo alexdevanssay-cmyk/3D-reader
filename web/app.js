@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.js";
+import { thicknessHistogram } from "./engine/thickness.js";
 
 // ---------------------------------------------------------------- units
 
@@ -109,6 +110,9 @@ function clearModel() {
     modelGroup.remove(obj);
     obj.traverse((o) => {
       o.geometry?.dispose();
+      // Geometries kept for the wall thickness view (one of them is o.geometry).
+      o.userData.indexed?.dispose();
+      o.userData.flat?.dispose();
       o.material?.dispose();
     });
   }
@@ -147,6 +151,7 @@ function buildModel(result) {
     }
     const mesh = new THREE.Mesh(geom, mat);
     mesh.userData.index = i;
+    mesh.userData.color = color.clone();
     modelGroup.add(mesh);
     state.meshes.push(mesh);
 
@@ -226,6 +231,7 @@ const STEP_TEXT = {
   mesh: "loading.mesh",
   measure: "loading.measure",
   summary: "loading.summary",
+  thickness: "loading.thickness",
 };
 
 // The engine reports its progress while it works, several times per second
@@ -360,6 +366,7 @@ async function openFile(file) {
     $("drop-hint").hidden = true;
     buildModel(data);
     renderPanel();
+    thicknessNewModel();
     publishResult(data);
     setStatus("done");
     afterAnalysisMemory();
@@ -785,6 +792,363 @@ window.addEventListener("drop", (e) => {
   openFile(e.dataTransfer.files[0]);
 });
 
+// ---------------------------------------------------------------- wall thickness
+
+// Wall thickness ("épaisseur de toile") for casting design: computed on demand
+// in the engine worker (engine/thickness.js), one value per triangle of the
+// display mesh. The model can be coloured with a scale (thin: blue, thick:
+// red), and the triangles of one thickness (± a tolerance) highlighted.
+const thick = {
+  results: null, // per body {ray, sphere} (Float32Array per triangle) or null
+  pending: null, // promise of the computation in progress
+  colors: false,
+  highlight: false,
+  value: null, // mm, thickness highlighted
+  tol: null, // mm
+  max: null, // mm, top of the colour scale
+  userMax: false, // the scale was set by hand
+};
+const HIGHLIGHT = new THREE.Color(0xff00ff);
+const NO_VALUE = new THREE.Color(0x9aa0aa);
+const BINS = 50;
+
+function thickMethod() {
+  return $("thick-method").value;
+}
+
+/** Values (mm per triangle) of body i for the current method, or null. */
+function thickValues(i) {
+  return thick.results?.[i]?.[thickMethod()] ?? null;
+}
+
+/** Colour of a thickness on the scale: blue (0) -> cyan -> green -> yellow -> red (max and above). */
+function scaleHue(value) {
+  const f = Math.min(1, Math.max(0, value / thick.max));
+  return (1 - f) * 240;
+}
+
+function niceCeil(x) {
+  if (!(x > 0)) return 1;
+  const p = 10 ** Math.floor(Math.log10(x));
+  for (const m of [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) if (m * p >= x * (1 - 1e-9)) return m * p;
+  return 10 * p;
+}
+
+function niceStep(range, count) {
+  const raw = range / count;
+  const p = 10 ** Math.floor(Math.log10(raw));
+  for (const m of [1, 2, 5, 10]) if (m * p >= raw) return m * p;
+  return 10 * p;
+}
+
+/** Area-weighted quantile of the thickness of all bodies (method in use). */
+function thickQuantiles(fractions) {
+  const items = [];
+  state.meshes.forEach((mesh, i) => {
+    const values = thickValues(i);
+    if (!values) return;
+    const pos = mesh.userData.indexed?.attributes.position.array ?? mesh.geometry.attributes.position.array;
+    const idx = (mesh.userData.indexed ?? mesh.geometry).index.array;
+    for (let f = 0; f < values.length; f++) {
+      if (!Number.isFinite(values[f])) continue;
+      const a = 3 * idx[3 * f], b = 3 * idx[3 * f + 1], c = 3 * idx[3 * f + 2];
+      const ux = pos[b] - pos[a], uy = pos[b + 1] - pos[a + 1], uz = pos[b + 2] - pos[a + 2];
+      const vx = pos[c] - pos[a], vy = pos[c + 1] - pos[a + 1], vz = pos[c + 2] - pos[a + 2];
+      items.push([values[f], Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx)]);
+    }
+  });
+  if (!items.length) return null;
+  items.sort((x, y) => x[0] - y[0]);
+  const total = items.reduce((n, it) => n + it[1], 0);
+  return fractions.map((fr) => {
+    let acc = 0;
+    for (const [v, w] of items) if ((acc += w) >= fr * total) return v;
+    return items.at(-1)[0];
+  });
+}
+
+/** A new model is shown: forget the previous thicknesses, recompute if in use. */
+function thicknessNewModel() {
+  thick.results = null;
+  thick.pending = null;
+  thick.userMax = false;
+  thick.value = null;
+  renderThickness();
+  if (thick.colors || thick.highlight) ensureThickness();
+}
+
+/** Compute the thicknesses of the model shown (once), with progress. */
+async function ensureThickness() {
+  if (thick.results || !state.result) return thick.results;
+  if (thick.pending) return thick.pending;
+  const result = state.result;
+  const run = (async () => {
+    const client = await browserClient();
+    const bodies = state.meshes.map((mesh, i) => {
+      // Open bodies have no inside: no thickness.
+      if (!result.bodies[i].closed) return null;
+      const geom = mesh.userData.indexed ?? mesh.geometry;
+      return { positions: geom.attributes.position.array, indices: geom.index.array };
+    });
+    setLoading(t("loading.thickness"), 0);
+    $("loading-file").textContent = state.file?.name ?? "";
+    $("loading").hidden = false;
+    startProgress();
+    try {
+      const results = await client.computeThickness(bodies, { onProgress: showProgress });
+      if (state.result !== result) return null; // another file was opened meanwhile
+      thick.results = results;
+      const [p50, p99] = thickQuantiles([0.5, 0.99]) ?? [NaN, NaN];
+      if (!thick.userMax) thick.max = niceCeil(p99);
+      thick.value ??= Number.isFinite(p50) ? Math.round(p50 * 10) / 10 : thick.max / 2;
+      thick.tol ??= Math.max(0.1, Math.round(thick.max * 2) / 100);
+      return results;
+    } catch (err) {
+      if (!err.cancelled) showError(`${t("thick.title")} : ${tMessage(err.message || String(err))}`);
+      thick.colors = thick.highlight = false;
+      return null;
+    } finally {
+      if (state.result === result) {
+        thick.pending = null;
+        $("loading").hidden = true;
+        stopProgress();
+        applyThickness();
+        renderThickness();
+      }
+    }
+  })();
+  thick.pending = run;
+  return run;
+}
+
+/** Colour the meshes by thickness, or give them their own colour back. */
+function applyThickness() {
+  const active = (thick.colors || thick.highlight) && thick.results;
+  state.meshes.forEach((mesh, i) => {
+    const values = thickValues(i);
+    if (!active) {
+      if (mesh.userData.indexed) {
+        mesh.geometry = mesh.userData.indexed;
+        mesh.material.vertexColors = false;
+        mesh.material.color.copy(mesh.userData.color);
+        mesh.material.needsUpdate = true;
+      }
+      return;
+    }
+    // One colour per triangle: a geometry without shared vertices.
+    if (!mesh.userData.indexed) {
+      mesh.userData.indexed = mesh.geometry;
+      mesh.userData.flat = mesh.geometry.toNonIndexed();
+      mesh.userData.flat.setAttribute("color", new THREE.BufferAttribute(new Float32Array(mesh.userData.flat.attributes.position.count * 3), 3));
+    }
+    const geom = mesh.userData.flat;
+    const colors = geom.attributes.color.array;
+    const color = new THREE.Color();
+    const lo = thick.value - thick.tol;
+    const hi = thick.value + thick.tol;
+    const triangles = colors.length / 9;
+    for (let f = 0; f < triangles; f++) {
+      const v = values ? values[f] : NaN;
+      const inBand = thick.highlight && v >= lo && v <= hi;
+      if (inBand) color.copy(HIGHLIGHT);
+      else if (!Number.isFinite(v)) color.copy(NO_VALUE);
+      else if (thick.colors) color.setHSL(scaleHue(v) / 360, 0.9, 0.5);
+      else color.copy(mesh.userData.color);
+      // With a highlight, the rest of the model steps back.
+      if (thick.highlight && !inBand) color.lerp(NO_VALUE, thick.colors ? 0.55 : 0.6).multiplyScalar(0.8);
+      for (let k = 0; k < 3; k++) {
+        colors[9 * f + 3 * k] = color.r;
+        colors[9 * f + 3 * k + 1] = color.g;
+        colors[9 * f + 3 * k + 2] = color.b;
+      }
+    }
+    geom.attributes.color.needsUpdate = true;
+    if (mesh.geometry !== geom) mesh.geometry = geom;
+    if (!mesh.material.vertexColors) {
+      mesh.material.vertexColors = true;
+      mesh.material.color.set(0xffffff);
+      mesh.material.needsUpdate = true;
+    }
+  });
+}
+
+function fmtMm(v) {
+  return Number.isFinite(v) ? `${fmtNum(v, 2)} mm` : "—";
+}
+
+/** The card: buttons, scale with histogram, highlighted share, statistics. */
+function renderThickness() {
+  const card = $("thickness-card");
+  card.hidden = !state.result;
+  if (!state.result) return;
+  const ready = !!thick.results;
+  $("thick-compute").hidden = ready || !!thick.pending;
+  $("thick-body").hidden = !ready;
+  $("thick-colors").checked = thick.colors;
+  $("thick-highlight").checked = thick.highlight;
+  $("toggle-thickness").classList.toggle("active", thick.colors);
+  $("thick-note").textContent = t(thickMethod() === "sphere" ? "thick.note.sphere" : "thick.note.ray");
+  if (!ready) return;
+
+  $("thick-max").value = thick.max;
+  $("thick-value").value = Math.round(thick.value * 100) / 100;
+  $("thick-tol").value = Math.round(thick.tol * 100) / 100;
+  $("thick-slider").value = Math.round((Math.min(thick.value, thick.max) / thick.max) * 1000);
+
+  // Area per thickness class, all bodies.
+  const width = thick.max / BINS;
+  const area = new Float64Array(BINS + 1); // the last class: thicker than the scale
+  let total = 0;
+  let band = 0;
+  state.meshes.forEach((mesh, i) => {
+    const values = thickValues(i);
+    if (!values) return;
+    const geom = mesh.userData.indexed ?? mesh.geometry;
+    const h = thicknessHistogram(geom.attributes.position.array, geom.index.array, values, width, BINS + 1);
+    h.area.forEach((a, k) => (area[k] += a));
+    total += h.total;
+    const lo = thick.value - thick.tol;
+    const hi = thick.value + thick.tol;
+    const banded = Float32Array.from(values, (v) => (v >= lo && v <= hi ? 1 : 2));
+    band += thicknessHistogram(geom.attributes.position.array, geom.index.array, banded, 1, 3).area[1];
+  });
+  drawScale(area, total);
+
+  const [p1, p50, p99] = thickQuantiles([0.01, 0.5, 0.99]) ?? [NaN, NaN, NaN];
+  let mode = 0;
+  for (let k = 1; k < BINS; k++) if (area[k] > area[mode]) mode = k;
+  $("thick-share").textContent = total
+    ? t("thick.share", { percent: ((band / total) * 100).toLocaleString(locale(), { maximumFractionDigits: 1 }), lo: fmtNum(Math.max(0, thick.value - thick.tol), 3), hi: fmtNum(thick.value + thick.tol, 3) })
+    : t("thick.none");
+  const rows = [
+    [t("thick.dominant"), total ? `${fmtNum(mode * width, 2)} – ${fmtNum((mode + 1) * width, 2)} mm` : "—"],
+    [t("thick.median"), fmtMm(p50)],
+    [t("thick.range"), Number.isFinite(p1) ? `${fmtNum(p1, 2)} – ${fmtNum(p99, 2)} mm` : "—"],
+  ];
+  $("thick-stats").innerHTML = rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join("");
+}
+
+/** Histogram (area per class) over the colour scale, graduated in mm. */
+function drawScale(area, total) {
+  const canvas = $("thick-scale");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 280;
+  const h = canvas.clientHeight || 96;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const style = getComputedStyle(document.body);
+  const text = style.color;
+  const pad = 16; // room for the first and last labels
+  const x = (v) => pad + (Math.min(v, thick.max) / thick.max) * (w - 2 * pad);
+  const barTop = 4, barBottom = 52, stripTop = 56, stripBottom = 68;
+
+  // Histogram bars, in the colour of their class.
+  const peak = Math.max(...area.slice(0, BINS), 1e-30);
+  const width = thick.max / BINS;
+  for (let k = 0; k < BINS; k++) {
+    if (!area[k]) continue;
+    const hgt = Math.max(1, (area[k] / peak) * (barBottom - barTop));
+    g.fillStyle = `hsl(${scaleHue((k + 0.5) * width)}, 90%, 50%)`;
+    g.fillRect(x(k * width), barBottom - hgt, Math.max(1, x((k + 1) * width) - x(k * width) - 0.5), hgt);
+  }
+  // Colour scale.
+  const grad = g.createLinearGradient(pad, 0, w - pad, 0);
+  for (let k = 0; k <= 10; k++) grad.addColorStop(k / 10, `hsl(${(1 - k / 10) * 240}, 90%, 50%)`);
+  g.fillStyle = grad;
+  g.fillRect(pad, stripTop, w - 2 * pad, stripBottom - stripTop);
+  // Graduations.
+  g.fillStyle = text;
+  g.strokeStyle = text;
+  g.font = "11px system-ui, sans-serif";
+  g.textAlign = "center";
+  g.textBaseline = "top";
+  const step = niceStep(thick.max, Math.max(2, Math.floor((w - 2 * pad) / 48)));
+  for (let v = 0; v <= thick.max + 1e-9; v += step / 5) {
+    const major = Math.abs(v / step - Math.round(v / step)) < 1e-6;
+    g.beginPath();
+    g.moveTo(x(v) + 0.5, stripBottom);
+    g.lineTo(x(v) + 0.5, stripBottom + (major ? 6 : 3));
+    g.stroke();
+    if (major) g.fillText(fmtNum(v, 3) + (v + step > thick.max + 1e-9 ? "+" : ""), x(v), stripBottom + 8);
+  }
+  // Highlighted band and cursor.
+  if (thick.value != null) {
+    const lo = x(Math.max(0, thick.value - thick.tol));
+    const hi = x(thick.value + thick.tol);
+    g.fillStyle = thick.highlight ? "rgba(255, 0, 255, 0.25)" : "rgba(128, 128, 128, 0.2)";
+    g.fillRect(lo, barTop, Math.max(2, hi - lo), stripBottom - barTop);
+    g.strokeStyle = thick.highlight ? "#ff00ff" : text;
+    g.lineWidth = 2;
+    g.beginPath();
+    g.moveTo(x(thick.value), barTop);
+    g.lineTo(x(thick.value), stripBottom);
+    g.stroke();
+    g.lineWidth = 1;
+  }
+  canvas.dataset.max = thick.max;
+  canvas.dataset.pad = pad;
+}
+
+async function setThickness(changes) {
+  Object.assign(thick, changes);
+  if ((thick.colors || thick.highlight) && !(await ensureThickness())) {
+    renderThickness();
+    return;
+  }
+  applyThickness();
+  renderThickness();
+}
+
+$("thick-compute").addEventListener("click", () => setThickness({ colors: true }));
+$("toggle-thickness").addEventListener("click", () => setThickness({ colors: !thick.colors }));
+$("thick-colors").addEventListener("change", (e) => setThickness({ colors: e.target.checked }));
+$("thick-highlight").addEventListener("change", (e) => setThickness({ highlight: e.target.checked }));
+$("thick-method").addEventListener("change", () => {
+  if (!thick.results) return renderThickness();
+  if (!thick.userMax) thick.max = niceCeil((thickQuantiles([0.99]) ?? [1])[0]);
+  setThickness({});
+});
+$("thick-slider").addEventListener("input", (e) => {
+  setThickness({ value: Math.round((e.target.value / 1000) * thick.max * 100) / 100, highlight: true });
+});
+$("thick-value").addEventListener("change", (e) => {
+  const v = parseFloat(e.target.value);
+  if (v >= 0) setThickness({ value: v, highlight: true });
+  else renderThickness();
+});
+$("thick-tol").addEventListener("change", (e) => {
+  const v = parseFloat(e.target.value);
+  if (v >= 0) setThickness({ tol: v });
+  else renderThickness();
+});
+$("thick-max").addEventListener("change", (e) => {
+  const v = parseFloat(e.target.value);
+  if (v > 0) setThickness({ max: v, userMax: true });
+  else renderThickness();
+});
+// Click or drag on the scale to choose the thickness to highlight.
+{
+  const canvas = $("thick-scale");
+  const pick = (e) => {
+    if (!thick.results) return;
+    const rect = canvas.getBoundingClientRect();
+    const pad = Number(canvas.dataset.pad) || 0;
+    const f = Math.min(1, Math.max(0, (e.clientX - rect.left - pad) / (rect.width - 2 * pad)));
+    setThickness({ value: Math.round(f * thick.max * 100) / 100, highlight: true });
+  };
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    pick(e);
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (canvas.hasPointerCapture(e.pointerId)) pick(e);
+  });
+}
+new ResizeObserver(() => thick.results && renderThickness()).observe($("thick-scale"));
+
 // ---------------------------------------------------------------- memory gauge
 
 // The CAD engine runs in WebAssembly, whose memory (heap) only grows, up to
@@ -988,6 +1352,7 @@ function applyLanguage() {
   showEngineStatus(null);
   renderPanel();
   renderMemory();
+  renderThickness();
 }
 
 $("language").addEventListener("change", (e) => {

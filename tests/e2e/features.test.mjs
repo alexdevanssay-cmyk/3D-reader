@@ -1,5 +1,6 @@
 // End-to-end tests of the user-facing features of the built site (dist/):
-// French interface, analysis progress, memory gauge, Excel export, and the
+// French interface, analysis progress, memory gauge, Excel export, wall
+// thickness, and the
 // link-driven mode for AI assistants (?url=…&report=1, window.reader3d).
 //
 //   npm run build && node --test tests/e2e/features.test.mjs
@@ -91,6 +92,38 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(total, rows[3][2]);
     approx(Number(total[1]), expected['named_assembly.step'].summary.volume, 1e-9, 0, 'total volume');
     assert.match(sheet, /<autoFilter ref="A1:M4"\/>/);
+    await page.context().close();
+  });
+
+  test('wall thickness: colour scale, graduated scale and highlight', { timeout: CAD_TIMEOUT }, async () => {
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    await page.setInputFiles('#file-input', fixturePath('holed_block.step'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    assert.equal(await page.isVisible('#thickness-card'), true);
+    assert.equal(await page.textContent('#toggle-thickness'), 'Épaisseurs');
+    await page.click('#toggle-thickness');
+    await page.waitForSelector('#thick-body:not([hidden])', { timeout: 60_000 });
+    assert.equal(await page.evaluate(() => document.getElementById('toggle-thickness').classList.contains('active')), true);
+    assert.equal(await page.isChecked('#thick-colors'), true);
+    // The block is 20 mm thick: the scale goes up to a round value above it.
+    assert.match(await page.textContent('#thick-stats'), /Médiane \(en surface\)20 mm/);
+    assert.equal(await page.inputValue('#thick-max'), '25');
+    // Highlight 20 ± 0.5 mm: the whole surface.
+    await page.fill('#thick-tol', '0.5');
+    await page.dispatchEvent('#thick-tol', 'change');
+    await page.fill('#thick-value', '20');
+    await page.dispatchEvent('#thick-value', 'change');
+    assert.equal(await page.isChecked('#thick-highlight'), true);
+    assert.match(await page.textContent('#thick-share'), /^100 % de la surface entre 19,5 et 20,5 mm/);
+    // Moving the slider highlights another thickness: nothing at 5 mm.
+    await page.fill('#thick-slider', '200');
+    assert.match(await page.textContent('#thick-share'), /^0 % de la surface entre 4,5 et 5,5 mm/);
+    // The colour filter can be switched off, the highlight stays.
+    await page.click('#toggle-thickness');
+    assert.equal(await page.isChecked('#thick-colors'), false);
+    assert.equal(await page.isVisible('#thick-body'), true);
+    assert.deepEqual(errors, []);
     await page.context().close();
   });
 

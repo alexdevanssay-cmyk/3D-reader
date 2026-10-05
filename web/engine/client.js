@@ -179,3 +179,16 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
     elapsed_s: Math.round(performance.now() - start) / 1000,
   };
 }
+
+/**
+ * Wall thickness of bodies, in the worker (see thickness.js).
+ *
+ * bodies -- per body {positions, indices} (copied, the caller keeps its arrays)
+ *           or null to skip it (open bodies: no inside, no thickness)
+ * Resolves to, per body, {ray, sphere} (Float32Array per triangle, mm) or null.
+ */
+export function computeThickness(bodies, { onProgress } = {}) {
+  const copies = bodies.map((b) => b && { positions: Float32Array.from(b.positions), indices: Uint32Array.from(b.indices) });
+  const transfer = copies.flatMap((b) => (b ? [b.positions.buffer, b.indices.buffer] : []));
+  return call({ type: 'thickness', bodies: copies }, transfer, onProgress);
+}

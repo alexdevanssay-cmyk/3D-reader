@@ -9,6 +9,7 @@ import { loadOcct } from './occt.js';
 import { analyzeCad } from './cad.js';
 import { loadMeshFile } from './meshload.js';
 import { analyzeMeshParts } from './meshanalysis.js';
+import { wallThickness } from './thickness.js';
 
 // Root of the site (…/web/ or …/3D-reader/), where vendor/ lives.
 const baseUrl = new URL('../', import.meta.url).href;
@@ -65,6 +66,29 @@ self.onmessage = async (event) => {
     }
     if (msg.type === 'memory') {
       postMessage({ type: 'memory', id: msg.id, memory: memory() });
+      return;
+    }
+    if (msg.type === 'thickness') {
+      // Wall thickness of the bodies of the model shown (see thickness.js).
+      const total = Math.max(1, msg.bodies.reduce((n, b) => n + (b ? b.indices.length : 0), 0));
+      let done = 0;
+      let last = -1;
+      const results = msg.bodies.map((b) => {
+        if (!b) return null;
+        const size = b.indices.length;
+        const result = wallThickness(b.positions, b.indices, {
+          onProgress: (f) => {
+            const percent = Math.floor(((done + f * size) / total) * 100);
+            if (percent === last) return;
+            last = percent;
+            postMessage({ type: 'progress', id: msg.id, stage: 'analyze', step: 'thickness', percent });
+          },
+        });
+        done += size;
+        return result;
+      });
+      const buffers = results.flatMap((r) => (r ? [r.ray.buffer, r.sphere.buffer] : []));
+      postMessage({ type: 'result', id: msg.id, result: results }, buffers);
       return;
     }
     if (msg.type !== 'analyze') return;
