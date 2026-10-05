@@ -131,6 +131,13 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.reference"]'), 'AB-123');
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.volumes.1"]'), '1500');
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.tailleSerie"]'), '1500');
+    // The metal of the request's foundry quote, as the defaults of the "Matière" card.
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.alliage"]'), 'AS9U3');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.month"]'), '2026-03');
+    for (const [bind, value] of [['coursAchat', '2800'], ['p1020Achat', '400'], ['premiumAchat', '330'], ['premiumVente', '640'], ['pafAchat', '5'], ['pafVente', '7']]) {
+      assert.equal(await page.inputValue(`#page-chiffrage [data-bind="q.${bind}"]`), value, bind);
+    }
+    assert.match(await page.textContent('#page-chiffrage'), /2[\s\u202f]810,00\s*valeur de la demande client/);
     const moqRows = await page.$$eval('#page-chiffrage .ctable tbody tr', (trs) => trs.map((tr) => tr.textContent).filter((t) => /MOQ \d/.test(t)));
     assert.equal(moqRows.length, 3, moqRows.join('\n'));
     const price = (t) => Number(/(\d[\d\s\u202f]*,\d\d) €(?=[^€]*%)/.exec(t)[1].replace(/[\s\u202f]/g, '').replace(',', '.'));

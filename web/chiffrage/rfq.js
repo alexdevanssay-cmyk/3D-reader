@@ -3,10 +3,11 @@
 // quantities (MOQ), target price and the identification of the part. Read in
 // the browser like the other workbooks: nothing of it is published.
 
-import { columnName, parseRef, readWorkbook } from "./xlsxread.js";
+import { columnName, excelDate, parseRef, readWorkbook } from "./xlsxread.js";
 
 const SHEET = "1- Données GO NO GO";
 const DATA = "3- Données de chiffrages";
+const FOUNDRY = "5- Chiffrage Fonderie";
 
 const str = (v) => (v === undefined || v === null || typeof v === "object" ? "" : String(v).trim());
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
@@ -75,7 +76,36 @@ export function readSeriesOrder(bytes, fileName = "") {
     targetPrice: num(value(/^target price/)),
     elec: num(dataValue(/^electricite/)),
     gaz: num(dataValue(/^gaz/)),
+    matiere: metalOf(wb.sheet(FOUNDRY)),
   };
+}
+
+/**
+ * The metal of the foundry quote of the request ("5- Chiffrage Fonderie",
+ * labels in column C, values in D): alloy, averaging, price index, month,
+ * purchase and sale prices (€/t), loss on melting. null without that sheet;
+ * missing values are null.
+ */
+function metalOf(cells) {
+  if (!cells) return null;
+  const at = (re) => rowOf(cells, re, "C")?.at("D");
+  const date = num(at(/^date de reference/));
+  const d = date ? excelDate(date) : null;
+  const out = {
+    alliage: str(at(/^alliage/)),
+    typologie: str(at(/^typologie/)),
+    cours: str(at(/^cours utilise/)),
+    month: d ? `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}` : null,
+    coursAchat: num(at(/^valeur de reference achat/)),
+    coursVente: num(at(/^valeur de reference vente/)),
+    p1020Achat: num(at(/^p1020 achat/)),
+    p1020Vente: num(at(/^p1020 vente/)),
+    premiumAchat: num(at(/^premium achat/)),
+    premiumVente: num(at(/^premium vente/)),
+    pafAchat: num(at(/^paf pri/)),
+    pafVente: num(at(/^paf vendue/)),
+  };
+  return Object.values(out).some((v) => v !== null && v !== "") ? out : null;
 }
 
 /** The volumes of the programme: first year with a volume, number of years, volume of each year. */

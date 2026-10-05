@@ -293,6 +293,10 @@ describe('series order of a customer request', () => {
     assert.equal(order.elec, 150);
     assert.equal(order.gaz, 60);
     assert.deepEqual(programmeOf(order), { premiereAnnee: 2027, annees: 4, volumes: [1000, 1500, 1500, 800], pic: 1500 });
+    assert.deepEqual(order.matiere, {
+      alliage: 'AS9U3', typologie: 'M-1', cours: 'LME primary Alloy cash seller', month: '2026-03',
+      coursAchat: 2800, coursVente: 2810, p1020Achat: 400, p1020Vente: 410, premiumAchat: 330, premiumVente: 640, pafAchat: 0.05, pafVente: 0.07,
+    });
   });
 
   test('another workbook is refused with the reason', () => {
