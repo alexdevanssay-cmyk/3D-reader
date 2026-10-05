@@ -213,5 +213,12 @@ export function seriesOrderWorkbook() {
     'Mode opératoire': { A1: 'Template Go No Go' },
     '1- Données GO NO GO': go,
     '3- Données de chiffrages': { A24: 'Electricité (/Mwh) : ', B24: 150, A25: 'Gaz (/Mwh) :', B25: 60, A45: 'N° Offre :', B45: 'GTEST-CG-2026-00' },
+    // Metal of the foundry quote: AS9U3, M-1, LME cash seller, March 2026 (not in the indices of the fixture).
+    '5- Chiffrage Fonderie': {
+      C18: 'Alliage', D18: 'AS9U3', C19: 'Typologie de la moyenne', D19: 'M-1', C20: 'Cours utilisé', D20: 'LME primary Alloy cash seller',
+      C21: 'Date de référence', D21: 46082, C22: 'Valeur de référence achat', D22: 2800, C23: 'Valeur de référence vente', D23: 2810,
+      C24: 'P1020 achat', D24: 400, C25: 'P1020 vente', D25: 410, C26: 'Premium achat', D26: 330, C27: 'Premium vente', D27: 640,
+      C28: 'PAF PRI', D28: 0.05, C29: 'PAF vendue', D29: 0.07,
+    },
   });
 }

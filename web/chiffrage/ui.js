@@ -317,7 +317,17 @@ function applySeriesOrder(order) {
   if (m) [q.reference, q.designation] = [m[1], m[2]];
   else if (order.reference) q.reference = order.reference;
   if (order.plan) q.plan = order.plan;
-  if (base?.lists.alliages.includes(order.alliage)) q.alliage = order.alliage;
+  // The metal of the foundry quote of the request, as the default of the "Matière" card.
+  const metal = order.matiere;
+  const pick = (value, options) => options?.find((o) => String(o).toLowerCase() === String(value ?? "").toLowerCase());
+  q.alliage = pick(metal?.alliage, base?.lists.alliages) ?? pick(order.alliage, base?.lists.alliages) ?? q.alliage;
+  if (metal) {
+    const typologies = indices?.typologies?.length ? indices.typologies.map((t) => t.name) : base?.lists.typologies;
+    q.typologie = pick(metal.typologie, typologies) ?? q.typologie;
+    q.cours = pick(metal.cours, base?.lists.cours) ?? q.cours;
+    if (metal.month) q.month = metal.month;
+    for (const k of ["coursAchat", "p1020Achat", "premiumAchat", "premiumVente", "pafAchat", "pafVente"]) if (metal[k] !== null) q[k] = metal[k];
+  }
 }
 
 function download(name, blob) {
@@ -367,7 +377,10 @@ function compute() {
   const years = Array.from({ length: Math.max(1, q.annees || 1) }, (_, i) => (q.premiereAnnee || new Date().getFullYear()) + i);
   const volumes = Array.isArray(q.volumes) && q.volumes.length === years.length ? q.volumes : years.map(() => q.volumeAnnuel || 0);
   const volumeTotal = volumes.reduce((a, b) => a + (b || 0), 0);
-  const sale = indices ? saleMetalPrice(indices, base.lists, { month: q.month, typology: q.typologie, index: q.cours }) : { cours: null, p1020: null };
+  let sale = indices ? saleMetalPrice(indices, base.lists, { month: q.month, typology: q.typologie, index: q.cours }) : { cours: null, p1020: null };
+  // Month missing from the price indices: the sale values of the request's own quote, for its month.
+  const m = q.serie?.matiere;
+  if (sale.cours === null && m?.coursVente > 0 && m.month === q.month) sale = { cours: m.coursVente, p1020: m.p1020Vente ?? 0, source: "demande" };
   const metal = {
     coursAchat: q.coursAchat || 0,
     p1020Achat: q.p1020Achat || 0,
@@ -639,10 +652,10 @@ function renderQuote() {
     <section class="ccard">
       <h3>Matière</h3>
       <div class="cfields">
-        ${field("Date d'application", months.length ? select("q.month", q.month, [...months].reverse().map((m) => [m, monthLabel(m)])) : "<em>importez les indices</em>")}
+        ${field("Date d'application", months.length || q.month ? select("q.month", q.month, [...new Set([...months, ...(q.month ? [q.month] : [])])].sort().reverse().map((m) => [m, monthLabel(m)])) : "<em>importez les indices</em>")}
         ${field("Typologie de la moyenne", select("q.typologie", q.typologie, typologies))}
         ${field("Cours utilisé", select("q.cours", q.cours, lists.cours))}
-        ${field("Cours vente (€/t)", `<output>${c.sale.cours === null ? "indisponible" : nf(c.sale.cours, 2)}</output>`, c.sale.cours === null ? "mois absent du fichier des indices" : "moyenne des indices")}
+        ${field("Cours vente (€/t)", `<output>${c.sale.cours === null ? "indisponible" : nf(c.sale.cours, 2)}</output>`, c.sale.cours === null ? "mois absent du fichier des indices" : c.sale.source === "demande" ? "valeur de la demande client (mois absent des indices)" : "moyenne des indices")}
         ${field("Prime P1020 vente (€/t)", `<output>${nf(c.sale.p1020 ?? 0, 2)}</output>`)}
         ${field("Premium vente (€/t)", input("q.premiumVente", q.premiumVente))}
         ${field("PAF vendue", input("q.pafVente", q.pafVente, { kind: "pct" }), "%")}
