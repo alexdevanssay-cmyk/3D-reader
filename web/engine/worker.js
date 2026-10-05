@@ -19,7 +19,8 @@ let occtModule = null; // once loaded: its WebAssembly heap is reported with eve
 // Memory of the CAD engine: the WebAssembly heap only grows (up to 4 GiB) and is
 // never given back, so the page can restart the worker when it gets large.
 const HEAP_MAX = 4294901760;
-const memory = () => ({ heap: occtModule ? occtModule.HEAPU8.length : 0, heap_max: HEAP_MAX });
+const heapSize = () => occtModule?.HEAPU8?.length ?? occtModule?.wasmMemory?.buffer?.byteLength ?? 0;
+const memory = () => ({ heap: heapSize(), heap_max: HEAP_MAX, loaded: occtModule !== null });
 let progressTarget = null; // id of the request that currently wants loading progress
 
 function occt() {
