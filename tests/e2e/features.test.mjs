@@ -170,6 +170,11 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.textContent('#thick-min'), min);
     assert.equal(await page.isVisible('#thick-body'), true);
 
+    // The wireframe is built when shown (no error on a model opened from the kept results).
+    await page.click('#toggle-wire');
+    assert.equal(await page.evaluate(() => document.getElementById('toggle-wire').classList.contains('active')), true);
+    await page.click('#toggle-wire');
+
     // "Refresh": analysed again, without the kept results.
     await page.evaluate(() => (document.body.dataset.status = ''));
     await page.click('#refresh');

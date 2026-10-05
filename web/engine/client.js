@@ -201,7 +201,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
 
 /** Keep the wall thickness of a model with its results (see analyzeInBrowser). */
 export function saveThickness(key, results) {
-  return saveResult(key, { thickness: results }, { patch: true });
+  return saveResult(key, { thickness: results });
 }
 
 export { clearCache, cacheInfo } from './cache.js';
