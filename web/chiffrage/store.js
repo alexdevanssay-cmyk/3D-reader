@@ -1,0 +1,158 @@
+// What the costing pages keep in this browser (localStorage): the data read
+// from the costing workbook and from the metal prices file, the settings
+// (TRS, islands, methods...) and the inputs of the current quote. Saved at
+// every change, so they are back when the page is opened again. Nothing is
+// sent anywhere.
+
+import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS } from "./routes.js";
+import { indexAverage } from "./model.js";
+
+const KEYS = {
+  base: "reader3d.chiffrage.base.v1",
+  indices: "reader3d.chiffrage.indices.v1",
+  settings: "reader3d.chiffrage.settings.v1",
+  quote: "reader3d.chiffrage.quote.v1",
+};
+
+// Densities of the alloys (g/cm³), to get the weight of the part from its volume.
+export const DEFAULT_DENSITIES = {
+  AS7G03: 2.68, AS7G06: 2.68, AS7U3: 2.75, AS8U3: 2.75, AS9G: 2.65, AS9GU: 2.7, AS9U3: 2.76,
+  AS10G: 2.65, AS12: 2.65, AS12U: 2.7, AS12UNG: 2.68, AS13: 2.65, AZ10: 2.85, AZ5: 2.8,
+};
+
+const clone = (x) => JSON.parse(JSON.stringify(x));
+
+function read(key) {
+  try {
+    const text = localStorage.getItem(key);
+    return text ? JSON.parse(text) : null;
+  } catch {
+    return null;
+  }
+}
+
+function write(key, value) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch {
+    return false; // private window, storage full or blocked: works for this visit only
+  }
+}
+
+export const loadBase = () => read(KEYS.base);
+export const saveBase = (base) => write(KEYS.base, base);
+export const loadIndices = () => read(KEYS.indices);
+export const saveIndices = (indices) => write(KEYS.indices, indices);
+
+/** Settings with their defaults; the workbook's values where it has some. */
+export function defaultSettings(base) {
+  const d = base?.defaults ?? {};
+  return {
+    trs: { ...DEFAULT_TRS },
+    modes: {},
+    processes: clone(DEFAULT_PROCESSES),
+    operations: clone(DEFAULT_OPERATIONS),
+    densities: { ...DEFAULT_DENSITIES },
+    inflation: {
+      salaires: d.evolutionSalaires ?? 0.015,
+      conso: d.evolutionConso ?? 0.02,
+      elec: d.evolutionElec ?? 0,
+      gaz: d.evolutionGaz ?? 0,
+      autresEnergies: d.evolutionAutresEnergies ?? 0.03,
+    },
+    energy: null, // null: the workbook's prices
+    marge: d.marge ?? 0.12,
+    tauxMini: d.tauxMini ?? 0.1,
+    coefSecurite: d.coefSecurite ?? 0.1,
+    heuresChangementCoulee: d.changeover?.[0]?.heures ?? 8,
+    heuresChangementFinition: d.changeover?.[1]?.heures ?? 1,
+  };
+}
+
+/** Merge saved settings over the defaults (new settings of later versions get their default). */
+export function loadSettings(base) {
+  const defaults = defaultSettings(base);
+  const saved = read(KEYS.settings);
+  if (!saved) return defaults;
+  const merged = { ...defaults, ...saved };
+  for (const key of ["trs", "modes", "densities", "inflation"]) merged[key] = { ...defaults[key], ...saved[key] };
+  for (const key of ["processes", "operations"]) {
+    merged[key] = { ...defaults[key] };
+    for (const [code, value] of Object.entries(saved[key] ?? {})) merged[key][code] = { ...defaults[key][code], ...value, cycle: { ...defaults[key][code]?.cycle, ...value.cycle } };
+  }
+  return merged;
+}
+
+export const saveSettings = (settings) => write(KEYS.settings, settings);
+export const resetSettings = () => write(KEYS.settings, null);
+
+export function defaultQuote(base, indices) {
+  const d = base?.defaults ?? {};
+  const lists = base?.lists ?? {};
+  const year = lists.anneePri ? lists.anneePri + 1 : new Date().getFullYear();
+  const typologies = indices?.typologies?.map((t) => t.name) ?? lists.typologies ?? [];
+  const typologie = typologies.includes("M-1/M-3") ? "M-1/M-3" : typologies[0] ?? null;
+  // The newest month and the first price index of the list that have a value.
+  let month = indices?.months?.at(-1) ?? null;
+  let cours = lists.cours?.[0] ?? null;
+  search: for (const m of [...(indices?.months ?? [])].reverse()) {
+    for (const c of lists.cours ?? []) {
+      if (indexAverage(indices, c, m, typologie) !== null) {
+        month = m;
+        cours = c;
+        break search;
+      }
+    }
+  }
+  return {
+    client: "",
+    reference: "",
+    designation: "",
+    plan: "",
+    alliage: lists.alliages?.[0] ?? "AS7G03",
+    poids: null, // null: from the 3D model
+    toileMini: null,
+    epaisseurMax: null,
+    moduleMm: null,
+    dimMax: null,
+    volumeAnnuel: 10000,
+    annees: 5,
+    premiereAnnee: year,
+    volumes: null, // null: the annual volume every year
+    tth: "none",
+    noyaux: false,
+    sableKg: 0,
+    tribo: false,
+    redressage: false,
+    month,
+    typologie,
+    cours,
+    coursAchat: d.coursAchat ?? 0,
+    p1020Achat: d.p1020Achat ?? 0,
+    premiumAchat: d.premiumAchat ?? 0,
+    premiumVente: d.premiumVente ?? 0,
+    pafAchat: d.pafAchat ?? 0.06,
+    pafVente: d.pafVente ?? 0.08,
+    procede: "auto",
+    finition: "auto",
+    mode: null, // null: the setting of the casting centre
+    cycle: null, // null: estimated
+    empreintes: null,
+    miseAuMille: null,
+    coefDifficulte: d.coefDifficulte ?? 0,
+    vaUsinage: d.vaUsinage ?? 0,
+    rebutUsinage: d.rebutUsinage ?? 0,
+    tailleSerie: d.tailleSerie || 1000,
+    marge: null, // null: the setting
+    composants: [],
+  };
+}
+
+export function loadQuote(base, indices) {
+  return { ...defaultQuote(base, indices), ...read(KEYS.quote) };
+}
+
+export const saveQuote = (quote) => write(KEYS.quote, quote);
+export const resetQuote = () => write(KEYS.quote, null);

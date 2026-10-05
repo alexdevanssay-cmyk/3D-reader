@@ -1215,6 +1215,30 @@ $("thick-max").addEventListener("change", (e) => {
 }
 new ResizeObserver(() => thick.results && renderThickness()).observe($("thick-scale"));
 
+// ---------------------------------------------------------------- pages
+
+// The costing pages (web/chiffrage/) are loaded the first time they are opened.
+let costingPages = null;
+function showPage(name) {
+  for (const tab of document.querySelectorAll(".tabs .tab")) {
+    const on = tab.dataset.page === name;
+    tab.classList.toggle("active", on);
+    tab.setAttribute("aria-selected", String(on));
+  }
+  $("page-viewer").hidden = name !== "viewer";
+  for (const page of ["chiffrage", "parametres"]) $(`page-${page}`).hidden = name !== page;
+  if (name !== "viewer") {
+    costingPages ??= import("./chiffrage/ui.js").then((m) => m.mount({ chiffrage: $("page-chiffrage"), parametres: $("page-parametres") }));
+    costingPages.then((ui) => ui.show(name)).catch((err) => showError(err.message || String(err)));
+  }
+  try {
+    sessionStorage.setItem("reader3d.page", name);
+  } catch {
+    // storage unavailable: the page opens on the 3D view next time
+  }
+}
+for (const tab of document.querySelectorAll(".tabs .tab")) tab.addEventListener("click", () => showPage(tab.dataset.page));
+
 // ---------------------------------------------------------------- memory gauge
 
 // The CAD engine runs in WebAssembly, whose memory (heap) only grows, up to
@@ -1366,6 +1390,7 @@ function publishResult(r) {
 
 /** The machine-readable result in the page (and the text report), kept up to date. */
 function updatePublished(r) {
+  document.dispatchEvent(new CustomEvent("reader3d-part"));
   const data = exportableResult(r);
   // "<" escaped so that a part name cannot close the script element.
   $("reader3d-result").textContent = JSON.stringify(data).replace(/</g, "\\u003c");
@@ -1416,7 +1441,38 @@ window.reader3d = {
   report() {
     return state.result ? plainReport(exportableResult(state.result)) : "";
   },
+  /** The part shown, for the costing page: geometry and wall thickness (null if not computed). */
+  part() {
+    return partFeatures();
+  },
+  /** Compute the wall thickness of the part shown (with progress), then return part(). */
+  async computeThickness() {
+    if (state.result?.bodies.some((b) => b.closed)) await ensureThickness();
+    return partFeatures();
+  },
 };
+
+function partFeatures() {
+  const r = state.result;
+  if (!r) return null;
+  const s = r.summary;
+  const thickness = thick.results
+    ? {
+        min: thickStats(undefined, "wall").min,
+        median: thickStats(undefined, "sphere").median,
+        max: thickStats(undefined, "sphere").max,
+      }
+    : null;
+  return {
+    file: r.file,
+    volume: s.volume,
+    area: s.area,
+    bboxSize: s.bbox.size,
+    bodies: s.bodies,
+    openBodies: s.open_bodies,
+    thickness,
+  };
+}
 
 // ---------------------------------------------------------------- language
 
@@ -1442,6 +1498,15 @@ for (const [param, id] of [["unit", "unit"], ["quality", "quality"]]) {
 }
 applyLanguage();
 setStatus("idle");
+{
+  let page = params.get("page");
+  try {
+    page ??= sessionStorage.getItem("reader3d.page");
+  } catch {
+    // no storage
+  }
+  if (page === "chiffrage" || page === "parametres") showPage(page);
+}
 initEngines().then(() => {
   const url = params.get("url");
   if (url) {

@@ -5,6 +5,9 @@ const STRINGS = {
   en: {
     "app.description": "Open STEP, IGES, STL, OBJ, GLB, 3MF… files in the browser and compute the real volume of material, the envelope and the mass.",
     "top.open": "Open file…",
+    "tab.viewer": "3D analysis",
+    "tab.costing": "Costing",
+    "tab.settings": "Settings",
     "top.unit": "Mesh unit",
     "top.unit.title": "Unit of mesh files (STL, OBJ...). CAD files (STEP, IGES) carry their own unit.",
     "top.quality": "Display quality",
@@ -187,6 +190,9 @@ const STRINGS = {
   fr: {
     "app.description": "Ouvrez des fichiers STEP, IGES, STL, OBJ, GLB, 3MF… dans le navigateur et calculez le volume réel de matière, l'encombrement et la masse.",
     "top.open": "Ouvrir un fichier…",
+    "tab.viewer": "Analyse 3D",
+    "tab.costing": "Chiffrage",
+    "tab.settings": "Paramètres",
     "top.unit": "Unité du maillage",
     "top.unit.title": "Unité des fichiers maillés (STL, OBJ…). Les fichiers CAO (STEP, IGES) portent leur propre unité.",
     "top.quality": "Qualité d'affichage",

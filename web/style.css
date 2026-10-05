@@ -237,3 +237,41 @@ table.bodies .open { color: var(--warn); }
 .thick-min span { color: var(--muted); }
 .thick-min strong { font-size: 20px; font-variant-numeric: tabular-nums; }
 .thick-min button { margin-left: auto; }
+
+/* Pages (tabs of the top bar) */
+.tabs { display: flex; gap: 2px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
+.tab { border: none; background: transparent; padding: 4px 12px; border-radius: 6px; }
+.tab.active { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+.page { height: calc(100% - 53px); overflow-y: auto; padding: 16px; }
+@media (max-width: 900px) { .page { height: auto; } }
+
+/* Costing pages */
+.cpage { max-width: 1400px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+.cgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 14px; }
+.ccard { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+.ccard h3 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.ccard h4 { margin: 14px 0 6px; font-size: 13px; }
+.cfields { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px 14px; margin: 8px 0; }
+.cf { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.cf > input, .cf > select, .cf > output { font-size: 14px; color: var(--text); }
+.cf > output { padding: 5px 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+.cf small { font-size: 11px; }
+.crow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+.cscroll { overflow-x: auto; }
+.ctable { border-collapse: collapse; width: 100%; font-size: 13px; }
+.ctable th, .ctable td { padding: 5px 8px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }
+.ctable th { color: var(--muted); font-weight: 600; font-size: 12px; white-space: nowrap; }
+.ctable .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ctable tr.retained td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.ctable tr.sub td { font-weight: 600; }
+.ctable tr.total td { font-weight: 700; border-top: 2px solid var(--text); }
+.ctable.compact input[type="number"] { width: 80px; }
+.cstats { display: grid; grid-template-columns: auto auto; gap: 4px 16px; justify-content: start; margin: 0; }
+.cstats dt { color: var(--muted); }
+.cstats dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.cmsg { padding: 8px 12px; border-radius: 8px; margin: 6px 0; font-size: 13px; }
+.cmsg.ok { background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.cmsg.error { background: var(--error-bg); color: var(--error-text); }
+.cmsg.warn { background: color-mix(in srgb, var(--warn) 16%, transparent); }
+.cactions { display: flex; gap: 8px; flex-wrap: wrap; }
+@media (max-width: 700px) { .cgrid { grid-template-columns: 1fr; } }
