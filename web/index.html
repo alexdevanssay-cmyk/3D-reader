@@ -6,6 +6,7 @@
   <title>3D Reader</title>
   <meta name="description" content="Open STEP, IGES, STL, OBJ, GLB, 3MF… files in the browser and compute the real volume of material, the envelope and the mass.">
   <link rel="stylesheet" href="style.css">
+  <link rel="help" href="ai.html" title="Use 3D Reader from AI assistants and scripts">
   <script type="importmap">
     {
       "imports": {
@@ -18,62 +19,75 @@
 <body>
   <header class="topbar">
     <div class="brand">3D Reader</div>
-    <button id="open-file" class="btn primary" type="button">Open file…</button>
+    <button id="open-file" class="btn primary" type="button" data-i18n="top.open">Open file…</button>
     <input id="file-input" type="file" hidden>
-    <label class="field" title="Unit of mesh files (STL, OBJ...). CAD files (STEP, IGES) carry their own unit.">
-      Mesh unit
+    <label class="field" data-i18n-title="top.unit.title" title="Unit of mesh files (STL, OBJ...). CAD files (STEP, IGES) carry their own unit.">
+      <span data-i18n="top.unit">Mesh unit</span>
       <select id="unit">
         <option value="auto">auto</option>
         <option value="mm">mm</option>
         <option value="cm">cm</option>
         <option value="m">m</option>
-        <option value="in">inch</option>
-        <option value="ft">foot</option>
+        <option value="in" data-i18n="unit.inch">inch</option>
+        <option value="ft" data-i18n="unit.foot">foot</option>
       </select>
     </label>
-    <label class="field" title="Display tessellation of CAD files. Does not change the computed volume.">
-      Display quality
+    <label class="field" data-i18n-title="top.quality.title" title="Display tessellation of CAD files. Does not change the computed volume.">
+      <span data-i18n="top.quality">Display quality</span>
       <select id="quality">
-        <option value="coarse">coarse</option>
-        <option value="normal" selected>normal</option>
-        <option value="fine">fine</option>
+        <option value="coarse" data-i18n="quality.coarse">coarse</option>
+        <option value="normal" selected data-i18n="quality.normal">normal</option>
+        <option value="fine" data-i18n="quality.fine">fine</option>
       </select>
     </label>
-    <label class="field" id="engine-field" hidden title="Where the computation runs">
-      Engine
+    <label class="field" id="engine-field" hidden data-i18n-title="top.engine.title" title="Where the computation runs">
+      <span data-i18n="top.engine">Engine</span>
       <select id="engine">
-        <option value="server">Python server</option>
-        <option value="browser">Browser (WebAssembly)</option>
+        <option value="server" data-i18n="engine.server">Python server</option>
+        <option value="browser" data-i18n="engine.browser">Browser (WebAssembly)</option>
+      </select>
+    </label>
+    <label class="field">
+      <span data-i18n="top.language">Language</span>
+      <select id="language">
+        <option value="en">English</option>
+        <option value="fr">Français</option>
       </select>
     </label>
     <span id="file-name" class="file-name"></span>
+    <button id="memory-gauge" class="memory-gauge" type="button" hidden aria-describedby="memory-card">
+      <span class="memory-label" data-i18n="memory.short">Memory</span>
+      <span class="memory-track"><span class="memory-fill" id="memory-fill"></span></span>
+      <span id="memory-percent">0 %</span>
+    </button>
     <span id="engine-status" class="engine-status" hidden></span>
   </header>
 
   <main class="layout">
     <section class="viewport" id="viewport">
       <div class="toolbar">
-        <button data-view="iso" title="Isometric view">Iso</button>
-        <button data-view="front" title="Front view (−Y)">Front</button>
-        <button data-view="top" title="Top view (+Z)">Top</button>
-        <button data-view="right" title="Right view (+X)">Right</button>
-        <button id="fit" title="Fit to view">Fit</button>
+        <button data-view="iso" data-i18n="view.iso.label" data-i18n-title="view.iso" title="Isometric view">Iso</button>
+        <button data-view="front" data-i18n="view.front.label" data-i18n-title="view.front" title="Front view (−Y)">Front</button>
+        <button data-view="top" data-i18n="view.top.label" data-i18n-title="view.top" title="Top view (+Z)">Top</button>
+        <button data-view="right" data-i18n="view.right.label" data-i18n-title="view.right" title="Right view (+X)">Right</button>
+        <button id="fit" data-i18n="view.fit.label" data-i18n-title="view.fit" title="Fit to view">Fit</button>
         <span class="sep"></span>
-        <button id="toggle-wire" class="toggle" title="Show triangle edges">Wireframe</button>
-        <button id="toggle-box" class="toggle" title="Show the bounding box">Envelope</button>
-        <button id="toggle-section" class="toggle" title="Section plane">Section</button>
+        <button id="toggle-wire" class="toggle" data-i18n="view.wire.label" data-i18n-title="view.wire" title="Show triangle edges">Wireframe</button>
+        <button id="toggle-box" class="toggle" data-i18n="view.box.label" data-i18n-title="view.box" title="Show the bounding box">Envelope</button>
+        <button id="toggle-section" class="toggle" data-i18n="view.section.label" data-i18n-title="view.section" title="Section plane">Section</button>
         <span id="section-controls" class="section-controls" hidden>
           <select id="section-axis"><option>X</option><option>Y</option><option selected>Z</option></select>
           <input id="section-pos" type="range" min="0" max="1000" value="500">
-          <button id="section-flip" title="Flip section side">⇄</button>
+          <button id="section-flip" data-i18n-title="view.flip" title="Flip section side">⇄</button>
         </span>
       </div>
       <div id="drop-hint" class="drop-hint">
         <div class="drop-card">
-          <h2>Drop a 3D file here</h2>
+          <h2 data-i18n="drop.title">Drop a 3D file here</h2>
           <p>STEP · IGES · BREP · STL · OBJ · PLY · OFF · GLB/glTF · 3MF · DAE</p>
-          <p class="muted">The real (material) volume is computed, not only the bounding envelope.</p>
-          <p class="muted small" id="privacy-note" hidden>Your file never leaves your computer: everything is computed in this browser tab.</p>
+          <p class="muted" data-i18n="drop.real">The real (material) volume is computed, not only the bounding envelope.</p>
+          <p class="muted small" id="privacy-note" hidden data-i18n="drop.privacy">Your file never leaves your computer: everything is computed in this browser tab.</p>
+          <p class="muted small" data-i18n-html="drop.ai">For AI assistants and scripts: see <a href="ai.html">ai.html</a>.</p>
         </div>
       </div>
       <div id="loading" class="loading" hidden>
@@ -81,8 +95,12 @@
           <div class="spinner"></div>
           <span id="loading-text">Analysing…</span>
           <span id="loading-file" class="muted small"></span>
-          <progress id="loading-bar" max="1" hidden></progress>
-          <button id="cancel" class="small" type="button">Cancel</button>
+          <div class="progress-row">
+            <progress id="loading-bar" max="1"></progress>
+            <span id="loading-percent" class="progress-percent"></span>
+          </div>
+          <span id="loading-memory" class="muted small"></span>
+          <button id="cancel" class="small" type="button" data-i18n="loading.cancel">Cancel</button>
         </div>
       </div>
       <div id="error" class="error" hidden></div>
@@ -91,7 +109,7 @@
     <aside class="panel">
       <section class="card" id="summary-card" hidden>
         <div class="card-head">
-          <h3>Real volume</h3>
+          <h3 data-i18n="summary.volume">Real volume</h3>
           <select id="vol-unit">
             <option value="mm3">mm³</option>
             <option value="cm3" selected>cm³</option>
@@ -104,33 +122,33 @@
         <div class="method" id="method"></div>
 
         <dl class="stats">
-          <dt>Surface area</dt><dd id="total-area">—</dd>
-          <dt>Envelope (L × W × H)</dt><dd id="bbox-size">—</dd>
-          <dt>Envelope volume</dt><dd id="bbox-volume">—</dd>
-          <dt>Min. oriented envelope</dt><dd id="obb-size">—</dd>
-          <dt>Material fill of envelope</dt><dd id="fill">—</dd>
-          <dt>Centre of mass (mm)</dt><dd id="centroid">—</dd>
-          <dt>Bodies</dt><dd id="body-count">—</dd>
+          <dt data-i18n="summary.area">Surface area</dt><dd id="total-area">—</dd>
+          <dt data-i18n="summary.bbox">Envelope (L × W × H)</dt><dd id="bbox-size">—</dd>
+          <dt data-i18n="summary.bboxVolume">Envelope volume</dt><dd id="bbox-volume">—</dd>
+          <dt data-i18n="summary.obb">Min. oriented envelope</dt><dd id="obb-size">—</dd>
+          <dt data-i18n="summary.fill">Material fill of envelope</dt><dd id="fill">—</dd>
+          <dt data-i18n="summary.centroid">Centre of mass (mm)</dt><dd id="centroid">—</dd>
+          <dt data-i18n="summary.bodies">Bodies</dt><dd id="body-count">—</dd>
         </dl>
       </section>
 
       <section class="card" id="mass-card" hidden>
-        <h3>Mass</h3>
+        <h3 data-i18n="mass.title">Mass</h3>
         <div class="row">
           <select id="material">
-            <option value="7.85">Steel (7.85)</option>
-            <option value="8.00">Stainless steel (8.00)</option>
-            <option value="7.20">Cast iron (7.20)</option>
-            <option value="2.70" selected>Aluminium (2.70)</option>
-            <option value="4.43">Titanium Ti-6Al-4V (4.43)</option>
-            <option value="8.96">Copper (8.96)</option>
-            <option value="8.50">Brass (8.50)</option>
+            <option value="7.85" data-i18n-material="material.steel">Steel (7.85)</option>
+            <option value="8.00" data-i18n-material="material.stainless">Stainless steel (8.00)</option>
+            <option value="7.20" data-i18n-material="material.castIron">Cast iron (7.20)</option>
+            <option value="2.70" selected data-i18n-material="material.aluminium">Aluminium (2.70)</option>
+            <option value="4.43" data-i18n-material="material.titanium">Titanium Ti-6Al-4V (4.43)</option>
+            <option value="8.96" data-i18n-material="material.copper">Copper (8.96)</option>
+            <option value="8.50" data-i18n-material="material.brass">Brass (8.50)</option>
             <option value="1.04">ABS (1.04)</option>
             <option value="1.24">PLA (1.24)</option>
-            <option value="1.14">Nylon PA6 (1.14)</option>
-            <option value="1.20">Resin SLA (1.20)</option>
-            <option value="0.60">Wood, oak-ish (0.60)</option>
-            <option value="custom">Custom…</option>
+            <option value="1.14" data-i18n-material="material.nylon">Nylon PA6 (1.14)</option>
+            <option value="1.20" data-i18n-material="material.resin">Resin SLA (1.20)</option>
+            <option value="0.60" data-i18n-material="material.wood">Wood, oak-ish (0.60)</option>
+            <option value="custom" data-i18n="material.custom">Custom…</option>
           </select>
           <input id="density" type="number" step="0.01" min="0" value="2.70"> <span class="muted">g/cm³</span>
         </div>
@@ -139,17 +157,34 @@
 
       <section class="card" id="bodies-card" hidden>
         <div class="card-head">
-          <h3>Bodies</h3>
-          <button id="export-csv" class="small">Export CSV</button>
+          <h3 data-i18n="bodies.title">Bodies</h3>
+          <div class="exports">
+            <button id="export-xlsx" class="small" data-i18n="export.excel" data-i18n-title="export.excel.title">Excel</button>
+            <button id="export-csv" class="small" data-i18n="export.csv" data-i18n-title="export.csv.title">CSV</button>
+            <button id="export-json" class="small" data-i18n="export.json" data-i18n-title="export.json.title">JSON</button>
+          </div>
         </div>
         <table class="bodies">
-          <thead><tr><th></th><th>Name</th><th class="num">Volume</th><th class="num">%</th></tr></thead>
+          <thead><tr><th></th><th data-i18n="bodies.name">Name</th><th class="num" data-i18n="bodies.volume">Volume</th><th class="num">%</th></tr></thead>
           <tbody id="bodies"></tbody>
         </table>
         <div id="body-detail" class="body-detail" hidden></div>
       </section>
+
+      <section class="card" id="memory-card" hidden>
+        <div class="card-head">
+          <h3 data-i18n="memory.title">Memory load</h3>
+          <span id="memory-level" class="memory-level"></span>
+        </div>
+        <div class="memory-track big-track"><span class="memory-fill" id="memory-fill-big"></span></div>
+        <dl class="stats" id="memory-stats"></dl>
+        <p class="muted small" id="memory-advice"></p>
+      </section>
     </aside>
   </main>
+
+  <!-- Machine-readable results of the last analysis (for AI assistants and scripts). -->
+  <script type="application/json" id="reader3d-result"></script>
 
   <script type="module" src="app.js"></script>
 </body>

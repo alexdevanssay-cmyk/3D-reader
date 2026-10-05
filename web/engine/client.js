@@ -17,6 +17,25 @@ let worker = null;
 let nextId = 1;
 const pending = new Map(); // id -> { resolve, reject, onProgress }
 const listeners = new Set(); // CAD engine loading listeners (preload)
+const memoryListeners = new Set(); // CAD engine memory reports
+
+/** Called with {heap, heap_max} (bytes) whenever the worker reports its memory. */
+export function onMemory(fn) {
+  memoryListeners.add(fn);
+}
+
+/**
+ * Restart the worker to give its WebAssembly heap back to the system (the heap
+ * never shrinks). Only when nothing is being analysed; the CAD engine is then
+ * reloaded from the browser cache on the next CAD file.
+ */
+export function releaseMemory() {
+  if (pending.size || !worker) return false;
+  resetWorker();
+  memoryListeners.forEach((fn) => fn({ heap: 0, heap_max: 0, restarted: true }));
+  listeners.forEach((fn) => fn({ stage: 'idle' }));
+  return true;
+}
 
 function extensionOf(name) {
   const i = name.lastIndexOf('.');
@@ -28,6 +47,7 @@ function getWorker() {
   worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
   worker.onmessage = ({ data }) => {
     const job = data.id != null ? pending.get(data.id) : null;
+    if (data.memory) memoryListeners.forEach((fn) => fn(data.memory));
     if (data.type === 'progress') {
       job?.onProgress?.(data);
       if (data.stage !== 'analyze') listeners.forEach((fn) => fn(data));
@@ -93,6 +113,21 @@ export function preloadCadEngine(listener) {
   getWorker().postMessage({ type: 'preload', id: null });
 }
 
+// Memory an analysis needs, measured on test files: the CAD engine starts with
+// a ~100 MiB WebAssembly heap and adds about 3 bytes per byte of STEP/IGES file
+// (a 35 MB STEP of 2000 solids: 207 MiB); meshes are analysed in double
+// precision with welding tables (about 12 bytes per byte of file). The factors
+// are rounded up: this is a warning, not a limit.
+const CAD_BASE_HEAP = 110 * 2 ** 20;
+const BYTES_PER_FILE_BYTE = { cad: 4, mesh: 12 };
+
+/** Rough memory (bytes) the analysis of `file` will use, and of which kind. */
+export function estimateMemory(file, currentHeap = 0) {
+  const kind = CAD_EXTENSIONS.includes(extensionOf(file.name)) ? 'cad' : 'mesh';
+  const base = kind === 'cad' ? Math.max(currentHeap, CAD_BASE_HEAP) : 0;
+  return { kind, bytes: base + file.size * BYTES_PER_FILE_BYTE[kind] };
+}
+
 /**
  * Analyse a File in the browser. Resolves to the same structure as the Python
  * server's /api/analyze response (with typed arrays instead of base64 meshes).
@@ -122,7 +157,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
     ));
   } else {
     kind = 'mesh';
-    onProgress?.({ stage: 'parse' });
+    onProgress?.({ stage: 'analyze', percent: 5, step: 'read' });
     const { loadMeshFile } = await import('./meshload.js');
     const { parts, source_unit } = await loadMeshFile(bytes, file.name, { unit });
     sourceUnit = source_unit;
@@ -130,7 +165,8 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
     ({ bodies } = await call({ type: 'analyze', kind, name: file.name, parts }, transfer, onProgress));
   }
 
-  onProgress?.({ stage: 'summary' });
+  onProgress?.({ stage: 'analyze', percent: 96, step: 'summary' });
+  await new Promise((resolve) => setTimeout(resolve, 0)); // let the page show it before the envelope search
   return {
     file: file.name,
     kind,

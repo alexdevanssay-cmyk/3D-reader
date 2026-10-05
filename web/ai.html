@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>3D Reader for AI assistants</title>
+  <meta name="description" content="How AI assistants and scripts can use 3D Reader to measure a 3D model: real volume, envelope, area, centre of mass, mass.">
+  <style>
+    :root { --bg: #fff; --text: #1d2330; --muted: #5b6475; --code: #f2f4f7; --border: #dde1e8; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #14171d; --text: #e6e9ef; --muted: #9aa1b0; --code: #1f242d; --border: #2c323d; } }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    main { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; }
+    h1 { font-size: 26px; margin: 0 0 4px; } h2 { font-size: 19px; margin-top: 32px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; background: var(--code); border-radius: 6px; }
+    code { padding: 1px 5px; } pre { padding: 12px 14px; overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; font-size: 14px; } td, th { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+    .muted { color: var(--muted); } a { color: #2f6fed; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>3D Reader — use from AI assistants and scripts</h1>
+  <p class="muted">Français plus bas · <a href="./">Open the reader</a></p>
+
+  <p>3D Reader measures a 3D model: the <strong>real volume of material</strong> (exact for STEP/IGES/BREP CAD files,
+  enclosed volume for meshes), surface area, axis-aligned and minimum oriented envelope, fill ratio, centre of mass,
+  mass from a density, per body. It runs entirely in the browser (no upload to a server). Formats: STEP, STP, IGES, IGS,
+  BREP, STL, OBJ, PLY, OFF, GLB, glTF, 3MF, DAE. Units of results: mm, mm², mm³, g.</p>
+
+  <h2>1. Agent that can open web pages (browser automation)</h2>
+  <p>If the model is reachable at a public URL that allows cross-origin downloads (CORS: for example
+  <code>raw.githubusercontent.com</code>), open:</p>
+  <pre>https://alexdevanssay-cmyk.github.io/3D-reader/?url=&lt;URL of the 3D file&gt;&amp;report=1</pre>
+  <p>Wait until <code>&lt;body data-status="done"&gt;</code> (or <code>"error"</code>, with the message in
+  <code>data-error</code>), then read either:</p>
+  <ul>
+    <li>the plain-text report in <code>&lt;pre id="reader3d-report"&gt;</code> (shown in the page with <code>report=1</code>), or</li>
+    <li>the JSON in <code>&lt;script id="reader3d-result" type="application/json"&gt;</code>.</li>
+  </ul>
+  <p>The first CAD file downloads the CAD engine (about 13 MB): allow up to a minute.</p>
+
+  <h2>2. Agent that was given the file itself</h2>
+  <p>Open <a href="./">the reader</a> and upload the file through the file input <code>#file-input</code>
+  (button “Open file…”), or run JavaScript in the page:</p>
+  <pre>const result = await reader3d.analyze(fileOrBlobOrUrl, { name: "part.step" });
+console.log(reader3d.report());   // plain-text summary</pre>
+  <p>Then read the results as above, or click <strong>Excel</strong>, <strong>CSV</strong> or <strong>JSON</strong> to download them.</p>
+
+  <h2>3. Agent or script that can run Python</h2>
+  <pre>pip install "git+https://github.com/alexdevanssay-cmyk/3D-reader"
+reader3d analyze part.step --json</pre>
+  <p class="muted">Python 3.11+. Same results as the browser (same OpenCascade exact integration).</p>
+
+  <h2>Link parameters</h2>
+  <table>
+    <tr><th>Parameter</th><th>Meaning</th></tr>
+    <tr><td><code>url</code></td><td>Address of the 3D file to analyse (must allow CORS).</td></tr>
+    <tr><td><code>name</code></td><td>File name to use when the URL does not end with one (its extension selects the format).</td></tr>
+    <tr><td><code>report=1</code></td><td>Show the results as plain text at the top of the results panel.</td></tr>
+    <tr><td><code>export</code></td><td><code>json</code>, <code>xlsx</code> or <code>csv</code>: download the results when done.</td></tr>
+    <tr><td><code>unit</code></td><td>Unit of mesh files: <code>mm</code>, <code>cm</code>, <code>m</code>, <code>in</code>, <code>ft</code> (default: auto).</td></tr>
+    <tr><td><code>quality</code></td><td>Display tessellation of CAD files: <code>coarse</code>, <code>normal</code>, <code>fine</code> (does not change the volume).</td></tr>
+    <tr><td><code>lang</code></td><td><code>fr</code> or <code>en</code>.</td></tr>
+  </table>
+
+  <h2>JSON results</h2>
+  <pre>{
+  "file": "part.step", "kind": "cad" | "mesh", "source_unit": "mm",
+  "units": { "length": "mm", "area": "mm2", "volume": "mm3", "mass": "g", "density": "g/cm3" },
+  "density": 2.7,
+  "summary": {
+    "volume": 113716.81, "area": 18913.27, "mass": 307.04,
+    "bbox": { "min": [0,0,0], "max": [100,60,20], "size": [100,60,20], "volume": 120000 },
+    "obb": { "size": [100,60,20], "volume": 120000 },
+    "fill_ratio": 0.9476, "centroid": [50,30,10],
+    "bodies": 1, "solids": 1, "open_bodies": 0, "triangles": 1234
+  },
+  "bodies": [ { "name": "...", "volume": ..., "area": ..., "bbox": {...}, "centroid": [...],
+                "closed": true, "method": "brep" | "mesh", "mass": ..., "notes": [] } ]
+}</pre>
+  <p><code>volume</code> is <code>null</code> when the geometry is not a closed solid (open surfaces): it cannot be computed.</p>
+
+  <h2 lang="fr">En français</h2>
+  <div lang="fr">
+    <p>Pour qu'une IA mesure un modèle 3D avec ce lecteur :</p>
+    <ul>
+      <li><strong>Le fichier est en ligne</strong> (adresse publique autorisant le CORS, par exemple un dépôt GitHub) :
+        l'IA ouvre <code>https://alexdevanssay-cmyk.github.io/3D-reader/?url=&lt;adresse du fichier&gt;&amp;report=1&amp;lang=fr</code>,
+        attend <code>data-status="done"</code> puis lit le rapport texte ou le JSON.</li>
+      <li><strong>L'IA a reçu le fichier</strong> et pilote un navigateur : elle ouvre le lecteur et charge le fichier par
+        le bouton « Ouvrir un fichier… » (ou <code>await reader3d.analyze(fichier)</code>), puis lit les résultats ou
+        télécharge l'Excel.</li>
+      <li><strong>L'IA exécute du Python</strong> : <code>pip install "git+https://github.com/alexdevanssay-cmyk/3D-reader"</code>
+        puis <code>reader3d analyze piece.step --json</code>.</li>
+    </ul>
+  </div>
+</main>
+</body>
+</html>

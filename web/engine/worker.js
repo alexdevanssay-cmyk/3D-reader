@@ -14,6 +14,12 @@ import { analyzeMeshParts } from './meshanalysis.js';
 const baseUrl = new URL('../', import.meta.url).href;
 
 let occtPromise = null;
+let occtModule = null; // once loaded: its WebAssembly heap is reported with every message
+
+// Memory of the CAD engine: the WebAssembly heap only grows (up to 4 GiB) and is
+// never given back, so the page can restart the worker when it gets large.
+const HEAP_MAX = 4294901760;
+const memory = () => ({ heap: occtModule ? occtModule.HEAPU8.length : 0, heap_max: HEAP_MAX });
 let progressTarget = null; // id of the request that currently wants loading progress
 
 function occt() {
@@ -21,7 +27,9 @@ function occt() {
     occtPromise = loadOcct({
       baseUrl,
       onProgress: (p) => postMessage({ type: 'progress', id: progressTarget, ...p }),
-    }).catch((err) => {
+    })
+      .then((oc) => (occtModule = oc))
+      .catch((err) => {
       occtPromise = null; // allow a retry, e.g. after a network error
       throw err;
     });
@@ -51,27 +59,42 @@ self.onmessage = async (event) => {
   try {
     if (msg.type === 'preload') {
       await occt();
-      postMessage({ type: 'ready', engine: 'cad' });
+      postMessage({ type: 'ready', engine: 'cad', memory: memory() });
+      return;
+    }
+    if (msg.type === 'memory') {
+      postMessage({ type: 'memory', id: msg.id, memory: memory() });
       return;
     }
     if (msg.type !== 'analyze') return;
 
     let result;
+    // Progress of the analysis itself, in percent (the CAD engine download has its own).
+    let last = -1;
+    const progress = (percent, step) => {
+      percent = Math.min(100, Math.max(0, Math.floor(percent)));
+      if (percent === last) return;
+      last = percent;
+      postMessage({ type: 'progress', id: msg.id, stage: 'analyze', engine: msg.kind === 'cad' ? 'cad' : 'mesh', percent, step, memory: memory() });
+    };
     if (msg.kind === 'cad') {
       progressTarget = msg.id;
       const oc = await occt();
-      postMessage({ type: 'progress', id: msg.id, stage: 'analyze', engine: 'cad' });
-      result = analyzeCad(oc, new Uint8Array(msg.bytes), msg.name, { quality: msg.quality });
+      progress(0, 'read');
+      result = analyzeCad(oc, new Uint8Array(msg.bytes), msg.name, {
+        quality: msg.quality,
+        onProgress: (p) => progress(p.percent * 0.95, p.step), // the last 5 %: envelopes, on the page
+      });
     } else if (msg.kind === 'meshfile') {
-      postMessage({ type: 'progress', id: msg.id, stage: 'parse' });
+      progress(0, 'read');
       const { parts, source_unit } = await loadMeshFile(msg.bytes, msg.name, { unit: msg.unit });
-      postMessage({ type: 'progress', id: msg.id, stage: 'analyze' });
-      result = { bodies: analyzeMeshParts(parts), source_unit };
+      progress(30, 'measure');
+      result = { bodies: analyzeMeshParts(parts, (f) => progress(30 + f * 65, 'measure')), source_unit };
     } else {
-      postMessage({ type: 'progress', id: msg.id, stage: 'analyze' });
-      result = { bodies: analyzeMeshParts(msg.parts) };
+      progress(30, 'measure');
+      result = { bodies: analyzeMeshParts(msg.parts, (f) => progress(30 + f * 65, 'measure')) };
     }
-    postMessage({ type: 'result', id: msg.id, result }, transferables(result.bodies));
+    postMessage({ type: 'result', id: msg.id, result, memory: memory() }, transferables(result.bodies));
   } catch (err) {
     // A crash inside WebAssembly can leave the module in an unusable state:
     // ask the client to start a fresh worker for the next file.
@@ -81,6 +104,6 @@ self.onmessage = async (event) => {
       (!(err instanceof Error) ||
         err instanceof WebAssembly.RuntimeError ||
         /abort|not enough memory/i.test(err.message));
-    postMessage({ type: 'error', id: msg.id, message: errorMessage(err), fatal });
+    postMessage({ type: 'error', id: msg.id, message: errorMessage(err), fatal, memory: memory() });
   }
 };

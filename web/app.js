@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.js";
 
 // ---------------------------------------------------------------- units
 
@@ -18,15 +19,16 @@ function fmtNum(v, digits = 3) {
   const abs = Math.abs(v);
   if (abs !== 0 && (abs < 1e-3 || abs >= 1e12)) return v.toExponential(4);
   // Below 1, a fixed number of decimals would leave only one or two significant digits.
-  if (abs !== 0 && abs < 1) return v.toLocaleString(undefined, { maximumSignificantDigits: 4 });
-  return v.toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: 0 });
+  if (abs !== 0 && abs < 1) return v.toLocaleString(locale(), { maximumSignificantDigits: 4 });
+  return v.toLocaleString(locale(), { maximumFractionDigits: digits, minimumFractionDigits: 0 });
 }
 
 function volUnit() { return VOL_UNITS[$("vol-unit").value]; }
 function fmtVol(mm3) { const u = volUnit(); return mm3 == null ? "—" : `${fmtNum(mm3 / u.factor)} ${u.label}`; }
 function fmtArea(mm2) { const u = volUnit(); return mm2 == null ? "—" : `${fmtNum(mm2 / u.areaFactor)} ${u.area}`; }
 // Coordinates: hide floating-point noise such as 2.9e-14 around zero.
-function fmtPoint(p) { return p ? p.map((x) => fmtNum(Math.abs(x) < 1e-6 ? 0 : x, 2)).join(", ") : "—"; }
+// (French numbers use a decimal comma: coordinates are then separated by semicolons.)
+function fmtPoint(p) { return p ? p.map((x) => fmtNum(Math.abs(x) < 1e-6 ? 0 : x, 2)).join(language() === "fr" ? " ; " : ", ") : "—"; }
 function fmtSize(s) { return s.map((x) => fmtNum(x, 2)).join(" × ") + " mm"; }
 function fmtMass(mm3, density) {
   if (mm3 == null || !(density >= 0)) return "—";
@@ -197,56 +199,64 @@ async function detectServer() {
 }
 
 function browserClient() {
-  engine.browserClient ??= import("./engine/client.js");
+  engine.browserClient ??= import("./engine/client.js").then((client) => {
+    client.onMemory(onEngineMemory);
+    return client;
+  });
   return engine.browserClient;
 }
 
 function fmtMB(bytes) {
-  return `${(bytes / 1048576).toFixed(1)} MB`;
+  const mb = bytes / 1048576;
+  return `${mb.toLocaleString(locale(), { maximumFractionDigits: mb < 10 ? 1 : 0 })} ${language() === "fr" ? "Mo" : "MB"}`;
 }
 
+// Progress of the file being analysed (0..1, or null when unknown).
 function setLoading(text, fraction = null) {
   $("loading-text").textContent = text;
   const bar = $("loading-bar");
-  bar.hidden = fraction === null;
-  if (fraction !== null) bar.value = fraction;
+  if (fraction === null) bar.removeAttribute("value"); // indeterminate
+  else bar.value = Math.min(1, Math.max(0, fraction));
+  $("loading-percent").textContent = fraction === null ? "" : `${Math.floor(fraction * 100)} %`;
 }
+
+const STEP_TEXT = { read: "loading.read", mesh: "loading.mesh", measure: "loading.measure", summary: "loading.summary" };
 
 function describeProgress(p) {
   switch (p.stage) {
     case "download":
       return p.total
-        ? [`Downloading the CAD engine… ${fmtMB(p.loaded)} / ${fmtMB(p.total)}`, p.loaded / p.total]
-        : [`Downloading the CAD engine… ${fmtMB(p.loaded)}`, null];
+        ? [t("loading.download", { loaded: fmtMB(p.loaded), total: fmtMB(p.total) }), p.loaded / p.total]
+        : [t("loading.downloadNoTotal", { loaded: fmtMB(p.loaded) }), null];
     case "compile":
-      return ["Starting the CAD engine…", null];
-    case "parse":
-      return ["Reading the file…", null];
-    case "summary":
-      return ["Computing the envelope…", null];
+      return [t("loading.compile"), null];
+    case "analyze":
+      return [t(STEP_TEXT[p.step] ?? "loading.analysing"), p.percent == null ? null : p.percent / 100];
     default:
-      return ["Analysing…", null];
+      return [t("loading.analysing"), null];
   }
 }
 
 // Small status chip showing whether the CAD engine (WebAssembly) is ready.
+let engineStage = "idle";
 function showEngineStatus(p) {
   const el = $("engine-status");
+  if (p) engineStage = p.stage === "download" && p.total ? { ...p } : p.stage;
   if (currentEngine() !== "browser") {
     el.hidden = true;
     return;
   }
+  const stage = typeof engineStage === "object" ? "download" : engineStage;
   el.hidden = false;
-  el.classList.toggle("ready", p.stage === "ready");
-  el.classList.toggle("error", p.stage === "error");
-  if (p.stage === "download" && p.total) el.textContent = `CAD engine ${Math.round((p.loaded / p.total) * 100)} %`;
-  else if (p.stage === "download" || p.stage === "compile") el.textContent = "CAD engine loading…";
-  else if (p.stage === "ready") el.textContent = "CAD engine ready";
-  else if (p.stage === "idle") el.textContent = "CAD engine not loaded";
-  else if (p.stage === "error") {
-    el.textContent = "CAD engine unavailable";
-    el.title = p.message || "";
-  }
+  el.classList.toggle("ready", stage === "ready");
+  el.classList.toggle("error", stage === "error");
+  if (typeof engineStage === "object") el.textContent = t("status.percent", { percent: Math.round((engineStage.loaded / engineStage.total) * 100) });
+  else if (stage === "download" || stage === "compile") el.textContent = t("status.loading");
+  else if (stage === "ready") el.textContent = t("status.ready");
+  else if (stage === "error") {
+    el.textContent = t("status.error");
+    if (p?.message) el.title = p.message;
+  } else el.textContent = t("status.idle");
 }
 
 let serverRequest = null; // AbortController of the request in progress
@@ -257,6 +267,7 @@ async function analyzeOnServer(file) {
   form.append("unit", $("unit").value);
   form.append("quality", $("quality").value);
   serverRequest = new AbortController();
+  setLoading(t("loading.upload"), null);
   // Aborting the request also stops the analysis on the server.
   const res = await fetch("api/analyze", { method: "POST", body: form, signal: serverRequest.signal });
   const data = await res.json().catch(() => ({ detail: res.statusText }));
@@ -272,7 +283,7 @@ async function analyzeInBrowser(file) {
     onProgress: (p) => {
       setLoading(...describeProgress(p));
       if (p.stage === "download" || p.stage === "compile") showEngineStatus(p);
-      if (p.stage === "analyze" && p.engine === "cad") showEngineStatus({ stage: "ready" });
+      if (p.stage === "analyze" && p.engine === "cad" && engineStage !== "ready") showEngineStatus({ stage: "ready" });
     },
   });
 }
@@ -293,10 +304,12 @@ async function openFile(file) {
   // handles one file at a time, and server slots are limited).
   await stopAnalysis();
   if (seq !== openSeq) return;
+  if (currentEngine() === "browser" && !(await memoryCheck(file))) return;
   $("error").hidden = true;
-  setLoading("Analysing…");
+  setLoading(t("loading.analysing"));
   $("loading-file").textContent = file.name;
   $("loading").hidden = false;
+  setStatus("analysing");
   try {
     const data = currentEngine() === "server" ? await analyzeOnServer(file) : await analyzeInBrowser(file);
     if (seq !== openSeq) return;
@@ -307,9 +320,16 @@ async function openFile(file) {
     $("drop-hint").hidden = true;
     buildModel(data);
     renderPanel();
+    publishResult(data);
+    setStatus("done");
+    afterAnalysisMemory();
   } catch (err) {
     const cancelled = err.cancelled || err.name === "AbortError";
-    if (seq === openSeq && !cancelled) showError(`${file.name}: ${err.message || err}`);
+    if (seq === openSeq && !cancelled) {
+      const message = tMessage(err.message || String(err));
+      showError(`${file.name}: ${message}`);
+      setStatus("error", message);
+    }
   } finally {
     if (seq === openSeq) $("loading").hidden = true;
   }
@@ -353,15 +373,11 @@ function renderPanel() {
   $("total-volume").textContent = (estimated ? "≈ " : "") + fmtVol(s.volume);
   const method = $("method");
   method.classList.toggle("warn", s.open_bodies > 0 || s.volume == null || estimated > 0);
-  const how = r.kind === "cad"
-    ? "Exact volume computed on the CAD B-rep geometry (OpenCascade)."
-    : `Volume enclosed by the triangle mesh. Source unit: ${r.source_unit}.`;
+  const how = r.kind === "cad" ? t("method.cad") : t("method.mesh", { unit: r.source_unit });
   const notes = [];
-  if (estimated) notes.push(`${estimated} body/bodies had holes: volume estimated after filling them.`);
-  if (s.open_bodies > 0) notes.push(`${s.open_bodies} open body/bodies excluded from the volume.`);
-  method.textContent = s.volume == null
-    ? "No closed solid in this file: the volume cannot be computed."
-    : [how, ...notes].join(" ");
+  if (estimated) notes.push(t("method.estimated", { n: estimated }));
+  if (s.open_bodies > 0) notes.push(t("method.open", { n: s.open_bodies }));
+  method.textContent = s.volume == null ? t("method.none") : [how, ...notes].join(" ");
 
   $("total-area").textContent = fmtArea(s.area);
   $("bbox-size").textContent = fmtSize(s.bbox.size);
@@ -369,7 +385,7 @@ function renderPanel() {
   $("obb-size").textContent = s.obb ? fmtSize(s.obb.size) : "—";
   $("fill").textContent = s.fill_ratio == null ? "—" : `${fmtNum(s.fill_ratio * 100, 2)} %`;
   $("centroid").textContent = fmtPoint(s.centroid);
-  $("body-count").textContent = s.open_bodies ? `${s.bodies} (${s.open_bodies} open)` : `${s.bodies}`;
+  $("body-count").textContent = s.open_bodies ? t("summary.bodiesOpen", { bodies: s.bodies, open: s.open_bodies }) : `${s.bodies}`;
 
   updateMass();
   renderBodies();
@@ -400,7 +416,7 @@ function renderBodies() {
     const vis = document.createElement("input");
     vis.type = "checkbox";
     vis.checked = state.meshes[i].visible;
-    vis.title = "Show / hide";
+    vis.title = t("bodies.showHide");
     vis.addEventListener("click", (e) => e.stopPropagation());
     vis.addEventListener("change", () => (state.meshes[i].visible = vis.checked));
 
@@ -410,7 +426,7 @@ function renderBodies() {
     tr.insertAdjacentHTML(
       "beforeend",
       `<td class="name" title="${escapeHtml(b.name)}"><span class="swatch" style="background:#${color}"></span>${escapeHtml(b.name)}</td>` +
-        `<td class="num ${b.volume == null || isEstimate(b) ? "open" : ""}">${b.volume == null ? "open" : (isEstimate(b) ? "≈ " : "") + fmtVol(b.volume)}</td>` +
+        `<td class="num ${b.volume == null || isEstimate(b) ? "open" : ""}">${b.volume == null ? t("bodies.open") : (isEstimate(b) ? "≈ " : "") + fmtVol(b.volume)}</td>` +
         `<td class="num">${b.volume != null && total ? fmtNum((b.volume / total) * 100, 1) : ""}</td>`,
     );
     tr.addEventListener("click", () => select(i === state.selected ? -1 : i));
@@ -429,22 +445,22 @@ function renderBodyDetail() {
   const b = r.bodies[state.selected];
   const density = parseFloat($("density").value);
   const rows = [
-    ["Real volume", fmtVol(b.volume)],
-    ["Mass", fmtMass(b.volume, density)],
-    ["Surface area", fmtArea(b.area)],
-    ["Envelope", fmtSize(b.bbox.size)],
-    ["Centre of mass (mm)", fmtPoint(b.centroid)],
-    ["Triangles (display)", fmtNum(b.triangles, 0)],
+    [t("detail.volume"), fmtVol(b.volume)],
+    [t("detail.mass"), fmtMass(b.volume, density)],
+    [t("detail.area"), fmtArea(b.area)],
+    [t("detail.envelope"), fmtSize(b.bbox.size)],
+    [t("detail.centroid"), fmtPoint(b.centroid)],
+    [t("detail.triangles"), fmtNum(b.triangles, 0)],
   ];
   if (b.method === "brep" && b.volume != null && b.mesh_volume != null) {
     const dev = ((b.mesh_volume - b.volume) / b.volume) * 100;
-    rows.push(["Display mesh volume", `${fmtVol(b.mesh_volume)} (${dev >= 0 ? "+" : ""}${fmtNum(dev, 3)} %)`]);
+    rows.push([t("detail.meshVolume"), `${fmtVol(b.mesh_volume)} (${dev >= 0 ? "+" : ""}${fmtNum(dev, 3)} %)`]);
   }
   el.innerHTML =
     `<h4>${escapeHtml(b.name)}</h4><dl class="stats">` +
     rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("") +
     "</dl>" +
-    b.notes.map((n) => `<div class="note">⚠ ${escapeHtml(n)}</div>`).join("");
+    b.notes.map((n) => `<div class="note">⚠ ${escapeHtml(tMessage(n))}</div>`).join("");
   el.hidden = false;
 }
 
@@ -462,6 +478,106 @@ function select(i) {
   document.querySelector("#bodies tr.selected")?.scrollIntoView({ block: "nearest" });
 }
 
+// ---------------------------------------------------------------- exports
+
+/** Results without the display meshes, for files and for scripts. */
+function exportableResult(r) {
+  const density = parseFloat($("density").value);
+  const mass = (v) => (v != null && Number.isFinite(density) && density >= 0 ? (v / 1000) * density : null);
+  return {
+    file: r.file,
+    kind: r.kind,
+    source_unit: r.source_unit,
+    units: { length: "mm", area: "mm2", volume: "mm3", mass: "g", density: "g/cm3" },
+    engine: r.engine ?? "python",
+    density,
+    summary: { ...r.summary, mass: mass(r.summary.volume) },
+    bodies: r.bodies.map(({ mesh, ...b }) => ({ ...b, mass: mass(b.volume) })),
+    elapsed_s: r.elapsed_s,
+  };
+}
+
+function download(name, blob) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+const baseName = (r) => r.file.replace(/\.[^.]+$/, "");
+
+/**
+ * Spreadsheet values: 12 significant digits (far beyond the accuracy of the
+ * measures), and floating-point noise around zero (1e-15 on a 5 m part) as 0.
+ */
+function sheetNumber(v, scale) {
+  if (typeof v !== "number" || !Number.isFinite(v)) return v;
+  return Math.abs(v) <= 1e-9 * scale ? 0 : Number(v.toPrecision(12));
+}
+
+function cleanRows(rows, scale) {
+  return rows.map((row) => row.map((v) => (v && typeof v === "object" ? { ...v, value: sheetNumber(v.value, scale) } : sheetNumber(v, scale))));
+}
+
+/** One row per body and one column per quantity; numbers stay numbers. */
+function tableRows(data) {
+  const head = ["xlsx.name", "xlsx.volume", "xlsx.volumeCm3", "xlsx.area", "xlsx.bboxX", "xlsx.bboxY", "xlsx.bboxZ",
+    "xlsx.cx", "xlsx.cy", "xlsx.cz", "xlsx.mass", "xlsx.closed", "xlsx.notes"].map((k) => t(k));
+  const yesNo = (v) => t(v ? "xlsx.yes" : "xlsx.no");
+  const row = (name, x, notes) => [
+    name, x.volume, x.volume == null ? null : x.volume / 1000, x.area, ...x.bbox.size,
+    ...(x.centroid ?? [null, null, null]), x.mass, yesNo(x.closed), notes,
+  ];
+  const rows = data.bodies.map((b) => row(b.name, b, b.notes.map(tMessage).join(" ; ")));
+  const s = data.summary;
+  rows.push(row(t("xlsx.total"), { ...s, closed: data.bodies.every((b) => b.closed) }, ""));
+  return [head, ...cleanRows(rows, Math.max(...s.bbox.size, 1e-12))];
+}
+
+async function exportXlsx() {
+  const r = state.result;
+  if (!r) return;
+  const { buildXlsx, STYLE } = await import("./xlsx.js");
+  const data = exportableResult(r);
+  const s = data.summary;
+  const pct = (v) => (v == null ? null : { value: v, style: STYLE.percent });
+  const summary = [
+    [t("xlsx.file"), data.file],
+    [t("xlsx.kind"), t(data.kind === "cad" ? "xlsx.kind.cad" : "xlsx.kind.mesh")],
+    [t("xlsx.sourceUnit"), data.source_unit],
+    [t("xlsx.date"), new Date().toLocaleString(locale())],
+    [t("xlsx.volume"), s.volume],
+    [t("xlsx.volumeCm3"), s.volume == null ? null : s.volume / 1000],
+    [t("xlsx.area"), s.area],
+    [t("xlsx.bboxX"), s.bbox.size[0]],
+    [t("xlsx.bboxY"), s.bbox.size[1]],
+    [t("xlsx.bboxZ"), s.bbox.size[2]],
+    [t("xlsx.bboxVolume"), s.bbox.volume],
+    [`${t("xlsx.obb")} 1`, s.obb?.size[0] ?? null],
+    [`${t("xlsx.obb")} 2`, s.obb?.size[1] ?? null],
+    [`${t("xlsx.obb")} 3`, s.obb?.size[2] ?? null],
+    [t("xlsx.obbVolume"), s.obb?.volume ?? null],
+    [t("xlsx.fill"), pct(s.fill_ratio)],
+    [t("xlsx.cx"), s.centroid?.[0] ?? null],
+    [t("xlsx.cy"), s.centroid?.[1] ?? null],
+    [t("xlsx.cz"), s.centroid?.[2] ?? null],
+    [t("xlsx.density"), Number.isFinite(data.density) ? data.density : null],
+    [t("xlsx.mass"), s.mass],
+    [t("xlsx.bodyCount"), { value: s.bodies, style: STYLE.text }],
+  ].map(([k, v]) => [k, k === t("xlsx.fill") || k === t("xlsx.density") ? v : cleanRows([[v]], Math.max(...s.bbox.size, 1e-12))[0][0]]);
+  const table = tableRows(data);
+  const total = table.length - 1;
+  table[total] = table[total].map((v, i) => (i === 0 ? { value: v, style: STYLE.totalText } : typeof v === "number" ? { value: v, style: STYLE.totalNumber } : v));
+  const bytes = buildXlsx([
+    { name: t("xlsx.bodies"), rows: table, header: true, widths: [28, 18, 16, 18, 16, 16, 16, 18, 18, 18, 14, 12, 50] },
+    { name: t("xlsx.summary"), rows: summary, widths: [40, 28] },
+  ]);
+  download(`${baseName(r)}_volume.xlsx`, new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+}
+
 // A CSV cell. Text starting with = + - @ would be run as a formula by spreadsheet
 // software (names come from the file, so they are not trusted).
 function csvText(text) {
@@ -472,24 +588,19 @@ function csvText(text) {
 function exportCsv() {
   const r = state.result;
   if (!r) return;
-  const density = parseFloat($("density").value);
-  const mass = (v) => (v != null && Number.isFinite(density) && density >= 0 ? (v / 1000) * density : "");
-  const head = ["name", "volume_mm3", "area_mm2", "size_x_mm", "size_y_mm", "size_z_mm", "cx_mm", "cy_mm", "cz_mm", "closed", "mass_g"];
-  const lines = [head.join(",")];
-  for (const b of r.bodies) {
-    const c = b.centroid || ["", "", ""];
-    lines.push([csvText(b.name), b.volume ?? "", b.area, ...b.bbox.size, ...c, b.closed, mass(b.volume)].join(","));
-  }
-  const s = r.summary;
-  lines.push([csvText("TOTAL"), s.volume ?? "", s.area, ...s.bbox.size, ...(s.centroid || ["", "", ""]),
-    r.bodies.every((b) => b.closed), mass(s.volume)].join(","));
+  // French spreadsheet software expects ";" between cells and a decimal comma.
+  const fr = language() === "fr";
+  const sep = fr ? ";" : ",";
+  const cell = (v) => (typeof v === "number" ? (fr ? String(v).replace(".", ",") : String(v)) : v == null ? "" : csvText(v));
+  const lines = tableRows(exportableResult(r)).map((row) => row.map(cell).join(sep));
   // The BOM makes spreadsheet software read the names as UTF-8.
-  const blob = new Blob(["\ufeff" + lines.join("\r\n") + "\r\n"], { type: "text/csv;charset=utf-8" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = r.file.replace(/\.[^.]+$/, "") + "_volume.csv";
-  a.click();
-  URL.revokeObjectURL(a.href);
+  download(`${baseName(r)}_volume.csv`, new Blob(["\ufeff" + lines.join("\r\n") + "\r\n"], { type: "text/csv;charset=utf-8" }));
+}
+
+function exportJson() {
+  const r = state.result;
+  if (!r) return;
+  download(`${baseName(r)}_volume.json`, new Blob([JSON.stringify(exportableResult(r), null, 2)], { type: "application/json" }));
 }
 
 // ---------------------------------------------------------------- view tools
@@ -593,6 +704,8 @@ $("section-flip").addEventListener("click", () => {
   updateSection();
 });
 $("export-csv").addEventListener("click", exportCsv);
+$("export-xlsx").addEventListener("click", () => exportXlsx().catch((err) => showError(err.message)));
+$("export-json").addEventListener("click", exportJson);
 
 // Click a body in the 3D view to select it.
 const raycaster = new THREE.Raycaster();
@@ -628,4 +741,225 @@ window.addEventListener("drop", (e) => {
   openFile(e.dataTransfer.files[0]);
 });
 
-initEngines();
+// ---------------------------------------------------------------- memory gauge
+
+// The CAD engine runs in WebAssembly, whose memory (heap) only grows, up to
+// 4 GiB, and is never given back. The browser stops a page that asks for more
+// than the device can give: the gauge compares what the analysis uses (or will
+// use, estimated from the file size) with what it can safely get.
+const GiB = 2 ** 30;
+const WASM_MAX = 4294901760;
+const memory = { heap: 0, estimate: null, restarted: false };
+
+/** Bytes the analysis can use without risking a crash. */
+function memoryBudget() {
+  // navigator.deviceMemory: GB of RAM, rounded down, at most 8 (Chrome, Edge).
+  const device = navigator.deviceMemory;
+  if (device) return Math.min(WASM_MAX, (device * GiB) / 2);
+  // Not reported (Firefox, Safari): phones and tablets stop pages much earlier.
+  return /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent) ? 1 * GiB : 2 * GiB;
+}
+
+function jsHeap() {
+  const m = performance.memory; // Chrome only
+  return m ? { used: m.usedJSHeapSize, limit: m.jsHeapSizeLimit } : null;
+}
+
+function memoryLevel(ratio) {
+  return ratio < 0.6 ? "ok" : ratio < 0.85 ? "warn" : "critical";
+}
+
+function renderMemory() {
+  if (currentEngine() !== "browser") {
+    $("memory-gauge").hidden = true;
+    $("memory-card").hidden = true;
+    return;
+  }
+  const budget = memoryBudget();
+  const js = jsHeap();
+  const ratios = [memory.heap / budget, memory.estimate ? memory.estimate.bytes / budget : 0];
+  if (js) ratios.push(js.used / js.limit);
+  const ratio = Math.min(1, Math.max(0, ...ratios));
+  const level = memoryLevel(ratio);
+  const percent = Math.round(ratio * 100);
+  for (const id of ["memory-fill", "memory-fill-big"]) {
+    $(id).style.width = `${percent}%`;
+    $(id).dataset.level = level;
+  }
+  $("memory-percent").textContent = `${percent} %`;
+  $("memory-gauge").hidden = false;
+  $("memory-gauge").dataset.level = level;
+  $("memory-gauge").title = `${t("memory.title")} : ${percent} % — ${t(`memory.level.${level}`)}`;
+  $("memory-level").textContent = t(`memory.level.${level}`);
+  $("memory-level").dataset.level = level;
+
+  const of = (used, limit) => t("memory.of", { used: fmtMB(used), limit: fmtMB(limit), percent: Math.round((used / limit) * 100) });
+  const rows = [
+    [t("memory.cad"), of(memory.heap, budget)],
+    [t("memory.budget"), fmtMB(budget)],
+    [t("memory.device"), navigator.deviceMemory ? t("memory.deviceValue", { gb: navigator.deviceMemory }) : t("memory.unknown")],
+  ];
+  if (js) rows.push([t("memory.tab"), of(js.used, js.limit)]);
+  if (memory.estimate) rows.push([t("memory.estimate", { file: memory.estimate.file }), of(memory.estimate.bytes, budget)]);
+  $("memory-stats").innerHTML = rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join("");
+  $("memory-advice").textContent = (memory.restarted ? t("memory.restarted") + " " : "") + t(`memory.advice.${level}`);
+  $("loading-memory").textContent = `${t("memory.short")} : ${of(Math.max(memory.heap, js?.used ?? 0), budget)}`;
+  $("memory-card").hidden = false;
+}
+
+function onEngineMemory(m) {
+  memory.heap = m.heap;
+  if (m.restarted) memory.restarted = true;
+  renderMemory();
+}
+
+/** Estimate the memory the file needs; ask before an analysis that risks a crash. */
+async function memoryCheck(file) {
+  const client = await browserClient();
+  const { bytes } = client.estimateMemory(file, memory.heap);
+  memory.estimate = { file: file.name, bytes };
+  memory.restarted = false;
+  renderMemory();
+  const budget = memoryBudget();
+  if (bytes / budget < 0.9 || state.noPrompt) return true;
+  return confirm(t("memory.confirm", { file: file.name, need: fmtMB(bytes), percent: Math.round((bytes / budget) * 100), limit: fmtMB(budget) }));
+}
+
+/** After an analysis: give a large CAD engine heap back to the system. */
+async function afterAnalysisMemory() {
+  if (currentEngine() !== "browser") return;
+  memory.estimate = null;
+  if (memory.heap > 0.6 * memoryBudget()) {
+    const client = await browserClient();
+    if (client.releaseMemory()) memory.heap = 0;
+  }
+  renderMemory();
+}
+
+setInterval(() => document.visibilityState === "visible" && !$("memory-card").hidden && renderMemory(), 2000);
+
+// ---------------------------------------------------------------- scripts and AI assistants
+
+// The page can be driven by a link (see ai.html):
+//   ?url=<address of a 3D file>   analyse that file (the server must allow CORS)
+//   &lang=fr|en  &unit=mm|cm|m|in|ft  &quality=coarse|normal|fine
+//   &export=json|xlsx|csv         download the results once analysed
+//   &report=1                     show the results as plain text in the page
+// The results are also in <script id="reader3d-result" type="application/json">,
+// <body data-status="analysing|done|error"> and window.reader3d.
+const params = new URLSearchParams(location.search);
+
+function setStatus(status, message = "") {
+  document.body.dataset.status = status;
+  if (message) document.body.dataset.error = message;
+  else delete document.body.dataset.error;
+}
+
+function plainReport(data) {
+  const s = data.summary;
+  const n = (v, unit) => (v == null ? "—" : `${+v.toPrecision(10)} ${unit}`);
+  const lines = [
+    `file: ${data.file}`,
+    `kind: ${data.kind} (${data.kind === "cad" ? "exact B-rep volume" : "closed-mesh volume"}), source unit: ${data.source_unit}`,
+    `volume: ${n(s.volume, "mm3")}`,
+    `surface_area: ${n(s.area, "mm2")}`,
+    `envelope_aabb: ${s.bbox.size.map((x) => +x.toPrecision(10)).join(" x ")} mm (volume ${n(s.bbox.volume, "mm3")})`,
+    `envelope_min_oriented: ${s.obb ? s.obb.size.map((x) => +x.toPrecision(10)).join(" x ") + " mm" : "—"}`,
+    `fill_ratio: ${s.fill_ratio == null ? "—" : +(s.fill_ratio * 100).toPrecision(6) + " %"}`,
+    `centre_of_mass: ${s.centroid ? s.centroid.map((x) => +x.toPrecision(10)).join(", ") + " mm" : "—"}`,
+    `mass: ${n(s.mass, "g")} (density ${data.density} g/cm3)`,
+    `bodies: ${s.bodies} (${s.open_bodies} open)`,
+    "",
+    "name | volume_mm3 | area_mm2 | size_x_mm | size_y_mm | size_z_mm | closed",
+    ...data.bodies.map((b) => [b.name, b.volume ?? "—", b.area, ...b.bbox.size, b.closed].map((v) => (typeof v === "number" ? +v.toPrecision(10) : v)).join(" | ")),
+  ];
+  return lines.join("\n");
+}
+
+function publishResult(r) {
+  const data = exportableResult(r);
+  // "<" escaped so that a part name cannot close the script element.
+  $("reader3d-result").textContent = JSON.stringify(data).replace(/</g, "\\u003c");
+  if (params.get("report")) {
+    let pre = $("reader3d-report");
+    if (!pre) {
+      pre = document.createElement("pre");
+      pre.id = "reader3d-report";
+      pre.className = "card report";
+      document.querySelector(".panel").prepend(pre);
+    }
+    pre.textContent = plainReport(data);
+  }
+  const format = params.get("export");
+  if (format === "json") exportJson();
+  else if (format === "xlsx") exportXlsx().catch((err) => showError(err.message));
+  else if (format === "csv") exportCsv();
+}
+
+async function openUrl(url) {
+  setStatus("analysing");
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const name = decodeURIComponent(new URL(url, location.href).pathname.split("/").pop() || "model");
+    const fileName = params.get("name") || name;
+    await openFile(new File([await res.blob()], fileName));
+  } catch (err) {
+    const message = t("error.loadUrl", { url, reason: err.message });
+    showError(message);
+    setStatus("error", message);
+  }
+}
+
+// window.reader3d: for scripts and browser-driving AI agents.
+//   await reader3d.analyze(fileOrUrl) -> results (same JSON as the export)
+window.reader3d = {
+  version: 1,
+  get result() {
+    return state.result ? exportableResult(state.result) : null;
+  },
+  get status() {
+    return document.body.dataset.status ?? "idle";
+  },
+  async analyze(input, { name } = {}) {
+    state.noPrompt = true; // no memory confirmation dialog for scripts
+    if (typeof input === "string") await openUrl(input);
+    else await openFile(input instanceof File ? input : new File([input], name ?? "model"));
+    if (document.body.dataset.status === "error") throw new Error(document.body.dataset.error);
+    return this.result;
+  },
+  report() {
+    return state.result ? plainReport(exportableResult(state.result)) : "";
+  },
+};
+
+// ---------------------------------------------------------------- language
+
+function applyLanguage() {
+  applyToPage();
+  $("language").value = language();
+  showEngineStatus(null);
+  renderPanel();
+  renderMemory();
+}
+
+$("language").addEventListener("change", (e) => {
+  setLanguage(e.target.value);
+  applyLanguage();
+});
+
+// ---------------------------------------------------------------- start
+
+for (const [param, id] of [["unit", "unit"], ["quality", "quality"]]) {
+  const value = params.get(param);
+  if (value && [...$(id).options].some((o) => o.value === value)) $(id).value = value;
+}
+applyLanguage();
+setStatus("idle");
+initEngines().then(() => {
+  const url = params.get("url");
+  if (url) {
+    state.noPrompt = true;
+    openUrl(url);
+  }
+});

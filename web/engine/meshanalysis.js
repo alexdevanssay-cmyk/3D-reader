@@ -40,10 +40,16 @@ const INWARDS = 'Normals pointed inwards; volume sign corrected';
  *   for a non-indexed triangle soup.
  * @returns {object[]} one body per part with triangles (see the result contract in SPEC).
  */
-export function analyzeMeshParts(parts) {
+export function analyzeMeshParts(parts, onProgress = null) {
   const bodies = [];
+  // Progress, weighted by the size of each part.
+  const sizeOf = (p) => (p.indices ? p.indices.length : p.positions.length / 3);
+  const total = Math.max(1, parts.reduce((n, p) => n + sizeOf(p), 0));
+  let done = 0;
   for (const part of parts) {
-    const count = part.indices ? part.indices.length : part.positions.length / 3;
+    const count = sizeOf(part);
+    done += count;
+    onProgress?.(done / total);
     if (count < 3) continue; // like mesh.py: geometry without faces is skipped
     const body = analyzeMesh(part.name, part.positions, part.indices ?? null, part.color ?? null);
     // Every face had a non-finite vertex: trimesh removes them on load and mesh.py then

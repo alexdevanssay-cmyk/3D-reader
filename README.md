@@ -29,7 +29,16 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
 - Assemblies: one row per part with names and colours from the STEP file, per-part
   volume and share, show/hide, and click a part in 3D to select it.
 - Viewer: orbit, pan, zoom, standard views, wireframe, envelope display, section plane.
-- CSV export of the per-part results.
+- Export of the results to **Excel** (.xlsx, one value per cell: a row per body, a
+  column per quantity, plus a summary sheet), CSV (`;` and decimal comma in French)
+  and JSON.
+- Interface in **English or French** (button in the top bar, or `?lang=fr`).
+- Progress of the analysis in percent, and a **memory gauge** (criticality in %, memory
+  of the CAD engine, of the page and of the device) that warns before a file that could
+  make the browser stop the page; the CAD engine gives its memory back after a large file.
+- **AI assistants and scripts** can use the online reader by link
+  (`?url=<model URL>&report=1`), through `window.reader3d.analyze()` in the page, or
+  with the Python package: see [web/ai.html](web/ai.html) (published at `/ai.html`).
 - Units: everything is reported in mm / mm² / mm³ (switchable to cm³, dm³, m³, in³).
   CAD files are converted from their own unit automatically. Mesh files have no unit,
   so choose it (auto = mm, or metres for glTF, or the unit stored in 3MF/DAE).
@@ -87,6 +96,9 @@ the app in a URL like `https://<codespace>-8000.app.github.dev`. A codespace sto
 after a period of inactivity, so use GitHub Pages for a permanent URL.
 
 ### Command line
+
+Installable as a package (`pip install "git+https://github.com/alexdevanssay-cmyk/3D-reader"`
+gives a `reader3d` command), or from a checkout:
 
 ```bash
 python -m reader3d analyze part.step
