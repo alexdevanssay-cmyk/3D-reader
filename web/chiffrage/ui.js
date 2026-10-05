@@ -5,6 +5,7 @@
 import { MODES, readCostingWorkbook, readIndicesWorkbook } from "./workbook.js";
 import { centreRates, indexAverage, quote, saleMetalPrice, solveMargin as minimumMargin } from "./model.js";
 import { bestRoutes, buildRoute, rankRoutes } from "./routes.js";
+import { programmeOf, readSeriesOrder } from "./rfq.js";
 import * as store from "./store.js";
 
 let el = null;
@@ -48,7 +49,7 @@ const monthLabel = (m) => {
 };
 const dateLabel = (iso) => (iso ? new Date(iso).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" }) : "—");
 // Inputs of the user (the others are defaults from the workbook).
-const USER_FIELDS = ["client", "reference", "designation", "plan", "volumeAnnuel", "annees", "premiereAnnee", "volumes", "pieces", "pieceFile"];
+const USER_FIELDS = ["client", "reference", "designation", "plan", "volumeAnnuel", "annees", "premiereAnnee", "volumes", "pieces", "pieceFile", "serie", "moqs", "prixCible", "serieEnergie"];
 // Inputs of each piece (q.pieces[key]); null: from the 3D model or estimated.
 const PIECE_DEFAULTS = {
   poids: null, toileMini: null, epaisseurMax: null, moduleMm: null, dimMax: null,
@@ -67,8 +68,8 @@ const UO = { kgCast: "kg coulé", kgSold: "kg", pph: "h", hour: "h" };
 // Form fields. data-bind: "q.<path>" (quote) or "s.<path>" (settings);
 // data-kind: num (number, empty = null), pct (percent shown, ratio stored), text, bool, raw (select value).
 function input(bind, value, { kind = "num", step = "any", min, placeholder = "", width } = {}) {
-  const shown = value === null || value === undefined ? "" : kind === "pct" ? +(value * 100).toFixed(4) : value;
-  const type = kind === "text" ? "text" : "number";
+  const shown = value === null || value === undefined ? "" : kind === "pct" ? +(value * 100).toFixed(4) : kind === "list" ? value.join(" ; ") : value;
+  const type = kind === "text" || kind === "list" ? "text" : "number";
   return `<input type="${type}" data-bind="${esc(bind)}" data-kind="${kind}" value="${esc(shown)}"${type === "number" ? ` step="${step}"` : ""}${min !== undefined ? ` min="${min}"` : ""} placeholder="${esc(placeholder)}"${width ? ` style="width:${width}"` : ""}>`;
 }
 
@@ -102,6 +103,8 @@ function readValue(target) {
   const raw = target.value.trim();
   if (kind === "text" || kind === "raw") return raw;
   if (kind === "nullraw") return raw === "" ? null : raw;
+  // Positive whole numbers separated by ";", "," or spaces, largest first (order quantities).
+  if (kind === "list") return [...new Set(raw.split(/[;,\s]+/).map((x) => Math.round(Number(x))).filter((n) => n > 0))].sort((a, b) => b - a);
   if (raw === "") return null;
   const n = Number(raw.replace(",", "."));
   if (!Number.isFinite(n)) return null;
@@ -158,7 +161,7 @@ async function onClick(event) {
   const button = event.target.closest("[data-action]");
   if (!button) return;
   const action = button.dataset.action;
-  if (action === "import-workbook" || action === "import-indices" || action === "import-settings") button.parentElement.querySelector("input[data-file]")?.click();
+  if (action === "import-workbook" || action === "import-indices" || action === "import-settings" || action === "import-rfq") button.parentElement.querySelector("input[data-file]")?.click();
   else if (action === "thickness") {
     thicknessBusy = true;
     render();
@@ -204,6 +207,10 @@ async function onClick(event) {
   } else if (action === "remove-component") {
     const piece = pieceStore(currentKey);
     piece.composants = (piece.composants ?? []).filter((_, i) => i !== Number(button.dataset.index));
+    store.saveQuote(q);
+    render();
+  } else if (action === "remove-rfq") {
+    q.serie = null;
     store.saveQuote(q);
     render();
   } else if (action === "reset-quote") {
@@ -257,6 +264,15 @@ async function importFile(target) {
       q.month = [...indices.months].reverse().find((m) => indexAverage(indices, q.cours, m, q.typologie) !== null) ?? indices.months.at(-1);
       store.saveQuote(q);
       message = { kind: "ok", text: `Indices « ${file.name} » importés : ${Object.keys(indices.series).length} cours, ${monthLabel(indices.months[0])} à ${monthLabel(indices.months.at(-1))}.` };
+    } else if (target.dataset.file === "rfq") {
+      const order = readSeriesOrder(bytes, file.name);
+      applySeriesOrder(order);
+      store.saveQuote(q);
+      const prog = programmeOf(order);
+      message = {
+        kind: "ok",
+        text: `Commande série « ${file.name} » importée : ${prog ? `${prog.annees} an${prog.annees > 1 ? "s" : ""} à partir de ${prog.premiereAnnee}, ${nf(prog.volumes.reduce((a, b) => a + b, 0), 0)} pièces` : "pas de volume série"}${order.moqs.length ? `, MOQ ${order.moqs.join(" / ")}` : ""}${order.targetPrice ? `, prix cible ${eur(order.targetPrice, 2)}` : ""}.`,
+      };
     } else if (target.dataset.file === "settings") {
       const saved = JSON.parse(new TextDecoder().decode(bytes));
       store.saveSettings(saved);
@@ -267,6 +283,31 @@ async function importFile(target) {
     message = { kind: "error", text: `${file.name} : ${err.message || err}` };
   }
   render();
+}
+
+/** Take the series order of a customer request into the quote. */
+function applySeriesOrder(order) {
+  q.serie = order;
+  const prog = programmeOf(order);
+  if (prog) {
+    q.premiereAnnee = prog.premiereAnnee;
+    q.annees = prog.annees;
+    q.volumes = prog.volumes;
+    q.volumeAnnuel = prog.pic;
+  }
+  if (order.moqs.length) {
+    q.moqs = order.moqs;
+    // The changeover is spread over the largest order quantity, at most a year of production.
+    q.tailleSerie = prog ? Math.min(order.moqs[0], prog.pic) : order.moqs[0];
+  }
+  if (order.targetPrice) q.prixCible = order.targetPrice;
+  if (order.client) q.client = order.client;
+  // "MZ-0681155 - K.451.256G LABLE PLATE RIGHT": reference, then designation.
+  const m = /^(\S+)\s+-\s+(.+)$/.exec(order.reference);
+  if (m) [q.reference, q.designation] = [m[1], m[2]];
+  else if (order.reference) q.reference = order.reference;
+  if (order.plan) q.plan = order.plan;
+  if (base?.lists.alliages.includes(order.alliage)) q.alliage = order.alliage;
 }
 
 function download(name, blob) {
@@ -328,6 +369,11 @@ function compute() {
     pafVente: q.pafVente || 0,
   };
   const energy = Object.fromEntries(Object.entries(settings.energy ?? {}).filter(([, v]) => Number.isFinite(v)));
+  // Energy prices of the customer request (€/MWh), in place of the new prices of the settings.
+  if (q.serie && q.serieEnergie !== false) {
+    if (q.serie.elec > 0) energy.elecNouveau = q.serie.elec;
+    if (q.serie.gaz > 0) energy.gazNouveau = q.serie.gaz;
+  }
   const rates = centreRates(base, { modes: settings.modes, energy });
   const common = { density, years, volumes, volumeTotal, sale, metal, energy, rates };
   const results = pieces.map((piece) => computePiece(piece, common));
@@ -506,6 +552,9 @@ function sourcesCard() {
     <div class="crow"><span>Indices matière :</span> <strong>${indicesInfo}</strong>
       <button type="button" class="small" data-action="import-indices">Importer les indices…</button>
       <input type="file" data-file="indices" accept=".xlsx,.xlsm" hidden></div>
+    <div class="crow"><span>Commande série :</span> <strong>${q.serie ? `${esc(q.serie.fileName)} — importée le ${dateLabel(q.serie.importedAt)}` : "aucune"}</strong>
+      <button type="button" class="small" data-action="import-rfq">Importer la demande client…</button>
+      <input type="file" data-file="rfq" accept=".xlsm,.xlsx" hidden>${q.serie ? ` <button type="button" class="small" data-action="remove-rfq">Retirer</button>` : ""}</div>
     <p class="muted small">Les fichiers sont lus dans ce navigateur et mémorisés sur ce poste : rien n'est envoyé sur Internet.
       Indices : fichier Excel avec un onglet « Suivi indice » (comme VALEURS MB LME.xlsx) ; réimportez-le après chaque mise à jour des cours.</p>
   </section>`;
@@ -554,8 +603,8 @@ function renderQuote() {
         ${pieceSelect}
         ${field("Alliage", select("q.alliage", q.alliage, lists.alliages), `densité ${nf(c.density, 2)}`)}
         ${field("Volume annuel (ensembles / pièces)", input("q.volumeAnnuel", q.volumeAnnuel, { step: 1, min: 0 }))}
-        ${field("Durée du programme", select("q.annees", q.annees, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12].map((n) => [n, `${n} an${n > 1 ? "s" : ""}`]), { kind: "num" }))}
-        ${field("Première année", select("q.premiereAnnee", q.premiereAnnee, Array.from({ length: 8 }, (_, i) => new Date().getFullYear() - 1 + i), { kind: "num" }))}
+        ${field("Durée du programme", select("q.annees", q.annees, [...new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, q.annees])].sort((a, b) => a - b).map((n) => [n, `${n} an${n > 1 ? "s" : ""}`]), { kind: "num" }))}
+        ${field("Première année", select("q.premiereAnnee", q.premiereAnnee, [...new Set([...Array.from({ length: 8 }, (_, i) => new Date().getFullYear() - 1 + i), q.premiereAnnee])].sort((a, b) => a - b), { kind: "num" }))}
       </div>
       <p class="small muted">Modèle 3D : ${c.p3d ? `<strong>${esc(c.p3d.file)}</strong> — ${c.pieces.length} pièce${c.pieces.length > 1 ? "s" : ""}${openParts.length ? ` (${openParts.length} surface${openParts.length > 1 ? "s" : ""} ouverte${openParts.length > 1 ? "s" : ""} non chiffrée${openParts.length > 1 ? "s" : ""})` : ""}${thicknessButton}` : "aucun (ouvrez un fichier dans l'onglet Analyse 3D, ou saisissez les valeurs)"}</p>
       ${ensemble ? "" : pieceFields(r)}
@@ -584,6 +633,7 @@ function renderQuote() {
 
   ${ensemble ? ensembleCard(c) : solutionsCard(r)}
   ${ensemble ? ensembleDetailCard(c) : detailCard(r)}
+  ${seriesCard(c)}
   ${projectionCard(c, ensemble ? c.ensemble : r?.final)}
   <p class="cactions">
     <button type="button" data-action="export-xlsx"${c.results.some((x) => x.final) ? "" : " disabled"}>Exporter le chiffrage (Excel)</button>
@@ -803,6 +853,48 @@ function detailCard(r) {
   </section>`;
 }
 
+/** Prices of the order quantities: the changeover spread over each one, first year. */
+function moqPrices(c) {
+  const shown = c.selected === "ensemble" ? c.results.filter((r) => r.final) : c.results.filter((r) => r.piece.key === c.selected && r.final);
+  if (!shown.length) return null;
+  const at = (tailleSerie) => {
+    const ys = shown.map((r) => quote(r.finalRates, base.lists, { ...r.finalInput, tailleSerie }).years[0]);
+    const sum = (k) => ys.reduce((a, y) => a + (y[k] || 0), 0);
+    const vaVendueTotale = sum("vaVendueTotale");
+    return { tailleSerie, prixVente: sum("prixVente"), miseEnRoute: sum("miseEnRouteVendue"), margeVaPct: vaVendueTotale > 0 ? sum("margeVa") / vaVendueTotale : null };
+  };
+  return { base: at(q.tailleSerie), moqs: (q.moqs ?? []).map(at), shown };
+}
+
+function seriesCard(c) {
+  const s = q.serie;
+  const prices = moqPrices(c);
+  const target = q.prixCible;
+  const gap = (p) => (target > 0 ? `${p > target ? "+" : ""}${eur(p - target, 2)} (${pct(p / target - 1)})` : "—");
+  const rows = prices
+    ? [{ label: `Taille de série du chiffrage (${nf(q.tailleSerie, 0)})`, ...prices.base }, ...prices.moqs.map((x, i) => ({ label: `MOQ ${i + 1} : ${nf(x.tailleSerie, 0)} pièces`, ...x }))]
+        .map((x) => `<tr><td>${x.label}</td><td class="num">${eur(x.miseEnRoute, 3)}</td><td class="num">${eur(x.prixVente, 2)}</td><td class="num">${pct(x.margeVaPct)}</td><td class="num${target > 0 && x.prixVente > target ? " bad" : ""}">${gap(x.prixVente)}</td></tr>`)
+        .join("")
+    : "";
+  // The process asked by the customer (e.g. "CG": gravity die casting) against the islands retained.
+  const mismatch = s?.fonderie && prices ? prices.shown.filter((r) => r.route && !r.route.process.toUpperCase().startsWith(s.fonderie.toUpperCase())) : [];
+  return `<section class="ccard">
+    <h3>Commande série${c.selected === "ensemble" ? " — ensemble" : ""}</h3>
+    ${s ? `<p class="small">${[s.client, s.demande, s.offre && `offre ${s.offre}`, s.fonderie && `fonderie ${s.fonderie}`, s.usinage, s.references > 1 && `${s.references} références dans la demande`].filter(Boolean).map(esc).join(" — ")}</p>` : `<p class="small muted">Importez la demande client (onglet « 1- Données GO NO GO ») pour reprendre les volumes par année, les MOQ et le prix cible, ou saisissez-les ici.</p>`}
+    <div class="cfields">
+      ${field("Quantités commandées (MOQ)", input("q.moqs", q.moqs ?? [], { kind: "list", placeholder: "1000 ; 500 ; 50" }), "séparées par « ; »")}
+      ${field("Prix cible client (€/pièce)", input("q.prixCible", q.prixCible, { min: 0 }))}
+      ${field("Taille de série (pièces)", input("q.tailleSerie", q.tailleSerie, { step: 1, min: 1 }), "répartit le changement de série")}
+      ${s && (s.elec > 0 || s.gaz > 0) ? checkbox("q.serieEnergie", q.serieEnergie !== false, `Prix de l'énergie de la demande (élec ${nf(s.elec ?? 0, 0)} €/MWh, gaz ${nf(s.gaz ?? 0, 0)} €/MWh)`) : ""}
+    </div>
+    ${mismatch.length ? `<p class="cmsg warn">La demande indique la fonderie « ${esc(s.fonderie)} » : îlot retenu différent pour ${mismatch.map((r) => `${esc(r.piece.name)} (${esc(r.route.process)})`).join(", ")}.</p>` : ""}
+    ${prices ? `<div class="cscroll"><table class="ctable">
+      <thead><tr><th>Quantité</th><th class="num">Mise en route / pièce</th><th class="num">Prix de vente ${c.years[0]}</th><th class="num">Marge sur VA</th><th class="num">Écart au prix cible</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+      <p class="small muted">Prix de la première année : les frais de changement de série (coulée et finition) sont répartis sur la quantité de chaque commande.</p>` : ""}
+  </section>`;
+}
+
 function projectionCard(c, f) {
   if (!f?.years?.length) return "";
   const head = f.years.map((y) => `<th class="num">${y.year}</th>`).join("");
@@ -967,10 +1059,25 @@ async function exportXlsx() {
   const solutions = [["Pièce", "Rang", "Îlot", "Finition", "Cycle (s)", "Pièces par cycle", "Mise au mille", "PRI (€)", "Outillage / pièce (€)", "Qualité /10", "Qualité / prix"]];
   for (const r of done) r.best.forEach((x, i) => solutions.push([r.piece.name, i + 1, `${x.process} — ${x.famille}`, x.finition, x.cycle, x.parCycle, x.miseAuMille, x.result.pri, x.outillagePiece, x.qualite, x.ratio * 100]));
 
+  const prices = moqPrices(c);
+  const serie = [
+    [H("Commande série"), null],
+    ["Demande client", q.serie?.fileName ?? "—"], ["Client", q.serie?.client ?? q.client], ["N° offre", q.serie?.offre ?? null],
+    ["Fonderie demandée", q.serie?.fonderie ?? null], ["Prix cible (€/pièce)", q.prixCible ?? null],
+    [],
+    ["Année", ...c.years].map(H), ["Volume", ...c.volumes],
+    [],
+    ["Quantité", "Mise en route / pièce (€)", `Prix de vente ${c.years[0]} (€)`, "Marge sur VA", "Écart au prix cible (€)"].map(H),
+  ];
+  if (prices) {
+    for (const x of [prices.base, ...prices.moqs]) serie.push([x.tailleSerie, x.miseEnRoute, x.prixVente, P(x.margeVaPct), q.prixCible > 0 ? x.prixVente - q.prixCible : null]);
+  }
+
   const bytes = buildXlsx([
     { name: "Synthèse", rows: synthese, widths: [32, 14, 14, 20, 16, 34, 22, 14, 10, 12, 8, 12, 12, 14, 14, 14, 12] },
     { name: "Gammes", rows: gammes, header: true, widths: [28, 10, 34, 14, 12, 14, 10, 18, 14, 14] },
     { name: "Projection", rows: projection, header: true, widths: [10, 12, 14, 18, 16, 16, 22] },
+    { name: "Commande série", rows: serie, widths: [26, 24, 22, 14, 22, 12, 12, 12, 12, 12, 12, 12] },
     { name: "Solutions", rows: solutions, header: true, widths: [28, 8, 40, 10, 12, 14, 12, 12, 18, 12, 14] },
   ]);
   const name = (q.reference || c.p3d?.file?.replace(/\.[^.]+$/, "") || "piece").replace(/[^\w.-]+/g, "_");

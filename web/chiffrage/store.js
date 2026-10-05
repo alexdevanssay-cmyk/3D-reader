@@ -147,6 +147,10 @@ export function defaultQuote(base, indices) {
     tailleSerie: d.tailleSerie || 1000,
     marge: null, // null: the setting
     composants: [],
+    serie: null, // series order of the customer request (rfq.js)
+    moqs: [], // order quantities, largest first
+    prixCible: null,
+    serieEnergie: true, // energy prices of the request in place of the settings
   };
 }
 

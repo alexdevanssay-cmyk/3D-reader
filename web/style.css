@@ -275,3 +275,4 @@ table.bodies .open { color: var(--warn); }
 .cmsg.warn { background: color-mix(in srgb, var(--warn) 16%, transparent); }
 .cactions { display: flex; gap: 8px; flex-wrap: wrap; }
 @media (max-width: 700px) { .cgrid { grid-template-columns: 1fr; } }
+.ctable td.bad { color: var(--error-text); }

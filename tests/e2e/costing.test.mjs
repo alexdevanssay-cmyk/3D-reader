@@ -16,7 +16,7 @@ import { unzipSync, strFromU8 } from '../../node_modules/three/examples/jsm/libs
 
 import { createStaticServer } from '../../scripts/serve.mjs';
 import { ROOT, fixturePath } from '../js/helpers.mjs';
-import { costingWorkbook, indicesWorkbook } from '../js/costing-fixture.mjs';
+import { costingWorkbook, indicesWorkbook, seriesOrderWorkbook } from '../js/costing-fixture.mjs';
 
 const DIST = join(ROOT, 'dist');
 
@@ -30,6 +30,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     dir = mkdtempSync(join(tmpdir(), 'costing-'));
     writeFileSync(join(dir, 'chiffrage.xlsm'), costingWorkbook());
     writeFileSync(join(dir, 'VALEURS MB LME.xlsx'), indicesWorkbook(100));
+    writeFileSync(join(dir, 'RFQ.xlsm'), seriesOrderWorkbook());
     server = createStaticServer(DIST);
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     base = `http://127.0.0.1:${server.address().port}/`;
@@ -96,11 +97,24 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.match(await page.textContent('#page-chiffrage'), /300 s × 1 — TRS 60 %/);
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.poids"]'), '1.2', 'inputs kept too');
 
+    // The series order of the customer request: volumes per year, MOQ, target price.
+    await page.setInputFiles('#page-chiffrage input[data-file="rfq"]', join(dir, 'RFQ.xlsm'));
+    await page.waitForFunction(() => /Commande série « RFQ\.xlsm » importée : 4 ans à partir de 2027, 4 800 pièces, MOQ 2000 \/ 500 \/ 50, prix cible 30,00 €/.test(document.getElementById('page-chiffrage').textContent.replace(/\u202f/g, ' ')));
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.client"]'), 'ACME RAIL');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.reference"]'), 'AB-123');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.volumes.1"]'), '1500');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.tailleSerie"]'), '1500');
+    const moqRows = await page.$$eval('#page-chiffrage .ctable tbody tr', (trs) => trs.map((tr) => tr.textContent).filter((t) => /MOQ \d/.test(t)));
+    assert.equal(moqRows.length, 3, moqRows.join('\n'));
+    const price = (t) => Number(/(\d[\d\s\u202f]*,\d\d) €(?=[^€]*%)/.exec(t)[1].replace(/[\s\u202f]/g, '').replace(',', '.'));
+    assert.ok(price(moqRows[2]) > price(moqRows[0]), moqRows.join('\n'));
+    assert.match(await page.textContent('#page-chiffrage'), /Écart au prix cible/);
+
     // Excel export of the quote.
     const [download] = await Promise.all([page.waitForEvent('download'), page.click('#page-chiffrage [data-action="export-xlsx"]')]);
     const files = unzipSync(new Uint8Array(readFileSync(await download.path())));
     const workbook = strFromU8(files['xl/workbook.xml']);
-    for (const name of ['Synthèse', 'Gammes', 'Projection', 'Solutions']) assert.match(workbook, new RegExp(`name="${name}"`));
+    for (const name of ['Synthèse', 'Gammes', 'Projection', 'Commande série', 'Solutions']) assert.match(workbook, new RegExp(`name="${name}"`));
     const synthese = strFromU8(files['xl/worksheets/sheet1.xml']);
     assert.match(synthese, /CG3 — Coquille gravité \(traditionnel\)/);
     assert.match(synthese, /Mise au mille/);
