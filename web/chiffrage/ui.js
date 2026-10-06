@@ -54,13 +54,24 @@ export function mount(targets) {
   document.addEventListener("reader3d-part", () => {
     if (!el.chiffrage.hidden) render();
   });
-  return { show };
+  return { show, setTab, forgetTab };
 }
 
 export function show(name) {
   page = name;
   render();
 }
+
+/** The tab `id` of the 3D page is shown: its own quote (the settings and the workbooks are shared). */
+export function setTab(id) {
+  store.setQuoteTab(id);
+  q = store.loadQuote(base, indices);
+  message = null;
+  render();
+}
+
+/** The tab `id` was closed: its quote is forgotten. */
+export const forgetTab = (id) => store.forgetQuote(id);
 
 // --------------------------------------------------------------------------- formatting
 

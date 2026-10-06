@@ -182,6 +182,20 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.match(synthese, /Mise au mille/);
     assert.match(strFromU8(files['xl/worksheets/sheet2.xml']), /CG3/);
 
+    // A new tab of the 3D page: its own quote, without the series order; the workbook and the indices are shared.
+    await page.click('.doc-tab-new');
+    await page.waitForFunction(() => /Commande série :\s*aucune/.test(document.getElementById('page-chiffrage').textContent));
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.client"]'), '');
+    assert.match(await page.textContent('#page-chiffrage'), /Classeur de chiffrage :\s*[^\n]*\.xlsm — importé le/);
+    assert.match(await page.textContent('#page-chiffrage'), /Indices matière :\s*VALEURS MB LME\.xlsx/);
+    await page.click('.doc-tab:first-child');
+    await page.waitForFunction(() => /Commande série :\s*RFQ\.xlsm/.test(document.getElementById('page-chiffrage').textContent));
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.client"]'), 'ACME RAIL');
+    // Closing the second tab forgets its quote; the first one keeps its own.
+    await page.click('.doc-tab:nth-child(2) .doc-tab-close');
+    assert.equal(await page.locator('.doc-tab').count(), 1);
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.client"]'), 'ACME RAIL');
+
     assert.deepEqual(errors, []);
     await context.close();
   });

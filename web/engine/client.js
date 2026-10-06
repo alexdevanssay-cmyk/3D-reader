@@ -138,7 +138,7 @@ export function estimateMemory(file, currentHeap = 0) {
  * Analyse a File in the browser. Resolves to the same structure as the Python
  * server's /api/analyze response (with typed arrays instead of base64 meshes).
  */
-export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal', onProgress, cache = true } = {}) {
+export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal', onProgress, cache = true, close = false } = {}) {
   const start = performance.now();
   const ext = extensionOf(file.name);
   if (!SUPPORTED_EXTENSIONS.includes(ext)) {
@@ -150,7 +150,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
   // computed again, and the kept results replaced).
   const isCad = CAD_EXTENSIONS.includes(ext);
   const key = await cacheKey(bytes, isCad ? { ext, quality } : { ext, unit }).catch(() => null);
-  if (cache && key) {
+  if (cache && key && !close) {
     const kept = await loadResult(key);
     if (kept?.data) {
       return { ...kept.data, file: file.name, cacheKey: key, cached: true, cachedThickness: kept.thickness ?? null, elapsed_s: Math.round(performance.now() - start) / 1000 };
@@ -161,7 +161,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
   if (CAD_EXTENSIONS.includes(ext)) {
     kind = 'cad';
     ({ bodies, source_unit: sourceUnit = 'mm' } = await call(
-      { type: 'analyze', kind, name: file.name, bytes, quality },
+      { type: 'analyze', kind, name: file.name, bytes, quality, close },
       [bytes],
       onProgress,
     ));

@@ -52,6 +52,8 @@ const GENERIC_NAMES = new Set([
 ]);
 
 const NOTE_SEWN = 'Solid rebuilt by sewing the surfaces of the file';
+const NOTE_CLOSED = (tol) => `Body closed on request: surfaces sewn with a tolerance of ${tol} mm`;
+const NOTE_FILLED = (n) => `${n} hole(s) of the surfaces filled: approximate volume`;
 const NOTE_INVERTED = 'Solid had inverted orientation; volume sign corrected';
 const NOTE_OPEN = 'Open surfaces (not a closed solid): no volume can be computed';
 
@@ -89,7 +91,7 @@ let fileCounter = 0;
  * always converted to millimetres. Throws an Error with the same messages as
  * cad.py when the file cannot be read.
  */
-export function analyzeCad(oc, bytes, fileName, { quality = 'normal', onProgress = null } = {}) {
+export function analyzeCad(oc, bytes, fileName, { quality = 'normal', onProgress = null, close = false } = {}) {
   const base = String(fileName).split(/[\\/]/).pop();
   const ext = suffix(base);
   const fmt = CAD_EXTENSIONS[ext];
@@ -103,7 +105,7 @@ export function analyzeCad(oc, bytes, fileName, { quality = 'normal', onProgress
   if (oc.work && onProgress) oc.work.onBeat = () => ctx.beat();
   try {
     oc.FS.writeFile(path, data);
-    return { bodies: readCad(ctx, path, data, fmt, stem(base), quality), source_unit: 'mm' };
+    return { bodies: readCad(ctx, path, data, fmt, stem(base), quality, close), source_unit: 'mm' };
   } catch (err) {
     // A C++ exception that unwinds into JavaScript skips the code that pops
     // the emscripten stack: without this, every failed file would leave the
@@ -121,7 +123,7 @@ export function analyzeCad(oc, bytes, fileName, { quality = 'normal', onProgress
   }
 }
 
-function readCad(ctx, path, bytes, fmt, fileStem, quality) {
+function readCad(ctx, path, bytes, fmt, fileStem, quality, close = false) {
   const { oc } = ctx;
   // Progress, weighted by the times measured on a 35 MB STEP file of 2000 solids:
   // parsing the text (0 -> 15 %), converting it to shapes (15 -> 50 %), the
@@ -162,7 +164,7 @@ function readCad(ctx, path, bytes, fmt, fileStem, quality) {
     if (openShapes.length) openParts.push({ part, shapes: openShapes, hasSolids: solids.length > 0 });
   }
 
-  if (openParts.length) bodies.push(...surfaceBodies(ctx, openParts, fileStem, deflection, ang));
+  if (openParts.length) bodies.push(...surfaceBodies(ctx, openParts, fileStem, deflection, ang, close));
   ctx.progress(1, 'measure');
   ctx.current = null;
   // Faces left without triangulation are dropped like in cad.py, unless the
@@ -699,9 +701,9 @@ function linearToSrgb(v) {
  * loose surfaces of the whole file are sewn together; the closed shells that
  * result become solids whose volume can be computed.
  */
-function surfaceBodies(ctx, openParts, fileStem, deflection, ang) {
+function surfaceBodies(ctx, openParts, fileStem, deflection, ang, close = false) {
   const allOpen = openParts.flatMap((p) => p.shapes);
-  const { solids, remaining } = sewToSolids(ctx, allOpen, deflection, ang);
+  const { solids, remaining, notes = [NOTE_SEWN] } = close ? closeSurfaces(ctx, allOpen, deflection, ang) : sewToSolids(ctx, allOpen, deflection, ang);
   if (!solids.length) {
     return openParts.map(({ part, shapes, hasSolids }) =>
       openBody(ctx, hasSolids ? `${part.name} (surfaces)` : part.name, compound(ctx, shapes), part.color),
@@ -712,7 +714,7 @@ function surfaceBodies(ctx, openParts, fileStem, deflection, ang) {
   const base = single ? openParts[0].part.name : fileStem;
   const color = single ? openParts[0].part.color : null;
   const bodies = solids.map((solid, i) =>
-    solidBody(ctx, solids.length === 1 ? base : `${base} [${i + 1}]`, solid, color, [NOTE_SEWN]),
+    solidBody(ctx, solids.length === 1 ? base : `${base} [${i + 1}]`, solid, color, [...notes]),
   );
   if (remaining.length) bodies.push(openBody(ctx, `${base} (surfaces)`, compound(ctx, remaining), color));
   return bodies;
@@ -901,6 +903,112 @@ function sewToSolids(ctx, shapes, deflection, ang) {
     meshEach(ctx, [...solids, ...remaining], deflection, ang, false);
   }
   return { solids, remaining };
+}
+
+/**
+ * Close open surfaces on request ("Fermer le corps"): sewing with larger and
+ * larger tolerances (the gaps a CAD export leaves between faces); then the
+ * holes still bounded by free edges are filled, by a plane face when their
+ * contour is flat, else by a filling surface through it, and sewn again.
+ * Returns {solids, remaining, notes} like sewToSolids.
+ */
+function closeSurfaces(ctx, shapes, deflection, ang) {
+  const { oc } = ctx;
+  const { TopAbs_SHELL, TopAbs_FACE, TopAbs_WIRE, TopAbs_EDGE } = oc.TopAbs_ShapeEnum;
+  const sew = (items, tol) => {
+    const sewing = new oc.BRepBuilderAPI_Sewing(tol, true, true, true, false);
+    try {
+      for (const s of items) sewing.Add(s);
+      sewing.Perform(ctx.keep(new oc.Message_ProgressRange_1()));
+      return ctx.keep(sewing.SewedShape());
+    } finally {
+      sewing.delete();
+    }
+  };
+  const shellsOf = (sewn) => [
+    ...children(ctx, sewn, TopAbs_SHELL),
+    ...children(ctx, sewn, TopAbs_FACE, TopAbs_SHELL).map((face) => shellOf(ctx, face)),
+  ];
+  const allClosed = (shells) => shells.length > 0 && shells.every((s) => oc.BRep_Tool.IsClosed_1(s));
+
+  const TOLERANCES = [1e-3, 1e-2, 0.1];
+  let sewn = null;
+  let tol = TOLERANCES[0];
+  let shells = [];
+  for (tol of TOLERANCES) {
+    sewn = sew(shapes, tol);
+    shells = shellsOf(sewn);
+    if (allClosed(shells)) break;
+  }
+  let filled = 0;
+  if (!allClosed(shells)) {
+    // Holes: the closed contours of free edges, each one filled by a face.
+    const bounds = new oc.ShapeAnalysis_FreeBounds_2(sewn, tol, false, false);
+    const faces = [];
+    try {
+      for (const w of children(ctx, bounds.GetClosedWires(), TopAbs_WIRE)) {
+        const wire = ctx.keep(oc.TopoDS.Wire_1(w));
+        let face = null;
+        const plane = new oc.BRepBuilderAPI_MakeFace_15(wire, true);
+        try {
+          if (plane.IsDone()) face = ctx.keep(plane.Face());
+        } finally {
+          plane.delete();
+        }
+        if (!face) {
+          const fill = new oc.BRepOffsetAPI_MakeFilling(3, 15, 2, false, 1e-5, 1e-4, 1e-2, 0.1, 8, 9);
+          try {
+            for (const e of children(ctx, wire, TopAbs_EDGE)) fill.Add_1(ctx.keep(oc.TopoDS.Edge_1(e)), oc.GeomAbs_Shape.GeomAbs_C0, true);
+            fill.Build(ctx.keep(new oc.Message_ProgressRange_1()));
+            if (fill.IsDone()) face = ctx.keep(fill.Shape());
+          } catch {
+            // a contour that cannot be filled: the body stays open
+          } finally {
+            fill.delete();
+          }
+        }
+        if (face) {
+          faces.push(face);
+          filled++;
+        }
+      }
+    } finally {
+      bounds.delete();
+    }
+    if (faces.length) {
+      sewn = sew([sewn, ...faces], tol);
+      shells = shellsOf(sewn);
+    }
+  }
+
+  const solids = [];
+  const remaining = [];
+  for (const shell of shells) {
+    if (oc.BRep_Tool.IsClosed_1(shell)) {
+      const maker = new oc.BRepBuilderAPI_MakeSolid_3(ctx.keep(oc.TopoDS.Shell_1(shell)));
+      try {
+        if (maker.IsDone()) {
+          // Faces of a closed shell may face inwards: oriented outwards.
+          const fix = new oc.ShapeFix_Solid_1();
+          try {
+            fix.Init(ctx.keep(maker.Solid()));
+            fix.Perform(ctx.keep(new oc.Message_ProgressRange_1()));
+            solids.push(ctx.keep(fix.Solid()));
+          } finally {
+            fix.delete();
+          }
+          continue;
+        }
+      } finally {
+        maker.delete();
+      }
+    }
+    remaining.push(shell);
+  }
+  meshEach(ctx, [...solids, ...remaining], deflection, ang, false);
+  const notes = [NOTE_CLOSED(tol)];
+  if (filled) notes.push(NOTE_FILLED(filled));
+  return { solids, remaining, notes };
 }
 
 // --------------------------------------------------------------------------- helpers

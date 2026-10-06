@@ -110,6 +110,7 @@ self.onmessage = async (event) => {
       progress(0, 'read');
       result = analyzeCad(oc, new Uint8Array(msg.bytes), msg.name, {
         quality: msg.quality,
+        close: !!msg.close, // open surfaces closed into solids (on request, "Fermer le corps")
         onProgress: (p) => progress(p.percent * 0.95, p.step, p), // the last 5 %: envelopes, on the page
       });
     } else if (msg.kind === 'meshfile') {

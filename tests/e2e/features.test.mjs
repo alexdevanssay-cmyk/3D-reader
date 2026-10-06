@@ -6,7 +6,7 @@
 //   npm run build && node --test tests/e2e/features.test.mjs
 
 import assert from 'node:assert/strict';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 
@@ -157,7 +157,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.dispatchEvent('#thick-min-used', 'change');
     approx(await page.evaluate(() => window.reader3d.part().thickness.min), 20, 0.01, 0, 'back to the detected one');
     // The name of the part, in the bar; a material set from elsewhere (customer request).
-    assert.equal(await page.textContent('#file-name'), 'holed_block');
+    assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'holed_block');
     await page.evaluate(() => window.reader3d.setMaterial('AS7G06', 2.68));
     assert.equal(await page.inputValue('#density'), '2.68');
     assert.match(await page.textContent('#material'), /AS7G06 \(2,68\)/);
@@ -198,12 +198,121 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.evaluate(() => document.getElementById('toggle-wire').classList.contains('active')), true);
     await page.click('#toggle-wire');
 
+    // Kept by an earlier version (one record {data, thickness}), with a thickness
+    // computed since then in a record of its own: opened again, the same model.
+    await page.evaluate(async () => {
+      const db = await new Promise((resolve, reject) => {
+        const req = indexedDB.open('reader3d-cache');
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      const store = db.transaction('data', 'readwrite').objectStore('data');
+      const keys = await new Promise((resolve) => (store.getAllKeys().onsuccess = (e) => resolve(e.target.result)));
+      const key = keys.find((k) => !String(k).includes('#'));
+      const record = await new Promise((resolve) => (store.get(key).onsuccess = (e) => resolve(e.target.result)));
+      await new Promise((resolve) => {
+        const tx = db.transaction('data', 'readwrite');
+        tx.objectStore('data').put({ data: record, thickness: null }, key);
+        tx.oncomplete = resolve;
+      });
+      db.close();
+    });
+    await page.reload();
+    await open();
+    assert.match(await page.textContent('#method'), /Résultats mémorisés/);
+    assert.equal(await page.textContent('#total-volume'), volume);
+    assert.equal(await page.textContent('#thick-min'), min);
+
     // "Refresh": analysed again, without the kept results.
     await page.evaluate(() => (document.body.dataset.status = ''));
     await page.click('#refresh');
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     assert.doesNotMatch(await page.textContent('#method'), /mémorisés/);
     assert.equal(await page.textContent('#total-volume'), volume);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
+  test('open surfaces closed on request ("Fermer le corps")', { timeout: CAD_TIMEOUT }, async () => {
+    // A box 40 x 30 x 20 mm given as 5 loose faces: open, a face missing.
+    const { loadOcctNode } = await import('../../web/engine/occt.js');
+    const oc = await loadOcctNode();
+    const box = new oc.BRepPrimAPI_MakeBox_2(40, 30, 20).Shape();
+    const faces = new oc.TopoDS_Compound();
+    const builder = new oc.BRep_Builder();
+    builder.MakeCompound(faces);
+    const explorer = new oc.TopExp_Explorer_2(box, oc.TopAbs_ShapeEnum.TopAbs_FACE, oc.TopAbs_ShapeEnum.TopAbs_SHAPE);
+    for (let n = 0; explorer.More() && n < 5; explorer.Next(), n++) builder.Add(faces, explorer.Current());
+    const writer = new oc.STEPControl_Writer_1();
+    writer.Transfer(faces, oc.STEPControl_StepModelType.STEPControl_AsIs, true, new oc.Message_ProgressRange_1());
+    writer.Write('/open_box.step');
+    mkdirSync(SAMPLE_DIR, { recursive: true });
+    const file = join(SAMPLE_DIR, 'open_box.step');
+    writeFileSync(file, oc.FS.readFile('/open_box.step'));
+
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    await page.setInputFiles('#file-input', file);
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    // Open: no volume, and the link under the open bodies (nothing closed during the analysis).
+    assert.match(await page.textContent('#bodies'), /ouvert/);
+    assert.ok((await page.$$('#bodies .close-body')).length >= 1);
+    assert.equal((await page.textContent('#bodies .close-body')).trim(), 'Fermer le corps');
+    await page.evaluate(() => (document.body.dataset.status = ''));
+    await page.click('#bodies .close-body');
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    const part = await page.evaluate(() => window.reader3d.part());
+    approx(part.volume, 24000, 1e-6, 0, 'closed volume');
+    assert.equal(part.openBodies, 0);
+    assert.equal((await page.$$('#bodies .close-body')).length, 0);
+    await page.click('#bodies tr[data-index="0"]');
+    assert.match(await page.textContent('#body-detail'), /1 trou\(s\) des surfaces bouché\(s\)/);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
+  test('tabs: several parts open side by side, each with its own analysis', { timeout: CAD_TIMEOUT }, async () => {
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'Nouvel onglet');
+    // A file opened while the tab shown is still analysing another one goes to a new tab.
+    await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
+    await page.waitForSelector('.doc-tab.busy');
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    assert.equal(await page.locator('.doc-tab').count(), 2);
+    assert.equal(await page.getAttribute('.doc-tab.active', 'title'), 'box.stl');
+    await page.waitForFunction(() => !document.querySelector('.doc-tab.busy') && document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    const boxVolume = await page.textContent('#total-volume');
+    const boxBodies = await page.locator('#bodies tr').count();
+    assert.notEqual(boxVolume, '7,257 cm³');
+    // Each tab its own model, results and material.
+    await page.evaluate(() => window.reader3d.setMaterial('AS7G06', 2.68));
+    await page.click('.doc-tab:first-child');
+    assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'named_assembly');
+    assert.equal(await page.textContent('#total-volume'), '7,257 cm³');
+    assert.equal(await page.inputValue('#density'), '2.70');
+    assert.equal((await page.evaluate(() => window.reader3d.result)).file, 'named_assembly.step');
+    await page.click('.doc-tab:nth-child(2)');
+    assert.equal(await page.textContent('#total-volume'), boxVolume);
+    assert.equal(await page.locator('#bodies tr').count(), boxBodies);
+    assert.equal(await page.inputValue('#density'), '2.68');
+    // An empty tab: the drop hint, no results.
+    await page.click('.doc-tab-new');
+    assert.equal(await page.locator('.doc-tab').count(), 3);
+    assert.equal(await page.isVisible('#drop-hint'), true);
+    assert.equal(await page.isVisible('#summary-card'), false);
+    assert.equal(await page.evaluate(() => window.reader3d.result), null);
+    // Closing a tab shows its neighbour.
+    await page.click('.doc-tab.active .doc-tab-close');
+    assert.equal(await page.locator('.doc-tab').count(), 2);
+    assert.equal(await page.textContent('#total-volume'), boxVolume);
+    // "3D Reader": start again with one empty tab (after confirmation).
+    page.once('dialog', (dialog) => dialog.accept());
+    await page.click('#brand');
+    assert.equal(await page.locator('.doc-tab').count(), 1);
+    assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'Nouvel onglet');
+    assert.equal(await page.isVisible('#drop-hint'), true);
+    assert.equal(await page.isVisible('#summary-card'), false);
     assert.deepEqual(errors, []);
     await page.context().close();
   });
