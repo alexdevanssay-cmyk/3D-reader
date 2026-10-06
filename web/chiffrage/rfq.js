@@ -39,13 +39,14 @@ export function readSeriesOrder(bytes, fileName = "") {
   // Volumes: the row "Année" (years) and the row "Volume série", labels in column H.
   const yearsRow = rowOf(cells, /^annee$/, "H");
   const volumesRow = rowOf(cells, /^volume serie/, "H");
+  const protoRow = rowOf(cells, /^volume proto/, "H");
   const years = [];
   if (yearsRow && volumesRow) {
     for (let c = 8; c < 60; c++) {
       const name = columnName(c);
       const year = num(yearsRow.at(name));
       if (year === null) continue;
-      years.push({ year, volume: num(volumesRow.at(name)) ?? 0 });
+      years.push({ year, volume: num(volumesRow.at(name)) ?? 0, proto: num(protoRow?.at(name)) ?? 0 });
     }
   }
   const moqs = [];
@@ -56,6 +57,7 @@ export function readSeriesOrder(bytes, fileName = "") {
   const data = wb.sheet(DATA);
   const dataValue = (re) => (data ? rowOf(data, re)?.at("B") : undefined);
   const refDes = str(value(/^reference & designation piece/));
+  const offre = str(dataValue(/^n° offre/));
   const autres = str(value(/^autres/));
   return {
     fileName,
@@ -64,7 +66,11 @@ export function readSeriesOrder(bytes, fileName = "") {
     demande: str(value(/^reference de la demande client/)),
     reference: refDes,
     plan: str(value(/^plan 2d/, "C")) || str(value(/^plan 3d/, "C")),
-    offre: str(dataValue(/^n° offre/)),
+    offre,
+    // A prototype request: the rule of the "3- Données de chiffrages" sheet (GSAB number
+    // with "-P": prototype volumes, no productivity, no target price), or "Proto: Oui".
+    gsab: str(dataValue(/^gsab/)),
+    prototype: /-P/i.test(str(dataValue(/^gsab/))) || /^oui/i.test(str(value(/^proto$/))),
     alliage: str(value(/^alliage/)),
     fonderie: str(value(/^fonderie/)),
     usinage: str(value(/^usinage/)),
@@ -108,13 +114,17 @@ function metalOf(cells) {
   return Object.values(out).some((v) => v !== null && v !== "") ? out : null;
 }
 
-/** The volumes of the programme: first year with a volume, number of years, volume of each year. */
-export function programmeOf(order) {
-  const active = order.years.filter((y) => y.volume > 0);
+/**
+ * The volumes of the programme: first year with a volume, number of years,
+ * volume of each year. proto: the prototype volumes (row "Volume proto").
+ */
+export function programmeOf(order, { proto = false } = {}) {
+  const volumeOf = (y) => (proto ? y.proto ?? 0 : y.volume);
+  const active = order.years.filter((y) => volumeOf(y) > 0);
   if (!active.length) return null;
   const first = active[0].year;
   const last = active.at(-1).year;
-  const volumes = order.years.filter((y) => y.year >= first && y.year <= last).map((y) => y.volume);
+  const volumes = order.years.filter((y) => y.year >= first && y.year <= last).map(volumeOf);
   return { premiereAnnee: first, annees: volumes.length, volumes, pic: Math.max(...volumes) };
 }
 

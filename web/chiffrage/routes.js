@@ -182,7 +182,8 @@ export function buildRoute(code, finition, part, settings, rates) {
   };
 
   const operations = [{ code: "ASF" }];
-  if (part.noyaux) operations.push(simple("ASN"));
+  // Core making: the time of the cores of the piece (cores.js) when they are described.
+  if (part.noyaux) operations.push(part.noyauxCycle > 0 ? { code: "ASN", cycle: part.noyauxCycle, parCycle: 1, trs: trs("ASN") } : simple("ASN"));
   operations.push({ code, cycle, parCycle, trs: trs(code) });
   if (part.noyaux) operations.push(simple("DEG"));
   operations.push(simple(finition));

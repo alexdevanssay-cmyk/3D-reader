@@ -12,6 +12,7 @@ import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, bestRoutes, buildRo
 import { readWorkbook } from '../../web/chiffrage/xlsxread.js';
 import { heatTreatmentOf, programmeOf, readSeriesOrder } from '../../web/chiffrage/rfq.js';
 import { DEFAULT_TOOLING, estimateTooling } from '../../web/chiffrage/tooling.js';
+import { DEFAULT_CORES, boxSize, coreBoxCost, coresPerPiece } from '../../web/chiffrage/cores.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -293,6 +294,8 @@ describe('series order of a customer request', () => {
     assert.equal(order.elec, 150);
     assert.equal(order.gaz, 60);
     assert.deepEqual(programmeOf(order), { premiereAnnee: 2027, annees: 4, volumes: [1000, 1500, 1500, 800], pic: 1500 });
+    assert.equal(order.prototype, false);
+    assert.deepEqual(programmeOf(order, { proto: true }), { premiereAnnee: 2026, annees: 1, volumes: [20], pic: 20 });
     assert.deepEqual(order.matiere, {
       alliage: 'AS9U3', typologie: 'M-1', cours: 'LME primary Alloy cash seller', month: '2026-03',
       coursAchat: 2800, coursVente: 2810, p1020Achat: 400, p1020Vente: 410, premiumAchat: 330, premiumVente: 640, pafAchat: 0.05, pafVente: 0.07,
@@ -369,5 +372,29 @@ describe('in-house gravity die and heat treatments', () => {
     const t5 = quote(rates, wb.base.lists, input(0.4)).lines.find((l) => l.code === tth.code);
     close(t6.units, 2, 1e-12, 'value');
     close(t5.cost, t6.cost * 0.4, 1e-9, 'value');
+  });
+});
+
+describe('sand cores and core boxes', () => {
+  test('the box of the workbook method: steel by weight, hours of its weight band, subcontracting', () => {
+    const core = { nom: 'N1', masse: 1, qte: 2, L: 300, l: 200, h: 150, type: 0, tiroirs: 1, complexite: 'Moyen' };
+    const box = coreBoxCost(core, DEFAULT_CORES);
+    const kg = (300 * 200 * 150 * 7.8) / 1e6; // 70.2 kg: band <= 200 kg
+    close(box.kg, kg, 1e-12, 'kg');
+    const t = DEFAULT_CORES.taux;
+    const cost = kg * 8 + (50 * t.ax3 + 50 * t.ax3auto + 5 * t.ax3) + (5 * t.ax5 + 5 * t.ax5auto + 5 * t.ax5) + 8 * t.fao + 60 * t.etude + 5 * t.scan + 50 * t.ajustage;
+    close(box.total, cost / 0.9, 1e-9, 'total with 10 % subcontracting');
+  });
+
+  test('without dimensions, the box is sized from the sand of the core', () => {
+    const size = boxSize({ masse: 1.6 }, DEFAULT_CORES); // 1 dm³: a 100 mm cube, plus 2 x 50 mm
+    close(size.L, 200, 1e-9, 'L');
+    assert.equal(size.auto, true);
+  });
+
+  test('sand and core-making time per piece', () => {
+    const per = coresPerPiece([{ masse: 0.5, qte: 2 }, { masse: 1, qte: 1 }], { base: 40, parKg: 10 });
+    close(per.sable, 2, 1e-12, 'sand');
+    close(per.cycle, 2 * (40 + 5) + (40 + 10), 1e-12, 'cycle');
   });
 });
