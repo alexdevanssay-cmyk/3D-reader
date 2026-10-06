@@ -157,7 +157,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.dispatchEvent('#thick-min-used', 'change');
     approx(await page.evaluate(() => window.reader3d.part().thickness.min), 20, 0.01, 0, 'back to the detected one');
     // The name of the part, in the bar; a material set from elsewhere (customer request).
-    assert.equal(await page.textContent('#file-name'), 'holed_block');
+    assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'holed_block');
     await page.evaluate(() => window.reader3d.setMaterial('AS7G06', 2.68));
     assert.equal(await page.inputValue('#density'), '2.68');
     assert.match(await page.textContent('#material'), /AS7G06 \(2,68\)/);
@@ -267,6 +267,52 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal((await page.$$('#bodies .close-body')).length, 0);
     await page.click('#bodies tr[data-index="0"]');
     assert.match(await page.textContent('#body-detail'), /1 trou\(s\) des surfaces bouché\(s\)/);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
+  test('tabs: several parts open side by side, each with its own analysis', { timeout: CAD_TIMEOUT }, async () => {
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'Nouvel onglet');
+    // A file opened while the tab shown is still analysing another one goes to a new tab.
+    await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
+    await page.waitForSelector('.doc-tab.busy');
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    assert.equal(await page.locator('.doc-tab').count(), 2);
+    assert.equal(await page.getAttribute('.doc-tab.active', 'title'), 'box.stl');
+    await page.waitForFunction(() => !document.querySelector('.doc-tab.busy') && document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    const boxVolume = await page.textContent('#total-volume');
+    const boxBodies = await page.locator('#bodies tr').count();
+    assert.notEqual(boxVolume, '7,257 cm³');
+    // Each tab its own model, results and material.
+    await page.evaluate(() => window.reader3d.setMaterial('AS7G06', 2.68));
+    await page.click('.doc-tab:first-child');
+    assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'named_assembly');
+    assert.equal(await page.textContent('#total-volume'), '7,257 cm³');
+    assert.equal(await page.inputValue('#density'), '2.70');
+    assert.equal((await page.evaluate(() => window.reader3d.result)).file, 'named_assembly.step');
+    await page.click('.doc-tab:nth-child(2)');
+    assert.equal(await page.textContent('#total-volume'), boxVolume);
+    assert.equal(await page.locator('#bodies tr').count(), boxBodies);
+    assert.equal(await page.inputValue('#density'), '2.68');
+    // An empty tab: the drop hint, no results.
+    await page.click('.doc-tab-new');
+    assert.equal(await page.locator('.doc-tab').count(), 3);
+    assert.equal(await page.isVisible('#drop-hint'), true);
+    assert.equal(await page.isVisible('#summary-card'), false);
+    assert.equal(await page.evaluate(() => window.reader3d.result), null);
+    // Closing a tab shows its neighbour.
+    await page.click('.doc-tab.active .doc-tab-close');
+    assert.equal(await page.locator('.doc-tab').count(), 2);
+    assert.equal(await page.textContent('#total-volume'), boxVolume);
+    // "3D Reader": start again with one empty tab (after confirmation).
+    page.once('dialog', (dialog) => dialog.accept());
+    await page.click('#brand');
+    assert.equal(await page.locator('.doc-tab').count(), 1);
+    assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'Nouvel onglet');
+    assert.equal(await page.isVisible('#drop-hint'), true);
+    assert.equal(await page.isVisible('#summary-card'), false);
     assert.deepEqual(errors, []);
     await page.context().close();
   });

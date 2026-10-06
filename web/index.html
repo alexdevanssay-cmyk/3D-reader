@@ -38,7 +38,7 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">3D Reader</div>
+    <button id="brand" class="brand" type="button" data-i18n-title="brand.title" title="Start again: closes all the tabs (the settings, the costing workbook and the metal prices are kept)">3D Reader</button>
     <nav class="tabs" role="tablist" aria-label="Pages">
       <button type="button" role="tab" class="tab active" data-page="viewer" aria-selected="true" data-i18n="tab.viewer">3D analysis</button>
       <button type="button" role="tab" class="tab" data-page="chiffrage" aria-selected="false" data-i18n="tab.costing">Costing</button>
@@ -80,7 +80,7 @@
       </select>
     </label>
     <button id="refresh" class="btn small" type="button" disabled data-i18n="refresh" data-i18n-title="refresh.title">Refresh</button>
-    <span id="file-name" class="file-name"></span>
+    <div id="doc-tabs" class="doc-tabs" role="tablist" aria-label="Parts"></div>
     <button id="memory-gauge" class="memory-gauge" type="button" hidden aria-describedby="memory-card">
       <span class="memory-label" data-i18n="memory.short">Memory</span>
       <span class="memory-track"><span class="memory-fill" id="memory-fill"></span></span>

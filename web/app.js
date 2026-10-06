@@ -107,9 +107,9 @@ function decode(data, Type) {
 
 const PALETTE = [0x6c8ebf, 0xb4a76c, 0x82b366, 0xd79b00, 0x9673a6, 0x5aa5a5, 0xb85450, 0x8c8c8c];
 
-function clearModel() {
-  for (const obj of [...modelGroup.children]) {
-    modelGroup.remove(obj);
+/** Free the GPU memory of the meshes of a model. */
+function disposeObjects(objects) {
+  for (const obj of objects) {
     obj.traverse((o) => {
       o.geometry?.dispose();
       // Geometries kept for the wall thickness view (one of them is o.geometry).
@@ -118,6 +118,12 @@ function clearModel() {
       o.material?.dispose();
     });
   }
+}
+
+function clearModel() {
+  const objects = [...modelGroup.children];
+  modelGroup.clear();
+  disposeObjects(objects);
   state.meshes = [];
   state.edges = [];
   state.selected = -1;
@@ -215,19 +221,24 @@ function buildModel(result) {
   state.subsetSummary = null;
   const s = result.summary.bbox;
   state.bounds.set(new THREE.Vector3(...s.min), new THREE.Vector3(...s.max));
-
-  if (boxHelper) scene.remove(boxHelper);
-  boxHelper = new THREE.Box3Helper(state.bounds, 0xff8800);
-  boxHelper.visible = $("toggle-box").classList.contains("active");
-  scene.add(boxHelper);
-
-  if (axes) scene.remove(axes);
-  const size = state.bounds.getSize(new THREE.Vector3());
-  axes = new THREE.AxesHelper(Math.max(size.x, size.y, size.z) * 0.25);
-  scene.add(axes);
-
-  updateSection();
+  placeHelpers();
   setView("iso");
+}
+
+/** The envelope and the axes of the model shown (none without a model), and the section plane. */
+function placeHelpers() {
+  if (boxHelper) scene.remove(boxHelper);
+  if (axes) scene.remove(axes);
+  boxHelper = axes = null;
+  if (!state.bounds.isEmpty()) {
+    boxHelper = new THREE.Box3Helper(state.bounds, 0xff8800);
+    boxHelper.visible = $("toggle-box").classList.contains("active");
+    scene.add(boxHelper);
+    const size = state.bounds.getSize(new THREE.Vector3());
+    axes = new THREE.AxesHelper(Math.max(size.x, size.y, size.z) * 0.25);
+    scene.add(axes);
+  }
+  updateSection();
 }
 
 // ---------------------------------------------------------------- engines
@@ -285,28 +296,32 @@ const STEP_TEXT = {
 
 // The engine reports its progress while it works, several times per second
 // (measured work, see engine/occt.js); the page also shows the time elapsed.
-const progressState = { timer: null, started: 0, last: null };
+// Each tab has its own progress (tab.progress: {started, last}); the one of
+// the tab shown is on screen.
+let progressTimer = null;
 
-function startProgress() {
-  progressState.started = performance.now();
-  progressState.last = null;
-  clearInterval(progressState.timer);
-  progressState.timer = setInterval(tickProgress, 500);
+function startProgress(tab = activeTab) {
+  tab.progress = { started: performance.now(), last: null };
+  progressTimer ??= setInterval(tickProgress, 500);
 }
 
-function stopProgress() {
-  clearInterval(progressState.timer);
-  progressState.timer = null;
+function stopProgress(tab = activeTab) {
+  tab.progress = null;
+  if (tabs.some((other) => other.progress)) return;
+  clearInterval(progressTimer);
+  progressTimer = null;
 }
 
-function showProgress(p) {
-  progressState.last = p;
-  tickProgress();
+function showProgress(p, tab = activeTab) {
+  if (tab.progress) tab.progress.last = p;
+  if (tab === activeTab) tickProgress();
 }
 
 function tickProgress() {
-  const p = progressState.last;
-  const elapsed = Math.floor((performance.now() - progressState.started) / 1000);
+  const progress = activeTab?.progress;
+  if (!progress) return;
+  const p = progress.last;
+  const elapsed = Math.floor((performance.now() - progress.started) / 1000);
   $("loading-elapsed").textContent = elapsed >= 2 ? t("loading.elapsed", { seconds: elapsed }) : "";
   if (!p) return;
   let [text, fraction] = describeProgress(p);
@@ -357,23 +372,22 @@ function showEngineStatus(p) {
   } else el.textContent = t("status.idle");
 }
 
-let serverRequest = null; // AbortController of the request in progress
-
-async function analyzeOnServer(file) {
+async function analyzeOnServer(file, tab) {
   const form = new FormData();
   form.append("file", file);
   form.append("unit", $("unit").value);
   form.append("quality", $("quality").value);
-  serverRequest = new AbortController();
-  setLoading(t("loading.upload"), null);
+  tab.serverRequest = new AbortController(); // of the request in progress
+  tab.loading.text = t("loading.upload");
+  if (tab === activeTab) setLoading(tab.loading.text, null);
   // Aborting the request also stops the analysis on the server.
-  const res = await fetch("api/analyze", { method: "POST", body: form, signal: serverRequest.signal });
+  const res = await fetch("api/analyze", { method: "POST", body: form, signal: tab.serverRequest.signal });
   const data = await res.json().catch(() => ({ detail: res.statusText }));
   if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`);
   return data;
 }
 
-async function analyzeInBrowser(file, { refresh = false, close = false } = {}) {
+async function analyzeInBrowser(file, { refresh = false, close = false, tab = activeTab } = {}) {
   const client = await browserClient();
   return client.analyzeInBrowser(file, {
     unit: $("unit").value,
@@ -381,70 +395,79 @@ async function analyzeInBrowser(file, { refresh = false, close = false } = {}) {
     cache: !refresh,
     close,
     onProgress: (p) => {
-      showProgress(p);
+      showProgress(p, tab);
       if (p.stage === "download" || p.stage === "compile") showEngineStatus(p);
       if (p.stage === "analyze" && p.engine === "cad" && engineStage !== "ready") showEngineStatus({ stage: "ready" });
     },
   });
 }
 
-let openSeq = 0;
-
-// Stop the analysis in progress, if any: a newer file was opened, or Cancel.
-async function stopAnalysis() {
-  serverRequest?.abort();
-  serverRequest = null;
+// Stop the analysis in progress in a tab: a newer file was opened in it, it
+// was closed, or Cancel. The browser engine is restarted: the analyses of the
+// other tabs, queued on it, start again (see openFile).
+async function stopAnalysis(tab) {
+  tab.serverRequest?.abort();
+  tab.serverRequest = null;
   if (engine.browserClient) (await engine.browserClient).cancelAll();
 }
 
-/**
- * Analyse a file and show it.
- * refresh -- computed again, without the results kept in this browser
- * handle  -- its FileSystemFileHandle when known: "Refresh" reads the file
- *            again from the disk (it may have changed)
- */
 /** Close the open surfaces of the file shown: analysed again, open surfaces sewn and filled into solids. */
 function closeOpenBodies() {
   if (state.file) openFile(state.file, { refresh: true, handle: state.handle, close: true });
 }
 
-async function openFile(file, { refresh = false, handle = null, close = false } = {}) {
+/**
+ * Analyse a file and show it, in a tab (the one shown by default).
+ * refresh -- computed again, without the results kept in this browser
+ * handle  -- its FileSystemFileHandle when known: "Refresh" reads the file
+ *            again from the disk (it may have changed)
+ * close   -- close the open surfaces into solids
+ */
+async function openFile(file, { refresh = false, handle = null, close = false, tab = activeTab } = {}) {
   if (!file) return;
-  const seq = ++openSeq;
+  const seq = ++tab.seq;
   // The new file must not wait behind an abandoned one (the browser engine
   // handles one file at a time, and server slots are limited).
-  await stopAnalysis();
-  if (seq !== openSeq) return;
+  if (tab.loading) await stopAnalysis(tab);
+  if (seq !== tab.seq) return;
   if (currentEngine() === "browser" && !(await memoryCheck(file))) return;
-  $("error").hidden = true;
-  setLoading(t(close ? "loading.closing" : "loading.analysing"));
-  $("loading-file").textContent = file.name;
-  $("loading").hidden = false;
-  setStatus("analysing");
-  startProgress();
+  if (seq !== tab.seq || !tabs.includes(tab)) return;
+  const shown = () => tab === activeTab;
+  if (shown()) $("error").hidden = true;
+  const loading = (tab.loading = { kind: "file", text: t(close ? "loading.closing" : "loading.analysing"), file: file.name });
+  startProgress(tab);
+  if (shown()) {
+    renderLoading();
+    setStatus("analysing");
+  }
+  renderTabs();
   let data = null;
   try {
-    data = currentEngine() === "server" ? await analyzeOnServer(file) : await analyzeInBrowser(file, { refresh, close });
-    if (seq !== openSeq) return;
-    // Only now does the page show this file (a failed file leaves the previous one).
-    state.handle = handle ?? (file === state.file ? state.handle : null);
+    data = currentEngine() === "server" ? await analyzeOnServer(file, tab) : await analyzeInBrowser(file, { refresh, close, tab });
+    if (seq !== tab.seq) return;
+    // Only now does the tab show this file (a failed file leaves the previous one).
+    tab.handle = handle ?? (file === tab.file ? tab.handle : null);
+    tab.file = file;
+    tab.result = data;
+    if (!shown()) {
+      // Opened in a tab not shown: its model is built when the tab is shown.
+      if (tab.view) disposeObjects(tab.view.meshes);
+      tab.view = null;
+      return;
+    }
+    state.handle = tab.handle;
     state.file = file;
     state.result = data;
-    // The part shown, in large type: its name without the extension (the whole name as a tip).
-    $("file-name").textContent = file.name.replace(/\.[^.]+$/, "");
-    $("file-name").title = file.name;
-    $("drop-hint").hidden = true;
-    buildModel(data);
-    renderPanel();
-    thicknessNewModel(data.cachedThickness?.length === data.bodies.length ? data.cachedThickness : null);
-    $("refresh").disabled = false;
+    showModel(data);
     // The wall thickness workers start now, while the model is looked at.
     if (data.bodies.some((b) => b.closed)) browserClient().then((client) => client.warmThicknessPool());
     // Link mode: ?thickness=1 adds the wall thickness to the published results.
     if (params.get("thickness")) {
-      $("loading").hidden = true;
+      tab.loading = null;
+      stopProgress(tab);
+      renderLoading();
       await ensureThickness();
-      if (seq !== openSeq) return;
+      if (seq !== tab.seq) return;
     }
     publishResult(data);
     setStatus("done");
@@ -453,20 +476,49 @@ async function openFile(file, { refresh = false, handle = null, close = false } 
     const cancelled = err.cancelled || err.name === "AbortError";
     // Results kept from an earlier opening that cannot be shown (kept by an
     // older version, damaged): the file is analysed again, and they are replaced.
-    if (seq === openSeq && !cancelled && data?.cached && !refresh) {
-      console.warn(`${file.name}: kept results not usable, analysed again`, err);
-      return openFile(file, { refresh: true, handle });
+    // Stopped for another tab (its file opened again, closed or cancelled): started again.
+    if (seq === tab.seq && tabs.includes(tab) && ((!cancelled && data?.cached && !refresh) || err.cancelled)) {
+      if (!err.cancelled) console.warn(`${file.name}: kept results not usable, analysed again`, err);
+      tab.loading = null;
+      return openFile(file, { refresh: refresh || !err.cancelled, handle, close, tab });
     }
-    if (seq === openSeq && !cancelled) {
+    if (seq === tab.seq && !cancelled) {
       const message = tMessage(err.message || String(err));
       showError(`${file.name}: ${message}`);
-      setStatus("error", message);
+      if (shown()) setStatus("error", message);
     }
   } finally {
-    if (seq === openSeq) {
-      $("loading").hidden = true;
-      stopProgress();
+    if (tab.loading === loading) {
+      tab.loading = null;
+      stopProgress(tab);
+      if (shown()) {
+        renderLoading();
+        if (document.body.dataset.status === "analysing") setStatus(tab.result ? "done" : "idle");
+      }
     }
+    renderTabs();
+  }
+}
+
+/** Show the model of a file just analysed in the tab shown. */
+function showModel(data) {
+  $("drop-hint").hidden = true;
+  $("refresh").disabled = false;
+  buildModel(data);
+  renderPanel();
+  thicknessNewModel(data.cachedThickness?.length === data.bodies.length ? data.cachedThickness : null);
+}
+
+/** The loading box of the tab shown: its analysis in progress, if any. */
+function renderLoading() {
+  const loading = activeTab?.loading;
+  $("loading").hidden = !loading;
+  if (!loading) return;
+  $("loading-file").textContent = loading.file;
+  if (activeTab.progress?.last) tickProgress();
+  else {
+    setLoading(loading.text);
+    tickProgress();
   }
 }
 
@@ -901,7 +953,7 @@ $("open-file").addEventListener("click", async () => {
       types: [{ description: t("top.open"), accept: { "application/octet-stream": client.SUPPORTED_EXTENSIONS } }],
       excludeAcceptAllOption: false,
     });
-    openFile(await handle.getFile(), { handle });
+    openFile(await handle.getFile(), { handle, tab: freeTab() });
   } catch (err) {
     if (err?.name !== "AbortError") $("file-input").click();
   }
@@ -922,16 +974,11 @@ $("refresh").addEventListener("click", async () => {
   openFile(file, { refresh: true, handle: state.handle });
 });
 $("file-input").addEventListener("change", (e) => {
-  openFile(e.target.files[0]);
+  openFile(e.target.files[0], { tab: freeTab() });
   e.target.value = ""; // allow re-opening the same file
 });
 // Some malformed CAD files make OpenCascade run for a very long time.
-$("cancel").addEventListener("click", () => {
-  openSeq++; // forget the file being analysed
-  $("loading").hidden = true;
-  stopProgress();
-  stopAnalysis();
-});
+$("cancel").addEventListener("click", () => cancelTab(activeTab));
 $("engine").addEventListener("change", () => {
   showEngineStatus({ stage: "idle" });
   if (state.file) openFile(state.file);
@@ -1025,13 +1072,24 @@ window.addEventListener("drop", (e) => {
   e.preventDefault();
   hint.classList.remove("dragging");
   if (state.result) hint.hidden = true;
-  // On the costing pages, files go to the rows of their data files (chiffrage/ui.js), not to the 3D view.
-  if ($("page-viewer").hidden) return;
+  $("doc-tabs").querySelector(".drop-target")?.classList.remove("drop-target");
+  // Dropped on a tab: opened in it; on "+": in a new tab.
+  const target = e.target.closest?.(".doc-tab, .doc-tab-new");
+  let tab;
+  if (target) {
+    tab = target.dataset.tab ? tabs.find((x) => x.id === +target.dataset.tab) : createTab();
+    if (tab !== activeTab) showTab(tab);
+    showPage("viewer");
+  } else {
+    // On the costing pages, files go to the rows of their data files (chiffrage/ui.js), not to the 3D view.
+    if ($("page-viewer").hidden) return;
+    tab = freeTab();
+  }
   const item = [...(e.dataTransfer.items ?? [])].find((i) => i.kind === "file");
   const handle = item?.getAsFileSystemHandle?.();
   const file = e.dataTransfer.files[0];
-  if (!handle) return openFile(file);
-  handle.then((h) => openFile(file, { handle: h?.kind === "file" ? h : null }), () => openFile(file));
+  if (!handle) return openFile(file, { tab });
+  handle.then((h) => openFile(file, { handle: h?.kind === "file" ? h : null, tab }), () => openFile(file, { tab }));
 });
 
 // ---------------------------------------------------------------- wall thickness
@@ -1208,36 +1266,53 @@ async function ensureThickness() {
   if (thick.results || !state.result) return thick.results;
   if (thick.pending) return thick.pending;
   const result = state.result;
+  const tab = activeTab; // the computation goes on if another tab is shown
+  const meshes = state.meshes;
   const run = (async () => {
     const client = await browserClient();
-    const bodies = state.meshes.map((mesh, i) => {
+    const bodies = meshes.map((mesh, i) => {
       // Open bodies have no inside: no thickness.
       if (!result.bodies[i].closed) return null;
       const geom = mesh.userData.indexed ?? mesh.geometry;
       return { positions: geom.attributes.position.array, indices: geom.index.array };
     });
-    setLoading(t("loading.thickness"), 0);
-    $("loading-file").textContent = state.file?.name ?? "";
-    $("loading").hidden = false;
-    startProgress();
+    const loading = (tab.loading = { kind: "thickness", text: t("loading.thickness"), file: tab.file?.name ?? "" });
+    startProgress(tab);
+    if (tab === activeTab) {
+      renderLoading();
+      setLoading(loading.text, 0);
+    }
+    renderTabs();
     try {
-      const results = await client.computeThickness(bodies, { onProgress: showProgress });
-      if (state.result !== result) return null; // another file was opened meanwhile
-      adoptThickness(results);
+      const results = await client.computeThickness(bodies, { onProgress: (p) => showProgress(p, tab) });
+      if (tab.result !== result) return null; // another file was opened meanwhile
       client.saveThickness(result.cacheKey, results);
+      if (tab === activeTab) adoptThickness(results);
+      else if (tab.view) {
+        // Shown when the tab is shown again.
+        tab.view.thick.results = results;
+        tab.view.thickReady = true;
+      }
       return results;
     } catch (err) {
       if (!err.cancelled) showError(`${t("thick.title")} : ${tMessage(err.message || String(err))}`);
-      thick.colors = thick.highlight = false;
+      if (tab === activeTab) thick.colors = thick.highlight = false;
       return null;
     } finally {
-      if (state.result === result) {
-        thick.pending = null;
-        $("loading").hidden = true;
-        stopProgress();
+      if (tab.result === result) {
+        const kept = tab === activeTab ? thick : tab.view?.thick;
+        if (kept?.pending === run) kept.pending = null;
+      }
+      if (tab.loading === loading) {
+        tab.loading = null;
+        stopProgress(tab);
+      }
+      if (tab === activeTab && tab.result === result) {
+        renderLoading();
         applyThickness();
         renderThickness();
       }
+      renderTabs();
     }
   })();
   thick.pending = run;
@@ -1572,6 +1647,222 @@ $("thick-max").addEventListener("change", (e) => {
 }
 new ResizeObserver(() => thick.results && renderThickness()).observe($("thick-scale"));
 
+// ---------------------------------------------------------------- tabs
+
+// Several parts open side by side, like the tabs of a browser: a part can be
+// opened while another one is still being analysed. Each tab has its own
+// model, analysis, wall thickness, material and quote (with its series
+// order); the settings, the costing workbook and the metal prices are shared.
+// The analyses of the tabs take turns on the CAD engine. The tabs live in this
+// page: a reload starts again with one tab.
+const tabs = [];
+let activeTab = null;
+let nextTabId = 1;
+let defaultMaterial = null; // material of a new tab: the one of the page at start
+// The wall thickness state of a tab (see `thick`), put aside with its model.
+const TAB_THICK = ["results", "markCache", "minOverride", "pending", "value", "tol", "max", "userMax", "spots"];
+
+function createTab() {
+  const tab = { id: nextTabId++, file: null, handle: null, result: null, view: null, material: null, seq: 0, loading: null, progress: null, serverRequest: null };
+  tabs.push(tab);
+  renderTabs();
+  return tab;
+}
+
+/** The tab to open a file in: the one shown, or a new one while it is busy analysing another file. */
+function freeTab() {
+  if (activeTab.loading?.kind !== "file") return activeTab;
+  const tab = createTab();
+  showTab(tab);
+  return tab;
+}
+
+/** Put the model of the tab shown aside (its meshes kept, out of the scene). */
+function stashTab(tab) {
+  const option = $("material").selectedOptions[0];
+  tab.material = { value: $("material").value, alloy: option?.dataset.alloy ?? null, density: $("density").value };
+  modelGroup.clear();
+  tab.view = state.result && state.meshes.length
+    ? {
+        meshes: state.meshes,
+        edges: state.edges,
+        selected: state.selected,
+        included: state.included,
+        subsetSummary: state.subsetSummary,
+        bounds: state.bounds.clone(),
+        camera: { position: camera.position.clone(), up: camera.up.clone(), near: camera.near, far: camera.far, target: controls.target.clone() },
+        thick: Object.fromEntries(TAB_THICK.map((k) => [k, thick[k]])),
+      }
+    : null;
+  state.meshes = [];
+  state.edges = [];
+  state.selected = -1;
+}
+
+function restoreMaterial(m) {
+  if (m.alloy) return setMaterial(m.alloy, parseFloat(m.density));
+  $("material").value = m.value;
+  $("density").value = m.density;
+}
+
+/** Show a tab: its model, its analysis in progress and its quote. */
+function showTab(tab) {
+  if (tab === activeTab) return;
+  if (activeTab && tabs.includes(activeTab)) stashTab(activeTab);
+  activeTab = tab;
+  state.file = tab.file;
+  state.handle = tab.handle;
+  state.result = tab.result;
+  restoreMaterial(tab.material ?? defaultMaterial);
+  $("error").hidden = true;
+  const view = tab.view;
+  tab.view = null;
+  if (view) {
+    state.meshes = view.meshes;
+    state.edges = view.edges;
+    state.selected = view.selected;
+    state.included = view.included;
+    state.subsetSummary = view.subsetSummary;
+    if (view.meshes.length) modelGroup.add(...view.meshes);
+    state.bounds.copy(view.bounds);
+    placeHelpers();
+    camera.position.copy(view.camera.position);
+    camera.up.copy(view.camera.up);
+    camera.near = view.camera.near;
+    camera.far = view.camera.far;
+    camera.updateProjectionMatrix();
+    controls.target.copy(view.camera.target);
+    controls.update();
+    Object.assign(thick, view.thick);
+    thick.statsHtml = null;
+    showWireframe($("toggle-wire").classList.contains("active"));
+    $("drop-hint").hidden = true;
+    $("refresh").disabled = false;
+    renderPanel();
+    select(state.selected);
+    if (view.thickReady) adoptThickness(thick.results);
+    applyThickness();
+    renderThickness();
+  } else if (tab.result) {
+    showModel(tab.result);
+  } else {
+    clearModel();
+    state.bounds.makeEmpty();
+    placeHelpers();
+    for (const id of ["summary-card", "mass-card", "bodies-card", "body-detail"]) $(id).hidden = true;
+    $("drop-hint").hidden = false;
+    $("refresh").disabled = true;
+    thicknessNewModel();
+  }
+  renderLoading();
+  setStatus(tab.loading && !tab.result ? "analysing" : tab.result ? "done" : "idle");
+  if (tab.result) updatePublished(tab.result);
+  else {
+    $("reader3d-result").textContent = "null";
+    document.dispatchEvent(new CustomEvent("reader3d-part"));
+  }
+  costingPages?.then((ui) => ui.setTab(tab.id));
+  renderTabs();
+}
+
+/** Stop the analysis in progress in a tab (Cancel). */
+function cancelTab(tab) {
+  if (!tab.loading) return;
+  tab.seq++; // forget the file being analysed
+  tab.loading = null;
+  stopProgress(tab);
+  stopAnalysis(tab);
+  if (tab === activeTab) renderLoading();
+  renderTabs();
+}
+
+/** Close a tab: its model and its quote are forgotten. */
+function closeTab(tab) {
+  const i = tabs.indexOf(tab);
+  if (i < 0) return;
+  cancelTab(tab);
+  if (tab === activeTab) clearModel();
+  else if (tab.view) disposeObjects(tab.view.meshes);
+  tab.view = tab.result = tab.file = null;
+  tabs.splice(i, 1);
+  forgetQuote(tab.id);
+  if (!tabs.length) nextTabId = 1;
+  if (tab === activeTab) {
+    activeTab = null;
+    showTab(tabs[Math.min(i, tabs.length - 1)] ?? createTab());
+  } else renderTabs();
+}
+
+function forgetQuote(id) {
+  if (costingPages) costingPages.then((ui) => ui.forgetTab(id));
+  else if (id === 1) {
+    try {
+      localStorage.removeItem("reader3d.chiffrage.quote.v1"); // chiffrage/store.js, quote of the first tab
+    } catch {
+      // no storage
+    }
+  }
+}
+
+/** "3D Reader": start again with one empty tab (the settings, the costing workbook and the metal prices are kept). */
+function resetTabs() {
+  if (tabs.some((tab) => tab.result || tab.loading) && !confirm(t("tabs.reset.confirm"))) return;
+  for (const tab of tabs.filter((x) => x !== activeTab)) closeTab(tab);
+  closeTab(activeTab);
+  showPage("viewer");
+}
+
+function renderTabs() {
+  const strip = $("doc-tabs");
+  const items = tabs.map((tab) => {
+    const name = tab.loading?.file ?? tab.file?.name ?? null;
+    const el = document.createElement("div");
+    el.className = "doc-tab";
+    el.classList.toggle("active", tab === activeTab);
+    el.classList.toggle("busy", !!tab.loading);
+    el.dataset.tab = tab.id;
+    el.setAttribute("role", "tab");
+    el.setAttribute("aria-selected", String(tab === activeTab));
+    el.title = name ?? t("tabs.new");
+    el.innerHTML = '<span class="doc-tab-spin" aria-hidden="true"></span><span class="doc-tab-name"></span><button type="button" class="doc-tab-close">×</button>';
+    // The part, without the extension of its file (the whole name as a tip).
+    el.querySelector(".doc-tab-name").textContent = name ? name.replace(/\.[^.]+$/, "") : t("tabs.new");
+    const close = el.querySelector(".doc-tab-close");
+    close.title = t("tabs.close");
+    close.setAttribute("aria-label", t("tabs.close"));
+    return el;
+  });
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "doc-tab-new";
+  add.textContent = "+";
+  add.title = t("tabs.add");
+  add.setAttribute("aria-label", t("tabs.add"));
+  strip.setAttribute("aria-label", t("tabs.label"));
+  strip.replaceChildren(...items, add);
+}
+
+$("doc-tabs").addEventListener("click", (e) => {
+  if (e.target.closest(".doc-tab-new")) return showTab(createTab());
+  const el = e.target.closest(".doc-tab");
+  const tab = el && tabs.find((x) => x.id === +el.dataset.tab);
+  if (!tab) return;
+  if (e.target.closest(".doc-tab-close")) closeTab(tab);
+  else showTab(tab);
+});
+// Middle click closes a tab, as in a browser.
+$("doc-tabs").addEventListener("auxclick", (e) => {
+  const el = e.button === 1 && e.target.closest(".doc-tab");
+  const tab = el && tabs.find((x) => x.id === +el.dataset.tab);
+  if (tab) closeTab(tab);
+});
+$("doc-tabs").addEventListener("dragover", (e) => {
+  const target = e.target.closest(".doc-tab, .doc-tab-new");
+  for (const el of $("doc-tabs").querySelectorAll(".drop-target")) if (el !== target) el.classList.remove("drop-target");
+  target?.classList.add("drop-target");
+});
+$("brand").addEventListener("click", resetTabs);
+
 // ---------------------------------------------------------------- pages
 
 // The costing pages (web/chiffrage/) are loaded the first time they are opened.
@@ -1585,7 +1876,11 @@ function showPage(name) {
   $("page-viewer").hidden = name !== "viewer";
   for (const page of ["chiffrage", "parametres"]) $(`page-${page}`).hidden = name !== page;
   if (name !== "viewer") {
-    costingPages ??= import("./chiffrage/ui.js").then((m) => m.mount({ chiffrage: $("page-chiffrage"), parametres: $("page-parametres") }));
+    costingPages ??= import("./chiffrage/ui.js").then((m) => {
+      const ui = m.mount({ chiffrage: $("page-chiffrage"), parametres: $("page-parametres") });
+      ui.setTab(activeTab.id);
+      return ui;
+    });
     costingPages.then((ui) => ui.show(name)).catch((err) => showError(err.message || String(err)));
   }
   try {
@@ -1856,6 +2151,7 @@ function partFeatures() {
 
 function applyLanguage() {
   applyToPage();
+  renderTabs();
   $("language").value = language();
   showEngineStatus(null);
   renderPanel();
@@ -1874,6 +2170,8 @@ for (const [param, id] of [["unit", "unit"], ["quality", "quality"]]) {
   const value = params.get(param);
   if (value && [...$(id).options].some((o) => o.value === value)) $(id).value = value;
 }
+defaultMaterial = { value: $("material").value, alloy: null, density: $("density").value };
+showTab(createTab());
 applyLanguage();
 setStatus("idle");
 {

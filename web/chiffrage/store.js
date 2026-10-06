@@ -181,9 +181,31 @@ export function defaultQuote(base, indices) {
   };
 }
 
-export function loadQuote(base, indices) {
-  return { ...defaultQuote(base, indices), ...read(KEYS.quote) };
+// Each tab of the 3D page has its own quote: the first one is kept in this
+// browser, the others live as long as the page (like their models).
+const tabQuotes = new Map(); // tab id -> JSON of its quote
+let quoteTab = 1;
+
+/** The quote read and saved from now on: the one of the tab `id` of the 3D page. */
+export function setQuoteTab(id) {
+  quoteTab = id;
 }
 
-export const saveQuote = (quote) => write(KEYS.quote, quote);
-export const resetQuote = () => write(KEYS.quote, null);
+function readQuote() {
+  if (quoteTab === 1) return read(KEYS.quote);
+  const text = tabQuotes.get(quoteTab);
+  return text ? JSON.parse(text) : null;
+}
+
+export function loadQuote(base, indices) {
+  return { ...defaultQuote(base, indices), ...readQuote() };
+}
+
+export const saveQuote = (quote) => (quoteTab === 1 ? write(KEYS.quote, quote) : !!tabQuotes.set(quoteTab, JSON.stringify(quote)));
+export const resetQuote = () => forgetQuote(quoteTab);
+
+/** Forget the quote of the tab `id` (closed). */
+export function forgetQuote(id) {
+  if (id === 1) write(KEYS.quote, null);
+  else tabQuotes.delete(id);
+}
