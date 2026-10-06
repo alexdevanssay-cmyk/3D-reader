@@ -84,16 +84,29 @@ export function loadSettings(base) {
   const merged = { ...defaults, ...saved };
   for (const key of ["trs", "modes", "densities", "inflation"]) merged[key] = { ...defaults[key], ...saved[key] };
   merged.cores = { ...defaults.cores, ...saved.cores };
-  for (const k of ["taux", "etude"]) merged.cores[k] = { ...defaults.cores[k], ...saved.cores?.[k] };
+  for (const k of ["etude", "fao"]) merged.cores[k] = { ...defaults.cores[k], ...saved.cores?.[k] };
   merged.tth = { ...defaults.tth };
   for (const [code, value] of Object.entries(saved.tth ?? {})) merged.tth[code] = { ...defaults.tth[code], ...value };
   merged.tooling = { ...defaults.tooling, ...saved.tooling };
-  for (const [k, v] of Object.entries(defaults.tooling)) if (v && typeof v === "object") merged.tooling[k] = { ...v, ...saved.tooling?.[k] };
+  for (const [k, v] of Object.entries(defaults.tooling)) {
+    if (v && typeof v === "object" && !Array.isArray(v)) merged.tooling[k] = { ...v, ...saved.tooling?.[k] };
+    else if (Array.isArray(v) && !Array.isArray(saved.tooling?.[k])) merged.tooling[k] = v;
+  }
   for (const key of ["processes", "operations"]) {
     merged[key] = { ...defaults[key] };
     for (const [code, value] of Object.entries(saved[key] ?? {})) merged[key][code] = { ...defaults[key][code], ...value, cycle: { ...defaults[key][code]?.cycle, ...value.cycle }, rendement: { ...defaults[key][code]?.rendement, ...value.rendement } };
   }
   return merged;
+}
+
+const isPlain = (v) => v && typeof v === "object" && !Array.isArray(v);
+
+/** Settings `extra` (a whole or partial settings file) merged into `settings`; arrays are replaced. */
+export function mergeSettings(settings, extra) {
+  if (!isPlain(extra)) return settings;
+  const out = { ...settings };
+  for (const [k, v] of Object.entries(extra)) out[k] = isPlain(v) && isPlain(settings?.[k]) ? mergeSettings(settings[k], v) : v;
+  return out;
 }
 
 export const saveSettings = (settings) => write(KEYS.settings, settings);

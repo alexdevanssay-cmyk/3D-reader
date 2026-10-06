@@ -60,6 +60,7 @@ const PIECE_DEFAULTS = {
   noyaux: false, sableKg: 0, tribo: false, redressage: false,
   procede: "auto", finition: "auto", mode: null, cycle: null, empreintes: null, miseAuMille: null,
   outillagePrix: null, // € of the tooling; null: estimated
+  outillageTiroirs: null, outillageComplexite: null, // slides and complexity of the die; null: the defaults of the settings
   cores: [], // sand cores (cores.js): {nom, masse kg, qte per piece, L, l, h box mm, type, tiroirs, complexite}
   composants: [],
 };
@@ -304,8 +305,9 @@ async function importFile(target) {
         text: `${q.prototype ? "Demande de prototypes" : "Commande série"} « ${file.name} » importée : ${prog ? `${prog.annees} an${prog.annees > 1 ? "s" : ""} à partir de ${prog.premiereAnnee}, ${nf(prog.volumes.reduce((a, b) => a + b, 0), 0)} pièces` : "pas de volume série"}${order.moqs.length ? `, MOQ ${order.moqs.join(" / ")}` : ""}${order.targetPrice ? `, prix cible ${eur(order.targetPrice, 2)}` : ""}.`,
       };
     } else if (target.dataset.file === "settings") {
+      // Merged into the current settings: a file can hold only some of them (calibrated values...).
       const saved = JSON.parse(new TextDecoder().decode(bytes));
-      store.saveSettings(saved);
+      store.saveSettings(store.mergeSettings(settings, saved));
       settings = store.loadSettings(base);
       message = { kind: "ok", text: `Paramètres « ${file.name} » importés.` };
     }
@@ -464,6 +466,8 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
     })(),
     tribo: !!inputs.tribo,
     redressage: !!inputs.redressage,
+    outillageTiroirs: inputs.outillageTiroirs ?? null,
+    outillageComplexite: inputs.outillageComplexite || null,
   };
   const quoteBase = {
     metal,
@@ -518,7 +522,7 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
   if (inputs.outillagePrix > 0) route.outillage = inputs.outillagePrix;
   // Core boxes of the cores of the piece, added to the tooling.
   route.outillageMoule = route.outillage;
-  route.boxes = part.noyaux ? (inputs.cores ?? []).map((core) => ({ core, ...coreBoxCost(core, settings.cores) })) : [];
+  route.boxes = part.noyaux ? (inputs.cores ?? []).map((core) => ({ core, ...coreBoxCost(core, settings.cores, settings.tooling) })) : [];
   route.outillage += route.boxes.reduce((n, b) => n + b.total, 0);
   out.chosen = chosen;
   out.route = route;
@@ -539,7 +543,7 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
       q.outillageInclus === false
         ? []
         : [
-            { designation: route.tooling ? "Coquille acier réalisée sur place" : `Outillage ${process.famille}`, qte: 1, prix: route.outillageMoule },
+            { designation: route.tooling ? (/^Basse pression/i.test(process.famille) ? "Moule basse pression acier réalisé sur place" : "Coquille acier réalisée sur place") : `Outillage ${process.famille}`, qte: 1, prix: route.outillageMoule },
             ...route.boxes.map((b) => ({ designation: `Boîte à noyau — ${b.core.nom}`, qte: 1, prix: b.total })),
           ],
     margeOutillages: 0,
@@ -752,7 +756,7 @@ function coresFields(r) {
   const sc = settings.cores;
   const rows = cores
     .map((c, i) => {
-      const box = coreBoxCost(c, sc);
+      const box = coreBoxCost(c, sc, settings.tooling);
       const auto = box.size;
       return `<tr>
         <td>${input(`p.cores.${i}.nom`, c.nom, { kind: "text", width: "110px" })}</td>
@@ -819,18 +823,20 @@ function toolingCard(r) {
     ? t.lines.map((l) => `<tr><td>${esc(l.label)}</td><td class="muted small">${esc(l.detail)}</td><td class="num">${total(l.value)}</td></tr>`).join("")
     : `<tr><td>Outillage ${esc(route.famille)}</td><td class="muted small">prix de l'îlot (Paramètres)</td><td class="num">${total(route.outillageEstime)}</td></tr>`;
   return `<section class="ccard">
-      <h3>Outillage — ${t ? "coquille acier réalisée sur place" : esc(route.famille)}</h3>
+      <h3>Outillage — ${t ? (/^Basse pression/i.test(route.famille) ? "moule basse pression acier réalisé sur place" : "coquille acier réalisée sur place") : esc(route.famille)}</h3>
       <div class="cscroll"><table class="ctable">
         <tbody>${rows}</tbody>
-        <tfoot><tr><td><strong>Total estimé</strong></td><td class="muted small">${t ? `${t.cavities} empreinte${t.cavities > 1 ? "s" : ""} — CNC ${nf(t.hours.cnc, 1)} h, FAO ${nf(t.hours.programmation, 1)} h, montage ${nf(t.hours.montage, 1)} h` : ""}</td><td class="num"><strong>${total(route.outillageEstime)}</strong></td></tr></tfoot>
+        <tfoot><tr><td><strong>Total estimé</strong></td><td class="muted small">${t ? `${t.cavities} empreinte${t.cavities > 1 ? "s" : ""}, ${t.tiroirs} tiroir${t.tiroirs > 1 ? "s" : ""}, ${esc(t.complexite)} — outillage suivant ${total(t.suivant)} (sans étude ni FAO)` : ""}</td><td class="num"><strong>${total(route.outillageEstime)}</strong></td></tr></tfoot>
       </table></div>
       <div class="cfields">
+        ${t ? field("Tiroirs du moule", input("p.outillageTiroirs", r.inputs.outillageTiroirs, { min: 0, step: 1, placeholder: nf(settings.tooling.tiroirs, 0) }), "vide = valeur par défaut") : ""}
+        ${t ? field("Complexité du moule", select("p.outillageComplexite", r.inputs.outillageComplexite ?? "", [["", `par défaut (${settings.tooling.complexite})`], ...Object.keys(settings.tooling.etude).map((k) => [k, k])]), "heures d'étude et de FAO") : ""}
         ${field("Prix d'outillage retenu (€)", input("p.outillagePrix", r.inputs.outillagePrix, { min: 0, placeholder: nf(route.outillageEstime, 0) }), "vide = estimation")}
         ${q.outillageInclus === false
           ? field("Vendu à part", `<output>${eur(route.outillage * (1 + (q.margeOutillage || 0)), 0)} HT</output>`, "non compris dans le prix pièce (voir le détail du chiffrage)")
           : field("Amorti par pièce", `<output>${amortised === null ? "—" : eur(amortised, 3)}</output>`, `sur ${nf(r.part.volumeTotal, 0)} pièces du programme, compris dans le prix pièce`)}
       </div>
-      ${t ? `<p class="small muted">Estimation à partir du modèle 3D : blocs = encombrement de la pièce + parois, ébauche = volume des empreintes, finition = leur surface (+ ${pct(settings.tooling.alimentation, 0)} pour l'alimentation). Taux, vitesses et temps de montage dans Paramètres.</p>` : ""}
+      ${t ? `<p class="small muted">Méthode du classeur « Outillage fonderie » : moule ${nf(t.block.L, 0)} × ${nf(t.block.W, 0)} × ${nf(t.block.H, 0)} mm = encombrement de la pièce + marges, poids × coefficient, heures d'usinage, de scan et d'ajustage par tranche de poids, étude et FAO selon la complexité. Taux et tableaux dans Paramètres.</p>` : ""}
       ${route.boxes.length ? `<h4>Boîtes à noyau</h4>
       <div class="cscroll"><table class="ctable">
         <tbody>${route.boxes
@@ -1117,6 +1123,7 @@ function renderSettings() {
       <td>${input(`s.processes.${code}.rendement.petitePiece`, p.rendement?.petitePiece, { kind: "pct", width: "60px" })}</td>
       <td>${input(`s.processes.${code}.cycle.base`, p.cycle.base, { width: "60px" })}</td>
       <td>${input(`s.processes.${code}.cycle.parKg`, p.cycle.parKg, { width: "60px" })}</td>
+      <td>${input(`s.processes.${code}.cycle.exposant`, p.cycle.exposant ?? 1, { width: "60px" })}</td>
       <td>${input(`s.processes.${code}.cycle.parModule2`, p.cycle.parModule2, { width: "60px" })}</td>
       <td>${pnum(code, "qualite", { width: "50px" })}</td><td>${pnum(code, "outillage", { width: "80px" })}</td>
       <td>${checkbox(`s.processes.${code}.tth`, p.tth, "")}</td><td>${checkbox(`s.processes.${code}.noyaux`, p.noyaux, "")}</td></tr>`,
@@ -1127,6 +1134,7 @@ function renderSettings() {
       ([code, o]) => `<tr><td><strong>${esc(code)}</strong> ${esc(o.label)}</td>
       <td>${input(`s.operations.${code}.base`, o.base, { width: "70px" })}</td>
       <td>${input(`s.operations.${code}.parKg`, o.parKg, { width: "70px" })}</td>
+      <td>${input(`s.operations.${code}.exposant`, o.exposant ?? 1, { width: "60px" })}</td>
       <td>${o.chargeKg !== undefined ? input(`s.operations.${code}.chargeKg`, o.chargeKg, { width: "70px" }) : input(`s.operations.${code}.parCycle`, o.parCycle, { width: "70px" })}</td></tr>`,
     )
     .join("");
@@ -1143,8 +1151,8 @@ function renderSettings() {
   const tl = settings.tooling;
   const sc = settings.cores;
   const cf = (label, path, value, hint = "", opts = {}) => field(label, input(`s.cores.${path}`, value, opts), hint);
-  const bandRows = sc.bandes
-    .map((b, i) => `<tr><td class="num">≤ ${nf(b.max, 0)} kg</td>${["ax3", "ax3auto", "ax5", "ax5auto", "tiroir3", "tiroir5", "scan", "ajustage"].map((k) => `<td>${input(`s.cores.bandes.${i}.${k}`, b[k], { width: "56px" })}</td>`).join("")}</tr>`)
+  const bandRows = tl.bandes
+    .map((b, i) => `<tr><td class="num">≤ ${nf(b.max, 0)} kg</td>${["ax3", "ax3auto", "ax5", "ax5auto", "tiroir3", "tiroir5", "scan", "ajustage"].map((k) => `<td>${input(`s.tooling.bandes.${i}.${k}`, b[k], { width: "56px" })}</td>`).join("")}</tr>`)
     .join("");
   const tf = (label, path, value, hint = "", opts = {}) => field(label, input(`s.tooling.${path}`, value, opts), hint);
   return `<div class="cpage">${messageHtml()}
@@ -1179,13 +1187,14 @@ function renderSettings() {
   <section class="ccard">
     <h3>Îlots de coulée et méthodes</h3>
     <div class="cscroll"><table class="ctable compact">
-      <thead><tr><th>Îlot</th><th>Toile mini (mm)</th><th>Épaisseur maxi (mm)</th><th>Poids maxi (kg)</th><th>Dimension maxi (mm)</th><th>Volume mini /an</th><th>Empreintes maxi</th><th>Grappe maxi (kg)</th><th>Mise au mille par défaut</th><th>Rendement type (%)</th><th>− % par doublement épaisseur maxi / toile</th><th>− % × ln(2 kg / poids)</th><th>Cycle : base (s)</th><th>+ s / kg coulé</th><th>+ s / mm² de module</th><th>Qualité /10</th><th>Outillage (€)</th><th>TTH</th><th>Noyaux</th></tr></thead>
+      <thead><tr><th>Îlot</th><th>Toile mini (mm)</th><th>Épaisseur maxi (mm)</th><th>Poids maxi (kg)</th><th>Dimension maxi (mm)</th><th>Volume mini /an</th><th>Empreintes maxi</th><th>Grappe maxi (kg)</th><th>Mise au mille par défaut</th><th>Rendement type (%)</th><th>− % par doublement épaisseur maxi / toile</th><th>− % × ln(2 kg / poids)</th><th>Cycle : base (s)</th><th>+ coef × (kg coulés)^exp.</th><th>exposant</th><th>+ s / mm² de module</th><th>Qualité /10</th><th>Outillage (€)</th><th>TTH</th><th>Noyaux</th></tr></thead>
       <tbody>${processRows}</tbody></table></div>
-    <p class="small muted">Temps de cycle estimé = base + (s/kg) × kg coulés par cycle + (s/mm²) × module V/S². Mise au mille estimée = 1 / rendement, rendement = rendement type − (% par doublement) × log₂(épaisseur maxi / toile mini) − (%) × ln(2 kg / poids) pour les pièces de moins de 2 kg, borné entre 30 et 95 % (valeur par défaut tant que les épaisseurs ne sont pas calculées). Un îlot est écarté si la toile mini, le poids, la dimension, le traitement thermique ou les noyaux sont hors de ses possibilités. Valeurs de départ à ajuster aux îlots réels.</p>
+    <p class="small muted">Temps de cycle estimé = base + coef × (kg coulés par cycle)^exposant + (s/mm²) × module V/S² (exposant 1 : linéaire). Mise au mille estimée = 1 / rendement, rendement = rendement type − (% par doublement) × log₂(épaisseur maxi / toile mini) − (%) × ln(2 kg / poids) pour les pièces de moins de 2 kg, borné entre 30 et 95 % (valeur par défaut tant que les épaisseurs ne sont pas calculées). Un îlot est écarté si la toile mini, le poids, la dimension, le traitement thermique ou les noyaux sont hors de ses possibilités. Valeurs de départ à ajuster aux îlots réels.</p>
   </section>
   <section class="ccard">
     <h3>Autres opérations</h3>
-    <table class="ctable compact"><thead><tr><th>Opération</th><th>Cycle : base (s)</th><th>+ s / kg pièce</th><th>Pièces par cycle / charge (kg)</th></tr></thead><tbody>${opRows}</tbody></table>
+    <table class="ctable compact"><thead><tr><th>Opération</th><th>Cycle : base (s)</th><th>+ coef × (kg pièce)^exp.</th><th>exposant</th><th>Pièces par cycle / charge (kg)</th></tr></thead><tbody>${opRows}</tbody></table>
+    <p class="small muted">Cycle = base + coef × (poids de la pièce)^exposant ; noyautage : par noyau, base + coef × kg de sable.</p>
   </section>
   <section class="ccard">
     <h3>Traitements thermiques</h3>
@@ -1193,33 +1202,38 @@ function renderSettings() {
     <p class="small muted">Le centre TTH du classeur est chiffré au kg pour un T6 : le coût d'un autre traitement = coût T6 × coefficient (surtout le temps de four). Le type est choisi pièce par pièce (menu « Traitement thermique ») ou repris de la demande client.</p>
   </section>
   <section class="ccard">
-    <h3>Outillage : coquille acier réalisée sur place</h3>
+    <h3>Outillage : coquilles, moules basse pression et boîtes à noyau réalisés sur place</h3>
     <div class="cfields">
-      ${field("Estimer les coquilles gravité", checkbox("s.tooling.actif", tl.actif, "îlots « Coquille gravité »"), "sinon : prix de l'îlot")}
-      ${tf("Nuance d'acier", "acier.nuance", tl.acier.nuance, "", { kind: "text" })}
-      ${tf("Prix de l'acier (€/kg)", "acier.prixKg", tl.acier.prixKg)}
-      ${tf("Densité de l'acier", "acier.densite", tl.acier.densite)}
-      ${tf("Traitement de l'acier (€/kg)", "acier.traitementKg", tl.acier.traitementKg, "trempe, revenu, nitruration")}
-      ${tf("Paroi autour des empreintes (mm)", "bloc.paroi", tl.bloc.paroi)}
-      ${tf("Fond de chaque demi-coquille (mm)", "bloc.fond", tl.bloc.fond)}
-      ${tf("Entre deux empreintes (mm)", "bloc.entreEmpreintes", tl.bloc.entreEmpreintes)}
-      ${tf("Alimentation (jets, masselottes, évents)", "alimentation", tl.alimentation, "% du volume et de la surface des empreintes", { kind: "pct" })}
-      ${tf("Taux horaire fraisage CNC (€/h)", "usinage.taux", tl.usinage.taux)}
-      ${tf("Dressage des blocs (cm²/h)", "usinage.dressage", tl.usinage.dressage)}
-      ${tf("Ébauche (cm³/min)", "usinage.ebauche", tl.usinage.ebauche, "débit de copeaux dans l'acier")}
-      ${tf("Finition des empreintes (cm²/h)", "usinage.finition", tl.usinage.finition, "fraise boule")}
-      ${tf("Taux horaire programmation FAO (€/h)", "usinage.tauxProgrammation", tl.usinage.tauxProgrammation)}
-      ${tf("Programmation : base (h)", "usinage.programmationBase", tl.usinage.programmationBase)}
-      ${tf("Programmation : h par dm² d'empreinte", "usinage.programmationParDm2", tl.usinage.programmationParDm2)}
-      ${tf("Taux horaire montage / ajustage (€/h)", "montage.taux", tl.montage.taux)}
-      ${tf("Montage et assemblage : base (h)", "montage.base", tl.montage.base, "ajustage, éjection, refroidissement, essais")}
-      ${tf("Montage : h par empreinte", "montage.parEmpreinte", tl.montage.parEmpreinte)}
-      ${tf("Montage : h si noyaux", "montage.parNoyau", tl.montage.parNoyau)}
-      ${tf("Composants standard : base (€)", "composants.base", tl.composants.base, "colonnes, bagues, éjecteurs, cartouches")}
-      ${tf("Composants standard : par empreinte (€)", "composants.parEmpreinte", tl.composants.parEmpreinte)}
-      ${tf("Aléas", "aleas", tl.aleas, "% du total", { kind: "pct" })}
+      ${field("Estimer les moules", checkbox("s.tooling.actif", tl.actif, "îlots « Coquille gravité » et « Basse pression »"), "sinon : prix de l'îlot")}
+      ${field("Type de moule", select("s.tooling.type", tl.type, tl.types.map((t, j) => [j, t.label]), { kind: "num" }))}
+      ${tl.types.map((t, i) => tf(`${t.label} (€/kg)`, `types.${i}.prixKg`, t.prixKg)).join("")}
+      ${tf("Densité de l'acier", "densite", tl.densite)}
+      ${tf("Marge sur la longueur (mm, par côté)", "marges.longueur", tl.marges.longueur, "moule = pièce + 2 marges")}
+      ${tf("Marge sur la largeur (mm, par côté)", "marges.largeur", tl.marges.largeur, "empreintes côte à côte")}
+      ${tf("Marge sur la hauteur (mm, par côté)", "marges.hauteur", tl.marges.hauteur)}
+      ${tf("Entre deux empreintes (mm)", "marges.entreEmpreintes", tl.marges.entreEmpreintes)}
+      ${tf("Tiroirs par défaut", "tiroirs", tl.tiroirs, "chaque pièce peut avoir les siens")}
+      ${field("Complexité par défaut", select("s.tooling.complexite", tl.complexite, Object.keys(tl.etude)))}
+      ${Object.keys(tl.etude).map((k) => tf(`Coquille — heures d'étude : ${k}`, `etude.${k}`, tl.etude[k])).join("")}
+      ${Object.keys(tl.fao).map((k) => tf(`Coquille — heures de FAO : ${k}`, `fao.${k}`, tl.fao[k])).join("")}
+      ${tf("Étude (€/h)", "taux.etude", tl.taux.etude)}
+      ${tf("FAO (€/h)", "taux.fao", tl.taux.fao)}
+      ${tf("Usinage 3 axes présentiel (€/h)", "taux.ax3", tl.taux.ax3)}
+      ${tf("Usinage 3 axes auto (€/h)", "taux.ax3auto", tl.taux.ax3auto)}
+      ${tf("Usinage 5 axes présentiel (€/h)", "taux.ax5", tl.taux.ax5)}
+      ${tf("Usinage 5 axes auto (€/h)", "taux.ax5auto", tl.taux.ax5auto)}
+      ${tf("Scan 3D + rapport (€/h)", "taux.scan", tl.taux.scan)}
+      ${tf("Ajustage / montage (€/h)", "taux.ajustage", tl.taux.ajustage)}
+      ${tf("Sous-traitance (STT)", "sousTraitance", tl.sousTraitance, "%", { kind: "pct" })}
+      ${tf("Marge sur les moules", "marge", tl.marge, "%", { kind: "pct" })}
     </div>
-    <p class="small muted">Deux demi-coquilles : longueur = plus grande dimension de la pièce + 2 parois, largeur = empreintes côte à côte + parois, hauteur = plus petite dimension + 2 fonds. Ébauche = volume des empreintes (volume de la pièce × empreintes + alimentation) ; finition = leur surface ; programmation selon la surface. Valeurs de départ à ajuster à l'atelier.</p>
+    <div class="cscroll"><table class="ctable compact">
+      <thead><tr><th>Poids de l'outillage</th><th>3 axes (h)</th><th>3 axes auto (h)</th><th>5 axes (h)</th><th>5 axes auto (h)</th><th>Tiroir 3 axes (h)</th><th>Tiroir 5 axes (h)</th><th>Scan (h)</th><th>Ajustage (h)</th></tr></thead>
+      <tbody>${bandRows}</tbody></table></div>
+    <div class="cscroll"><table class="ctable compact">
+      <thead><tr><th>Poids du bloc nu jusqu'à (kg)</th><th>Coefficient de poids</th></tr></thead>
+      <tbody>${tl.coefPoids.map((c, i) => `<tr><td>${input(`s.tooling.coefPoids.${i}.max`, c.max, { width: "90px" })}</td><td>${input(`s.tooling.coefPoids.${i}.coef`, c.coef, { width: "70px" })}</td></tr>`).join("")}</tbody></table></div>
+    <p class="small muted">Méthode du classeur « Outillage fonderie » : poids = L × l × h × densité × coefficient (selon le poids du bloc nu), acier = poids × prix au kg du type, usinage 3 et 5 axes (+ tiroirs), scan et ajustage selon la tranche de poids, étude et FAO selon la complexité, puis sous-traitance et marge. L × l × h = encombrement de la pièce + marges. Les boîtes à noyau utilisent les mêmes taux, tranches et coefficients. Valeurs de départ : importez le fichier de paramètres calé sur vos outillages (Importer des paramètres…).</p>
   </section>
   <section class="ccard">
     <h3>Noyaux et boîtes à noyau</h3>
@@ -1227,23 +1241,12 @@ function renderSettings() {
       ${cf("Densité du sable de noyau (kg/dm³)", "sableDensite", sc.sableDensite, "dimension estimée d'une boîte")}
       ${cf("Paroi autour du noyau (mm)", "paroi", sc.paroi)}
       ${sc.types.map((t, i) => cf(`Acier ${t.label} (€/kg)`, `types.${i}.prixKg`, t.prixKg)).join("")}
-      ${cf("Usinage 3 axes présentiel (€/h)", "taux.ax3", sc.taux.ax3)}
-      ${cf("Usinage 3 axes auto (€/h)", "taux.ax3auto", sc.taux.ax3auto)}
-      ${cf("Usinage 5 axes présentiel (€/h)", "taux.ax5", sc.taux.ax5)}
-      ${cf("Usinage 5 axes auto (€/h)", "taux.ax5auto", sc.taux.ax5auto)}
-      ${cf("FAO (€/h)", "taux.fao", sc.taux.fao)}
-      ${cf("Heures de FAO par boîte", "faoHeures", sc.faoHeures)}
-      ${cf("Étude (€/h)", "taux.etude", sc.taux.etude)}
-      ${Object.keys(sc.etude).map((k) => cf(`Heures d'étude : ${k}`, `etude.${k}`, sc.etude[k])).join("")}
-      ${cf("Scan 3D (€/h)", "taux.scan", sc.taux.scan)}
-      ${cf("Ajustage / montage (€/h)", "taux.ajustage", sc.taux.ajustage)}
+      ${Object.keys(sc.etude).map((k) => cf(`Boîte — heures d'étude : ${k}`, `etude.${k}`, sc.etude[k])).join("")}
+      ${Object.keys(sc.fao).map((k) => cf(`Boîte — heures de FAO : ${k}`, `fao.${k}`, sc.fao[k])).join("")}
       ${cf("Sous-traitance (STT)", "sousTraitance", sc.sousTraitance, "%", { kind: "pct" })}
       ${cf("Marge sur les boîtes", "marge", sc.marge, "%", { kind: "pct" })}
     </div>
-    <div class="cscroll"><table class="ctable compact">
-      <thead><tr><th>Poids de la boîte</th><th>3 axes (h)</th><th>3 axes auto (h)</th><th>5 axes (h)</th><th>5 axes auto (h)</th><th>Tiroir 3 axes (h)</th><th>Tiroir 5 axes (h)</th><th>Scan (h)</th><th>Ajustage (h)</th></tr></thead>
-      <tbody>${bandRows}</tbody></table></div>
-    <p class="small muted">Méthode et heures par tranche de poids de l'onglet « 4- Outillage » (section BAN) de la demande client ; les taux horaires de ce modèle de fichier valent 10 €/h (à compléter) : les taux ci-dessus sont des valeurs de départ à ajuster. Noyautage par pièce : centre ASN, cycle = base + s/kg × sable de chaque noyau (Autres opérations).</p>
+    <p class="small muted">Boîtes à noyau : même méthode que les moules (section BAN du classeur « Outillage fonderie »), taux horaires et heures par tranche de poids de la section Outillage. Sans dimensions saisies, une boîte = cube du volume de sable + 2 parois. Noyautage par pièce : centre ASN, cycle = base + s/kg × sable de chaque noyau (Autres opérations).</p>
   </section>
   <section class="ccard">
     <h3>Densités des alliages (g/cm³)</h3>

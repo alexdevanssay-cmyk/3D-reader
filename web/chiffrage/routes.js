@@ -5,7 +5,9 @@
 //
 // The capabilities of the islands and the cycle-time coefficients below are
 // starting values: they are settings of the page (Paramètres), meant to be
-// adjusted to the real islands of the foundry.
+// adjusted to the real islands of the foundry, or imported from a settings
+// file calibrated on the foundry's own quotes (kept out of this public code).
+//   casting cycle = base + parKg × (kg cast per cycle)^exposant + parModule2 × module²
 
 import { quote } from "./model.js";
 import { estimateTooling, isGravityDie } from "./tooling.js";
@@ -18,7 +20,7 @@ export const DEFAULT_PROCESSES = {
     empreintesMax: 4, grappeMax: 15, miseAuMille: 1.3, qualite: 6,
     tth: false, noyaux: false, finitions: ["FSP"], outillage: 60000,
     rendement: { base: 0.75, parDoublement: 0.03, petitePiece: 0.04 },
-    cycle: { base: 25, parKg: 3, parModule2: 3 },
+    cycle: { base: 25, parKg: 3, exposant: 1, parModule2: 3 },
   },
   BPR: {
     famille: "Basse pression",
@@ -26,7 +28,7 @@ export const DEFAULT_PROCESSES = {
     empreintesMax: 2, grappeMax: 60, miseAuMille: 1.25, qualite: 9,
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 35000,
     rendement: { base: 0.88, parDoublement: 0.04, petitePiece: 0.03 },
-    cycle: { base: 120, parKg: 4, parModule2: 12 },
+    cycle: { base: 120, parKg: 4, exposant: 1, parModule2: 12 },
   },
   CG1: {
     famille: "Coquille gravité (DFP5 New look)",
@@ -34,7 +36,7 @@ export const DEFAULT_PROCESSES = {
     empreintesMax: 2, grappeMax: 50, miseAuMille: 1.6, qualite: 8,
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 20000,
     rendement: { base: 0.68, parDoublement: 0.06, petitePiece: 0.04 },
-    cycle: { base: 90, parKg: 6, parModule2: 10 },
+    cycle: { base: 90, parKg: 6, exposant: 1, parModule2: 10 },
   },
   CG2: {
     famille: "Coquille gravité (Gauss 2)",
@@ -42,7 +44,7 @@ export const DEFAULT_PROCESSES = {
     empreintesMax: 2, grappeMax: 30, miseAuMille: 1.6, qualite: 8,
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 20000,
     rendement: { base: 0.68, parDoublement: 0.06, petitePiece: 0.04 },
-    cycle: { base: 80, parKg: 6, parModule2: 10 },
+    cycle: { base: 80, parKg: 6, exposant: 1, parModule2: 10 },
   },
   CG4: {
     famille: "Coquille gravité (SAB Auto)",
@@ -50,7 +52,7 @@ export const DEFAULT_PROCESSES = {
     empreintesMax: 2, grappeMax: 30, miseAuMille: 1.6, qualite: 8,
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 20000,
     rendement: { base: 0.68, parDoublement: 0.06, petitePiece: 0.04 },
-    cycle: { base: 80, parKg: 6, parModule2: 10 },
+    cycle: { base: 80, parKg: 6, exposant: 1, parModule2: 10 },
   },
   CG5: {
     famille: "Coquille gravité (Gauss 1)",
@@ -58,7 +60,7 @@ export const DEFAULT_PROCESSES = {
     empreintesMax: 2, grappeMax: 30, miseAuMille: 1.6, qualite: 8,
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 20000,
     rendement: { base: 0.68, parDoublement: 0.06, petitePiece: 0.04 },
-    cycle: { base: 80, parKg: 6, parModule2: 10 },
+    cycle: { base: 80, parKg: 6, exposant: 1, parModule2: 10 },
   },
   CG3: {
     famille: "Coquille gravité (traditionnel)",
@@ -66,7 +68,7 @@ export const DEFAULT_PROCESSES = {
     empreintesMax: 1, grappeMax: 100, miseAuMille: 1.8, qualite: 7.5,
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 10000,
     rendement: { base: 0.6, parDoublement: 0.06, petitePiece: 0.04 },
-    cycle: { base: 150, parKg: 10, parModule2: 12 },
+    cycle: { base: 150, parKg: 10, exposant: 1, parModule2: 12 },
   },
 };
 
@@ -82,17 +84,18 @@ export const DEFAULT_TTH = {
   STAB: { label: "Stabilisation / détensionnement", coef: 0.3, cycle: "≈ 4 h à 250 °C" },
 };
 
-// Other operations: cycle = base + parKg * piece weight (s), pieces per cycle.
+// Other operations: cycle = base + parKg × (piece weight)^exposant (s), pieces per cycle;
+// noyautage: base + parKg × kg of sand, per core.
 export const DEFAULT_OPERATIONS = {
-  ASN: { label: "Noyautage", base: 40, parKg: 10, parCycle: 1 },
-  DEG: { label: "Dégotage", base: 20, parKg: 5, parCycle: 1 },
-  FSP: { label: "Finition sous pression", base: 15, parKg: 4, parCycle: 1 },
-  FCE: { label: "Finition cellules", base: 30, parKg: 6, parCycle: 1, volumeMin: 3000 },
-  FTR: { label: "Finition traditionnelle", base: 60, parKg: 15, parCycle: 1 },
-  TRI: { label: "Tribofinition", base: 1200, parKg: 0, parCycle: 0, chargeKg: 60 },
-  RED: { label: "Redressage", base: 30, parKg: 5, parCycle: 1 },
-  GCV: { label: "Grenaillage / contrôle visuel", base: 10, parKg: 2, parCycle: 1 },
-  EXP: { label: "Expédition", base: 600, parKg: 0, parCycle: 0, chargeKg: 250, maxPieces: 500 },
+  ASN: { label: "Noyautage", base: 40, parKg: 10, exposant: 1, parCycle: 1 },
+  DEG: { label: "Dégotage", base: 20, parKg: 5, exposant: 1, parCycle: 1 },
+  FSP: { label: "Finition sous pression", base: 15, parKg: 4, exposant: 1, parCycle: 1 },
+  FCE: { label: "Finition cellules", base: 30, parKg: 6, exposant: 1, parCycle: 1, volumeMin: 3000 },
+  FTR: { label: "Finition traditionnelle", base: 60, parKg: 15, exposant: 1, parCycle: 1 },
+  TRI: { label: "Tribofinition", base: 1200, parKg: 0, exposant: 1, parCycle: 0, chargeKg: 60 },
+  RED: { label: "Redressage", base: 30, parKg: 5, exposant: 1, parCycle: 1 },
+  GCV: { label: "Grenaillage / contrôle visuel", base: 10, parKg: 2, exposant: 1, parCycle: 1 },
+  EXP: { label: "Expédition", base: 600, parKg: 0, exposant: 1, parCycle: 0, chargeKg: 250, maxPieces: 500 },
 };
 
 export const DEFAULT_TRS = {
@@ -173,8 +176,8 @@ export function buildRoute(code, finition, part, settings, rates) {
   const miseAuMille = mam.value;
   const kgCast = part.poids * miseAuMille;
   const parCycle = Math.max(1, Math.min(p.empreintesMax, Math.floor(p.grappeMax / Math.max(kgCast, 1e-9))));
-  const cycle = p.cycle.base + p.cycle.parKg * kgCast * parCycle + p.cycle.parModule2 * (part.moduleMm || 0) ** 2;
-  const simple = (c) => ({ code: c, cycle: ops[c].base + ops[c].parKg * part.poids, parCycle: ops[c].parCycle || 1, trs: trs(c) });
+  const cycle = p.cycle.base + p.cycle.parKg * (kgCast * parCycle) ** (p.cycle.exposant ?? 1) + (p.cycle.parModule2 || 0) * (part.moduleMm || 0) ** 2;
+  const simple = (c) => ({ code: c, cycle: ops[c].base + ops[c].parKg * part.poids ** (ops[c].exposant ?? 1), parCycle: ops[c].parCycle || 1, trs: trs(c) });
   const batch = (c) => {
     const o = ops[c];
     const n = Math.max(1, Math.min(o.maxPieces ?? Infinity, Math.floor(o.chargeKg / Math.max(part.poids, 1e-9))));
