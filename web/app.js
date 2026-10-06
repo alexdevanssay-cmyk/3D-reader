@@ -620,6 +620,12 @@ function setIncluded(indices) {
   state.included = new Set(indices);
   state.meshes.forEach((m, i) => (m.visible = state.included.has(i)));
   renderPanel();
+  // The wall thickness card: the values of the bodies checked, on a scale fitted to them.
+  if (thick.results) {
+    if (!thick.userMax) thick.max = niceCeil((thickQuantiles([0.99]) ?? [thick.max])[0]);
+    applyThickness();
+    renderThickness();
+  }
   updatePublished(state.result);
 }
 
@@ -1155,8 +1161,8 @@ function bodyGeometry(i) {
   return mesh.userData.indexed ?? mesh.geometry;
 }
 
-/** Statistics (min, median, max in mm) of the bodies listed (default: all) for a method (default: the one chosen). */
-function thickStats(indices = state.meshes.map((_, i) => i), method = thickMethod()) {
+/** Statistics (min, median, max in mm) of the bodies listed (default: those checked) for a method (default: the one chosen). */
+function thickStats(indices = includedIndices(), method = thickMethod()) {
   const parts = [];
   let markings = 0;
   for (const i of indices) {
@@ -1209,11 +1215,11 @@ function niceStep(range, count) {
   return 10 * p;
 }
 
-/** Area-weighted quantile of the thickness of all bodies (method in use). */
+/** Area-weighted quantile of the thickness of the bodies checked (method in use). */
 function thickQuantiles(fractions) {
   const items = [];
   state.meshes.forEach((mesh, i) => {
-    const values = thickValues(i);
+    const values = state.included.has(i) ? thickValues(i) : null;
     if (!values) return;
     const pos = mesh.userData.indexed?.attributes.position.array ?? mesh.geometry.attributes.position.array;
     const idx = (mesh.userData.indexed ?? mesh.geometry).index.array;
@@ -1417,13 +1423,13 @@ function renderThickness() {
   $("thick-tol").value = Math.round(thick.tol * 100) / 100;
   $("thick-slider").value = Math.round((Math.min(thick.value, thick.max) / thick.max) * 1000);
 
-  // Area per thickness class, all bodies.
+  // Area per thickness class, of the bodies checked in the list (the values of the card are theirs).
   const width = thick.max / BINS;
   const area = new Float64Array(BINS + 1); // the last class: thicker than the scale
   let total = 0;
   let band = 0;
   state.meshes.forEach((mesh, i) => {
-    const values = thickValues(i);
+    const values = state.included.has(i) ? thickValues(i) : null;
     if (!values) return;
     const geom = mesh.userData.indexed ?? mesh.geometry;
     const h = thicknessHistogram(geom.attributes.position.array, geom.index.array, values, width, BINS + 1);
