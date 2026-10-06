@@ -81,8 +81,9 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
 
     // The in-house steel die, estimated from the part.
     assert.match(await page.textContent('#page-chiffrage'), /Outillage — coquille acier réalisée sur place/);
-    assert.match(await page.textContent('#page-chiffrage'), /Fraisage CNC — ébauche des empreintes/);
-    assert.match(await page.textContent('#page-chiffrage'), /Montage, ajustage et assemblage du moule/);
+    assert.match(await page.textContent('#page-chiffrage'), /Usinage 3 axes/);
+    assert.match(await page.textContent('#page-chiffrage'), /Méthode du classeur « Outillage fonderie »/);
+    assert.match(await page.textContent('#page-chiffrage'), /Ajustage \/ montage/);
     // Heat treatment chosen in the list: a T5 costs less than a T6.
     const pri = async () => Number((/PRI complet[^\d]*([\d\s\u202f]+,\d+)/.exec((await page.textContent('#page-chiffrage')).replace(/\u202f/g, ' ')) ?? [])[1]?.replace(/\s/g, '').replace(',', '.'));
     const noTth = await pri();

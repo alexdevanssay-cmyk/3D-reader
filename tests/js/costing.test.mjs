@@ -11,8 +11,9 @@ import { centreRates, indexAverage, minimumMargin, quote, saleMetalPrice } from 
 import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, bestRoutes, buildRoute, estimateMiseAuMille, rankRoutes } from '../../web/chiffrage/routes.js';
 import { readWorkbook } from '../../web/chiffrage/xlsxread.js';
 import { heatTreatmentOf, programmeOf, readSeriesOrder } from '../../web/chiffrage/rfq.js';
-import { DEFAULT_TOOLING, estimateTooling } from '../../web/chiffrage/tooling.js';
+import { DEFAULT_TOOLING, coefOf, estimateTooling, steelToolCost } from '../../web/chiffrage/tooling.js';
 import { DEFAULT_CORES, boxSize, coreBoxCost, coresPerPiece } from '../../web/chiffrage/cores.js';
+import { defaultSettings, mergeSettings } from '../../web/chiffrage/store.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -274,7 +275,14 @@ describe('manufacturing routes', () => {
     const p = DEFAULT_PROCESSES.CG3;
     const route = buildRoute('CG3', 'FTR', part, settings, rates);
     assert.equal(route.parCycle, 1);
-    close(route.cycle, p.cycle.base + p.cycle.parKg * part.poids * route.miseAuMille + p.cycle.parModule2 * 9, 1e-12, 'cycle');
+    close(route.cycle, p.cycle.base + p.cycle.parKg * (part.poids * route.miseAuMille) ** p.cycle.exposant + p.cycle.parModule2 * 9, 1e-12, 'cycle');
+    // A power law: 200 x (kg cast per cycle)^0.5, 10 kg cast per cycle.
+    const power = { ...settings, processes: { ...settings.processes, CG3: { ...p, miseAuMille: 2, cycle: { base: 0, parKg: 200, exposant: 0.5, parModule2: 0 } } } };
+    const cg = buildRoute('CG3', 'FTR', { ...part, poids: 5, toileMini: 0, epaisseurMax: 0 }, power, rates);
+    close(cg.cycle, 200 * Math.sqrt(10), 1e-9, 'power law cycle');
+    // Without an exponent (settings of earlier versions), linear in the weight cast.
+    const linear = buildRoute('CG3', 'FTR', part, { ...settings, processes: { ...settings.processes, CG3: { ...p, cycle: { base: 100, parKg: 10, parModule2: 0 } } } }, rates);
+    close(linear.cycle, 100 + 10 * part.poids * linear.miseAuMille, 1e-12, 'linear cycle');
     const ssp = buildRoute('SSP', 'FSP', { ...part, poids: 0.5 }, settings, rates);
     assert.equal(ssp.parCycle, 4); // limited by the number of cavities, not by the shot weight
     assert.equal(ssp.operations.find((o) => o.code === 'SSP').trs, DEFAULT_TRS.SSP);
@@ -325,28 +333,59 @@ describe('series order of a customer request', () => {
 describe('in-house gravity die and heat treatments', () => {
   const part = { bboxSize: [200, 120, 60], volume: 400e3, area: 150e3, dimMax: 200, noyaux: false };
 
-  test('the die: steel of the blocks, milling, assembly, more with more cavities', () => {
-    const one = estimateTooling(part, 1);
-    const two = estimateTooling(part, 2);
-    // Blocks 320 x 240 x 160 mm of steel at 7.85: 96.5 kg.
-    close(one.block.kg, (320 * 240 * 160 * 7.85) / 1e6, 1e-9, 'value');
-    assert.ok(one.lines.some((l) => /Acier/.test(l.label)));
-    assert.ok(one.lines.some((l) => /Fraisage CNC — ébauche/.test(l.label)));
-    assert.ok(one.lines.some((l) => /Montage/.test(l.label)));
-    close(one.total, one.lines.reduce((s, l) => s + l.value, 0), 1e-9, 'value');
-    assert.ok(two.total > one.total * 1.3, `${two.total} vs ${one.total}`);
-    assert.ok(two.hours.cnc > one.hours.cnc);
+  test('the die of the tooling workbook: steel by weight, hours of its band, design and CAM, subcontracting', () => {
+    const s = {
+      densite: 8,
+      coefPoids: [{ max: 100, coef: 1.3 }, { max: 1e9, coef: 1.2 }],
+      bandes: [
+        { max: 200, ax3: 10, ax3auto: 20, ax5: 3, ax5auto: 4, tiroir3: 1, tiroir5: 2, scan: 5, ajustage: 6 },
+        { max: 2000, ax3: 100, ax3auto: 200, ax5: 30, ax5auto: 40, tiroir3: 10, tiroir5: 20, scan: 50, ajustage: 60 },
+      ],
+      taux: { etude: 1, fao: 2, ax3: 3, ax3auto: 4, ax5: 5, ax5auto: 6, scan: 7, ajustage: 8 },
+      sousTraitance: 0.2,
+      marge: 0,
+    };
+    // 500 x 250 x 100 mm of steel at 8: 100 kg bare (coefficient 1.3), 130 kg: first band.
+    const r = steelToolCost({ L: 500, l: 250, h: 100, prixKg: 10, typeLabel: 'T', tiroirs: 2, etudeH: 30, faoH: 40 }, s);
+    close(r.kg, 130, 1e-9, 'kg');
+    const cost = 130 * 10 + (10 * 3 + 20 * 4 + 1 * 3 * 2) + (3 * 5 + 4 * 6 + 2 * 5 * 2) + 40 * 2 + 5 * 7 + 30 * 1 + 6 * 8;
+    close(r.total, cost / 0.8, 1e-9, 'total with 20 % subcontracting');
+    close(r.suivant, cost / 0.8 - 40 * 2 - 30 * 1, 1e-9, 'next die: without design and CAM');
+    // Above the bare weight of the first coefficient: the next one, and the next band.
+    const big = steelToolCost({ L: 500, l: 500, h: 100, prixKg: 10, typeLabel: 'T', tiroirs: 0, etudeH: 0, faoH: 0 }, s);
+    close(big.kg, 240, 1e-9, 'kg');
+    assert.equal(big.band.max, 2000);
+    assert.equal(coefOf(s.coefPoids, 100), 1.3);
+    assert.equal(coefOf(s.coefPoids, 101), 1.2);
   });
 
-  test('gravity die islands get the estimate, the others their price', () => {
+  test('the die of a part: its size plus the margins, more with more cavities', () => {
+    const one = estimateTooling(part, 1);
+    const two = estimateTooling(part, 2);
+    const m = DEFAULT_TOOLING.marges;
+    close(one.block.L, 200 + 2 * m.longueur, 1e-9, 'L');
+    close(one.block.W, 120 + 2 * m.largeur, 1e-9, 'l');
+    close(one.block.H, 60 + 2 * m.hauteur, 1e-9, 'h');
+    close(two.block.W, 2 * 120 + m.entreEmpreintes + 2 * m.largeur, 1e-9, 'l, 2 cavities');
+    close(one.total, one.lines.reduce((s, l) => s + l.value, 0), 1e-9, 'value');
+    assert.ok(two.total > one.total);
+    assert.equal(one.tiroirs, DEFAULT_TOOLING.tiroirs);
+    const complex = estimateTooling({ ...part, outillageTiroirs: 3, outillageComplexite: 'Compliqué(e)' }, 1);
+    assert.equal(complex.tiroirs, 3);
+    assert.ok(complex.total > one.total);
+  });
+
+  test('gravity and low pressure islands get the estimate, the others their price', () => {
     const settings = { processes: DEFAULT_PROCESSES, operations: DEFAULT_OPERATIONS, trs: DEFAULT_TRS, tooling: DEFAULT_TOOLING };
     const p = { ...part, poids: 1, toileMini: 5, epaisseurMax: 10, moduleMm: 3, volumeAnnuel: 5000, volumeTotal: 25000 };
     const cg = buildRoute('CG3', 'FTR', p, settings, null);
     const bp = buildRoute('BPR', 'FTR', p, settings, null);
+    const ssp = buildRoute('SSP', 'FSP', p, settings, null);
     assert.ok(cg.tooling && cg.outillage === cg.tooling.total);
     close(cg.outillagePiece, cg.outillage / 25000, 1e-9, 'value');
-    assert.equal(bp.tooling, null);
-    assert.equal(bp.outillage, DEFAULT_PROCESSES.BPR.outillage);
+    assert.ok(bp.tooling && bp.outillage === bp.tooling.total);
+    assert.equal(ssp.tooling, null);
+    assert.equal(ssp.outillage, DEFAULT_PROCESSES.SSP.outillage);
     const off = buildRoute('CG3', 'FTR', p, { ...settings, tooling: { ...DEFAULT_TOOLING, actif: false } }, null);
     assert.equal(off.outillage, DEFAULT_PROCESSES.CG3.outillage);
   });
@@ -376,19 +415,19 @@ describe('in-house gravity die and heat treatments', () => {
 });
 
 describe('sand cores and core boxes', () => {
-  test('the box of the workbook method: steel by weight, hours of its weight band, subcontracting', () => {
-    const core = { nom: 'N1', masse: 1, qte: 2, L: 300, l: 200, h: 150, type: 0, tiroirs: 1, complexite: 'Moyen' };
-    const box = coreBoxCost(core, DEFAULT_CORES);
-    const kg = (300 * 200 * 150 * 7.8) / 1e6; // 70.2 kg: band <= 200 kg
-    close(box.kg, kg, 1e-12, 'kg');
-    const t = DEFAULT_CORES.taux;
-    const cost = kg * 8 + (50 * t.ax3 + 50 * t.ax3auto + 5 * t.ax3) + (5 * t.ax5 + 5 * t.ax5auto + 5 * t.ax5) + 8 * t.fao + 60 * t.etude + 5 * t.scan + 50 * t.ajustage;
-    close(box.total, cost / 0.9, 1e-9, 'total with 10 % subcontracting');
+  test('the box of the workbook method: the method and rates of the dies, its own design and CAM hours', () => {
+    const core = { nom: 'N1', masse: 1, qte: 2, L: 300, l: 200, h: 150, type: 1, tiroirs: 1, complexite: 'Moyen' };
+    const box = coreBoxCost(core, DEFAULT_CORES, DEFAULT_TOOLING);
+    const same = steelToolCost({ L: 300, l: 200, h: 150, prixKg: DEFAULT_CORES.types[1].prixKg, typeLabel: '', tiroirs: 1, etudeH: DEFAULT_CORES.etude.Moyen, faoH: DEFAULT_CORES.fao.Moyen }, { ...DEFAULT_TOOLING, sousTraitance: DEFAULT_CORES.sousTraitance, marge: DEFAULT_CORES.marge });
+    close(box.kg, same.kg, 1e-12, 'kg');
+    close(box.total, same.total, 1e-9, 'total');
+    // Complexity of an earlier version: the most complex one.
+    close(coreBoxCost({ ...core, complexite: 'Très compliqué(e)' }).total, coreBoxCost({ ...core, complexite: 'Compliqué(e)' }).total, 1e-9, 'old complexity');
   });
 
   test('without dimensions, the box is sized from the sand of the core', () => {
-    const size = boxSize({ masse: 1.6 }, DEFAULT_CORES); // 1 dm³: a 100 mm cube, plus 2 x 50 mm
-    close(size.L, 200, 1e-9, 'L');
+    const size = boxSize({ masse: 1.6 }, DEFAULT_CORES); // 1 dm³: a 100 mm cube, plus 2 walls
+    close(size.L, 100 + 2 * DEFAULT_CORES.paroi, 1e-9, 'L');
     assert.equal(size.auto, true);
   });
 
@@ -396,5 +435,23 @@ describe('sand cores and core boxes', () => {
     const per = coresPerPiece([{ masse: 0.5, qte: 2 }, { masse: 1, qte: 1 }], { base: 40, parKg: 10 });
     close(per.sable, 2, 1e-12, 'sand');
     close(per.cycle, 2 * (40 + 5) + (40 + 10), 1e-12, 'cycle');
+  });
+});
+
+describe('settings files', () => {
+  test('a partial settings file changes only what it holds', () => {
+    const settings = defaultSettings(null);
+    settings.marge = 0.2;
+    const merged = mergeSettings(settings, {
+      processes: { CG3: { cycle: { base: 0, parKg: 100, exposant: 0.5 } } },
+      tooling: { taux: { ax3: 99 }, coefPoids: [{ max: 1e9, coef: 1.4 }] },
+    });
+    assert.equal(merged.marge, 0.2);
+    assert.deepEqual(merged.processes.CG3.cycle, { base: 0, parKg: 100, exposant: 0.5, parModule2: settings.processes.CG3.cycle.parModule2 });
+    assert.equal(merged.processes.CG3.famille, settings.processes.CG3.famille);
+    assert.equal(merged.tooling.taux.ax3, 99);
+    assert.equal(merged.tooling.taux.ax5, settings.tooling.taux.ax5);
+    assert.deepEqual(merged.tooling.coefPoids, [{ max: 1e9, coef: 1.4 }]);
+    assert.deepEqual(settings.tooling.taux, DEFAULT_TOOLING.taux, 'the current settings are not changed');
   });
 });
