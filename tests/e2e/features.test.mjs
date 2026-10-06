@@ -6,7 +6,7 @@
 //   npm run build && node --test tests/e2e/features.test.mjs
 
 import assert from 'node:assert/strict';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 
@@ -229,6 +229,44 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     assert.doesNotMatch(await page.textContent('#method'), /mémorisés/);
     assert.equal(await page.textContent('#total-volume'), volume);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
+  test('open surfaces closed on request ("Fermer le corps")', { timeout: CAD_TIMEOUT }, async () => {
+    // A box 40 x 30 x 20 mm given as 5 loose faces: open, a face missing.
+    const { loadOcctNode } = await import('../../web/engine/occt.js');
+    const oc = await loadOcctNode();
+    const box = new oc.BRepPrimAPI_MakeBox_2(40, 30, 20).Shape();
+    const faces = new oc.TopoDS_Compound();
+    const builder = new oc.BRep_Builder();
+    builder.MakeCompound(faces);
+    const explorer = new oc.TopExp_Explorer_2(box, oc.TopAbs_ShapeEnum.TopAbs_FACE, oc.TopAbs_ShapeEnum.TopAbs_SHAPE);
+    for (let n = 0; explorer.More() && n < 5; explorer.Next(), n++) builder.Add(faces, explorer.Current());
+    const writer = new oc.STEPControl_Writer_1();
+    writer.Transfer(faces, oc.STEPControl_StepModelType.STEPControl_AsIs, true, new oc.Message_ProgressRange_1());
+    writer.Write('/open_box.step');
+    mkdirSync(SAMPLE_DIR, { recursive: true });
+    const file = join(SAMPLE_DIR, 'open_box.step');
+    writeFileSync(file, oc.FS.readFile('/open_box.step'));
+
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    await page.setInputFiles('#file-input', file);
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    // Open: no volume, and the link under the open bodies (nothing closed during the analysis).
+    assert.match(await page.textContent('#bodies'), /ouvert/);
+    assert.ok((await page.$$('#bodies .close-body')).length >= 1);
+    assert.equal((await page.textContent('#bodies .close-body')).trim(), 'Fermer le corps');
+    await page.evaluate(() => (document.body.dataset.status = ''));
+    await page.click('#bodies .close-body');
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    const part = await page.evaluate(() => window.reader3d.part());
+    approx(part.volume, 24000, 1e-6, 0, 'closed volume');
+    assert.equal(part.openBodies, 0);
+    assert.equal((await page.$$('#bodies .close-body')).length, 0);
+    await page.click('#bodies tr[data-index="0"]');
+    assert.match(await page.textContent('#body-detail'), /1 trou\(s\) des surfaces bouché\(s\)/);
     assert.deepEqual(errors, []);
     await page.context().close();
   });

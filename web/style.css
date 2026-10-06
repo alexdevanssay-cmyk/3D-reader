@@ -284,3 +284,6 @@ table.bodies .open { color: var(--warn); }
 .cactions { display: flex; gap: 8px; flex-wrap: wrap; }
 @media (max-width: 700px) { .cgrid { grid-template-columns: 1fr; } }
 .ctable td.bad { color: var(--error-text); }
+/* "Fermer le corps" under an open body of the bodies table. */
+.close-row td { padding-top: 0; border-top: 0; }
+.close-row .close-body { font-size: 12px; color: var(--accent); }

@@ -105,7 +105,10 @@ export async function saveResult(key, record, { file = '' } = {}) {
     const meta = await request(tx.objectStore('meta').get(key));
     if (part !== 'data' && !meta) return; // the analysis is no longer kept
     tx.objectStore('data').put(record[part], partKey(key, part));
-    const parts = { ...meta?.parts, [part]: bytes };
+    // A new analysis (refreshed, or its open surfaces closed): the thickness kept was of the former one.
+    const former = part === 'data' ? {} : meta?.parts;
+    if (part === 'data') for (const other of PARTS) if (other !== 'data') tx.objectStore('data').delete(partKey(key, other));
+    const parts = { ...former, [part]: bytes };
     tx.objectStore('meta').put({ key, file: meta?.file ?? file, savedAt: meta?.savedAt ?? Date.now(), parts, bytes: Object.values(parts).reduce((a, b) => a + b, 0), usedAt: Date.now() });
     await done(tx);
     await evict(d);

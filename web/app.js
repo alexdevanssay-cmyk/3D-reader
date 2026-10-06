@@ -373,12 +373,13 @@ async function analyzeOnServer(file) {
   return data;
 }
 
-async function analyzeInBrowser(file, { refresh = false } = {}) {
+async function analyzeInBrowser(file, { refresh = false, close = false } = {}) {
   const client = await browserClient();
   return client.analyzeInBrowser(file, {
     unit: $("unit").value,
     quality: $("quality").value,
     cache: !refresh,
+    close,
     onProgress: (p) => {
       showProgress(p);
       if (p.stage === "download" || p.stage === "compile") showEngineStatus(p);
@@ -402,7 +403,12 @@ async function stopAnalysis() {
  * handle  -- its FileSystemFileHandle when known: "Refresh" reads the file
  *            again from the disk (it may have changed)
  */
-async function openFile(file, { refresh = false, handle = null } = {}) {
+/** Close the open surfaces of the file shown: analysed again, open surfaces sewn and filled into solids. */
+function closeOpenBodies() {
+  if (state.file) openFile(state.file, { refresh: true, handle: state.handle, close: true });
+}
+
+async function openFile(file, { refresh = false, handle = null, close = false } = {}) {
   if (!file) return;
   const seq = ++openSeq;
   // The new file must not wait behind an abandoned one (the browser engine
@@ -411,14 +417,14 @@ async function openFile(file, { refresh = false, handle = null } = {}) {
   if (seq !== openSeq) return;
   if (currentEngine() === "browser" && !(await memoryCheck(file))) return;
   $("error").hidden = true;
-  setLoading(t("loading.analysing"));
+  setLoading(t(close ? "loading.closing" : "loading.analysing"));
   $("loading-file").textContent = file.name;
   $("loading").hidden = false;
   setStatus("analysing");
   startProgress();
   let data = null;
   try {
-    data = currentEngine() === "server" ? await analyzeOnServer(file) : await analyzeInBrowser(file, { refresh });
+    data = currentEngine() === "server" ? await analyzeOnServer(file) : await analyzeInBrowser(file, { refresh, close });
     if (seq !== openSeq) return;
     // Only now does the page show this file (a failed file leaves the previous one).
     state.handle = handle ?? (file === state.file ? state.handle : null);
@@ -613,6 +619,17 @@ function renderBodies() {
     );
     tr.addEventListener("click", () => select(i === state.selected ? -1 : i));
     tbody.appendChild(tr);
+    // Open surfaces of a CAD file: closed into a solid on request (not during the analysis, too heavy).
+    if (!b.closed && r.kind === "cad" && currentEngine() === "browser") {
+      const row = document.createElement("tr");
+      row.className = "close-row";
+      row.innerHTML = `<td></td><td colspan="3"><button type="button" class="linklike close-body" title="${escapeHtml(t("bodies.close.title"))}"><em>${escapeHtml(t("bodies.close"))}</em></button></td>`;
+      row.querySelector("button").addEventListener("click", (e) => {
+        e.stopPropagation();
+        closeOpenBodies();
+      });
+      tbody.appendChild(row);
+    }
   });
   renderBodyDetail();
 }
