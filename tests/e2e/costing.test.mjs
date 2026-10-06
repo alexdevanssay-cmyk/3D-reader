@@ -94,6 +94,16 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const t5 = await pri();
     assert.ok(t6 > t5 && t5 > noTth, `T6 ${t6}, T5 ${t5}, none ${noTth}`);
 
+    // Sand cores: the cores of the piece and their core boxes (added to the tooling).
+    await page.check('#page-chiffrage [data-bind="p.noyaux"]');
+    await page.waitForSelector('#page-chiffrage [data-bind="p.cores.0.masse"]');
+    await typeIn('p.cores.0.masse', 0.5);
+    await page.waitForFunction(() => /Boîtes à noyau/.test(document.getElementById('page-chiffrage').textContent));
+    assert.match(await page.textContent('#page-chiffrage'), /Noyau 1 — boîte \d+ kg \(dimensions estimées\)/);
+    assert.match(await page.textContent('#page-chiffrage'), /moule [\d\s\u202f]+ € \+ boîtes à noyau [\d\s\u202f]+ €/);
+    await page.uncheck('#page-chiffrage [data-bind="p.noyaux"]');
+    await page.waitForFunction(() => !/Boîtes à noyau/.test(document.getElementById('page-chiffrage').textContent));
+
     // The tooling: amortised in the piece price, or sold apart.
     const salePrice = async () => Number((/Prix de vente complet[^\d]*([\d\s\u202f]+,\d+)/.exec((await page.textContent('#page-chiffrage')).replace(/\u202f/g, ' ')) ?? [])[1]?.replace(/\s/g, '').replace(',', '.'));
     assert.match(await page.textContent('#page-chiffrage'), /Outillage amorti \(/);
@@ -138,6 +148,14 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       assert.equal(await page.inputValue(`#page-chiffrage [data-bind="q.${bind}"]`), value, bind);
     }
     assert.match(await page.textContent('#page-chiffrage'), /2[\s\u202f]810,00\s*valeur de la demande client/);
+    // Prototype: the prototype volumes of the request, without target price.
+    assert.equal(await page.isChecked('#page-chiffrage [data-bind="q.prototype"]'), false);
+    await page.check('#page-chiffrage [data-bind="q.prototype"]');
+    await page.waitForFunction(() => /Prototypes/.test(document.getElementById('page-chiffrage').textContent));
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.volumes.0"]'), '20');
+    assert.match(await page.textContent('#page-chiffrage'), /non utilisé pour des prototypes/);
+    await page.uncheck('#page-chiffrage [data-bind="q.prototype"]');
+    await page.waitForFunction(() => document.querySelector('#page-chiffrage [data-bind="q.volumes.1"]')?.value === '1500');
     const moqRows = await page.$$eval('#page-chiffrage .ctable tbody tr', (trs) => trs.map((tr) => tr.textContent).filter((t) => /MOQ \d/.test(t)));
     assert.equal(moqRows.length, 3, moqRows.join('\n'));
     const price = (t) => Number(/(\d[\d\s\u202f]*,\d\d) €(?=[^€]*%)/.exec(t)[1].replace(/[\s\u202f]/g, '').replace(',', '.'));

@@ -191,6 +191,7 @@ export const indicesWorkbook = (offset = 100) => writeWorkbook({ Notes: { A1: 'c
 export function seriesOrderWorkbook() {
   const go = {
     H7: 'Année', H8: 'Volume série', H9: 'Volume proto',
+    A69: 'Proto', B69: 'Non',
     A20: 'Nom du client *', B20: 'ACME RAIL',
     A25: 'Référence de la demande client  *', B25: 'Castings 2027',
     A26: 'Référence & Désignation pièce *', B26: 'AB-123 - SUPPORT PLATE',
@@ -208,6 +209,7 @@ export function seriesOrderWorkbook() {
     const c = String.fromCharCode(73 + i); // I..N
     go[`${c}7`] = Number(y);
     go[`${c}8`] = vols[y];
+    go[`${c}9`] = y === '2026' ? 20 : 0; // prototypes the year before the series
   });
   return writeWorkbook({
     'Mode opératoire': { A1: 'Template Go No Go' },

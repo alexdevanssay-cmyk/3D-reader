@@ -6,6 +6,7 @@
 
 import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, DEFAULT_TTH } from "./routes.js";
 import { DEFAULT_TOOLING } from "./tooling.js";
+import { DEFAULT_CORES } from "./cores.js";
 import { indexAverage } from "./model.js";
 
 const KEYS = {
@@ -58,6 +59,7 @@ export function defaultSettings(base) {
     densities: { ...DEFAULT_DENSITIES },
     tooling: clone(DEFAULT_TOOLING), // in-house gravity dies (tooling.js)
     tth: clone(DEFAULT_TTH), // heat treatments: cost relative to T6
+    cores: clone(DEFAULT_CORES), // sand cores and core boxes (cores.js)
     inflation: {
       salaires: d.evolutionSalaires ?? 0.015,
       conso: d.evolutionConso ?? 0.02,
@@ -81,6 +83,8 @@ export function loadSettings(base) {
   if (!saved) return defaults;
   const merged = { ...defaults, ...saved };
   for (const key of ["trs", "modes", "densities", "inflation"]) merged[key] = { ...defaults[key], ...saved[key] };
+  merged.cores = { ...defaults.cores, ...saved.cores };
+  for (const k of ["taux", "etude"]) merged.cores[k] = { ...defaults.cores[k], ...saved.cores?.[k] };
   merged.tth = { ...defaults.tth };
   for (const [code, value] of Object.entries(saved.tth ?? {})) merged.tth[code] = { ...defaults.tth[code], ...value };
   merged.tooling = { ...defaults.tooling, ...saved.tooling };
@@ -158,6 +162,7 @@ export function defaultQuote(base, indices) {
     moqs: [], // order quantities, largest first
     prixCible: null,
     serieEnergie: true, // energy prices of the request in place of the settings
+    prototype: false, // prototypes: prototype volumes of the request, no target price
     outillageInclus: true, // tooling amortised in the piece price; false: sold apart
     margeOutillage: 0, // margin on the tooling sold apart
   };
