@@ -1001,6 +1001,8 @@ window.addEventListener("drop", (e) => {
   e.preventDefault();
   hint.classList.remove("dragging");
   if (state.result) hint.hidden = true;
+  // On the costing pages, files go to the rows of their data files (chiffrage/ui.js), not to the 3D view.
+  if ($("page-viewer").hidden) return;
   const item = [...(e.dataTransfer.items ?? [])].find((i) => i.kind === "file");
   const handle = item?.getAsFileSystemHandle?.();
   const file = e.dataTransfer.files[0];

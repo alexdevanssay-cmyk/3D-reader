@@ -136,7 +136,16 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.poids"]'), '1.2', 'inputs kept too');
 
     // The series order of the customer request: volumes per year, MOQ, target price.
-    await page.setInputFiles('#page-chiffrage input[data-file="rfq"]', join(dir, 'RFQ.xlsm'));
+    // Dropped on its row of the "Données" card (drag and drop replaces the file in use).
+    const rfq = readFileSync(join(dir, 'RFQ.xlsm')).toString('base64');
+    await page.evaluate((b64) => {
+      const zone = document.querySelector('#page-chiffrage [data-drop="rfq"]');
+      const data = new DataTransfer();
+      data.items.add(new File([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], 'RFQ.xlsm'));
+      zone.dispatchEvent(new DragEvent('dragover', { dataTransfer: data, bubbles: true, cancelable: true }));
+      if (!zone.classList.contains('drop-target')) throw new Error('the row is not highlighted');
+      zone.dispatchEvent(new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true }));
+    }, rfq);
     await page.waitForFunction(() => /Commande série « RFQ\.xlsm » importée : 4 ans à partir de 2027, 4 800 pièces, MOQ 2000 \/ 500 \/ 50, prix cible 30,00 €/.test(document.getElementById('page-chiffrage').textContent.replace(/\u202f/g, ' ')));
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.client"]'), 'ACME RAIL');
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.reference"]'), 'AB-123');

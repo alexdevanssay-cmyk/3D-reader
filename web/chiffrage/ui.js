@@ -27,6 +27,29 @@ export function mount(targets) {
     container.addEventListener("pointerdown", (e) => {
       if (e.target.closest("button, [data-action]")) pointerDown = true;
     }, true);
+    // A file dropped on the row of a data file replaces that file.
+    container.addEventListener("dragover", (e) => {
+      const zone = e.target.closest?.("[data-drop]");
+      if (!zone) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = "copy";
+      for (const z of container.querySelectorAll(".drop-target")) if (z !== zone) z.classList.remove("drop-target");
+      zone.classList.add("drop-target");
+    });
+    container.addEventListener("dragleave", (e) => {
+      const zone = e.target.closest?.("[data-drop]");
+      if (zone && !zone.contains(e.relatedTarget)) zone.classList.remove("drop-target");
+    });
+    container.addEventListener("drop", (e) => {
+      const zone = e.target.closest?.("[data-drop]");
+      if (!zone) return;
+      e.preventDefault();
+      e.stopPropagation();
+      zone.classList.remove("drop-target");
+      const file = e.dataTransfer.files?.[0];
+      if (file) importFile({ files: [file], dataset: { file: zone.dataset.drop }, value: "" });
+    });
   }
   document.addEventListener("reader3d-part", () => {
     if (!el.chiffrage.hidden) render();
@@ -632,16 +655,16 @@ function sourcesCard() {
     : "aucun";
   return `<section class="ccard csources">
     <h3>Données</h3>
-    <div class="crow"><span>Classeur de chiffrage :</span> <strong>${base ? `${esc(base.source?.fileName)} — importé le ${dateLabel(base.source?.importedAt)}` : "aucun"}</strong>
+    <div class="crow" data-drop="workbook" title="Glissez un classeur ici pour le remplacer"><span>Classeur de chiffrage :</span> <strong>${base ? `${esc(base.source?.fileName)} — importé le ${dateLabel(base.source?.importedAt)}` : "aucun"}</strong>
       <button type="button" class="small" data-action="import-workbook">Importer le classeur…</button>
       <input type="file" data-file="workbook" accept=".xlsm,.xlsx" hidden></div>
-    <div class="crow"><span>Indices matière :</span> <strong>${indicesInfo}</strong>
+    <div class="crow" data-drop="indices" title="Glissez un fichier d'indices ici pour le remplacer"><span>Indices matière :</span> <strong>${indicesInfo}</strong>
       <button type="button" class="small" data-action="import-indices">Importer les indices…</button>
       <input type="file" data-file="indices" accept=".xlsx,.xlsm" hidden></div>
-    <div class="crow"><span>Commande série :</span> <strong>${q.serie ? `${esc(q.serie.fileName)} — importée le ${dateLabel(q.serie.importedAt)}` : "aucune"}</strong>
+    <div class="crow" data-drop="rfq" title="Glissez une demande client ici pour la remplacer"><span>Commande série :</span> <strong>${q.serie ? `${esc(q.serie.fileName)} — importée le ${dateLabel(q.serie.importedAt)}` : "aucune"}</strong>
       <button type="button" class="small" data-action="import-rfq">Importer la demande client…</button>
       <input type="file" data-file="rfq" accept=".xlsm,.xlsx" hidden>${q.serie ? ` <button type="button" class="small" data-action="remove-rfq">Retirer</button>` : ""}</div>
-    <p class="muted small">Les fichiers sont lus dans ce navigateur et mémorisés sur ce poste : rien n'est envoyé sur Internet.
+    <p class="muted small">Glissez-déposez un fichier sur sa ligne pour le remplacer. Les fichiers sont lus dans ce navigateur et mémorisés sur ce poste : rien n'est envoyé sur Internet.
       Indices : fichier Excel avec un onglet « Suivi indice » (comme VALEURS MB LME.xlsx) ; réimportez-le après chaque mise à jour des cours.</p>
   </section>`;
 }
@@ -1254,7 +1277,7 @@ function renderSettings() {
     <h3>Densités des alliages (g/cm³)</h3>
     <div class="cfields">${densities}</div>
   </section>
-  <p class="cactions">
+  <p class="cactions" data-drop="settings" title="Glissez un fichier de paramètres (.json) ici pour l'importer">
     <button type="button" data-action="export-settings">Exporter les paramètres</button>
     <button type="button" data-action="import-settings">Importer des paramètres…</button>
     <input type="file" data-file="settings" accept=".json" hidden>

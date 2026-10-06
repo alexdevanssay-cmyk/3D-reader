@@ -262,6 +262,9 @@ table.bodies .open { color: var(--warn); }
 .cf > output { padding: 5px 0; font-weight: 600; font-variant-numeric: tabular-nums; }
 .cf small { font-size: 11px; }
 .crow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+/* A data file dragged over its row (or over the settings buttons): dropped, it replaces the one in use. */
+[data-drop] { border: 2px dashed transparent; border-radius: 6px; padding: 2px 6px; margin-left: -8px; transition: border-color 0.1s, background 0.1s; }
+[data-drop].drop-target { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .cscroll { overflow-x: auto; }
 .ctable { border-collapse: collapse; width: 100%; font-size: 13px; }
 .ctable th, .ctable td { padding: 5px 8px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }
