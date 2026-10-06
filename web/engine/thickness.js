@@ -681,3 +681,207 @@ function closestOnTriangle(T, o, x, y, z, out) {
   out[2] = rz;
   return (x - rx) * (x - rx) + (y - ry) * (y - ry) + (z - rz) * (z - rz);
 }
+
+// Markings (text, logos, symbols), hollow in the part or in relief (engraved
+// in the die): the thickness measured across them, or under a hollow one, is
+// not a wall of the part. The thinnest zone is tested: when it is the floor of
+// a shallow recess or the top of a shallow relief, or one of their sides
+// (side walls that all rise from the floor, or all go down from the top, to a
+// surface at most maxDepth away), it is left out and the next thinnest zone
+// is tested, until a zone that is not part of a marking.
+const ENGRAVING_STEEP = 0.5; // |cos| of a side wall to the floor
+const ENGRAVING_FLAT = 0.9; // cos of the triangles of one floor
+const ENGRAVING_SQUARE = 0.2; // |cos| of a floor (top) to a side
+const ENGRAVING_MAX_TRIANGLES = 20000; // larger: not an engraving
+const ENGRAVING_LEVEL = 0.2; // mm: the floor of an engraving is at one level within this
+
+/**
+ * Triangles of engravings: {mask (Uint8Array, 1 = left out), regions, depth (largest, mm)}.
+ *   values: thickness per triangle (mm); floor: thinner values are already left out.
+ */
+export function engravingMask(positions, indices, values, { floor = 0, maxDepth = 2, maxRegions = 200 } = {}) {
+  const nt = indices.length / 3;
+  const mask = new Uint8Array(nt);
+  if (!nt) return { mask, regions: 0, depth: 0 };
+  const { welded, nv } = weld(positions, indices);
+  const nb = edgeNeighbours(nv, welded, (Type, n) => new Type(n));
+  const normals = triangleNormals(positions, indices);
+  const centre = new Float64Array(3 * nt);
+  for (let f = 0; f < nt; f++) {
+    for (let k = 0; k < 3; k++) centre[3 * f + k] = (positions[3 * indices[3 * f] + k] + positions[3 * indices[3 * f + 1] + k] + positions[3 * indices[3 * f + 2] + k]) / 3;
+  }
+  const dot = (f, n) => normals[3 * f] * n[0] + normals[3 * f + 1] * n[1] + normals[3 * f + 2] * n[2];
+  const normal = (f) => [normals[3 * f], normals[3 * f + 1], normals[3 * f + 2]];
+  const samePlane = (f, g) =>
+    dot(f, normal(g)) > 0.99 &&
+    Math.abs((centre[3 * g] - centre[3 * f]) * normals[3 * f] + (centre[3 * g + 1] - centre[3 * f + 1]) * normals[3 * f + 1] + (centre[3 * g + 2] - centre[3 * f + 2]) * normals[3 * f + 2]) < ENGRAVING_LEVEL;
+
+  /**
+   * The marking whose floor (sign 1: a recess) or top (sign -1: a relief) holds
+   * triangle `seed`: {floor: Set, walls: Set, depth} or null.
+   */
+  function recessOf(seed, sign) {
+    const n0 = normal(seed);
+    const p = [centre[3 * seed], centre[3 * seed + 1], centre[3 * seed + 2]];
+    // Height above the floor, or depth under the top of a relief.
+    const height = (f) => sign * ((centre[3 * f] - p[0]) * n0[0] + (centre[3 * f + 1] - p[1]) * n0[1] + (centre[3 * f + 2] - p[2]) * n0[2]);
+    // The floor: the flat triangles around the seed, at its level.
+    const floorSet = new Set([seed]);
+    const list = [seed];
+    for (let i = 0; i < list.length; i++) {
+      for (let e = 0; e < 3; e++) {
+        const g = nb[3 * list[i] + e];
+        if (g < 0 || floorSet.has(g) || dot(g, n0) < ENGRAVING_FLAT || Math.abs(height(g)) > ENGRAVING_LEVEL) continue;
+        floorSet.add(g);
+        list.push(g);
+        if (list.length > ENGRAVING_MAX_TRIANGLES) return null;
+      }
+    }
+    // Its side walls, and the surface at their other end.
+    const walls = new Set();
+    const top = [];
+    const visited = new Set(floorSet);
+    const queue = [];
+    for (const f of floorSet) for (let e = 0; e < 3; e++) queue.push(nb[3 * f + e]);
+    while (queue.length) {
+      const g = queue.pop();
+      if (g < 0) return null; // a free edge: not a closed recess
+      if (visited.has(g)) continue;
+      visited.add(g);
+      const cos = dot(g, n0);
+      const h = height(g);
+      if (cos >= ENGRAVING_FLAT) {
+        // Facing the same way: the surface around, or the floor going on at its level.
+        if (h > ENGRAVING_LEVEL) top.push(g);
+        else if (h < -ENGRAVING_LEVEL) return null;
+      } else if (cos > -ENGRAVING_STEEP) {
+        // Side walls, their fillets and chamfers: rising from the floor (going down from the top).
+        if (h < -ENGRAVING_LEVEL) return null; // goes down under the floor: a step, not a recess
+        walls.add(g);
+        if (walls.size > ENGRAVING_MAX_TRIANGLES) return null;
+        for (let e = 0; e < 3; e++) queue.push(nb[3 * g + e]);
+      } else {
+        return null; // turns back under the floor
+      }
+    }
+    if (!walls.size || !top.length) return null;
+    let sum = 0, area = 0;
+    for (const f of top) {
+      const a = triangleArea(positions, indices[3 * f], indices[3 * f + 1], indices[3 * f + 2]);
+      sum += height(f) * a;
+      area += a;
+    }
+    const depth = area > 0 ? sum / area : 0;
+    if (!(depth > 0.05 && depth <= maxDepth + ENGRAVING_LEVEL)) return null;
+    return { floor: floorSet, walls, depth };
+  }
+
+  // From the thinnest wall reported (thinner triangles are noise the statistics leave out).
+  const start = thicknessStats([{ positions, indices, values }], { floor }).min ?? Infinity;
+  const order = [];
+  for (let f = 0; f < nt; f++) if (values[f] >= floor && values[f] >= start - 1e-6) order.push(f); // NaN left out
+  order.sort((a, b) => values[a] - values[b]);
+  const areaOf = (f) => triangleArea(positions, indices[3 * f], indices[3 * f + 1], indices[3 * f + 2]);
+  let total = 0;
+  for (const f of order) total += areaOf(f);
+  // Walls of the part found so far: once they are enough surface to set the thinnest wall, stop.
+  let walled = 0;
+  const seen = new Uint8Array(nt);
+  let regions = 0;
+  let deepest = 0;
+  for (let k = 0; k < order.length && regions < maxRegions; k++) {
+    const seed = order[k];
+    if (seen[seed] || mask[seed]) continue;
+    // The zone: neighbours in the same band of thickness, facing the same way.
+    const v0 = values[seed];
+    const band = v0 + Math.max(0.1, 0.1 * v0);
+    const n0 = normal(seed);
+    const zone = [seed];
+    seen[seed] = 1;
+    for (let i = 0; i < zone.length; i++) {
+      for (let e = 0; e < 3; e++) {
+        const g = nb[3 * zone[i] + e];
+        if (g < 0 || seen[g] || mask[g] || !(values[g] <= band) || dot(g, n0) < ENGRAVING_FLAT) continue;
+        seen[g] = 1;
+        zone.push(g);
+      }
+    }
+    // The zone is the floor of a recess (or the top of a relief), or a side: the
+    // floor (top) is then close by, square to it, past the fillets of its edges.
+    const floors = [seed];
+    const near = new Set(zone);
+    const ring = [...zone];
+    for (let i = 0; i < ring.length && ring.length < 200 && floors.length < 12; i++) {
+      for (let e = 0; e < 3; e++) {
+        const g = nb[3 * ring[i] + e];
+        if (g < 0 || near.has(g)) continue;
+        near.add(g);
+        ring.push(g);
+        const cos = dot(g, n0);
+        if (Math.abs(cos) < ENGRAVING_SQUARE && !floors.some((f) => samePlane(f, g))) floors.push(g);
+      }
+    }
+    let found = null;
+    for (const f of floors) {
+      for (const sign of [1, -1]) {
+        const r = recessOf(f, sign);
+        if (r && zone.every((z) => r.floor.has(z) || r.walls.has(z))) {
+          found = r;
+          break;
+        }
+      }
+      if (found) break;
+    }
+    if (!found) {
+      for (const f of zone) walled += areaOf(f);
+      if (walled >= STATS_SHARE * total) break; // the thinnest wall left is a wall of the part
+      continue;
+    }
+    for (const f of found.floor) mask[f] = 1;
+    for (const f of found.walls) mask[f] = 1;
+    regions++;
+    deepest = Math.max(deepest, found.depth);
+  }
+  return { mask, regions, depth: deepest };
+}
+
+/** Vertex indices merged by position (the faces of a CAD model have their own vertices). */
+function weld(positions, indices) {
+  const n = positions.length / 3;
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < positions.length; i++) {
+    if (positions[i] < lo) lo = positions[i];
+    if (positions[i] > hi) hi = positions[i];
+  }
+  const q = Math.max(1e-9, (hi - lo) * 1e-7);
+  let size = 16;
+  while (size < 2 * n) size *= 2;
+  const mask = size - 1;
+  const slots = new Int32Array(size).fill(-1);
+  const ids = new Int32Array(n);
+  const keys = new Float64Array(3 * n);
+  let nv = 0;
+  for (let v = 0; v < n; v++) {
+    const x = Math.round(positions[3 * v] / q), y = Math.round(positions[3 * v + 1] / q), z = Math.round(positions[3 * v + 2] / q);
+    let slot = (Math.imul(x | 0, 0x9e3779b1) ^ Math.imul(y | 0, 0x85ebca6b) ^ Math.imul(z | 0, 0xc2b2ae35)) & mask;
+    for (;;) {
+      const s = slots[slot];
+      if (s === -1) {
+        slots[slot] = nv;
+        keys[3 * nv] = x;
+        keys[3 * nv + 1] = y;
+        keys[3 * nv + 2] = z;
+        ids[v] = nv++;
+        break;
+      }
+      if (keys[3 * s] === x && keys[3 * s + 1] === y && keys[3 * s + 2] === z) {
+        ids[v] = s;
+        break;
+      }
+      slot = (slot + 1) & mask;
+    }
+  }
+  const welded = new Uint32Array(indices.length);
+  for (let i = 0; i < indices.length; i++) welded[i] = ids[indices[i]];
+  return { welded, nv };
+}

@@ -483,7 +483,7 @@ async function analyzeInPage(page, name, timeout) {
       const error = $('error');
       if (!error.hidden && error.textContent.trim()) return { error: error.textContent.trim() };
       const done = $('loading').hidden && !$('summary-card').hidden;
-      return done && $('file-name').textContent === fileName ? { ok: true } : false;
+      return done && $('file-name').title === fileName ? { ok: true } : false;
     },
     name,
     { timeout, polling: 100 },

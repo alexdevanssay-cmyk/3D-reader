@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.js";
-import { thicknessHistogram, thicknessStats } from "./engine/thickness.js";
+import { engravingMask, thicknessHistogram, thicknessStats } from "./engine/thickness.js";
 import { summarize } from "./engine/summary.js";
 
 // ---------------------------------------------------------------- units
@@ -423,7 +423,9 @@ async function openFile(file, { refresh = false, handle = null } = {}) {
     state.handle = handle ?? (file === state.file ? state.handle : null);
     state.file = file;
     state.result = data;
-    $("file-name").textContent = file.name;
+    // The part shown, in large type: its name without the extension (the whole name as a tip).
+    $("file-name").textContent = file.name.replace(/\.[^.]+$/, "");
+    $("file-name").title = file.name;
     $("drop-hint").hidden = true;
     buildModel(data);
     renderPanel();
@@ -926,6 +928,23 @@ $("density").addEventListener("input", () => {
   updateMass();
 });
 
+/** Material of the part from elsewhere (the alloy of a customer request): an entry of the list, selected. */
+function setMaterial(label, density) {
+  if (!(density > 0)) return;
+  const select = $("material");
+  let option = [...select.options].find((o) => o.dataset.alloy === label);
+  if (!option) {
+    option = new Option("", String(density));
+    option.dataset.alloy = label;
+    select.insertBefore(option, select.firstChild);
+  }
+  option.value = String(density);
+  option.textContent = `${label} (${density.toLocaleString(locale(), { minimumFractionDigits: 2 })})`;
+  option.selected = true;
+  $("density").value = density;
+  updateMass();
+}
+
 document.querySelectorAll("[data-view]").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
 $("fit").addEventListener("click", () => setView(null));
 
@@ -1006,8 +1025,24 @@ function loadFloor() {
   }
 }
 
+// Markings (text, logos) hollow in the part or in relief, at most this deep / high:
+// the thickness measured across them is not a wall (kept in this browser).
+const MARKINGS_KEY = "reader3d.thickness.markings";
+function loadMarkings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(MARKINGS_KEY));
+    if (saved && typeof saved.on === "boolean" && saved.depth >= 0) return saved;
+  } catch {
+    // none kept
+  }
+  return { on: true, depth: 2 };
+}
+
 const thick = {
   floor: loadFloor(), // mm
+  markings: loadMarkings(), // {on, depth mm}
+  markCache: new Map(), // body -> {key, mask, regions, depth}
+  minOverride: null, // mm: thinnest wall typed in for the quote (the model was misjudged), or null
   results: null, // per body {ray, sphere} (Float32Array per triangle) or null
   pending: null, // promise of the computation in progress
   colors: false,
@@ -1039,13 +1074,35 @@ function bodyGeometry(i) {
 /** Statistics (min, median, max in mm) of the bodies listed (default: all) for a method (default: the one chosen). */
 function thickStats(indices = state.meshes.map((_, i) => i), method = thickMethod()) {
   const parts = [];
+  let markings = 0;
   for (const i of indices) {
-    const values = thickValues(i, method);
+    let values = thickValues(i, method);
     if (!values) continue;
     const geom = bodyGeometry(i);
+    // The thinnest wall leaves out the markings.
+    const marks = method === "wall" ? markingsOf(i) : null;
+    if (marks?.regions) {
+      values = Float32Array.from(values, (v, f) => (marks.mask[f] ? NaN : v));
+      markings += marks.regions;
+    }
     parts.push({ positions: geom.attributes.position.array, indices: geom.index.array, values });
   }
-  return thicknessStats(parts, { floor: thick.floor });
+  return { ...thicknessStats(parts, { floor: thick.floor }), markings };
+}
+
+/** Markings of body i (engravingMask on its "wall" values), kept until the settings change; null when off. */
+function markingsOf(i) {
+  if (!thick.markings.on) return null;
+  const values = thickValues(i, "wall");
+  if (!values) return null;
+  const key = `${thick.floor}|${thick.markings.depth}`;
+  const kept = thick.markCache.get(i);
+  if (kept?.key === key && kept.values === values) return kept;
+  const geom = bodyGeometry(i);
+  const found = engravingMask(geom.attributes.position.array, geom.index.array, values, { floor: thick.floor, maxDepth: thick.markings.depth });
+  const out = { key, values, ...found };
+  thick.markCache.set(i, out);
+  return out;
 }
 
 /** Colour of a thickness on the scale: blue (0) -> cyan -> green -> yellow -> red (max and above). */
@@ -1097,6 +1154,8 @@ function thickQuantiles(fractions) {
 /** A new model is shown: forget the previous thicknesses, recompute if in use. */
 function thicknessNewModel(kept = null) {
   thick.results = null;
+  thick.markCache = new Map();
+  thick.minOverride = null;
   thick.pending = null;
   thick.userMax = false;
   thick.value = null;
@@ -1280,7 +1339,12 @@ function renderThickness() {
   const wall = thickStats(undefined, "wall");
   const thinnest = wall.min;
   $("thick-min").textContent = fmtMm(thinnest ?? NaN);
-  $("thick-details").textContent = detailsText(wall.details);
+  $("thick-min").classList.toggle("overridden", thick.minOverride != null);
+  $("thick-min-used").value = thick.minOverride ?? "";
+  $("thick-min-used").placeholder = thinnest == null ? "" : fmtNum(thinnest, 2);
+  $("thick-details").textContent = [detailsText(wall.details), wall.markings ? t("thick.markings.found", { count: wall.markings }) : ""].filter(Boolean).join(" ");
+  $("thick-markings").checked = thick.markings.on;
+  $("thick-mark-depth").value = thick.markings.depth;
   $("thick-floor").value = thick.floor;
   $("thick-locate").disabled = thinnest == null;
   let mode = 0;
@@ -1288,12 +1352,25 @@ function renderThickness() {
   $("thick-share").textContent = total
     ? t("thick.share", { percent: ((band / total) * 100).toLocaleString(locale(), { maximumFractionDigits: 1 }), lo: fmtNum(Math.max(0, thick.value - thick.tol), 3), hi: fmtNum(thick.value + thick.tol, 3) })
     : t("thick.none");
+  // Most frequent and thickest: a click highlights where they are.
+  thick.spots = {
+    dominant: total ? { value: (mode + 0.5) * width, tol: width / 2 } : null,
+    max: stats.max != null ? { value: stats.max, tol: Math.max(0.1, Math.round(stats.max * 5) / 100) } : null,
+  };
   const rows = [
-    [t("thick.dominant"), total ? `${fmtNum(mode * width, 2)} – ${fmtNum((mode + 1) * width, 2)} mm` : "—"],
-    [t("thick.median"), fmtMm(stats.median ?? NaN)],
-    [t("thick.maxValue"), fmtMm(stats.max ?? NaN)],
+    [t("thick.dominant"), total ? `${fmtNum(mode * width, 2)} – ${fmtNum((mode + 1) * width, 2)} mm` : "—", "dominant"],
+    [t("thick.median"), fmtMm(stats.median ?? NaN), null],
+    [t("thick.maxValue"), fmtMm(stats.max ?? NaN), "max"],
   ];
-  $("thick-stats").innerHTML = rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join("");
+  const html = rows
+    .map(([k, v, spot]) => {
+      const label = spot && thick.spots[spot] ? `<button type="button" class="linklike" data-spot="${spot}" title="${escapeHtml(t("thick.spot.title"))}">${escapeHtml(k)}</button>` : escapeHtml(k);
+      return `<dt>${label}</dt><dd>${escapeHtml(v)}</dd>`;
+    })
+    .join("");
+  // Rebuilt only when it changes: a click on a link must not lose its button (a field left
+  // by that click renders the card again between the press and the release).
+  if (html !== thick.statsHtml) $("thick-stats").innerHTML = thick.statsHtml = html;
 }
 
 /** Histogram (area per class) over the colour scale, graduated in mm. */
@@ -1392,6 +1469,36 @@ $("thick-locate").addEventListener("click", () => {
   if (!thick.userMax) thick.max = niceCeil((thickQuantiles([0.99]) ?? [1])[0]);
   const tol = Math.max(0.05, Math.round(min * 5) / 100);
   setThickness({ value: Math.round(min * 100) / 100, tol, highlight: true });
+});
+$("thick-stats").addEventListener("click", (e) => {
+  const spot = thick.spots?.[e.target.closest("[data-spot]")?.dataset.spot];
+  if (spot) setThickness({ value: Math.round(spot.value * 100) / 100, tol: Math.round(spot.tol * 100) / 100, highlight: true });
+});
+// The thinnest wall used by the quote, typed in when the model was misjudged (empty: the one detected).
+$("thick-min-used").addEventListener("change", (e) => {
+  const v = parseFloat(e.target.value);
+  thick.minOverride = v > 0 ? v : null;
+  renderThickness();
+  if (state.result) updatePublished(state.result);
+});
+function saveMarkings() {
+  try {
+    localStorage.setItem(MARKINGS_KEY, JSON.stringify(thick.markings));
+  } catch {
+    // kept for this visit only
+  }
+  renderThickness();
+  if (state.result) updatePublished(state.result);
+}
+$("thick-markings").addEventListener("change", (e) => {
+  thick.markings = { ...thick.markings, on: e.target.checked };
+  saveMarkings();
+});
+$("thick-mark-depth").addEventListener("change", (e) => {
+  const v = parseFloat(e.target.value);
+  if (!(v >= 0)) return renderThickness();
+  thick.markings = { ...thick.markings, depth: v };
+  saveMarkings();
 });
 $("toggle-thickness").addEventListener("click", () => setThickness({ colors: !thick.colors }));
 $("thick-colors").addEventListener("change", (e) => setThickness({ colors: e.target.checked }));
@@ -1674,6 +1781,10 @@ window.reader3d = {
     if (state.result) setIncluded(indices.filter((i) => i >= 0 && i < state.result.bodies.length));
     return partFeatures();
   },
+  /** Material of the part (alloy name and density g/cm³), e.g. from a customer request. */
+  setMaterial(label, density) {
+    setMaterial(label, density);
+  },
   /** Compute the wall thickness of the part shown (with progress), then return part(). */
   async computeThickness() {
     if (state.result?.bodies.some((b) => b.closed)) await ensureThickness();
@@ -1689,7 +1800,8 @@ function partFeatures() {
     if (!thick.results) return null;
     const wall = thickStats(indices, "wall");
     const sphere = thickStats(indices, "sphere");
-    return { min: wall.min, details: wall.details, floor: thick.floor, median: sphere.median, max: sphere.max };
+    // The thinnest wall of the quote: typed in, else the one detected.
+    return { min: thick.minOverride ?? wall.min, detected: wall.min, details: wall.details, floor: thick.floor, markings: wall.markings, median: sphere.median, max: sphere.max };
   };
   return {
     file: r.file,
