@@ -80,8 +80,9 @@ export async function loadResult(key) {
     const meta = await request(tx.objectStore('meta').get(key));
     if (meta) tx.objectStore('meta').put({ ...meta, usedAt: Date.now() });
     await done(tx);
-    // Kept by an earlier version: one record {data, thickness}.
-    if (data && 'data' in data && !thickness) return data;
+    // Kept by an earlier version: one record {data, thickness}; a thickness
+    // computed since then is a record of its own.
+    if (data && 'data' in data) return { data: data.data, thickness: thickness ?? data.thickness ?? null };
     return data ? { data, thickness: thickness ?? null } : null;
   } catch {
     return null;

@@ -198,6 +198,31 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.evaluate(() => document.getElementById('toggle-wire').classList.contains('active')), true);
     await page.click('#toggle-wire');
 
+    // Kept by an earlier version (one record {data, thickness}), with a thickness
+    // computed since then in a record of its own: opened again, the same model.
+    await page.evaluate(async () => {
+      const db = await new Promise((resolve, reject) => {
+        const req = indexedDB.open('reader3d-cache');
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      const store = db.transaction('data', 'readwrite').objectStore('data');
+      const keys = await new Promise((resolve) => (store.getAllKeys().onsuccess = (e) => resolve(e.target.result)));
+      const key = keys.find((k) => !String(k).includes('#'));
+      const record = await new Promise((resolve) => (store.get(key).onsuccess = (e) => resolve(e.target.result)));
+      await new Promise((resolve) => {
+        const tx = db.transaction('data', 'readwrite');
+        tx.objectStore('data').put({ data: record, thickness: null }, key);
+        tx.oncomplete = resolve;
+      });
+      db.close();
+    });
+    await page.reload();
+    await open();
+    assert.match(await page.textContent('#method'), /Résultats mémorisés/);
+    assert.equal(await page.textContent('#total-volume'), volume);
+    assert.equal(await page.textContent('#thick-min'), min);
+
     // "Refresh": analysed again, without the kept results.
     await page.evaluate(() => (document.body.dataset.status = ''));
     await page.click('#refresh');

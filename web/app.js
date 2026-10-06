@@ -416,8 +416,9 @@ async function openFile(file, { refresh = false, handle = null } = {}) {
   $("loading").hidden = false;
   setStatus("analysing");
   startProgress();
+  let data = null;
   try {
-    const data = currentEngine() === "server" ? await analyzeOnServer(file) : await analyzeInBrowser(file, { refresh });
+    data = currentEngine() === "server" ? await analyzeOnServer(file) : await analyzeInBrowser(file, { refresh });
     if (seq !== openSeq) return;
     // Only now does the page show this file (a failed file leaves the previous one).
     state.handle = handle ?? (file === state.file ? state.handle : null);
@@ -444,6 +445,12 @@ async function openFile(file, { refresh = false, handle = null } = {}) {
     afterAnalysisMemory();
   } catch (err) {
     const cancelled = err.cancelled || err.name === "AbortError";
+    // Results kept from an earlier opening that cannot be shown (kept by an
+    // older version, damaged): the file is analysed again, and they are replaced.
+    if (seq === openSeq && !cancelled && data?.cached && !refresh) {
+      console.warn(`${file.name}: kept results not usable, analysed again`, err);
+      return openFile(file, { refresh: true, handle });
+    }
     if (seq === openSeq && !cancelled) {
       const message = tMessage(err.message || String(err));
       showError(`${file.name}: ${message}`);
