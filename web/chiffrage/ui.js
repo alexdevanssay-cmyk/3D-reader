@@ -350,6 +350,8 @@ function applySeriesOrder(order) {
   const metal = order.matiere;
   const pick = (value, options) => options?.find((o) => String(o).toLowerCase() === String(value ?? "").toLowerCase());
   q.alliage = pick(metal?.alliage, base?.lists.alliages) ?? pick(order.alliage, base?.lists.alliages) ?? q.alliage;
+  // The same alloy as the material of the 3D analysis (its mass).
+  if (q.alliage && settings.densities[q.alliage]) window.reader3d?.setMaterial?.(q.alliage, settings.densities[q.alliage]);
   if (metal) {
     const typologies = indices?.typologies?.length ? indices.typologies.map((t) => t.name) : base?.lists.typologies;
     q.typologie = pick(metal.typologie, typologies) ?? q.typologie;

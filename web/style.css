@@ -52,7 +52,8 @@ html, body {
 }
 
 .brand { font-weight: 700; font-size: 16px; }
-.file-name { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The part shown: large and bold, in the free space of the bar. */
+.file-name { flex: 1 1 200px; min-width: 0; text-align: center; font-size: 20px; font-weight: 700; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .field { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
 
 select, input, button, .btn {
@@ -237,6 +238,10 @@ table.bodies .open { color: var(--warn); }
 .thick-min span { color: var(--muted); }
 .thick-min strong { font-size: 20px; font-variant-numeric: tabular-nums; }
 .thick-min button { margin-left: auto; }
+.thick-min strong.overridden { color: var(--muted); font-weight: 400; }
+.thick-min-used label { color: var(--text); font-weight: 600; }
+.linklike { background: none; border: 0; padding: 0; color: inherit; font: inherit; text-decoration: underline dotted; cursor: pointer; }
+.linklike:hover { color: var(--accent, #4f8cff); }
 
 /* Pages (tabs of the top bar) */
 .tabs { display: flex; gap: 2px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }

@@ -79,8 +79,8 @@
         <option value="fr">Français</option>
       </select>
     </label>
-    <span id="file-name" class="file-name"></span>
     <button id="refresh" class="btn small" type="button" disabled data-i18n="refresh" data-i18n-title="refresh.title">Refresh</button>
+    <span id="file-name" class="file-name"></span>
     <button id="memory-gauge" class="memory-gauge" type="button" hidden aria-describedby="memory-card">
       <span class="memory-label" data-i18n="memory.short">Memory</span>
       <span class="memory-track"><span class="memory-fill" id="memory-fill"></span></span>
@@ -205,6 +205,10 @@
             <span id="thick-details" class="muted small"></span>
             <button id="thick-locate" class="small" type="button" data-i18n="thick.locate" data-i18n-title="thick.locate.title" title="Highlight the thinnest walls on the model">Locate</button>
           </div>
+          <div class="row thick-controls thick-min-used">
+            <label for="thick-min-used" data-i18n="thick.minUsed" data-i18n-title="thick.minUsed.title" title="Thinnest wall used by the quote: type a value when the model was misjudged (empty: the one detected)">Thinnest wall used</label>
+            <input id="thick-min-used" type="number" min="0" step="0.1"> <span class="muted">mm</span>
+          </div>
           <canvas id="thick-scale" class="thick-scale" height="96" aria-describedby="thick-share"></canvas>
           <input id="thick-slider" class="thick-slider" type="range" min="0" max="1000" value="500" data-i18n-title="thick.slider" title="Thickness to highlight">
           <div class="row thick-controls">
@@ -215,6 +219,10 @@
           <div class="row thick-controls">
             <span class="muted" data-i18n="thick.floor" data-i18n-title="thick.floor.title" title="Thinner values are lettering or marks on the surface, not walls">Ignore below (lettering)</span>
             <input id="thick-floor" type="number" min="0" step="0.1"> <span class="muted">mm</span>
+          </div>
+          <div class="row thick-controls">
+            <label class="check" data-i18n-title="thick.markings.title" title="Text and logos hollow in the part, or in relief (engraved in the die), at most this deep or high: the thickness across them is not a wall"><input type="checkbox" id="thick-markings"> <span data-i18n="thick.markings">Ignore markings up to</span></label>
+            <input id="thick-mark-depth" type="number" min="0" step="0.1"> <span class="muted">mm</span>
           </div>
           <div class="row thick-controls">
             <span class="muted" data-i18n="thick.max">Scale up to</span>

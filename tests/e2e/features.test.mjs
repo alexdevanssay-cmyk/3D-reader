@@ -138,6 +138,29 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     approx(exported.thickness.min, 20, 0.01, 0, 'JSON thinnest wall');
     assert.equal(exported.thickness.method, 'wall');
     approx(exported.bodies[0].thickness.median, 20, 0.01, 0, 'JSON body median');
+    // The most frequent and the thickest are links: a click highlights them.
+    await page.fill('#thick-value', '5');
+    await page.dispatchEvent('#thick-value', 'change');
+    await page.click('#thick-stats [data-spot="max"]');
+    assert.equal(await page.isChecked('#thick-highlight'), true);
+    const shownMax = (await page.textContent('#thick-stats')).match(/point chaud\)([\d,]+) mm/)[1].replace(',', '.');
+    approx(Number(await page.inputValue('#thick-value')), Number(shownMax), 0.01, 0, 'highlight at the thickest');
+    // The thinnest wall of the quote can be typed in: the detected one stays shown, greyed.
+    await page.fill('#thick-min-used', '3.5');
+    await page.dispatchEvent('#thick-min-used', 'change');
+    assert.equal(await page.textContent('#thick-min'), '20 mm');
+    assert.equal(await page.evaluate(() => document.getElementById('thick-min').classList.contains('overridden')), true);
+    const used = await page.evaluate(() => window.reader3d.part().thickness);
+    assert.equal(used.min, 3.5);
+    approx(used.detected, 20, 0.01, 0, 'detected');
+    await page.fill('#thick-min-used', '');
+    await page.dispatchEvent('#thick-min-used', 'change');
+    approx(await page.evaluate(() => window.reader3d.part().thickness.min), 20, 0.01, 0, 'back to the detected one');
+    // The name of the part, in the bar; a material set from elsewhere (customer request).
+    assert.equal(await page.textContent('#file-name'), 'holed_block');
+    await page.evaluate(() => window.reader3d.setMaterial('AS7G06', 2.68));
+    assert.equal(await page.inputValue('#density'), '2.68');
+    assert.match(await page.textContent('#material'), /AS7G06 \(2,68\)/);
     // The colour filter can be switched off, the highlight stays.
     await page.click('#toggle-thickness');
     assert.equal(await page.isChecked('#thick-colors'), false);

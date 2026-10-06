@@ -2,9 +2,10 @@
 //
 //   node --test tests/js/thickness.test.mjs
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
+import { before, describe, test } from 'node:test';
 
-import { ballPass, coverPass, mergeMax, prepareMesh, thicknessHistogram, thicknessStats, valueRange, wallOf, wallThickness } from '../../web/engine/thickness.js';
+import { ballPass, coverPass, engravingMask, mergeMax, prepareMesh, thicknessHistogram, thicknessStats, valueRange, wallOf, wallThickness } from '../../web/engine/thickness.js';
+import { approx } from './helpers.mjs';
 
 /** Closed mesh of an extruded polygon (counter-clockwise, star-shaped from `kernel`), z from 0 to h. */
 function extrude(polygon, h, kernel, { divisions = 1 } = {}) {
@@ -217,5 +218,56 @@ describe('wall thickness', () => {
     assert.equal(sphere.length, 0);
     assert.equal(ray.length, 0);
     assert.equal(wall.length, 0);
+  });
+});
+
+describe('markings: hollow or in relief, the thickness across them is not a wall', () => {
+  // A plate 60 x 40 x 4 mm with, on its top: a raised line 2 mm wide (1 mm high),
+  // a groove 2 mm wide (1 mm deep), or a rib 2 mm wide but 6 mm high (a wall).
+  let oc;
+  const parts = {};
+  before(async () => {
+    const { loadOcctNode } = await import('../../web/engine/occt.js');
+    const { analyzeCad } = await import('../../web/engine/cad.js');
+    oc = await loadOcctNode();
+    const box = (x, y, z, dx, dy, dz) => new oc.BRepPrimAPI_MakeBox_3(new oc.gp_Pnt_3(x, y, z), dx, dy, dz).Shape();
+    const fuse = (a, b) => new oc.BRepAlgoAPI_Fuse_3(a, b, new oc.Message_ProgressRange_1()).Shape();
+    const cut = (a, b) => new oc.BRepAlgoAPI_Cut_3(a, b, new oc.Message_ProgressRange_1()).Shape();
+    const plate = () => box(0, 0, 0, 60, 40, 4);
+    const shapes = {
+      relief: fuse(plate(), box(10, 10, 4, 30, 2, 1)),
+      groove: cut(plate(), box(10, 10, 3, 30, 2, 1)),
+      rib: fuse(plate(), box(10, 10, 4, 30, 2, 6)),
+    };
+    for (const [name, shape] of Object.entries(shapes)) {
+      const writer = new oc.STEPControl_Writer_1();
+      writer.Transfer(shape, oc.STEPControl_StepModelType.STEPControl_AsIs, true, new oc.Message_ProgressRange_1());
+      writer.Write(`/${name}.step`);
+      const body = analyzeCad(oc, oc.FS.readFile(`/${name}.step`), `${name}.step`).bodies[0];
+      const { positions, indices } = body.mesh;
+      parts[name] = { positions, indices, values: wallThickness(positions, indices).wall };
+    }
+  });
+  const thinnest = ({ positions, indices, values }, mask) =>
+    thicknessStats([{ positions, indices, values: mask ? Float32Array.from(values, (v, f) => (mask[f] ? NaN : v)) : values }], { floor: 1 }).min;
+
+  test('a raised line and a groove are left out: the thinnest wall is the plate', () => {
+    for (const name of ['relief', 'groove']) {
+      const p = parts[name];
+      assert.ok(thinnest(p) < 3.5, `${name}: the marking is the thinnest without the rule`);
+      const m = engravingMask(p.positions, p.indices, p.values, { floor: 1, maxDepth: 2 });
+      assert.equal(m.regions, 1, name);
+      approx(m.depth, 1, 0.05, 0, `${name} depth`);
+      approx(thinnest(p, m.mask), 4, 0.05, 0, `${name} thinnest wall`);
+    }
+  });
+
+  test('a rib higher than the markings stays a wall; a marking deeper than the setting too', () => {
+    const rib = parts.rib;
+    const m = engravingMask(rib.positions, rib.indices, rib.values, { floor: 1, maxDepth: 2 });
+    assert.equal(m.regions, 0);
+    approx(thinnest(rib, m.mask), 2, 0.05, 0, 'rib');
+    const shallow = engravingMask(parts.groove.positions, parts.groove.indices, parts.groove.values, { floor: 1, maxDepth: 0.5 });
+    assert.equal(shallow.regions, 0);
   });
 });
