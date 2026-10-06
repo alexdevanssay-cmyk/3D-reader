@@ -221,6 +221,13 @@ function faces(shape) {
   return out;
 }
 
+function edges(shape) {
+  const out = [];
+  const exp = new oc.TopExp_Explorer_2(shape, oc.TopAbs_ShapeEnum.TopAbs_EDGE, oc.TopAbs_ShapeEnum.TopAbs_SHAPE);
+  for (; exp.More(); exp.Next()) out.push(oc.TopoDS.Edge_1(exp.Current()));
+  return out;
+}
+
 /** Compound, shell or solid made of `shapes`. */
 function assemble(kind, shapes) {
   const builder = new oc.BRep_Builder();
@@ -541,6 +548,31 @@ describe('CAD specifics', () => {
       approx(b.area, surface, NURBS, 0, `${name}: area`);
       approxVec(b.centroid, centroid, 0, 1e-6, `${name}: centroid`);
     }
+  });
+
+  test('closing on request: a missing chamfer between two contours is filled by a ring, not two caps', () => {
+    // A cylinder r 45 x 50 mm chamfered 4 mm at the top, given without its chamfer:
+    // two holes, the circle of the side (r 45) and the one of the top face (r 41), 4 mm apart.
+    const cylinder = new oc.BRepPrimAPI_MakeCylinder_1(45, 50).Shape();
+    const chamfer = new oc.BRepFilletAPI_MakeChamfer(cylinder);
+    const top = edges(cylinder).find((e) => {
+      const curve = new oc.BRepAdaptor_Curve_2(e);
+      return curve.Value(curve.FirstParameter()).Z() > 49;
+    });
+    chamfer.Add_2(4, top);
+    const solid = chamfer.Shape();
+    const props = new oc.GProp_GProps_1();
+    oc.BRepGProp.VolumeProperties_1(solid, props, false, false, false);
+    const kept = faces(solid).filter((f) => oc.BRep_Tool.Surface_2(f).get().DynamicType().get().Name() !== 'Geom_ConicalSurface');
+    assert.equal(kept.length, 3);
+    const bytes = brepBytes('no_chamfer.brep', assemble('Compound', kept));
+    const [open] = analyzeCad(oc, bytes, 'no_chamfer.brep').bodies;
+    assert.equal(open.closed, false);
+    const [body, ...others] = analyzeCad(oc, bytes, 'no_chamfer.brep', { close: true }).bodies;
+    assert.deepEqual(others, []);
+    assert.equal(body.closed, true);
+    // The ruled ring between the two circles is the chamfer itself: the volume of the chamfered cylinder.
+    approx(body.volume, props.Mass(), 1e-6, 0, 'closed volume');
   });
 
   test('a closed surface made of a single face becomes a solid', (t) => {

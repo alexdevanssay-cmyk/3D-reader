@@ -908,8 +908,7 @@ function sewToSolids(ctx, shapes, deflection, ang) {
 /**
  * Close open surfaces on request ("Fermer le corps"): sewing with larger and
  * larger tolerances (the gaps a CAD export leaves between faces); then the
- * holes still bounded by free edges are filled, by a plane face when their
- * contour is flat, else by a filling surface through it, and sewn again.
+ * holes still bounded by free edges are filled (see fillHoles) and sewn again.
  * Returns {solids, remaining, notes} like sewToSolids.
  */
 function closeSurfaces(ctx, shapes, deflection, ang) {
@@ -942,41 +941,10 @@ function closeSurfaces(ctx, shapes, deflection, ang) {
   }
   let filled = 0;
   if (!allClosed(shells)) {
-    // Holes: the closed contours of free edges, each one filled by a face.
-    const bounds = new oc.ShapeAnalysis_FreeBounds_2(sewn, tol, false, false);
-    const faces = [];
-    try {
-      for (const w of children(ctx, bounds.GetClosedWires(), TopAbs_WIRE)) {
-        const wire = ctx.keep(oc.TopoDS.Wire_1(w));
-        let face = null;
-        const plane = new oc.BRepBuilderAPI_MakeFace_15(wire, true);
-        try {
-          if (plane.IsDone()) face = ctx.keep(plane.Face());
-        } finally {
-          plane.delete();
-        }
-        if (!face) {
-          const fill = new oc.BRepOffsetAPI_MakeFilling(3, 15, 2, false, 1e-5, 1e-4, 1e-2, 0.1, 8, 9);
-          try {
-            for (const e of children(ctx, wire, TopAbs_EDGE)) fill.Add_1(ctx.keep(oc.TopoDS.Edge_1(e)), oc.GeomAbs_Shape.GeomAbs_C0, true);
-            fill.Build(ctx.keep(new oc.Message_ProgressRange_1()));
-            if (fill.IsDone()) face = ctx.keep(fill.Shape());
-          } catch {
-            // a contour that cannot be filled: the body stays open
-          } finally {
-            fill.delete();
-          }
-        }
-        if (face) {
-          faces.push(face);
-          filled++;
-        }
-      }
-    } finally {
-      bounds.delete();
-    }
-    if (faces.length) {
-      sewn = sew([sewn, ...faces], tol);
+    const holes = fillHoles(ctx, sewn, tol);
+    filled = holes.filled;
+    if (holes.faces.length) {
+      sewn = sew([sewn, ...holes.faces], tol);
       shells = shellsOf(sewn);
     }
   }
@@ -1009,6 +977,177 @@ function closeSurfaces(ctx, shapes, deflection, ang) {
   const notes = [NOTE_CLOSED(tol)];
   if (filled) notes.push(NOTE_FILLED(filled));
   return { solids, remaining, notes };
+}
+
+/**
+ * Faces that fill the holes of sewn surfaces, the closed contours of their free
+ * edges. {faces, filled: number of holes filled}.
+ * - Two contours one inside the other, parallel (the end face and the chamfer
+ *   of a boss, left out of the export): on the same plane, one ring face;
+ *   else a ruled surface between them. Filled one by one, they would give two
+ *   overlapping caps and a wrong volume.
+ * - A flat contour (within 1 % of its size): a plane face.
+ * - Else a filling surface through the contour, unless it bulges out (larger
+ *   than the disc of the same perimeter): then a fan of ruled faces from each
+ *   edge to the centre of the contour.
+ */
+function fillHoles(ctx, sewn, tol) {
+  const { oc } = ctx;
+  const { TopAbs_WIRE, TopAbs_EDGE } = oc.TopAbs_ShapeEnum;
+  const bounds = new oc.ShapeAnalysis_FreeBounds_2(sewn, tol, false, false);
+  let wires;
+  try {
+    wires = children(ctx, bounds.GetClosedWires(), TopAbs_WIRE).map((w) => ctx.keep(oc.TopoDS.Wire_1(w)));
+  } finally {
+    bounds.delete();
+  }
+  const faceOn = (surface, wire) => {
+    const maker = new oc.BRepBuilderAPI_MakeFace_21(surface, wire, true);
+    try {
+      return maker.IsDone() ? ctx.keep(maker.Face()) : null;
+    } finally {
+      maker.delete();
+    }
+  };
+  const planeOf = (face) => {
+    const adaptor = new oc.BRepAdaptor_Surface_2(face, true);
+    try {
+      return ctx.keep(adaptor.Plane());
+    } finally {
+      adaptor.delete();
+    }
+  };
+  /** The plane through a wire, its points within `within` of it: {face, plane} or null. */
+  const flat = (wire, within) => {
+    const finder = new oc.BRepLib_FindSurface_2(wire, within, true, false);
+    try {
+      const face = finder.Found() ? faceOn(ctx.keep(finder.Surface()), wire) : null;
+      return face ? { face, plane: planeOf(face) } : null;
+    } finally {
+      finder.delete();
+    }
+  };
+  const holes = wires.map((wire) => {
+    const props = new oc.GProp_GProps_1();
+    oc.BRepGProp.LinearProperties(wire, props, false, false);
+    const length = props.Mass();
+    const centre = ctx.keep(props.CentreOfMass());
+    props.delete();
+    const size = bboxDiagonal(ctx, wire);
+    const within = Math.max(tol, 0.01 * size);
+    const exact = flat(wire, within);
+    // The mean plane of a contour that is not flat, for its direction only.
+    const mean = exact ?? flat(wire, 0.5 * size);
+    return { wire, length, centre, size, within, face: exact?.face ?? null, plane: exact?.plane ?? null, normal: mean?.plane ?? null };
+  });
+
+  const faces = [];
+  let filled = 0;
+  const add = (shape) => {
+    faces.push(shape);
+    return true;
+  };
+  const xyz = (p) => [p.X(), p.Y(), p.Z()];
+  const pair = (a, b) => {
+    // b nested in a: parallel, its centre near a's axis and not far along it.
+    const n = a.normal.Axis().Direction();
+    if (Math.abs(n.Dot(b.normal.Axis().Direction())) < 0.95) return null;
+    const [ax, ay, az] = xyz(a.centre), [bx, by, bz] = xyz(b.centre);
+    const d = [bx - ax, by - ay, bz - az];
+    const along = d[0] * n.X() + d[1] * n.Y() + d[2] * n.Z();
+    const lateral = Math.sqrt(Math.max(0, d[0] ** 2 + d[1] ** 2 + d[2] ** 2 - along ** 2));
+    if (Math.abs(along) > 0.5 * a.size || lateral > 0.15 * a.size) return null;
+    return Math.hypot(...d);
+  };
+  const ring = (a, b) => {
+    if (!a.plane || !b.plane || a.plane.Distance_1(b.centre) > a.within) return false;
+    const target = area(ctx, a.face) - area(ctx, b.face);
+    // The inner contour as a hole: the orientation that removes its area.
+    for (const inner of [b.wire, ctx.keep(oc.TopoDS.Wire_1(b.wire.Reversed()))]) {
+      const maker = new oc.BRepBuilderAPI_MakeFace_22(a.face, inner);
+      const fix = new oc.ShapeFix_Face_2(ctx.keep(maker.Face()));
+      maker.delete();
+      try {
+        fix.Perform();
+        const face = ctx.keep(fix.Face());
+        if (Math.abs(area(ctx, face) - target) < 0.05 * Math.abs(target) + tol) return add(face);
+      } finally {
+        fix.delete();
+      }
+    }
+    return false;
+  };
+  const ruled = (sections, apex = null) => {
+    const loft = new oc.BRepOffsetAPI_ThruSections(false, true, 1e-6);
+    try {
+      for (const w of sections) loft.AddWire(w);
+      if (apex) loft.AddVertex(apex);
+      loft.Build(ctx.keep(new oc.Message_ProgressRange_1()));
+      return loft.IsDone() ? ctx.keep(loft.Shape()) : null;
+    } catch {
+      return null;
+    } finally {
+      loft.delete();
+    }
+  };
+  const single = (h) => {
+    if (h.face) return add(h.face);
+    let face = null;
+    const fill = new oc.BRepOffsetAPI_MakeFilling(3, 15, 2, false, 1e-5, 1e-4, 1e-2, 0.1, 8, 9);
+    try {
+      for (const e of children(ctx, h.wire, TopAbs_EDGE)) fill.Add_1(ctx.keep(oc.TopoDS.Edge_1(e)), oc.GeomAbs_Shape.GeomAbs_C0, true);
+      fill.Build(ctx.keep(new oc.Message_ProgressRange_1()));
+      if (fill.IsDone()) face = ctx.keep(fill.Shape());
+    } catch {
+      // not filled: the fan below
+    } finally {
+      fill.delete();
+    }
+    const disc = (h.length * h.length) / (4 * Math.PI);
+    const a = face ? area(ctx, face) : 0;
+    if (face && a > 0 && a < 1.5 * disc) return add(face);
+    // A fan of ruled faces, edge by edge, to the centre of the contour.
+    const apex = new oc.BRepBuilderAPI_MakeVertex(h.centre);
+    const vertex = ctx.keep(apex.Vertex());
+    apex.delete();
+    const fan = [];
+    for (const e of children(ctx, h.wire, TopAbs_EDGE)) {
+      const maker = new oc.BRepBuilderAPI_MakeWire_2(ctx.keep(oc.TopoDS.Edge_1(e)));
+      const piece = maker.IsDone() ? ruled([ctx.keep(maker.Wire())], vertex) : null;
+      maker.delete();
+      if (!piece) return false;
+      fan.push(piece);
+    }
+    fan.forEach(add);
+    return true;
+  };
+
+  holes.sort((x, y) => y.length - x.length);
+  const done = new Set();
+  holes.forEach((a, i) => {
+    if (done.has(i)) return;
+    done.add(i);
+    let best = -1;
+    let bestDistance = Infinity;
+    if (a.normal) {
+      holes.forEach((b, j) => {
+        if (done.has(j) || !b.normal || b.size < 0.4 * a.size) return;
+        const d = pair(a, b);
+        if (d != null && d < bestDistance) [best, bestDistance] = [j, d];
+      });
+    }
+    if (best >= 0) {
+      const b = holes[best];
+      done.add(best);
+      if (ring(a, b)) return void filled++;
+      const shape = ruled([a.wire, b.wire]);
+      if (shape) return void (add(shape), filled++);
+      filled += single(a) + single(b);
+      return;
+    }
+    filled += single(a);
+  });
+  return { faces, filled };
 }
 
 // --------------------------------------------------------------------------- helpers
