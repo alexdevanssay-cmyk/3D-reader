@@ -4,3 +4,5 @@
 
 - [Instructions for AI assistants and scripts](ai.html): open `?url=<public CORS-enabled URL of the model>&report=1`, wait for `body[data-status="done"]`, read `#reader3d-report` (text) or `#reader3d-result` (JSON); or call `await reader3d.analyze(file)` in the page; or `pip install "git+https://github.com/alexdevanssay-cmyk/3D-reader"` then `reader3d analyze FILE --json`.
 - [Reader](./)
+
+- Semantic JSON: `window.reader3d.semantic` and `#reader3d-semantic-result` expose feature schema 9.0, V5 manufacturing candidates and V6 `manufacturing_plan` metadata per body. V6 includes deterministic setup grouping by compatible tool axis, operation dependencies, planned order, readiness and unresolved constraints. Planning output is candidate-only and is not an executable CAM/toolpath program.
