@@ -56,12 +56,25 @@ export function mount({ page, reader }) {
   const $ = (id) => page.querySelector("#" + id);
   let task = "general";
   let messages = [];
+  try { messages = JSON.parse(sessionStorage.getItem("reader3d.ai.messages") || "[]"); } catch {}
+  const savedGateway = localStorage.getItem("reader3d.ai.gateway");
+  const savedModel = localStorage.getItem("reader3d.ai.model");
+  if (savedGateway) $("ai-gateway").value = savedGateway;
+  if (savedModel) $("ai-model").value = savedModel;
+  for (const message of messages) add(message.role, message.content);
 
   function add(role, content) {
     const box = document.createElement("div");
     box.style.cssText = "padding:10px 12px;border-radius:8px;white-space:pre-wrap";
     box.style.background = role === "user" ? "var(--panel, #eef)" : "var(--card, #f5f5f5)";
-    box.innerHTML = `<strong>${role === "user" ? "Vous" : "IA"}</strong><br>${escapeHtml(content)}`;
+    let display = content;
+    if (role === "assistant") {
+      try {
+        const parsed = JSON.parse(content);
+        display = [parsed.conclusion, parsed.observations?.length ? "\\nObservations :\\n- " + parsed.observations.join("\\n- ") : "", parsed.inferences?.length ? "\\nInférences :\\n- " + parsed.inferences.join("\\n- ") : "", parsed.recommendations?.length ? "\\nRecommandations :\\n- " + parsed.recommendations.join("\\n- ") : "", parsed.uncertainties?.length ? "\\nIncertitudes :\\n- " + parsed.uncertainties.join("\\n- ") : "", parsed.quote ? "\\nChiffrage :\\n" + JSON.stringify(parsed.quote, null, 2) : "", parsed.needs_human_validation ? "\\nValidation humaine requise." : ""].filter(Boolean).join("\\n");
+      } catch {}
+    }
+    box.innerHTML = `<strong>${role === "user" ? "Vous" : "IA"}</strong><br>${escapeHtml(display)}`;
     $("ai-chat").append(box);
     $("ai-chat").scrollTop = $("ai-chat").scrollHeight;
   }
@@ -89,10 +102,13 @@ export function mount({ page, reader }) {
 
   async function send(content) {
     const gatewayUrl = $("ai-gateway").value.trim();
+    localStorage.setItem("reader3d.ai.gateway", gatewayUrl);
+    localStorage.setItem("reader3d.ai.model", $("ai-model").value.trim());
     if (!gatewayUrl) throw new Error("Renseignez l'URL du AI Gateway.");
     const context = contextForCurrentTask();
     messages.push({ role: "user", content });
     add("user", content);
+    try { sessionStorage.setItem("reader3d.ai.messages", JSON.stringify(messages)); } catch {}
     $("ai-status").textContent = "Analyse…";
     const response = await fetch(gatewayUrl, {
       method: "POST",
@@ -109,6 +125,7 @@ export function mount({ page, reader }) {
     if (!response.ok) throw new Error(data.error || `Gateway HTTP ${response.status}`);
     const output = data.output || data.text || "";
     messages.push({ role: "assistant", content: output });
+    try { sessionStorage.setItem("reader3d.ai.messages", JSON.stringify(messages)); } catch {}
     add("assistant", output);
     $("ai-status").textContent = "Connecté";
   }
