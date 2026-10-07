@@ -180,3 +180,57 @@ test("semantic bodies expose analytic relations separately from inferred feature
   assert.ok(source.includes("relations:cylindricalRelations("));
   assert.ok(source.includes("features:featureCandidates(body,topo)"));
 });
+
+
+test("links inferred features to stable analytic relation evidence", () => {
+  const result = buildSemantic3D({
+    file: "linked.step", kind: "cad", engine: "browser",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [body({
+      geometric_surfaces: [
+        {
+          index: 0, type: "cylinder", radius_mm: 5, diameter_mm: 10,
+          axis: [0,0,1], center_mm: [0,0,0], edge_signatures: [],
+        },
+        {
+          index: 1, type: "cone", ref_radius_mm: 5, semi_angle_rad: 0.2,
+          axis: [0,0,1], center_mm: [0,0,2], edge_signatures: [],
+        },
+      ],
+    })],
+  });
+  const relation = result.bodies[0].relations.find(
+    r => r.type === "coaxial_cylinder_cone",
+  );
+  const feature = result.bodies[0].features.find(
+    f => f.type === "tapered_feature_candidate",
+  );
+  assert.ok(relation?.relation_id);
+  assert.deepEqual(feature?.evidence, [
+    { source: "relation", relation_id: relation.relation_id },
+  ]);
+});
+
+test("detects repeated equal-radius parallel cylinders as a provisional pattern", () => {
+  const cylinders = [0, 20, 40].map((x, index) => ({
+    index,
+    type: "cylinder",
+    radius_mm: 2,
+    diameter_mm: 4,
+    axis: [0,0,1],
+    center_mm: [x,0,0],
+    edge_signatures: [],
+  }));
+  const result = buildSemantic3D({
+    file: "pattern.step", kind: "cad", engine: "browser",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [body({ geometric_surfaces: cylinders })],
+  });
+  const pattern = result.bodies[0].features.find(
+    f => f.type === "pattern_feature_candidate",
+  );
+  assert.ok(pattern);
+  assert.equal(pattern.subtype, "possible_repeated_cylindrical_pattern");
+  assert.deepEqual(pattern.surfaces, [0, 1, 2]);
+  assert.equal(pattern.needs_topology_confirmation, true);
+});
