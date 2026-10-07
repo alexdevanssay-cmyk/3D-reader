@@ -45,6 +45,7 @@ function bodyContext(body, task) {
   const manufacturing = body.manufacturing ?? {};
   const plan = body.manufacturing_plan ?? null;
   const includeManufacturing = ["manufacturing_analysis","dfm","planning"].includes(task);
+  const includeFoundry = includeManufacturing || task === "general";
   const includePlanning = task === "planning";
   return {
     id: body.id ?? null,
@@ -65,6 +66,7 @@ function bodyContext(body, task) {
       }
     } : {}),
     ...(includePlanning ? { manufacturing_plan: plan } : {}),
+    ...(includeFoundry ? { foundry: body.foundry ?? null } : {}),
   };
 }
 
@@ -108,6 +110,8 @@ export function buildAIContext(semantic, options = {}) {
     schema_version: "1.0",
     semantic_schema_version: semantic.schema_version ?? null,
     feature_schema_version: semantic.feature_schema_version ?? null,
+    foundry_schema_version: semantic.foundry_schema_version ?? null,
+    foundry_knowledge_version: semantic.foundry_knowledge_version ?? null,
     manufacturing_schema_version: semantic.manufacturing_schema_version ?? null,
     manufacturing_planning_schema_version: semantic.manufacturing_planning_schema_version ?? null,
     task,
@@ -137,6 +141,9 @@ export function buildAIContext(semantic, options = {}) {
       cite_feature_or_relation_ids_for_conclusions: true,
       surface_missing_or_unverified_constraints: true,
       manufacturing_outputs_are_candidates_not_executable_cam: true,
+      foundry_geometry_screen_is_not_a_filling_or_solidification_simulation: true,
+      foundry_numeric_limits_require_process_and_alloy_context: true,
+      foundry_risks_must_be_cited_to_geometry_evidence_or_knowledge_source_ids: true,
     },
   };
 }
