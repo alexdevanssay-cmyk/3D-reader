@@ -32,7 +32,7 @@ const TOOL_DEFS = [
 ];
 
 function toolResult(context, name, args) {
-  if (name === "get_model_metrics") return context.model_facts ?? null;
+  if (name === "get_model_metrics") return context.model ?? null;
   if (name === "get_body") return (context.bodies || []).find((b) => b.body_id === args.body_id || b.id === args.body_id) ?? null;
   if (name === "get_feature") {
     for (const body of context.bodies || []) {
