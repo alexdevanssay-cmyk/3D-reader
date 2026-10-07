@@ -179,6 +179,17 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
     distortion: "not_simulated",
   };
 
+  const requiredEngineeringInputs = [
+    "casting_process",
+    "alloy_grade",
+    "parting_direction_or_tooling_strategy",
+    "mold_and_core_system",
+    "pouring_temperature_or_superheat",
+    "liquidus_solidus_or_solidification_range",
+    "density_and_shrinkage_data",
+    "thermal_properties_for_simulation",
+  ];
+
   return {
     schema_version: FOUNDRY_SCHEMA_VERSION,
     knowledge_version: FOUNDRY_KNOWLEDGE_VERSION,
@@ -201,6 +212,13 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
     rules: ruleStatus,
     risks,
     required_checks: [...new Set(requiredChecks)],
+    engineering_inputs: {
+      status: profile.requires_process_and_alloy ? "incomplete" : "profile_selected_but_material_data_still_required",
+      process_known: !!profile.process,
+      alloy_family_known: !!profile.alloy_family,
+      required: requiredEngineeringInputs,
+      missing_for_advanced_simulation: requiredEngineeringInputs,
+    },
     simulation_boundary: {
       filling: "not_computed",
       solidification: "not_computed",
