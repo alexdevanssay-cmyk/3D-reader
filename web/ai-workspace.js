@@ -59,7 +59,9 @@ export function mount({ page, reader }) {
   try { messages = JSON.parse(sessionStorage.getItem("reader3d.ai.messages") || "[]"); } catch {}
   const savedGateway = localStorage.getItem("reader3d.ai.gateway");
   const savedModel = localStorage.getItem("reader3d.ai.model");
-  if (savedGateway) $("ai-gateway").value = savedGateway;
+  if (savedGateway && /\/api\/analyze(?:$|[/?#])/.test(savedGateway)) {
+    $("ai-gateway").value = new URL("/api/ai", location.origin).href;
+  } else if (savedGateway) $("ai-gateway").value = savedGateway;
   else $("ai-gateway").value = new URL("/api/ai", location.origin).href;
   if (savedModel) $("ai-model").value = savedModel;
   for (const message of messages) add(message.role, message.content);
@@ -101,8 +103,41 @@ export function mount({ page, reader }) {
     return context;
   }
 
+  async function sendLocalOllama(content, context) {
+    const url = $("ai-gateway").value.trim() || "http://localhost:11434/v1/chat/completions";
+    const model = $("ai-model").value.trim() || "qwen3:14b";
+    const system = `You are the local engineering AI for 3D Reader.
+Use only the supplied semantic and foundry context.
+Never invent dimensions, process parameters, material properties, defect probabilities, gates, risers or simulation results.
+Distinguish measured geometry, engineering inference, recommendation and missing information.
+For foundry questions, cite the supplied source ids and state clearly when a conclusion requires filling/solidification simulation or foundry validation.
+Return ONLY valid JSON with this shape:
+{"conclusion":"","observations":[],"inferences":[],"recommendations":[],"uncertainties":[],"needs_human_validation":true,"quote":null}
+CONTEXT:
+${JSON.stringify(context)}`;
+    const localMessages = [
+      { role: "system", content: system },
+      ...messages.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content || "") })),
+      { role: "user", content },
+    ];
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: localMessages,
+        stream: false,
+        response_format: { type: "json_object" },
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error?.message || `Ollama HTTP ${response.status}`);
+    return data.choices?.[0]?.message?.content || "";
+  }
+
   async function send(content) {
-    const gatewayUrl = $("ai-gateway").value.trim() || new URL("/api/ai", location.origin).href;
+    const isLocal = $("ai-provider").value === "openai_compatible";
+    const gatewayUrl = $("ai-gateway").value.trim() || (isLocal ? "http://localhost:11434/v1/chat/completions" : new URL("/api/ai", location.origin).href);
     localStorage.setItem("reader3d.ai.gateway", gatewayUrl);
     localStorage.setItem("reader3d.ai.model", $("ai-model").value.trim());
     if (!gatewayUrl) throw new Error("Renseignez l'URL du AI Gateway.");
@@ -111,6 +146,14 @@ export function mount({ page, reader }) {
     add("user", content);
     try { sessionStorage.setItem("reader3d.ai.messages", JSON.stringify(messages)); } catch {}
     $("ai-status").textContent = "Analyse…";
+    if (isLocal) {
+      const output = await sendLocalOllama(content, context);
+      messages.push({ role: "assistant", content: output });
+      try { sessionStorage.setItem("reader3d.ai.messages", JSON.stringify(messages)); } catch {}
+      add("assistant", output);
+      $("ai-status").textContent = "Connecté à Ollama";
+      return;
+    }
     const response = await fetch(gatewayUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
@@ -130,6 +173,17 @@ export function mount({ page, reader }) {
     add("assistant", output);
     $("ai-status").textContent = "Connecté";
   }
+
+  $("ai-provider").addEventListener("change", () => {
+    const local = $("ai-provider").value === "openai_compatible";
+    if (local) {
+      $("ai-gateway").value = "http://localhost:11434/v1/chat/completions";
+      if (!$("ai-model").value || $("ai-model").value === "gpt-6-astra") $("ai-model").value = "qwen3:14b";
+    } else {
+      $("ai-gateway").value = new URL("/api/ai", location.origin).href;
+      if (!$("ai-model").value || $("ai-model").value.startsWith("qwen3")) $("ai-model").value = "gpt-6-astra";
+    }
+  });
 
   $("ai-connect").addEventListener("click", () => {
     $("ai-status").textContent = $("ai-gateway").value.trim() ? "Gateway configuré" : "URL manquante";
