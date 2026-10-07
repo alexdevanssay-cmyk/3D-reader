@@ -826,7 +826,15 @@ function describeGeometricSurface(oc, face, out, index) {
       item.axis = [d.X(), d.Y(), d.Z()];
       item.center_mm = [a.Location().X(), a.Location().Y(), a.Location().Z()];
     }
-    if (name === "cone") item.semi_angle_rad = surface.Cone().SemiAngle();
+    if (name === "cone") {
+      const c = surface.Cone();
+      const ax = c.Axis();
+      const d = ax.Direction();
+      item.semi_angle_rad = c.SemiAngle();
+      item.ref_radius_mm = c.RefRadius();
+      item.axis = [d.X(), d.Y(), d.Z()];
+      item.center_mm = [ax.Location().X(), ax.Location().Y(), ax.Location().Z()];
+    }
     if (name === "sphere") item.radius_mm = surface.Sphere().Radius();
     if (name === "torus") { const t = surface.Torus(); item.major_radius_mm = t.MajorRadius(); item.minor_radius_mm = t.MinorRadius(); }
     out.push(item);
