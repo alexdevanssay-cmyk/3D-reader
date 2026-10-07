@@ -1,6 +1,3 @@
-import OpenAI from "openai";
-
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const OUTPUT_SCHEMA = {
   type: "object",
@@ -47,6 +44,19 @@ function toolResult(context, name, args) {
   throw new Error(`Unknown tool: ${name}`);
 }
 
+async function createResponse(body) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) throw new Error("OPENAI_API_KEY is not configured on the gateway.");
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+    body: JSON.stringify(body)
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data?.error?.message || `OpenAI HTTP ${response.status}`);
+  return data;
+}
+
 const SYSTEM = `You are the engineering AI for 3D Reader.
 Use only the supplied 3D semantic context.
 Preserve units and never invent dimensions.
@@ -72,7 +82,7 @@ export default async function handler(req, res) {
       ...messages.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content || "") }))
     ];
 
-    let response = await client.responses.create({
+    let response = await createResponse({
       model: model || process.env.OPENAI_MODEL || "gpt-6-astra",
       instructions: SYSTEM,
       input,
@@ -88,7 +98,7 @@ export default async function handler(req, res) {
         const result = toolResult(context, call.name, JSON.parse(call.arguments || "{}"));
         input.push({ type:"function_call_output", call_id:call.call_id, output:JSON.stringify(result) });
       }
-      response = await client.responses.create({
+      response = await createResponse({
         model: model || process.env.OPENAI_MODEL || "gpt-6-astra",
         instructions: SYSTEM,
         input,
