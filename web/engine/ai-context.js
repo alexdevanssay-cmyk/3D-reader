@@ -123,7 +123,7 @@ export function buildAIContext(semantic, options = {}) {
       feature_ids: options.featureIds ?? [],
       selected_feature_count: selected ? selected.length : null,
     },
-    uncertainty: {
+    warnings,\n    uncertainty: {
       provisional_feature_count: provisional.length,
       validation_error_count: evidenceErrors.length,
       policy: "evidenced facts may be stated; provisional features are hypotheses and must not be treated as confirmed design intent",
