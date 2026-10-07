@@ -150,3 +150,7 @@ reader3d analyze part.step --json</pre>
 </main>
 <section><h2>Semantic feature candidates</h2><p>The feature schema v7.0 adds evidence-quality metadata and stable feature identifiers while retaining the provisional candidates for holes, tapered transitions, fillets, chamfers, and repeated cylindrical patterns. Candidates include explicit evidence and <code>needs_topology_confirmation</code> when design intent is not proven.</p></section><section><h2>Relations</h2><p>Each semantic body may expose analytic surface relations separately from inferred feature candidates. Relations describe geometric evidence; feature candidates interpret that evidence and may remain uncertain.</p></section></body>
 </html>
+
+
+### V5 manufacturing semantics
+The semantic JSON now also exposes a manufacturing layer per body. It contains candidate manufacturing operations, geometric tool-axis/setup candidates, a deterministic candidate operation sequence, functional wall-thickness metadata when the Reader already provides it, and conservative DFM recommendations. These values are explicitly candidates rather than executable toolpaths: stock, fixture, machine limits and exact accessibility are not inferred from geometry alone.
