@@ -546,16 +546,57 @@ function featureCandidates(body, topo, stableRelations) {
   return out;
 }
 
+function stableFeatureId(feature, occurrence) {
+  const identity = [
+    feature.type ?? "feature",
+    feature.subtype ?? "",
+    feature.surface_index ?? feature.floor_surface ?? "",
+    Array.isArray(feature.surfaces) ? feature.surfaces.join(",") : "",
+    Array.isArray(feature.boundary_planes) ? feature.boundary_planes.join(",") : "",
+    Array.isArray(feature.wall_surfaces) ? feature.wall_surfaces.join(",") : "",
+    occurrence,
+  ].join("|");
+  let hash = 2166136261;
+  for (let i=0;i<identity.length;i++) {
+    hash ^= identity.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return "feature-" + (hash >>> 0).toString(16).padStart(8, "0");
+}
+
 function normalizeFeatureEvidence(features) {
-  return features.map((feature, index) => {
+  const occurrences = new Map();
+  return features.map((feature) => {
+    const key = [
+      feature.type ?? "feature",
+      feature.subtype ?? "",
+      feature.surface_index ?? feature.floor_surface ?? "",
+      Array.isArray(feature.surfaces) ? feature.surfaces.join(",") : "",
+    ].join("|");
+    const occurrence = occurrences.get(key) ?? 0;
+    occurrences.set(key, occurrence + 1);
     const evidence = Array.isArray(feature.evidence) ? feature.evidence : [];
     const needsConfirmation = feature.needs_topology_confirmation === true;
+    const normalizedEvidence = evidence.length > 0
+      ? evidence
+      : feature.surface_index != null
+        ? [{source:"analytic_surface", surface_index:feature.surface_index}]
+        : feature.floor_surface != null
+          ? [{source:"analytic_surface", surface_index:feature.floor_surface}]
+          : Array.isArray(feature.surfaces)
+            ? feature.surfaces.map(surface_index => ({source:"analytic_surface", surface_index}))
+            : [];
+    const confidence = finite(feature.confidence) ? Math.max(0, Math.min(1, feature.confidence)) : 0;
     return {
       ...feature,
-      feature_id: feature.feature_id ?? "feature-" + index,
+      feature_id: feature.feature_id ?? stableFeatureId(feature, occurrence),
       status: needsConfirmation ? "provisional" : "evidenced",
-      evidence_count: evidence.length,
-      evidence_quality: evidence.length > 0 ? "linked_relation" : "analytic_or_metrology",
+      confidence,
+      evidence: normalizedEvidence,
+      evidence_count: normalizedEvidence.length,
+      evidence_quality: normalizedEvidence.some(e => e.source === "relation")
+        ? "linked_relation"
+        : normalizedEvidence.length > 0 ? "analytic_or_metrology" : "none",
     };
   });
 }
@@ -564,12 +605,22 @@ function semanticEvidenceQuality(relations, features) {
   const relationCount = relations.length;
   const featureCount = features.length;
   const provisionalCount = features.filter(f => f.status === "provisional").length;
-  const linkedCount = features.filter(f => f.evidence_count > 0).length;
+  const linkedCount = features.filter(f => f.evidence_quality === "linked_relation").length;
+  const validationErrors = features.flatMap(f => {
+    const errors = [];
+    if (!finite(f.confidence) || f.confidence < 0 || f.confidence > 1) errors.push("invalid_confidence");
+    if (typeof f.method !== "string" || !f.method) errors.push("missing_detection_method");
+    if (f.status === "provisional" && f.needs_topology_confirmation !== true) errors.push("provisional_without_topology_confirmation");
+    if (f.evidence_count !== f.evidence.length) errors.push("evidence_count_mismatch");
+    return errors.map(code => ({feature_id:f.feature_id, code}));
+  });
   return {
     relation_count: relationCount,
     feature_count: featureCount,
     provisional_feature_count: provisionalCount,
     linked_feature_count: linkedCount,
+    validation_error_count: validationErrors.length,
+    validation_errors: validationErrors,
     confidence_policy: "geometric_evidence_does_not_prove_design_intent",
   };
 }
