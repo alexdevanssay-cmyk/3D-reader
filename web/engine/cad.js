@@ -818,6 +818,13 @@ function describeGeometricSurface(oc, face, out, index) {
     const name = type === T.GeomAbs_Plane ? "plane" : type === T.GeomAbs_Cylinder ? "cylinder" : type === T.GeomAbs_Cone ? "cone" : type === T.GeomAbs_Sphere ? "sphere" : type === T.GeomAbs_Torus ? "torus" : type === T.GeomAbs_BSplineSurface ? "bspline" : type === T.GeomAbs_BezierSurface ? "bezier" : null;
     if (!name) return;
     const item = { index, type: name, orientation: face.Orientation_1(), wire_count: countSubShapes(oc, face, oc.TopAbs_ShapeEnum.TopAbs_WIRE), edge_count: countSubShapes(oc, face, oc.TopAbs_ShapeEnum.TopAbs_EDGE), edge_signatures: edgeSignatures(oc, face) };
+    if (name === "plane") {
+      const p = surface.Plane();
+      const a = p.Axis();
+      const d = a.Direction();
+      item.normal = [d.X(), d.Y(), d.Z()];
+      item.center_mm = [a.Location().X(), a.Location().Y(), a.Location().Z()];
+    }
     if (name === "cylinder") {
       const c = surface.Cylinder();
       const a = c.Axis();
