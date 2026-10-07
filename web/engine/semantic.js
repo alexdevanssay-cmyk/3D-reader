@@ -62,9 +62,7 @@ function normalizeAxis(v) {
   const n = Math.hypot(v[0], v[1], v[2]);
   if (n <= EPS) return null;
   const a = v.map(x => x / n);
-  return a.findIndex(x => Math.abs(x) > 1e-12) >= 0 && a.find(x => Math.abs(x) > 1e-12) < 0
-    ? a.map(x => -x)
-    : a;
+  return a;
 }
 
 function axisDistance(a, b) {
