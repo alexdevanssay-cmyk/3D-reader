@@ -230,7 +230,47 @@ test("detects repeated equal-radius parallel cylinders as a provisional pattern"
     f => f.type === "pattern_feature_candidate",
   );
   assert.ok(pattern);
-  assert.equal(pattern.subtype, "possible_repeated_cylindrical_pattern");
+  assert.equal(pattern.subtype, "possible_linear_cylindrical_pattern");
   assert.deepEqual(pattern.surfaces, [0, 1, 2]);
   assert.equal(pattern.needs_topology_confirmation, true);
+});
+
+
+test("detects a conservative pocket candidate from a planar floor and shared neighbors", () => {
+  const edge = (x) => [x,0,0,x,1,0];
+  const result = buildSemantic3D({
+    file: "pocket.step", kind: "cad", engine: "browser",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [body({
+      geometric_surfaces: [
+        { index: 0, type: "plane", edge_signatures: [edge(0), edge(1), edge(2)] },
+        { index: 1, type: "plane", edge_signatures: [edge(0)] },
+        { index: 2, type: "cylinder", radius_mm: 4, axis: [0,0,1], center_mm: [0,0,0], edge_signatures: [edge(1)] },
+        { index: 3, type: "plane", edge_signatures: [edge(2)] },
+      ],
+    })],
+  });
+  const pocket = result.bodies[0].features.find(f => f.type === "pocket_feature_candidate");
+  assert.ok(pocket);
+  assert.equal(pocket.subtype, "possible_pocket_or_recess");
+  assert.equal(pocket.needs_topology_confirmation, true);
+  assert.deepEqual(pocket.wall_surfaces, [1, 2, 3]);
+});
+
+test("keeps cylindrical boss detection explicitly ambiguous with bore intent", () => {
+  const shared = [0,0,0, 1,0,0];
+  const result = buildSemantic3D({
+    file: "boss.step", kind: "cad", engine: "browser",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [body({
+      geometric_surfaces: [
+        { index: 0, type: "cylinder", radius_mm: 6, axis: [0,0,1], center_mm: [0,0,0], edge_signatures: [shared] },
+        { index: 1, type: "plane", edge_signatures: [shared] },
+      ],
+    })],
+  });
+  const boss = result.bodies[0].features.find(f => f.type === "boss_feature_candidate");
+  assert.ok(boss);
+  assert.equal(boss.subtype, "possible_cylindrical_boss_or_bore");
+  assert.equal(boss.needs_topology_confirmation, true);
 });
