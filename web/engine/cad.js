@@ -817,7 +817,7 @@ function describeGeometricSurface(oc, face, out, index) {
     const type = surface.GetType();
     const name = type === T.GeomAbs_Plane ? "plane" : type === T.GeomAbs_Cylinder ? "cylinder" : type === T.GeomAbs_Cone ? "cone" : type === T.GeomAbs_Sphere ? "sphere" : type === T.GeomAbs_Torus ? "torus" : type === T.GeomAbs_BSplineSurface ? "bspline" : type === T.GeomAbs_BezierSurface ? "bezier" : null;
     if (!name) return;
-    const item = { index, type: name, orientation: face.Orientation_1(), wire_count: countSubShapes(oc, face, oc.TopAbs_ShapeEnum.TopAbs_WIRE), edge_count: countSubShapes(oc, face, oc.TopAbs_ShapeEnum.TopAbs_EDGE) };
+    const item = { index, type: name, orientation: face.Orientation_1(), wire_count: countSubShapes(oc, face, oc.TopAbs_ShapeEnum.TopAbs_WIRE), edge_count: countSubShapes(oc, face, oc.TopAbs_ShapeEnum.TopAbs_EDGE), edge_signatures: edgeSignatures(oc, face) };
     if (name === "cylinder") {
       const c = surface.Cylinder();
       const a = c.Axis();
@@ -840,6 +840,37 @@ function describeGeometricSurface(oc, face, out, index) {
     out.push(item);
   } finally {
     surface.delete();
+  }
+}
+
+function edgeSignatures(oc, face) {
+  const { TopAbs_EDGE, TopAbs_SHAPE, TopAbs_VERTEX } = oc.TopAbs_ShapeEnum;
+  const out = [];
+  forEachChildShape(oc, face, TopAbs_EDGE, TopAbs_SHAPE, (edge) => {
+    const points = [];
+    forEachChildShape(oc, edge, TopAbs_VERTEX, TopAbs_SHAPE, (vertex) => {
+      const v = oc.TopoDS.Vertex_1(vertex);
+      const p = oc.BRep_Tool.Pnt(v);
+      points.push([p.X(), p.Y(), p.Z()]);
+      release(oc, p);
+      release(oc, v);
+    });
+    if (points.length >= 2) {
+      const key = points.slice(0, 2).sort((a,b) => a.join(",").localeCompare(b.join(",")));
+      out.push(key.flat());
+    } else {
+      out.push(null);
+    }
+  });
+  return out;
+}
+
+function forEachChildShape(oc, shape, kind, upperKind, fn) {
+  const exp = new oc.TopExp_Explorer_2(shape, kind, upperKind);
+  try {
+    for (; exp.More(); exp.Next()) fn(exp.Current());
+  } finally {
+    exp.delete();
   }
 }
 
