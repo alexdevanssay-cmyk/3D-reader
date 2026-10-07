@@ -2,7 +2,7 @@ import { buildAIContext } from "./engine/ai-context.js";
 
 const PROVIDERS = [
   ["openai", "OpenAI / Responses API"],
-  ["openai_compatible", "OpenAI-compatible / local"],
+  ["openai_compatible", "Ollama local — Qwen3 8B"],
 ];
 
 const TASKS = [
