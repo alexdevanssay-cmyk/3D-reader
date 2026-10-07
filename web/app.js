@@ -5,7 +5,6 @@ import { engravingMask, thicknessHistogram, thicknessStats } from "./engine/thic
 import { summarize } from "./engine/summary.js";
 import { buildSemantic3D, SEMANTIC_VERSION } from "./engine/semantic.js";
 import { buildAIContext, AI_CONTEXT_VERSION } from "./engine/ai-context.js";
-import { mount as mountAIWorkspace } from "./ai-workspace.js";
 
 // ---------------------------------------------------------------- units
 
