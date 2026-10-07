@@ -740,7 +740,7 @@ function semanticBody(body, index) {
   const envelopeVolume=size.reduce((a,b)=>a*b,1);
   const relations=surfaceRelations(body.geometric_surfaces ?? []);
   const features=normalizeFeatureEvidence(featureCandidates(body,topo,relations));
-  return {
+  const semantic = {
     id: "body-"+index,
     source_index:index,
     name:body.name ?? "Body",
