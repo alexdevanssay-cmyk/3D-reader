@@ -62,21 +62,38 @@ function featureCandidates(body, topo) {
   const volume=body.volume;
   const fill = volume!=null && s[0]*s[1]*s[2]>EPS ? volume/(s[0]*s[1]*s[2]) : null;
 
-  if (body.closed && topo?.watertight) out.push({type:"closed_solid", confidence:1});
-  if (!body.closed) out.push({type:"open_surface", confidence:1});
-
-  // A very low fill ratio is a useful semantic signal (frame, bracket, shell,
-  // lattice-like part), not a claim about the exact design intent.
-  if (fill != null && fill < 0.35) out.push({type:"low_fill_ratio_geometry", confidence:0.85, fill_ratio:fill});
+  if (body.closed && topo?.watertight) out.push({type:"closed_solid", confidence:1, method:"topology"});
+  if (!body.closed) out.push({type:"open_surface", confidence:1, method:"reader"});
+  if (fill != null && fill < 0.35) out.push({type:"low_fill_ratio_geometry", confidence:0.85, method:"metrology", fill_ratio:fill});
 
   const st=body.surface_types;
   if (st) {
-    if ((st.cylinder ?? 0) > 0) out.push({type:"cylindrical_geometry", confidence:0.9, faces:st.cylinder});
-    if ((st.cone ?? 0) > 0) out.push({type:"conical_geometry", confidence:0.85, faces:st.cone});
-    if ((st.sphere ?? 0) > 0) out.push({type:"spherical_geometry", confidence:0.9, faces:st.sphere});
-    if ((st.torus ?? 0) > 0) out.push({type:"toroidal_geometry", confidence:0.85, faces:st.torus});
-    if ((st.plane ?? 0) > 0) out.push({type:"planar_geometry", confidence:0.95, faces:st.plane});
-    if ((st.bspline ?? 0) > 0) out.push({type:"freeform_geometry", confidence:0.8, faces:st.bspline});
+    if ((st.cylinder ?? 0) > 0) out.push({type:"cylindrical_geometry", confidence:0.9, method:"surface_class", faces:st.cylinder});
+    if ((st.cone ?? 0) > 0) out.push({type:"conical_geometry", confidence:0.85, method:"surface_class", faces:st.cone});
+    if ((st.sphere ?? 0) > 0) out.push({type:"spherical_geometry", confidence:0.9, method:"surface_class", faces:st.sphere});
+    if ((st.torus ?? 0) > 0) out.push({type:"toroidal_geometry", confidence:0.85, method:"surface_class", faces:st.torus});
+    if ((st.plane ?? 0) > 0) out.push({type:"planar_geometry", confidence:0.95, method:"surface_class", faces:st.plane});
+    if ((st.bspline ?? 0) > 0) out.push({type:"freeform_geometry", confidence:0.8, method:"surface_class", faces:st.bspline});
+  }
+
+  // Cylindrical faces become hole candidates only when the B-rep supplies enough
+  // evidence to distinguish an actual cylindrical wall from a boss/outer surface.
+  // V2 therefore emits "cylindrical_feature_candidate", never an unconditional hole.
+  const cylinders=(body.geometric_surfaces ?? []).filter(x=>x.type==="cylinder" && finite(x.radius_mm));
+  for (const c of cylinders) {
+    const axial = Math.max(...s);
+    const likelyThrough = c.radius_mm > 0 && axial > 0 && axial / (2*c.radius_mm) > 1.5;
+    out.push({
+      type:"cylindrical_feature_candidate",
+      subtype:likelyThrough ? "possible_hole_or_bore" : "cylindrical_surface",
+      confidence:likelyThrough ? 0.7 : 0.55,
+      method:"analytic_surface",
+      radius_mm:c.radius_mm,
+      diameter_mm:2*c.radius_mm,
+      axis:c.axis ?? null,
+      center_mm:c.center_mm ?? null,
+      needs_topology_confirmation:true
+    });
   }
   return out;
 }
