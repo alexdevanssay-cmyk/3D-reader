@@ -579,6 +579,8 @@ function semanticBody(body, index) {
   const size=body.bbox?.size ?? [0,0,0];
   const volume=body.volume;
   const envelopeVolume=size.reduce((a,b)=>a*b,1);
+  const relations=surfaceRelations(body.geometric_surfaces ?? []);
+  const features=normalizeFeatureEvidence(featureCandidates(body,topo,relations));
   return {
     id: "body-"+index,
     source_index:index,
@@ -599,11 +601,11 @@ function semanticBody(body, index) {
       analytic_surfaces:body.geometric_surfaces ?? [],
       principal_axes:principalAxes(body),
     },
-    features:normalizeFeatureEvidence(featureCandidates(body,topo, surfaceRelations(body.geometric_surfaces ?? []))),
-    relations:surfaceRelations(body.geometric_surfaces ?? []),
+    features,
+    relations,
     quality:{
       closed:!!body.closed,
-      evidence:semanticEvidenceQuality(surfaceRelations(body.geometric_surfaces ?? []), normalizeFeatureEvidence(featureCandidates(body,topo, surfaceRelations(body.geometric_surfaces ?? [])))),
+      evidence:semanticEvidenceQuality(relations, features),
       notes:Array.isArray(body.notes)?body.notes:[],
     },
   };
