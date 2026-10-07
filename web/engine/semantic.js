@@ -84,7 +84,7 @@ function featureCandidates(body, topo) {
     const axial = Math.max(...s);
     const likelyThrough = c.radius_mm > 0 && axial > 0 && axial / (2*c.radius_mm) > 1.5;
     const boundaryEvidence = c.edge_count === 2 || c.wire_count === 2;
-    const likelyBore = c.orientation != null && c.orientation !== 0 && likelyThrough;
+    const likelyBore = likelyThrough;
     out.push({
       type:"cylindrical_feature_candidate",
       subtype:boundaryEvidence && likelyBore ? "possible_through_hole" : likelyBore ? "possible_bore" : "cylindrical_surface",
