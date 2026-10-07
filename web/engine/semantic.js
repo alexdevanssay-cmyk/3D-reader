@@ -57,6 +57,51 @@ function principalAxes(body) {
   };
 }
 
+function normalizeAxis(v) {
+  if (!Array.isArray(v) || v.length !== 3 || !v.every(finite)) return null;
+  const n = Math.hypot(v[0], v[1], v[2]);
+  if (n <= EPS) return null;
+  const a = v.map(x => x / n);
+  return a.findIndex(x => Math.abs(x) > 1e-12) >= 0 && a.find(x => Math.abs(x) > 1e-12) < 0
+    ? a.map(x => -x)
+    : a;
+}
+
+function axisDistance(a, b) {
+  const aa=normalizeAxis(a), bb=normalizeAxis(b);
+  if (!aa || !bb) return Infinity;
+  const parallel = Math.abs(Math.abs(aa[0]*bb[0]+aa[1]*bb[1]+aa[2]*bb[2]) - 1);
+  if (parallel > 1e-5) return Infinity;
+  const d=[(b?.[0]??0)-(a?.[0]??0),(b?.[1]??0)-(a?.[1]??0),(b?.[2]??0)-(a?.[2]??0)];
+  const axial=d[0]*aa[0]+d[1]*aa[1]+d[2]*aa[2];
+  return Math.hypot(d[0]-axial*aa[0],d[1]-axial*aa[1],d[2]-axial*aa[2]);
+}
+
+function cylindricalRelations(cylinders, cones) {
+  const relations=[];
+  for (let i=0;i<cylinders.length;i++) {
+    for (let j=i+1;j<cylinders.length;j++) {
+      const a=cylinders[i], b=cylinders[j];
+      if (Math.abs(a.radius_mm-b.radius_mm)>Math.max(1e-5,Math.min(a.radius_mm,b.radius_mm)*1e-4)) continue;
+      if (axisDistance(a.center_mm,b.center_mm)>Math.max(1e-4,Math.min(a.radius_mm,b.radius_mm)*1e-3)) continue;
+      relations.push({type:"coaxial_cylinders", surfaces:[a.index,b.index], radius_mm:a.radius_mm, confidence:0.94});
+    }
+  }
+  for (const c of cylinders) {
+    for (const cone of cones) {
+      if (axisDistance(c.center_mm,cone.center_mm)>Math.max(1e-4,c.radius_mm*1e-3)) continue;
+      relations.push({
+        type:"coaxial_cylinder_cone",
+        surfaces:[c.index,cone.index],
+        diameter_mm:c.diameter_mm,
+        cone_ref_radius_mm:cone.ref_radius_mm ?? null,
+        confidence:0.9,
+      });
+    }
+  }
+  return relations;
+}
+
 function featureCandidates(body, topo) {
   const out=[];
   const s=body.bbox?.size ?? [0,0,0];
@@ -77,31 +122,52 @@ function featureCandidates(body, topo) {
     if ((st.bspline ?? 0) > 0) out.push({type:"freeform_geometry", confidence:0.8, method:"surface_class", faces:st.bspline});
   }
 
-  // Cylindrical faces become hole candidates only when the B-rep supplies enough
-  // evidence to distinguish an actual cylindrical wall from a boss/outer surface.
-  // V2 therefore emits "cylindrical_feature_candidate", never an unconditional hole.
-  const cylinders=(body.geometric_surfaces ?? []).filter(x=>x.type==="cylinder" && finite(x.radius_mm));
+  const surfaces=body.geometric_surfaces ?? [];
+  const cylinders=surfaces.filter(x=>x.type==="cylinder" && finite(x.radius_mm));
+  const cones=surfaces.filter(x=>x.type==="cone" && Array.isArray(x.axis) && Array.isArray(x.center_mm));
+  const relations=cylindricalRelations(cylinders,cones);
+
   for (const c of cylinders) {
     const axial = Math.max(...s);
     const likelyThrough = c.radius_mm > 0 && axial > 0 && axial / (2*c.radius_mm) > 1.5;
     const boundaryEvidence = c.edge_count === 2 || c.wire_count === 2;
-    const likelyBore = likelyThrough;
     out.push({
       type:"cylindrical_feature_candidate",
-      subtype:boundaryEvidence && likelyBore ? "possible_through_hole" : likelyBore ? "possible_bore" : "cylindrical_surface",
-      confidence:boundaryEvidence && likelyBore ? 0.86 : likelyBore ? 0.72 : 0.55,
+      subtype:boundaryEvidence && likelyThrough ? "possible_through_hole" : likelyThrough ? "possible_bore" : "cylindrical_surface",
+      confidence:boundaryEvidence && likelyThrough ? 0.86 : likelyThrough ? 0.72 : 0.55,
       method:"analytic_surface_plus_brep_boundaries",
+      surface_index:c.index,
       radius_mm:c.radius_mm,
       diameter_mm:2*c.radius_mm,
       axis:c.axis ?? null,
       center_mm:c.center_mm ?? null,
-      boundary_evidence:{
-        wire_count:c.wire_count ?? null,
-        edge_count:c.edge_count ?? null
-      },
-      needs_topology_confirmation:!(boundaryEvidence && likelyBore)
+      boundary_evidence:{wire_count:c.wire_count ?? null,edge_count:c.edge_count ?? null},
+      needs_topology_confirmation:!(boundaryEvidence && likelyThrough)
     });
   }
+
+  for (const r of relations) {
+    if (r.type==="coaxial_cylinder_cone") {
+      out.push({
+        type:"stepped_cylindrical_feature_candidate",
+        subtype:"possible_countersink_or_taper_transition",
+        relation:r,
+        confidence:0.78,
+        method:"coaxial_analytic_surfaces",
+        needs_topology_confirmation:true
+      });
+    } else if (r.type==="coaxial_cylinders") {
+      out.push({
+        type:"stepped_cylindrical_feature_candidate",
+        subtype:"possible_counterbore_or_coaxial_step",
+        relation:r,
+        confidence:0.74,
+        method:"coaxial_analytic_surfaces",
+        needs_topology_confirmation:true
+      });
+    }
+  }
+
   return out;
 }
 
