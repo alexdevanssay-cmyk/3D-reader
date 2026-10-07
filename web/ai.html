@@ -116,6 +116,15 @@ reader3d analyze part.step --json</pre>
   }]
 }</pre>
 
+  <h2>V7 AI reasoning context</h2>
+  <p>The semantic JSON can be compiled into a compact, evidence-linked context specifically intended for an LLM. This layer does not add geometry or upgrade provisional detections.</p>
+  <pre>const context = reader3d.aiContext({ task: "manufacturing_analysis" });
+const featureContext = reader3d.aiContext({
+  task: "feature_analysis",
+  featureIds: ["feature-..."]
+});</pre>
+  <p>Supported tasks are <code>general</code>, <code>feature_analysis</code>, <code>manufacturing_analysis</code>, <code>dfm</code> and <code>planning</code>. The context preserves feature/relation IDs, evidence, confidence, provisional status and unresolved manufacturing constraints. The LLM must treat provisional features as hypotheses, cite the supplied evidence for conclusions, preserve units and never invent dimensions. V7 remains a reasoning context layer, not an LLM itself and not a CAM generator.</p>
+
   <h2>JSON results</h2>
   <pre>{
   "file": "part.step", "kind": "cad" | "mesh", "source_unit": "mm",
