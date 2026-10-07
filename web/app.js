@@ -2094,8 +2094,17 @@ async function openUrl(url) {
 // window.reader3d: for scripts and browser-driving AI agents.
 //   await reader3d.analyze(fileOrUrl) -> results (same JSON as the export)
 window.reader3d = {
-  version: 1,\n  semanticVersion: SEMANTIC_VERSION,\n  aiContextVersion: AI_CONTEXT_VERSION,\n  aiContext(options = {}) {\n    if (!state.result) return null;\n    return buildAIContext(buildSemantic3D(exportableResult(state.result)), options);\n  },
-  get semantic() {\n    return state.result ? buildSemantic3D(exportableResult(state.result)) : null;\n  },\n  get result() {
+  version: 1,
+  semanticVersion: SEMANTIC_VERSION,
+  aiContextVersion: AI_CONTEXT_VERSION,
+  aiContext(options = {}) {
+    if (!state.result) return null;
+    return buildAIContext(buildSemantic3D(exportableResult(state.result)), options);
+  },
+  get semantic() {
+    return state.result ? buildSemantic3D(exportableResult(state.result)) : null;
+  },
+  get result() {
     return state.result ? exportableResult(state.result) : null;
   },
   get status() {
