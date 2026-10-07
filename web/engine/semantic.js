@@ -7,7 +7,7 @@
 // Contract version: 1.0
 export const SEMANTIC_VERSION = "1.0";
 
-const EPS = 1e-9;
+const EPS = 1e-9;\nconst FEATURE_SCHEMA_VERSION = "2.0";
 
 function finite(v) { return typeof v === "number" && Number.isFinite(v); }
 function dist(a, b) { const x=a[0]-b[0], y=a[1]-b[1], z=a[2]-b[2]; return Math.hypot(x,y,z); }
@@ -136,7 +136,7 @@ export function buildSemantic3D(result) {
   const s=result.summary ?? {};
   return {
     schema:"3d-semantic-json",
-    schema_version:SEMANTIC_VERSION,
+    schema_version:SEMANTIC_VERSION,\n    feature_schema_version:FEATURE_SCHEMA_VERSION,
     source:{
       file:result.file ?? null,
       kind:result.kind ?? null,
