@@ -745,7 +745,7 @@ function solidBody(ctx, name, solid, color, notes) {
   let volume = 0;
   let centroid = null;
   let surfaceArea = 0;
-  const surfaceTypes = { plane: 0, cylinder: 0, cone: 0, sphere: 0, torus: 0, bspline: 0, bezier: 0, other: 0 };
+  const surfaceTypes = { plane: 0, cylinder: 0, cone: 0, sphere: 0, torus: 0, bspline: 0, bezier: 0, other: 0 };\n  const geometricSurfaces = [];
   try {
     const faces = Math.max(1, countChildren(ctx, solid, TopAbs_FACE));
     let done = 0;
@@ -772,7 +772,7 @@ function solidBody(ctx, name, solid, color, notes) {
             bf.delete();
           }
         }
-        surfaceArea += area(ctx, face);\n        countSurfaceType(oc, face, surfaceTypes);
+        surfaceArea += area(ctx, face);\n        countSurfaceType(oc, face, surfaceTypes);\n        describeGeometricSurface(oc, face, geometricSurfaces, geometricSurfaces.length);
       } finally {
         release(oc, face);
       }
@@ -799,7 +799,7 @@ function solidBody(ctx, name, solid, color, notes) {
     centroid,
     closed: true,
     color,
-    notes,\n    surface_types: surfaceTypes,\n    tri,\n  });\n}\n\n/** Count OpenCascade surface classes for the semantic layer. */\nfunction countSurfaceType(oc, face, counts) {\n  const surface = new oc.BRepAdaptor_Surface_2(face, true);\n  try {\n    const T = oc.GeomAbs_SurfaceType;\n    switch (surface.GetType()) {\n      case T.GeomAbs_Plane: counts.plane++; break;\n      case T.GeomAbs_Cylinder: counts.cylinder++; break;\n      case T.GeomAbs_Cone: counts.cone++; break;\n      case T.GeomAbs_Sphere: counts.sphere++; break;\n      case T.GeomAbs_Torus: counts.torus++; break;\n      case T.GeomAbs_BSplineSurface: counts.bspline++; break;\n      case T.GeomAbs_BezierSurface: counts.bezier++; break;\n      default: counts.other++;\n    }\n  } finally {\n    surface.delete();\n  }\n}\n\n/** A plane, cylinder, cone or sphere (see GPROP_EPS). */
+    notes,\n    surface_types: surfaceTypes,\n    geometric_surfaces: geometricSurfaces,\n    tri,\n  });\n}\n\n/** Compact analytic descriptors used by the semantic layer. */\nfunction describeGeometricSurface(oc, face, out, index) {\n  const surface = new oc.BRepAdaptor_Surface_2(face, true);\n  try {\n    const T = oc.GeomAbs_SurfaceType;\n    const type = surface.GetType();\n    const name = type === T.GeomAbs_Plane ? "plane" : type === T.GeomAbs_Cylinder ? "cylinder" : type === T.GeomAbs_Cone ? "cone" : type === T.GeomAbs_Sphere ? "sphere" : type === T.GeomAbs_Torus ? "torus" : type === T.GeomAbs_BSplineSurface ? "bspline" : type === T.GeomAbs_BezierSurface ? "bezier" : null;\n    if (!name) return;\n    const item = { index, type: name, orientation: face.Orientation_1() };\n    if (name === "cylinder") {\n      const c = surface.Cylinder();\n      const a = c.Axis();\n      const d = a.Direction();\n      item.radius_mm = c.Radius();\n      item.axis = [d.X(), d.Y(), d.Z()];\n      item.center_mm = [a.Location().X(), a.Location().Y(), a.Location().Z()];\n    }\n    if (name === "cone") item.semi_angle_rad = surface.Cone().SemiAngle();\n    if (name === "sphere") item.radius_mm = surface.Sphere().Radius();\n    if (name === "torus") { const t = surface.Torus(); item.major_radius_mm = t.MajorRadius(); item.minor_radius_mm = t.MinorRadius(); }\n    out.push(item);\n  } finally {\n    surface.delete();\n  }\n}\n\n/** Count OpenCascade surface classes for the semantic layer. */\nfunction countSurfaceType(oc, face, counts) {\n  const surface = new oc.BRepAdaptor_Surface_2(face, true);\n  try {\n    const T = oc.GeomAbs_SurfaceType;\n    switch (surface.GetType()) {\n      case T.GeomAbs_Plane: counts.plane++; break;\n      case T.GeomAbs_Cylinder: counts.cylinder++; break;\n      case T.GeomAbs_Cone: counts.cone++; break;\n      case T.GeomAbs_Sphere: counts.sphere++; break;\n      case T.GeomAbs_Torus: counts.torus++; break;\n      case T.GeomAbs_BSplineSurface: counts.bspline++; break;\n      case T.GeomAbs_BezierSurface: counts.bezier++; break;\n      default: counts.other++;\n    }\n  } finally {\n    surface.delete();\n  }\n}\n\n/** A plane, cylinder, cone or sphere (see GPROP_EPS). */
 function analyticFace(oc, face) {
   const { GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Sphere } = oc.GeomAbs_SurfaceType;
   const surface = new oc.BRepAdaptor_Surface_2(face, true);
