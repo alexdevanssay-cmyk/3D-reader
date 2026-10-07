@@ -316,4 +316,10 @@ test("adds V4 evidence quality metadata and stable feature ids", () => {
   assert.equal(bodyResult.quality.evidence.feature_count, bodyResult.features.length);
   assert.equal(bodyResult.quality.evidence.confidence_policy,
     "geometric_evidence_does_not_prove_design_intent");
+  assert.equal(bodyResult.quality.evidence.validation_error_count, 0);
+  assert.ok(bodyResult.features.every(f => /^feature-[0-9a-f]{8}$/.test(f.feature_id)));
+  assert.ok(bodyResult.features.every(f => Number.isFinite(f.confidence) && f.confidence >= 0 && f.confidence <= 1));
+  assert.ok(bodyResult.features.every(f => typeof f.method === "string" && f.method.length > 0));
+  assert.ok(bodyResult.features.every(f => f.status !== "provisional" || f.needs_topology_confirmation === true));
+  assert.ok(bodyResult.features.every(f => f.evidence_count === f.evidence.length));
 });
