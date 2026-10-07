@@ -8,7 +8,7 @@
 export const SEMANTIC_VERSION = "1.0";
 
 const EPS = 1e-9;
-const FEATURE_SCHEMA_VERSION = "3.0";
+const FEATURE_SCHEMA_VERSION = "4.0";
 
 function finite(v) { return typeof v === "number" && Number.isFinite(v); }
 function dist(a, b) { const x=a[0]-b[0], y=a[1]-b[1], z=a[2]-b[2]; return Math.hypot(x,y,z); }
@@ -123,9 +123,15 @@ function cylindricalRelations(cylinders, cones, surfaces) {
   for (let i=0;i<cylinders.length;i++) {
     for (let j=i+1;j<cylinders.length;j++) {
       const a=cylinders[i], b=cylinders[j];
-      if (Math.abs(a.radius_mm-b.radius_mm)>Math.max(1e-5,Math.min(a.radius_mm,b.radius_mm)*1e-4)) continue;
       if (axisDistance(a.center_mm,b.center_mm)>Math.max(1e-4,Math.min(a.radius_mm,b.radius_mm)*1e-3)) continue;
-      relations.push({type:"coaxial_cylinders", surfaces:[a.index,b.index], radius_mm:a.radius_mm, confidence:0.94});
+      const radiiEqual=Math.abs(a.radius_mm-b.radius_mm)<=Math.max(1e-5,Math.min(a.radius_mm,b.radius_mm)*1e-4);
+      relations.push({
+        type:radiiEqual ? "coaxial_cylinders" : "coaxial_cylinder_step",
+        surfaces:[a.index,b.index],
+        radius_mm:radiiEqual ? a.radius_mm : null,
+        radii_mm:radiiEqual ? null : [a.radius_mm,b.radius_mm],
+        confidence:radiiEqual ? 0.94 : 0.91
+      });
     }
   }
   for (const c of cylinders) {
@@ -198,6 +204,31 @@ function featureCandidates(body, topo) {
     });
   }
 
+  // A cylindrical face bounded by two planar faces is a strong geometric
+  // signature of a cylindrical passage, but it is still not enough to prove
+  // design intent: an external boss can have the same topology.
+  for (const r of relations) {
+    if (r.type !== "cylindrical_boundary_planes") continue;
+    const cylinder = cylinders.find(c => c.index === r.surface);
+    if (!cylinder) continue;
+    const planeCount = r.planes.length;
+    const subtype = planeCount >= 2 ? "possible_through_hole_or_bore" :
+      planeCount === 1 ? "possible_blind_hole_or_bore" : "cylindrical_cut_candidate";
+    const confidence = planeCount >= 2 ? 0.84 : planeCount === 1 ? 0.76 : 0.6;
+    out.push({
+      type:"hole_feature_candidate",
+      subtype,
+      surface_index:cylinder.index,
+      diameter_mm:2*cylinder.radius_mm,
+      axis:cylinder.axis ?? null,
+      center_mm:cylinder.center_mm ?? null,
+      boundary_planes:r.planes,
+      confidence,
+      method:"cylindrical_face_plus_shared_brep_planar_boundaries",
+      needs_topology_confirmation:true
+    });
+  }
+
   for (const r of relations) {
     if (r.type==="cylindrical_boundary_planes") {
       out.push({
@@ -219,12 +250,21 @@ function featureCandidates(body, topo) {
         method:"coaxial_analytic_surfaces",
         needs_topology_confirmation:true
       });
-    } else if (r.type==="coaxial_cylinders") {
+    } else if (r.type==="coaxial_cylinder_step") {
       out.push({
         type:"stepped_cylindrical_feature_candidate",
         subtype:"possible_counterbore_or_coaxial_step",
         relation:r,
-        confidence:0.74,
+        confidence:0.79,
+        method:"coaxial_analytic_surfaces_with_different_radii",
+        needs_topology_confirmation:true
+      });
+    } else if (r.type==="coaxial_cylinders") {
+      out.push({
+        type:"coaxial_cylindrical_relation",
+        subtype:"same_diameter_coaxial_surfaces",
+        relation:r,
+        confidence:0.94,
         method:"coaxial_analytic_surfaces",
         needs_topology_confirmation:true
       });
