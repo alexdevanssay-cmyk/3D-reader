@@ -120,6 +120,7 @@ function semanticBody(body, index) {
     geometry:{
       method:body.method ?? null,
       surface_types:body.surface_types ?? null,
+      analytic_surfaces:body.geometric_surfaces ?? [],
       principal_axes:principalAxes(body),
     },
     features:featureCandidates(body,topo),
