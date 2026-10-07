@@ -274,3 +274,23 @@ test("keeps cylindrical boss detection explicitly ambiguous with bore intent", (
   assert.equal(boss.subtype, "possible_cylindrical_boss_or_bore");
   assert.equal(boss.needs_topology_confirmation, true);
 });
+
+
+test("emits provisional fillet and chamfer candidates from analytic adjacency", () => {
+  const e0=[0,0,0,1,0,0], e1=[0,1,0,1,1,0], e2=[0,2,0,1,2,0];
+  const result = buildSemantic3D({
+    file:"transitions.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({ geometric_surfaces:[
+      {index:0,type:"torus",minor_radius_mm:2,edge_signatures:[e0,e1]},
+      {index:1,type:"plane",edge_signatures:[e0]},
+      {index:2,type:"cylinder",radius_mm:8,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[e1]},
+      {index:3,type:"cone",semi_angle_rad:0.2,ref_radius_mm:8,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[e2,e0]},
+      {index:4,type:"plane",edge_signatures:[e2]},
+      {index:5,type:"cylinder",radius_mm:9,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[e0]},
+    ]})],
+  });
+  const features=result.bodies[0].features;
+  assert.ok(features.some(f=>f.type==="fillet_feature_candidate" && f.needs_topology_confirmation));
+  assert.ok(features.some(f=>f.type==="chamfer_feature_candidate" && f.needs_topology_confirmation));
+});
