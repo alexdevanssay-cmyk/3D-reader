@@ -8,7 +8,7 @@
 export const SEMANTIC_VERSION = "1.0";
 
 const EPS = 1e-9;
-const FEATURE_SCHEMA_VERSION = "4.0";
+const FEATURE_SCHEMA_VERSION = "6.0";
 
 function finite(v) { return typeof v === "number" && Number.isFinite(v); }
 function dist(a, b) { const x=a[0]-b[0], y=a[1]-b[1], z=a[2]-b[2]; return Math.hypot(x,y,z); }
@@ -160,6 +160,41 @@ function cylindricalRelations(cylinders, cones, surfaces) {
   return relations;
 }
 
+
+function parallelAxes(a,b,tol=1e-5) {
+  const aa=normalizeAxis(a), bb=normalizeAxis(b);
+  if (!aa || !bb) return false;
+  return Math.abs(Math.abs(aa[0]*bb[0]+aa[1]*bb[1]+aa[2]*bb[2])-1) <= tol;
+}
+
+function centerDistance(a,b) {
+  return Array.isArray(a) && Array.isArray(b) ? dist(a,b) : Infinity;
+}
+
+function repeatedCylinders(cylinders) {
+  const groups=[];
+  for (let i=0;i<cylinders.length;i++) {
+    for (let j=i+1;j<cylinders.length;j++) {
+      const a=cylinders[i], b=cylinders[j];
+      if (!parallelAxes(a.axis,b.axis)) continue;
+      const sameRadius=Math.abs(a.radius_mm-b.radius_mm) <= Math.max(1e-5,Math.min(a.radius_mm,b.radius_mm)*1e-4);
+      if (!sameRadius || centerDistance(a.center_mm,b.center_mm) <= Math.max(a.radius_mm*2,1e-3)) continue;
+      groups.push([a,b]);
+    }
+  }
+  return groups;
+}
+
+function surfaceRelations(surfaces) {
+  const cylinders=surfaces.filter(x=>x.type==="cylinder" && finite(x.radius_mm));
+  const cones=surfaces.filter(x=>x.type==="cone" && Array.isArray(x.axis) && Array.isArray(x.center_mm));
+  return cylindricalRelations(cylinders,cones,surfaces).map(r => ({
+    ...r,
+    evidence:"analytic_surface_geometry",
+    confirmed_by_shared_brep_edges: r.type==="cylindrical_boundary_planes"
+  }));
+}
+
 function featureCandidates(body, topo) {
   const out=[];
   const s=body.bbox?.size ?? [0,0,0];
@@ -226,6 +261,53 @@ function featureCandidates(body, topo) {
       confidence,
       method:"cylindrical_face_plus_shared_brep_planar_boundaries",
       needs_topology_confirmation:true
+    });
+  }
+
+  // Promote analytic cone/cylinder junctions only when their boundary evidence
+  // supports a machining-like transition. Keep the result explicitly provisional.
+  for (const r of relations) {
+    if (r.type === "coaxial_cylinder_cone") {
+      const cylinder = cylinders.find(c => c.index === r.surfaces[0]);
+      const cone = cones.find(c => c.index === r.surfaces[1]);
+      if (!cylinder || !cone) continue;
+      const coneAngle = Math.abs(cone.semi_angle_rad ?? 0);
+      out.push({
+        type: "tapered_feature_candidate",
+        subtype: coneAngle > 0 && coneAngle < Math.PI / 4
+          ? "possible_countersink_or_taper"
+          : "possible_conical_transition",
+        surfaces: [cylinder.index, cone.index],
+        cylinder_diameter_mm: 2 * cylinder.radius_mm,
+        cone_ref_radius_mm: cone.ref_radius_mm ?? null,
+        cone_semi_angle_rad: cone.semi_angle_rad ?? null,
+        confidence: coneAngle > 0 && coneAngle < Math.PI / 4 ? 0.82 : 0.68,
+        method: "coaxial_cylinder_cone_analytic_surfaces",
+        needs_topology_confirmation: true
+      });
+    }
+  }
+
+  // Promote coaxial cylinders to a pattern/step relation while retaining the
+  // underlying analytic evidence. Equal diameters are useful for pattern hints;
+  // different diameters are useful for counterbore/step candidates.
+  const coaxial = relations.filter(r => r.type === "coaxial_cylinders" || r.type === "coaxial_cylinder_step");
+  for (const r of coaxial) {
+    const surfacesByIndex = new Map(surfaces.map(x => [x.index, x]));
+    const a = surfacesByIndex.get(r.surfaces[0]);
+    const b = surfacesByIndex.get(r.surfaces[1]);
+    if (!a || !b) continue;
+    const subtype = r.type === "coaxial_cylinders"
+      ? "possible_coaxial_repeat_or_continuous_bore"
+      : "possible_counterbore_or_coaxial_step";
+    out.push({
+      type: "feature_relation_candidate",
+      subtype,
+      surfaces: r.surfaces,
+      radii_mm: r.radii_mm ?? [a.radius_mm, b.radius_mm],
+      confidence: r.type === "coaxial_cylinders" ? 0.88 : 0.9,
+      method: "coaxial_analytic_surface_relation",
+      needs_topology_confirmation: true
     });
   }
 
@@ -300,6 +382,7 @@ function semanticBody(body, index) {
       principal_axes:principalAxes(body),
     },
     features:featureCandidates(body,topo),
+    relations:surfaceRelations(body.geometric_surfaces ?? []),
     quality:{
       closed:!!body.closed,
       notes:Array.isArray(body.notes)?body.notes:[],
