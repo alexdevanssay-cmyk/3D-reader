@@ -83,16 +83,22 @@ function featureCandidates(body, topo) {
   for (const c of cylinders) {
     const axial = Math.max(...s);
     const likelyThrough = c.radius_mm > 0 && axial > 0 && axial / (2*c.radius_mm) > 1.5;
+    const boundaryEvidence = c.edge_count === 2 || c.wire_count === 2;
+    const likelyBore = c.orientation != null && c.orientation !== 0 && likelyThrough;
     out.push({
       type:"cylindrical_feature_candidate",
-      subtype:likelyThrough ? "possible_hole_or_bore" : "cylindrical_surface",
-      confidence:likelyThrough ? 0.7 : 0.55,
-      method:"analytic_surface",
+      subtype:boundaryEvidence && likelyBore ? "possible_through_hole" : likelyBore ? "possible_bore" : "cylindrical_surface",
+      confidence:boundaryEvidence && likelyBore ? 0.86 : likelyBore ? 0.72 : 0.55,
+      method:"analytic_surface_plus_brep_boundaries",
       radius_mm:c.radius_mm,
       diameter_mm:2*c.radius_mm,
       axis:c.axis ?? null,
       center_mm:c.center_mm ?? null,
-      needs_topology_confirmation:true
+      boundary_evidence:{
+        wire_count:c.wire_count ?? null,
+        edge_count:c.edge_count ?? null
+      },
+      needs_topology_confirmation:!(boundaryEvidence && likelyBore)
     });
   }
   return out;
