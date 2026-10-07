@@ -834,8 +834,6 @@ async function exportXlsx() {
   await withThickness();
   const { buildXlsx, STYLE } = await import("./xlsx.js");
   const data = exportableResult(r);
-  const semantic = buildSemantic3D(data);
-  $("reader3d-semantic-result").textContent = JSON.stringify(semantic).replace(/</g, "\\u003c");
   const s = data.summary;
   const pct = (v) => (v == null ? null : { value: v, style: STYLE.percent });
   const summary = [
@@ -2053,6 +2051,8 @@ function publishResult(r) {
 function updatePublished(r) {
   document.dispatchEvent(new CustomEvent("reader3d-part"));
   const data = exportableResult(r);
+  const semantic = buildSemantic3D(data);
+  $("reader3d-semantic-result").textContent = JSON.stringify(semantic).replace(/</g, "\\u003c");
   // "<" escaped so that a part name cannot close the script element.
   $("reader3d-result").textContent = JSON.stringify(data).replace(/</g, "\\u003c");
   if (params.get("report")) {
