@@ -5,10 +5,13 @@
 // existing Reader result. CAD surface classes are supplied by cad.js when available.
 //
 // Contract version: 1.0
+import { buildManufacturingPlan } from "./manufacturing-plan.js";
+
 export const SEMANTIC_VERSION = "1.0";
 
 const EPS = 1e-9;
-const FEATURE_SCHEMA_VERSION = "8.0";
+const FEATURE_SCHEMA_VERSION = "9.0";
+const MANUFACTURING_PLANNING_SCHEMA_VERSION = "1.0";
 const MANUFACTURING_SCHEMA_VERSION = "1.0";
 
 function finite(v) { return typeof v === "number" && Number.isFinite(v); }
@@ -737,7 +740,7 @@ function semanticBody(body, index) {
   const envelopeVolume=size.reduce((a,b)=>a*b,1);
   const relations=surfaceRelations(body.geometric_surfaces ?? []);
   const features=normalizeFeatureEvidence(featureCandidates(body,topo,relations));
-  return {
+  const semantic = {
     id: "body-"+index,
     source_index:index,
     name:body.name ?? "Body",
@@ -766,6 +769,8 @@ function semanticBody(body, index) {
     },
     manufacturing:manufacturingForBody(body, features, principalAxes(body)),
   };
+  semantic.manufacturing_plan = buildManufacturingPlan(semantic);
+  return semantic;
 }
 
 /** Build the compact AI-facing semantic contract from a Reader analysis result. */
@@ -800,11 +805,13 @@ export function buildSemantic3D(result) {
     bodies:(result.bodies ?? []).map(semanticBody),
     analysis_hints:[
       "features are geometric candidates, not guaranteed design intent",
-      "manufacturing operations, setup directions and DFM notes are candidates, not executable toolpaths",
+      "manufacturing operations, setups, dependencies and DFM notes are candidates, not executable toolpaths",
+      "V6 planning groups candidate operations by compatible tool axis and exposes unresolved access constraints",
       "functional thickness is reported only when an existing Reader metric is available",
       "raw tessellation is intentionally excluded from this AI payload",
       "use source_index to map semantic bodies back to Reader bodies",
     ],
     manufacturing_schema_version:MANUFACTURING_SCHEMA_VERSION,
+    manufacturing_planning_schema_version:MANUFACTURING_PLANNING_SCHEMA_VERSION,
   };
 }

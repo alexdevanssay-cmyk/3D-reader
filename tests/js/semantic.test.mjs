@@ -47,7 +47,7 @@ test("builds the versioned semantic contract without changing the raw result", (
 
   assert.equal(result.schema, "3d-semantic-json");
   assert.equal(result.schema_version, "1.0");
-  assert.equal(result.feature_schema_version, "8.0");
+  assert.equal(result.feature_schema_version, "9.0");
   assert.equal(result.model.body_count, 1);
   assert.equal(result.bodies[0].metrics.volume_mm3, 1000);
   assert.deepEqual(result.bodies[0].topology, {
@@ -168,7 +168,7 @@ test("keeps feature intent provisional even when analytic evidence is strong", (
 
 test("feature schema advances with conservative blend/chamfer/pattern candidates", () => {
   const source = "web/engine/semantic.js";
-  assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "8.0"'));
+  assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "9.0"'));
   assert.ok(source.includes('type:"fillet_feature_candidate"'));
   assert.ok(source.includes('type:"chamfer_feature_candidate"'));
   assert.ok(source.includes('type:"pattern_feature_candidate"'));
@@ -349,4 +349,48 @@ test("adds V5 manufacturing semantics with process, setup, sequence and DFM meta
   assert.equal(manufacturing.functional_thickness.status,"measured");
   assert.ok(Array.isArray(manufacturing.dfm_recommendations));
   assert.equal(result.manufacturing_schema_version,"1.0");
+});
+
+
+test("adds V6 deterministic manufacturing planning with setup grouping and constraints", () => {
+  const result = buildSemantic3D({
+    file:"plan.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({
+      geometric_surfaces:[
+        {index:0,type:"cylinder",radius_mm:2,diameter_mm:4,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[]},
+        {index:1,type:"cylinder",radius_mm:2,diameter_mm:4,axis:[1,0,0],center_mm:[20,0,0],edge_signatures:[]},
+      ],
+    })],
+  });
+  const plan=result.bodies[0].manufacturing_plan;
+  assert.equal(plan.schema_version,"1.0");
+  assert.equal(result.manufacturing_planning_schema_version,"1.0");
+  assert.equal(plan.operation_count,result.bodies[0].manufacturing.operations.length);
+  assert.equal(plan.setup_count,2);
+  assert.equal(plan.setups.length,2);
+  assert.ok(plan.setups.every(s=>s.status==="candidate_with_constraints"));
+  assert.ok(plan.setups.every(s=>s.unresolved_constraints.includes("stock_fixture_access_not_verified")));
+  assert.equal(plan.planned_order.length,plan.operation_count);
+  assert.ok(plan.dependencies.length >= 1);
+  assert.equal(plan.constraints.collision_check,"not_performed");
+  assert.equal(plan.constraints.machine_kinematics,"not_analyzed");
+  assert.equal(plan.readiness.status,"needs_review");
+  assert.ok(plan.readiness.unresolved_constraints.includes("stock_fixture_access_not_verified"));
+});
+
+test("keeps V6 planning deterministic across repeated semantic builds", () => {
+  const input={
+    file:"deterministic.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({
+      geometric_surfaces:[
+        {index:0,type:"cylinder",radius_mm:2,diameter_mm:4,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[]},
+        {index:1,type:"cylinder",radius_mm:3,diameter_mm:6,axis:[0,0,1],center_mm:[10,0,0],edge_signatures:[]},
+      ],
+    })],
+  };
+  const a=buildSemantic3D(input);
+  const b=buildSemantic3D(input);
+  assert.deepEqual(a.bodies[0].manufacturing_plan,b.bodies[0].manufacturing_plan);
 });
