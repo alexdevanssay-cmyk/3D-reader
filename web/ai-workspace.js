@@ -118,7 +118,6 @@ ${JSON.stringify(context)}`;
     const localMessages = [
       { role: "system", content: system },
       ...messages.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content || "") })),
-      { role: "user", content },
     ];
     const response = await fetch(url, {
       method: "POST",
