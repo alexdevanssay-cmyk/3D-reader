@@ -4,6 +4,7 @@ import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.
 import { engravingMask, thicknessHistogram, thicknessStats } from "./engine/thickness.js";
 import { summarize } from "./engine/summary.js";
 import { buildSemantic3D, SEMANTIC_VERSION } from "./engine/semantic.js";
+import { buildAIContext, AI_CONTEXT_VERSION } from "./engine/ai-context.js";
 
 // ---------------------------------------------------------------- units
 
@@ -1874,6 +1875,7 @@ $("brand").addEventListener("click", resetTabs);
 
 // The costing pages (web/chiffrage/) are loaded the first time they are opened.
 let costingPages = null;
+let aiWorkspace = null;
 function showPage(name) {
   for (const tab of document.querySelectorAll(".tabs .tab")) {
     const on = tab.dataset.page === name;
@@ -1881,7 +1883,14 @@ function showPage(name) {
     tab.setAttribute("aria-selected", String(on));
   }
   $("page-viewer").hidden = name !== "viewer";
+  $("page-ia").hidden = name !== "ia";
   for (const page of ["chiffrage", "parametres"]) $(`page-${page}`).hidden = name !== page;
+  if (name === "ia") {
+    aiWorkspace ??= import("./ai-workspace.js").then((m) => m.mount({ page: $("page-ia"), reader: window.reader3d }));
+    aiWorkspace.then((ui) => ui.show?.()).catch((err) => showError(err.message || String(err)));
+    try { sessionStorage.setItem("reader3d.page", name); } catch {}
+    return;
+  }
   if (name !== "viewer") {
     costingPages ??= import("./chiffrage/ui.js").then((m) => {
       const ui = m.mount({ chiffrage: $("page-chiffrage"), parametres: $("page-parametres") });
@@ -2085,8 +2094,17 @@ async function openUrl(url) {
 // window.reader3d: for scripts and browser-driving AI agents.
 //   await reader3d.analyze(fileOrUrl) -> results (same JSON as the export)
 window.reader3d = {
-  version: 1,\n  semanticVersion: SEMANTIC_VERSION,
-  get semantic() {\n    return state.result ? buildSemantic3D(exportableResult(state.result)) : null;\n  },\n  get result() {
+  version: 1,
+  semanticVersion: SEMANTIC_VERSION,
+  aiContextVersion: AI_CONTEXT_VERSION,
+  aiContext(options = {}) {
+    if (!state.result) return null;
+    return buildAIContext(buildSemantic3D(exportableResult(state.result)), options);
+  },
+  get semantic() {
+    return state.result ? buildSemantic3D(exportableResult(state.result)) : null;
+  },
+  get result() {
     return state.result ? exportableResult(state.result) : null;
   },
   get status() {
@@ -2190,7 +2208,7 @@ setStatus("idle");
   } catch {
     // no storage
   }
-  if (page === "chiffrage" || page === "parametres") showPage(page);
+  if (page === "ia" || page === "chiffrage" || page === "parametres") showPage(page);
 }
 initEngines().then(() => {
   const url = params.get("url");

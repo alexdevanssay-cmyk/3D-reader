@@ -40,6 +40,7 @@
   <header class="topbar">
     <button id="brand" class="brand" type="button" data-i18n-title="brand.title" title="Start again: closes all the tabs (the settings, the costing workbook and the metal prices are kept)">3D Reader</button>
     <nav class="tabs" role="tablist" aria-label="Pages">
+      <button type="button" role="tab" class="tab" data-page="ia" aria-selected="false">IA / analyse</button>
       <button type="button" role="tab" class="tab active" data-page="viewer" aria-selected="true" data-i18n="tab.viewer">3D analysis</button>
       <button type="button" role="tab" class="tab" data-page="chiffrage" aria-selected="false" data-i18n="tab.costing">Costing</button>
       <button type="button" role="tab" class="tab" data-page="parametres" aria-selected="false" data-i18n="tab.settings">Settings</button>
@@ -261,6 +262,8 @@
       </section>
     </aside>
   </main>
+
+  <section class="page" id="page-ia" hidden></section>
 
   <!-- Costing of the part (web/chiffrage/): filled when the page is first opened. -->
   <section class="page" id="page-chiffrage" hidden></section>

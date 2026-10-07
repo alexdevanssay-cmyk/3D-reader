@@ -5,10 +5,16 @@
 // existing Reader result. CAD surface classes are supplied by cad.js when available.
 //
 // Contract version: 1.0
+import { buildManufacturingPlan } from "./manufacturing-plan.js";
+import { buildFoundryAnalysis, FOUNDRY_SCHEMA_VERSION, FOUNDRY_KNOWLEDGE_VERSION } from "./foundry-knowledge.js";
+
 export const SEMANTIC_VERSION = "1.0";
 
 const EPS = 1e-9;
-const FEATURE_SCHEMA_VERSION = "6.0";
+const FEATURE_SCHEMA_VERSION = "9.0";
+const MANUFACTURING_PLANNING_SCHEMA_VERSION = "1.0";
+const MANUFACTURING_SCHEMA_VERSION = "1.0";
+const FOUNDRY_PROFILE = "unspecified";
 
 function finite(v) { return typeof v === "number" && Number.isFinite(v); }
 function dist(a, b) { const x=a[0]-b[0], y=a[1]-b[1], z=a[2]-b[2]; return Math.hypot(x,y,z); }
@@ -546,12 +552,197 @@ function featureCandidates(body, topo, stableRelations) {
   return out;
 }
 
+function stableFeatureId(feature, occurrence) {
+  const identity = [
+    feature.type ?? "feature",
+    feature.subtype ?? "",
+    feature.surface_index ?? feature.floor_surface ?? "",
+    Array.isArray(feature.surfaces) ? feature.surfaces.join(",") : "",
+    Array.isArray(feature.boundary_planes) ? feature.boundary_planes.join(",") : "",
+    Array.isArray(feature.wall_surfaces) ? feature.wall_surfaces.join(",") : "",
+    occurrence,
+  ].join("|");
+  let hash = 2166136261;
+  for (let i=0;i<identity.length;i++) {
+    hash ^= identity.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return "feature-" + (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function normalizeFeatureEvidence(features) {
+  const occurrences = new Map();
+  return features.map((feature) => {
+    const key = [
+      feature.type ?? "feature",
+      feature.subtype ?? "",
+      feature.surface_index ?? feature.floor_surface ?? "",
+      Array.isArray(feature.surfaces) ? feature.surfaces.join(",") : "",
+    ].join("|");
+    const occurrence = occurrences.get(key) ?? 0;
+    occurrences.set(key, occurrence + 1);
+    const evidence = Array.isArray(feature.evidence) ? feature.evidence : [];
+    const needsConfirmation = feature.needs_topology_confirmation === true;
+    const normalizedEvidence = evidence.length > 0
+      ? evidence
+      : feature.surface_index != null
+        ? [{source:"analytic_surface", surface_index:feature.surface_index}]
+        : feature.floor_surface != null
+          ? [{source:"analytic_surface", surface_index:feature.floor_surface}]
+          : Array.isArray(feature.surfaces)
+            ? feature.surfaces.map(surface_index => ({source:"analytic_surface", surface_index}))
+            : [];
+    const confidence = finite(feature.confidence) ? Math.max(0, Math.min(1, feature.confidence)) : 0;
+    return {
+      ...feature,
+      feature_id: feature.feature_id ?? stableFeatureId(feature, occurrence),
+      status: needsConfirmation ? "provisional" : "evidenced",
+      confidence,
+      evidence: normalizedEvidence,
+      evidence_count: normalizedEvidence.length,
+      evidence_quality: normalizedEvidence.some(e => e.source === "relation")
+        ? "linked_relation"
+        : normalizedEvidence.length > 0 ? "analytic_or_metrology" : "none",
+    };
+  });
+}
+
+function semanticEvidenceQuality(relations, features) {
+  const relationCount = relations.length;
+  const featureCount = features.length;
+  const provisionalCount = features.filter(f => f.status === "provisional").length;
+  const linkedCount = features.filter(f => f.evidence_quality === "linked_relation").length;
+  const validationErrors = features.flatMap(f => {
+    const errors = [];
+    if (!finite(f.confidence) || f.confidence < 0 || f.confidence > 1) errors.push("invalid_confidence");
+    if (typeof f.method !== "string" || !f.method) errors.push("missing_detection_method");
+    if (f.status === "provisional" && f.needs_topology_confirmation !== true) errors.push("provisional_without_topology_confirmation");
+    if (f.evidence_count !== f.evidence.length) errors.push("evidence_count_mismatch");
+    return errors.map(code => ({feature_id:f.feature_id, code}));
+  });
+  return {
+    relation_count: relationCount,
+    feature_count: featureCount,
+    provisional_feature_count: provisionalCount,
+    linked_feature_count: linkedCount,
+    validation_error_count: validationErrors.length,
+    validation_errors: validationErrors,
+    confidence_policy: "geometric_evidence_does_not_prove_design_intent",
+  };
+}
+
+function manufacturingOperation(feature) {
+  const t=feature.type;
+  const s=feature.subtype ?? "";
+  if (t==="hole_feature_candidate" || t==="cylindrical_feature_candidate") {
+    if (s.includes("through_hole")) return "drilling";
+    if (s.includes("blind_hole")) return "drilling_blind";
+    return "drilling_or_boring";
+  }
+  if (t==="stepped_cylindrical_feature_candidate" || s.includes("counterbore")) return "counterboring_or_boring";
+  if (t==="tapered_feature_candidate" || t==="chamfer_feature_candidate" || s.includes("countersink")) return "chamfering_or_countersinking";
+  if (t==="pocket_feature_candidate") return "pocket_milling";
+  if (t==="boss_feature_candidate") return "boss_milling_or_bore";
+  if (t==="fillet_feature_candidate") return "fillet_or_blend_finishing";
+  if (t==="pattern_feature_candidate") return "patterned_feature_machining";
+  if (t==="feature_relation_candidate") return s.includes("counterbore") ? "counterboring_or_boring" : "feature_machining";
+  if (t==="coaxial_cylindrical_relation") return "boring_or_coaxial_feature_machining";
+  return null;
+}
+
+function featureToolAxis(feature) {
+  if (Array.isArray(feature.axis)) return normalizeAxis(feature.axis);
+  if (Array.isArray(feature.axes) && feature.axes.length && Array.isArray(feature.axes[0])) return normalizeAxis(feature.axes[0]);
+  return null;
+}
+
+function manufacturingAccessibility(feature) {
+  const axis=featureToolAxis(feature);
+  return {
+    status: axis ? "candidate_only" : "undetermined",
+    tool_axis: axis,
+    setup_direction: axis,
+    access_evidence: axis ? "feature_axis_geometry" : "insufficient_geometric_evidence",
+    requires_stock_fixture_analysis: true,
+  };
+}
+
+function manufacturingForBody(body, features, principal) {
+  const operations=[];
+  for (const feature of features) {
+    const operation=manufacturingOperation(feature);
+    if (!operation) continue;
+    operations.push({
+      operation_id:"op-"+feature.feature_id,
+      feature_ids:[feature.feature_id],
+      operation,
+      confidence:feature.confidence,
+      status:"candidate",
+      accessibility:manufacturingAccessibility(feature),
+      rationale:feature.method,
+    });
+  }
+
+  const precedence={
+    "pocket_milling":20,
+    "boss_milling_or_bore":25,
+    "drilling":30,
+    "drilling_blind":30,
+    "drilling_or_boring":30,
+    "counterboring_or_boring":35,
+    "boring_or_coaxial_feature_machining":35,
+    "patterned_feature_machining":40,
+    "chamfering_or_countersinking":50,
+    "fillet_or_blend_finishing":60,
+    "feature_machining":40,
+  };
+  operations.sort((a,b)=>(precedence[a.operation]??45)-(precedence[b.operation]??45) || a.operation_id.localeCompare(b.operation_id));
+  const sequence=operations.map((op,i)=>({
+    sequence:i+1,
+    operation_id:op.operation_id,
+    feature_ids:op.feature_ids,
+    depends_on:i ? [operations[i-1].operation_id] : [],
+  }));
+
+  const minThickness=finite(body.min_thickness_mm) ? body.min_thickness_mm
+    : finite(body.thickness_mm) ? body.thickness_mm
+    : null;
+  const functionalThickness={
+    minimum_wall_thickness_mm:minThickness,
+    source:minThickness!=null ? "reader_body_metric" : "not_available",
+    status:minThickness!=null ? "measured" : "undetermined",
+    warning:minThickness!=null && minThickness < 2 ? "thin_wall_candidate" : null,
+  };
+
+  const dfm=[];
+  if (!body.closed) dfm.push({code:"open_body",severity:"high",recommendation:"repair_or_close_body_before_manufacturing_analysis"});
+  if (body.mesh && topology(body)?.non_manifold_edges>0) dfm.push({code:"non_manifold_geometry",severity:"high",recommendation:"repair_non_manifold_topology"});
+  if (minThickness!=null && minThickness < 2) dfm.push({code:"thin_wall",severity:"medium",recommendation:"verify_process_capability_and_clamping"});
+  if (features.some(f=>f.status==="provisional")) dfm.push({code:"provisional_feature_intent",severity:"info",recommendation:"confirm_feature_intent_before_generating_toolpaths"});
+  if (features.some(f=>f.type==="pattern_feature_candidate")) dfm.push({code:"repeated_features",severity:"info",recommendation:"consider a common setup/tool strategy for repeated features"});
+  if (!features.length) dfm.push({code:"no_machining_feature_detected",severity:"info",recommendation:"do_not_assume_a_specific_manufacturing_process_from_geometry_alone"});
+
+  return {
+    schema_version:MANUFACTURING_SCHEMA_VERSION,
+    process_candidates:[...new Set(operations.map(x=>x.operation))],
+    operations,
+    sequence,
+    accessibility_policy:"geometric_axis_is_not_proof_of_tool_access",
+    functional_thickness:functionalThickness,
+    dfm_recommendations:dfm,
+    confidence_policy:"manufacturing_operations_are_candidates_until_stock_fixture_and_process_constraints_are_known",
+    principal_axes:principal,
+  };
+}
+
 function semanticBody(body, index) {
   const topo=topology(body);
   const size=body.bbox?.size ?? [0,0,0];
   const volume=body.volume;
   const envelopeVolume=size.reduce((a,b)=>a*b,1);
-  return {
+  const relations=surfaceRelations(body.geometric_surfaces ?? []);
+  const features=normalizeFeatureEvidence(featureCandidates(body,topo,relations));
+  const semantic = {
     id: "body-"+index,
     source_index:index,
     name:body.name ?? "Body",
@@ -571,13 +762,18 @@ function semanticBody(body, index) {
       analytic_surfaces:body.geometric_surfaces ?? [],
       principal_axes:principalAxes(body),
     },
-    features:featureCandidates(body,topo, surfaceRelations(body.geometric_surfaces ?? [])),
-    relations:surfaceRelations(body.geometric_surfaces ?? []),
+    features,
+    relations,
     quality:{
       closed:!!body.closed,
+      evidence:semanticEvidenceQuality(relations, features),
       notes:Array.isArray(body.notes)?body.notes:[],
     },
+    manufacturing:manufacturingForBody(body, features, principalAxes(body)),
+    foundry: buildFoundryAnalysis(body, features, principalAxes(body), FOUNDRY_PROFILE),
   };
+  semantic.manufacturing_plan = buildManufacturingPlan(semantic);
+  return semantic;
 }
 
 /** Build the compact AI-facing semantic contract from a Reader analysis result. */
@@ -612,8 +808,17 @@ export function buildSemantic3D(result) {
     bodies:(result.bodies ?? []).map(semanticBody),
     analysis_hints:[
       "features are geometric candidates, not guaranteed design intent",
+      "manufacturing operations, setups, dependencies and DFM notes are candidates, not executable toolpaths",
+      "V6 planning groups candidate operations by compatible tool axis and exposes unresolved access constraints",
+      "functional thickness is reported only when an existing Reader metric is available",
       "raw tessellation is intentionally excluded from this AI payload",
       "use source_index to map semantic bodies back to Reader bodies",
+      "foundry analysis is a conservative geometry screen; filling, solidification, risering and gating are not simulated",
+      "numeric foundry limits are process/alloy specific and must be validated against the selected foundry process",
     ],
+    manufacturing_schema_version:MANUFACTURING_SCHEMA_VERSION,
+    manufacturing_planning_schema_version:MANUFACTURING_PLANNING_SCHEMA_VERSION,
+    foundry_schema_version: FOUNDRY_SCHEMA_VERSION,
+    foundry_knowledge_version: FOUNDRY_KNOWLEDGE_VERSION,
   };
 }
