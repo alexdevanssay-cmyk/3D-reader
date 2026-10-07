@@ -6,3 +6,5 @@
 - [Reader](./)
 
 - Semantic JSON: `window.reader3d.semantic` and `#reader3d-semantic-result` expose feature schema 9.0, V5 manufacturing candidates and V6 `manufacturing_plan` metadata per body. V6 includes deterministic setup grouping by compatible tool axis, operation dependencies, planned order, readiness and unresolved constraints. Planning output is candidate-only and is not an executable CAM/toolpath program.
+
+- V7 AI reasoning context: `reader3d.aiContext({ task })` returns schema `3d-ai-reasoning-context` 1.0. Supported tasks: `general`, `feature_analysis`, `manufacturing_analysis`, `dfm`, `planning`. Optional `featureIds` focuses the context. The compiler preserves feature/relation provenance, confidence, provisional status, units and unresolved constraints; it does not invent geometry or convert candidates into confirmed design intent. Manufacturing/planning outputs remain non-executable and non-CAM.

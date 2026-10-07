@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildSemantic3D } from "../../web/engine/semantic.js";
+import { buildAIContext } from "../../web/engine/ai-context.js";
 
 function body(overrides = {}) {
   return {
@@ -393,4 +394,41 @@ test("keeps V6 planning deterministic across repeated semantic builds", () => {
   const a=buildSemantic3D(input);
   const b=buildSemantic3D(input);
   assert.deepEqual(a.bodies[0].manufacturing_plan,b.bodies[0].manufacturing_plan);
+});
+
+
+test("builds deterministic V7 AI reasoning context with provenance and uncertainty", () => {
+  const semantic = buildSemantic3D({
+    file: "ai.step", kind: "cad", engine: "browser", source_unit: "mm",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [body({ geometric_surfaces: [
+      { index: 0, type: "cylinder", radius_mm: 5, diameter_mm: 10, axis: [0,0,1], center_mm: [0,0,0], wire_count: 2, edge_count: 2, edge_signatures: [] },
+    ] })],
+  });
+  const a = buildAIContext(semantic, { task: "manufacturing_analysis" });
+  const b = buildAIContext(semantic, { task: "manufacturing_analysis" });
+  assert.deepEqual(a, b);
+  assert.equal(a.schema, "3d-ai-reasoning-context");
+  assert.equal(a.schema_version, "1.0");
+  assert.equal(a.task, "manufacturing_analysis");
+  assert.equal(a.reasoning_contract.use_only_provided_geometry, true);
+  assert.ok(a.bodies[0].features.every(f => "feature_id" in f && "evidence" in f && "status" in f));
+  assert.ok(a.uncertainty.provisional_feature_count >= 1);
+});
+
+test("supports focused feature reasoning without losing provenance", () => {
+  const semantic = buildSemantic3D({
+    file: "focus.step", kind: "cad", engine: "browser",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [body({ geometric_surfaces: [
+      { index: 0, type: "cylinder", radius_mm: 5, diameter_mm: 10, axis: [0,0,1], center_mm: [0,0,0], edge_signatures: [] },
+    ] })],
+  });
+  const feature = semantic.bodies[0].features.find(f => f.feature_id);
+  const context = buildAIContext(semantic, { task: "feature_analysis", featureIds: [feature.feature_id] });
+  assert.deepEqual(context.focus.feature_ids, [feature.feature_id]);
+  assert.equal(context.focus.selected_feature_count, 1);
+  assert.equal(context.bodies[0].features.length, 1);
+  assert.equal(context.bodies[0].features[0].feature_id, feature.feature_id);
+  assert.equal(context.bodies[0].features[0].evidence_count, feature.evidence_count);
 });
