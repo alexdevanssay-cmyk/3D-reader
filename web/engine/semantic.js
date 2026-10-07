@@ -307,6 +307,7 @@ function featureCandidates(body, topo, stableRelations) {
       boundary_planes:r.planes,
       confidence,
       method:"cylindrical_face_plus_shared_brep_planar_boundaries",
+      evidence:[{source:"relation", relation_id:r.relation_id}],
       needs_topology_confirmation:true
     });
   }
@@ -360,6 +361,56 @@ function featureCandidates(body, topo, stableRelations) {
       centers_mm:members.map(x=>x.center_mm ?? null),
       confidence:subtype==="possible_repeated_cylindrical_pattern" ? 0.78 : 0.84,
       method:"parallel_equal_radius_cylindrical_surface_repetition",
+      needs_topology_confirmation:true
+    });
+  }
+
+  // Toroidal faces adjacent to analytic faces are strong evidence of a blend,
+  // but the semantic layer does not assume that every torus is a fillet.
+  const adjacencyForFeatures=faceAdjacency(surfaces);
+  const neighborMap=new Map();
+  for (const rel of adjacencyForFeatures) {
+    for (const [a,b] of [[rel.faces[0],rel.faces[1]],[rel.faces[1],rel.faces[0]]]) {
+      const list=neighborMap.get(a) ?? [];
+      list.push({index:b,shared_edges:rel.shared_edges});
+      neighborMap.set(a,list);
+    }
+  }
+  for (const torus of surfaces.filter(x=>x.type==="torus" && finite(x.minor_radius_mm))) {
+    const neighbors=(neighborMap.get(torus.index) ?? [])
+      .map(x=>surfaces.find(f=>f.index===x.index))
+      .filter(Boolean)
+      .filter(x=>["plane","cylinder","cone","bspline","bezier"].includes(x.type));
+    if (neighbors.length < 2) continue;
+    out.push({
+      type:"fillet_feature_candidate",
+      subtype:"possible_fillet_or_toroidal_blend",
+      surface_index:torus.index,
+      minor_radius_mm:torus.minor_radius_mm,
+      adjacent_surfaces:neighbors.map(x=>x.index),
+      confidence:0.8,
+      method:"toroidal_face_plus_shared_brep_edges",
+      needs_topology_confirmation:true
+    });
+  }
+
+  // A conical face adjacent to machining-like analytic faces is a possible
+  // chamfer/taper. Angle and adjacency are evidence, not proof of intent.
+  for (const cone of cones) {
+    const neighbors=(neighborMap.get(cone.index) ?? [])
+      .map(x=>surfaces.find(f=>f.index===x.index))
+      .filter(Boolean)
+      .filter(x=>["plane","cylinder"].includes(x.type));
+    if (neighbors.length < 2) continue;
+    const angle=Math.abs(cone.semi_angle_rad ?? 0);
+    out.push({
+      type:"chamfer_feature_candidate",
+      subtype:"possible_chamfer_or_taper_transition",
+      surface_index:cone.index,
+      semi_angle_rad:cone.semi_angle_rad ?? null,
+      adjacent_surfaces:neighbors.map(x=>x.index),
+      confidence:angle>0 && angle<Math.PI/3 ? 0.77 : 0.68,
+      method:"conical_face_plus_shared_brep_edges",
       needs_topology_confirmation:true
     });
   }
