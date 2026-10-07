@@ -64,6 +64,58 @@ reader3d analyze part.step --json</pre>
     <tr><td><code>lang</code></td><td><code>fr</code> or <code>en</code>.</td></tr>
   </table>
 
+  <h2>3D Semantic JSON</h2>
+  <p>The AI-facing semantic contract is exposed in <code>#reader3d-semantic-result</code> and as <code>window.reader3d.semantic</code>.
+  It is versioned independently from the raw measurement result: <code>schema = 3d-semantic-json</code>,
+  <code>schema_version = 1.0</code>. It contains model/body metrology, topology, principal axes and conservative geometric feature candidates.
+  Tessellation buffers are deliberately excluded from this payload.</p>
+  <pre>{
+  "schema": "3d-semantic-json",
+  "schema_version": "1.0",
+  "source": { "file": "part.step", "kind": "cad", "source_unit": "mm", "engine": "browser" },
+  "model": {
+    "body_count": 1,
+    "solid_count": 1,
+    "metrics": {
+      "volume_mm3": 113716.81,
+      "surface_area_mm2": 18913.27,
+      "mass_g": 307.04,
+      "centroid_mm": [50,30,10],
+      "bbox_mm": { "min": [0,0,0], "max": [100,60,20], "size": [100,60,20] },
+      "oriented_bbox_mm": { "size": [100,60,20], "volume": 120000 },
+      "fill_ratio": 0.9476
+    }
+  },
+  "bodies": [{
+    "id": "body-0",
+    "source_index": 0,
+    "name": "Housing",
+    "role": "solid_body",
+    "metrics": {},
+    "topology": {
+      "vertices": 1234,
+      "triangles": 2400,
+      "unique_edges": 3600,
+      "boundary_edges": 0,
+      "non_manifold_edges": 0,
+      "degenerate_triangles": 0,
+      "watertight": true
+    },
+    "geometry": {
+      "method": "brep",
+      "surface_types": null,
+      "principal_axes": {
+        "length_axis": "X",
+        "width_axis": "Y",
+        "height_axis": "Z",
+        "size_order": [100,60,20]
+      }
+    },
+    "features": [{ "type": "closed_solid", "confidence": 1 }],
+    "quality": { "closed": true, "notes": [] }
+  }]
+}</pre>
+
   <h2>JSON results</h2>
   <pre>{
   "file": "part.step", "kind": "cad" | "mesh", "source_unit": "mm",
