@@ -168,7 +168,7 @@ test("keeps feature intent provisional even when analytic evidence is strong", (
 
 test("feature schema advances with conservative blend/chamfer/pattern candidates", () => {
   const source = "web/engine/semantic.js";
-  assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "8.0"'));
+  assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "9.0"'));
   assert.ok(source.includes('type:"fillet_feature_candidate"'));
   assert.ok(source.includes('type:"chamfer_feature_candidate"'));
   assert.ok(source.includes('type:"pattern_feature_candidate"'));
