@@ -47,7 +47,7 @@ test("builds the versioned semantic contract without changing the raw result", (
 
   assert.equal(result.schema, "3d-semantic-json");
   assert.equal(result.schema_version, "1.0");
-  assert.equal(result.feature_schema_version, "7.0");
+  assert.equal(result.feature_schema_version, "8.0");
   assert.equal(result.model.body_count, 1);
   assert.equal(result.bodies[0].metrics.volume_mm3, 1000);
   assert.deepEqual(result.bodies[0].topology, {
@@ -168,7 +168,7 @@ test("keeps feature intent provisional even when analytic evidence is strong", (
 
 test("feature schema advances with conservative blend/chamfer/pattern candidates", () => {
   const source = "web/engine/semantic.js";
-  assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "7.0"'));
+  assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "8.0"'));
   assert.ok(source.includes('type:"fillet_feature_candidate"'));
   assert.ok(source.includes('type:"chamfer_feature_candidate"'));
   assert.ok(source.includes('type:"pattern_feature_candidate"'));
@@ -322,4 +322,31 @@ test("adds V4 evidence quality metadata and stable feature ids", () => {
   assert.ok(bodyResult.features.every(f => typeof f.method === "string" && f.method.length > 0));
   assert.ok(bodyResult.features.every(f => f.status !== "provisional" || f.needs_topology_confirmation === true));
   assert.ok(bodyResult.features.every(f => f.evidence_count === f.evidence.length));
+});
+
+
+test("adds V5 manufacturing semantics with process, setup, sequence and DFM metadata", () => {
+  const result = buildSemantic3D({
+    file:"manufacturing.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({
+      geometric_surfaces:[
+        {index:0,type:"cylinder",radius_mm:5,diameter_mm:10,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[[0,0,0,1,0,0],[0,0,0,0,1,0]],wire_count:2,edge_count:2},
+        {index:1,type:"plane",edge_signatures:[[0,0,0,1,0,0]]},
+        {index:2,type:"plane",edge_signatures:[[0,0,0,0,1,0]]},
+      ],
+      min_thickness_mm:3,
+    })],
+  });
+  const manufacturing=result.bodies[0].manufacturing;
+  assert.equal(manufacturing.schema_version,"1.0");
+  assert.ok(manufacturing.process_candidates.includes("drilling"));
+  assert.ok(manufacturing.operations.length>0);
+  assert.ok(manufacturing.sequence.length===manufacturing.operations.length);
+  assert.equal(manufacturing.sequence[0].depends_on.length,0);
+  assert.ok(manufacturing.operations.every(o=>o.accessibility.status==="candidate_only"));
+  assert.equal(manufacturing.functional_thickness.minimum_wall_thickness_mm,3);
+  assert.equal(manufacturing.functional_thickness.status,"measured");
+  assert.ok(Array.isArray(manufacturing.dfm_recommendations));
+  assert.equal(result.manufacturing_schema_version,"1.0");
 });
