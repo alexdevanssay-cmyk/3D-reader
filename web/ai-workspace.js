@@ -35,7 +35,7 @@ export function mount({ page, reader }) {
             <select id="ai-provider">${PROVIDERS.map(([v,l]) => `<option value="${v}">${l}</option>`).join("")}</select>
           </label>
           <label class="field">Modèle
-            <input id="ai-model" value="gpt-6-astra" style="min-width:180px">
+            <input id="ai-model" value="qwen3:8b" style="min-width:180px">
           </label>
           <button id="ai-connect" class="btn primary" type="button">Connecter</button>
         </div>
@@ -105,7 +105,22 @@ export function mount({ page, reader }) {
 
   async function sendLocalOllama(content, context) {
     const url = $("ai-gateway").value.trim() || "http://localhost:11434/v1/chat/completions";
-    const model = $("ai-model").value.trim() || "qwen3:14b";
+    const model = $("ai-model").value.trim() || "qwen3:8b";
+    // A GET is used first so the UI can distinguish an unreachable Ollama
+    // process from a POST/CORS/preflight problem.
+    try {
+      const probe = await fetch(new URL("/api/tags", url).href, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+      });
+      if (!probe.ok) throw new Error(`Ollama probe HTTP ${probe.status}`);
+    } catch (error) {
+      if (error instanceof TypeError) {
+        throw new Error("Ollama est inaccessible depuis le navigateur. Vérifiez qu’Ollama tourne et que son CORS autorise https://alexdevanssay-cmyk.github.io.");
+      }
+      throw error;
+    }
     const system = `You are the local engineering AI for 3D Reader.
 Use only the supplied semantic and foundry context.
 Never invent dimensions, process parameters, material properties, defect probabilities, gates, risers or simulation results.
@@ -119,16 +134,24 @@ ${JSON.stringify(context)}`;
       { role: "system", content: system },
       ...messages.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content || "") })),
     ];
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({
-        model,
-        messages: localMessages,
-        stream: false,
-        response_format: { type: "json_object" },
-      }),
-    });
+    let response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: localMessages,
+          stream: false,
+          response_format: { type: "json_object" },
+        }),
+      });
+    } catch (error) {
+      if (error instanceof TypeError) {
+        throw new Error("Ollama répond au test local mais bloque la requête POST depuis cette page (CORS/preflight). Redémarrez complètement Ollama après avoir défini OLLAMA_ORIGINS.");
+      }
+      throw error;
+    }
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error?.message || `Ollama HTTP ${response.status}`);
     return data.choices?.[0]?.message?.content || "";
@@ -177,7 +200,7 @@ ${JSON.stringify(context)}`;
     const local = $("ai-provider").value === "openai_compatible";
     if (local) {
       $("ai-gateway").value = "http://localhost:11434/v1/chat/completions";
-      if (!$("ai-model").value || $("ai-model").value === "gpt-6-astra") $("ai-model").value = "qwen3:14b";
+      if (!$("ai-model").value || $("ai-model").value === "gpt-6-astra") $("ai-model").value = "qwen3:8b";
     } else {
       $("ai-gateway").value = new URL("/api/ai", location.origin).href;
       if (!$("ai-model").value || $("ai-model").value.startsWith("qwen3")) $("ai-model").value = "gpt-6-astra";
