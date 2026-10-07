@@ -5,6 +5,7 @@ import { engravingMask, thicknessHistogram, thicknessStats } from "./engine/thic
 import { summarize } from "./engine/summary.js";
 import { buildSemantic3D, SEMANTIC_VERSION } from "./engine/semantic.js";
 import { buildAIContext, AI_CONTEXT_VERSION } from "./engine/ai-context.js";
+import { mount as mountAIWorkspace } from "./ai-workspace.js";
 
 // ---------------------------------------------------------------- units
 
@@ -1875,6 +1876,7 @@ $("brand").addEventListener("click", resetTabs);
 
 // The costing pages (web/chiffrage/) are loaded the first time they are opened.
 let costingPages = null;
+let aiWorkspace = null;
 function showPage(name) {
   for (const tab of document.querySelectorAll(".tabs .tab")) {
     const on = tab.dataset.page === name;
@@ -1882,7 +1884,14 @@ function showPage(name) {
     tab.setAttribute("aria-selected", String(on));
   }
   $("page-viewer").hidden = name !== "viewer";
+  $("page-ia").hidden = name !== "ia";
   for (const page of ["chiffrage", "parametres"]) $(`page-${page}`).hidden = name !== page;
+  if (name === "ia") {
+    aiWorkspace ??= import("./ai-workspace.js").then((m) => m.mount({ page: $("page-ia"), reader: window.reader3d }));
+    aiWorkspace.then((ui) => ui.show?.()).catch((err) => showError(err.message || String(err)));
+    try { sessionStorage.setItem("reader3d.page", name); } catch {}
+    return;
+  }
   if (name !== "viewer") {
     costingPages ??= import("./chiffrage/ui.js").then((m) => {
       const ui = m.mount({ chiffrage: $("page-chiffrage"), parametres: $("page-parametres") });
@@ -2191,7 +2200,7 @@ setStatus("idle");
   } catch {
     // no storage
   }
-  if (page === "chiffrage" || page === "parametres") showPage(page);
+  if (page === "ia" || page === "chiffrage" || page === "parametres") showPage(page);
 }
 initEngines().then(() => {
   const url = params.get("url");
