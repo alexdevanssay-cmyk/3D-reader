@@ -271,6 +271,39 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.context().close();
   });
 
+  test('wall thickness of several bodies: the values are those of the bodies checked', { timeout: CAD_TIMEOUT }, async () => {
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.selectOption('#thick-method', 'wall');
+    await page.click('#thick-compute');
+    await page.waitForSelector('#thick-body:not([hidden])', { timeout: CAD_TIMEOUT });
+    const maxOf = async () => Number((await page.textContent('#thick-stats')).match(/maxi[^\d]*([\d,]+) mm/i)[1].replace(',', '.'));
+    // Both bodies (bracket 5 mm, pin 8 mm across): the thinnest is the bracket's, the thickest the pin's.
+    assert.equal(await page.textContent('#thick-min'), '5 mm');
+    const maxBoth = await maxOf();
+    const uncheck = async (name) => {
+      const index = await page.$$eval('#bodies tr', (trs, n) => trs.findIndex((tr) => tr.querySelector('.name')?.textContent === n), name);
+      await page.uncheck(`#bodies tr:nth-child(${index + 1}) input`);
+    };
+    // The pin alone: its own values.
+    await uncheck('Équerre');
+    assert.equal(await page.textContent('#thick-min'), '8 mm');
+    const maxPin = await maxOf();
+    assert.equal((await page.evaluate(() => window.reader3d.part().thickness)).min, 8);
+    // The bracket alone: its own values.
+    await page.check('#bodies-all');
+    await uncheck('Pin');
+    assert.equal(await page.textContent('#thick-min'), '5 mm');
+    const maxBracket = await maxOf();
+    // The thickest of the set is the thickest of its bodies; each body alone has its own.
+    approx(maxBoth, Math.max(maxPin, maxBracket), 0.01, 0, 'max of the set');
+    assert.notEqual(maxPin, maxBracket);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
   test('tabs: several parts open side by side, each with its own analysis', { timeout: CAD_TIMEOUT }, async () => {
     const { page, errors } = await newPage('fr-FR');
     await page.goto(base);
