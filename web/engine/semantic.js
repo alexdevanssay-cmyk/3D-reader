@@ -8,7 +8,7 @@
 export const SEMANTIC_VERSION = "1.0";
 
 const EPS = 1e-9;
-const FEATURE_SCHEMA_VERSION = "6.0";
+const FEATURE_SCHEMA_VERSION = "7.0";
 
 function finite(v) { return typeof v === "number" && Number.isFinite(v); }
 function dist(a, b) { const x=a[0]-b[0], y=a[1]-b[1], z=a[2]-b[2]; return Math.hypot(x,y,z); }
@@ -546,6 +546,34 @@ function featureCandidates(body, topo, stableRelations) {
   return out;
 }
 
+function normalizeFeatureEvidence(features) {
+  return features.map((feature, index) => {
+    const evidence = Array.isArray(feature.evidence) ? feature.evidence : [];
+    const needsConfirmation = feature.needs_topology_confirmation === true;
+    return {
+      ...feature,
+      feature_id: feature.feature_id ?? "feature-" + index,
+      status: needsConfirmation ? "provisional" : "evidenced",
+      evidence_count: evidence.length,
+      evidence_quality: evidence.length > 0 ? "linked_relation" : "analytic_or_metrology",
+    };
+  });
+}
+
+function semanticEvidenceQuality(relations, features) {
+  const relationCount = relations.length;
+  const featureCount = features.length;
+  const provisionalCount = features.filter(f => f.status === "provisional").length;
+  const linkedCount = features.filter(f => f.evidence_count > 0).length;
+  return {
+    relation_count: relationCount,
+    feature_count: featureCount,
+    provisional_feature_count: provisionalCount,
+    linked_feature_count: linkedCount,
+    confidence_policy: "geometric_evidence_does_not_prove_design_intent",
+  };
+}
+
 function semanticBody(body, index) {
   const topo=topology(body);
   const size=body.bbox?.size ?? [0,0,0];
@@ -571,10 +599,11 @@ function semanticBody(body, index) {
       analytic_surfaces:body.geometric_surfaces ?? [],
       principal_axes:principalAxes(body),
     },
-    features:featureCandidates(body,topo, surfaceRelations(body.geometric_surfaces ?? [])),
+    features:normalizeFeatureEvidence(featureCandidates(body,topo, surfaceRelations(body.geometric_surfaces ?? []))),
     relations:surfaceRelations(body.geometric_surfaces ?? []),
     quality:{
       closed:!!body.closed,
+      evidence:semanticEvidenceQuality(surfaceRelations(body.geometric_surfaces ?? []), normalizeFeatureEvidence(featureCandidates(body,topo, surfaceRelations(body.geometric_surfaces ?? [])))),
       notes:Array.isArray(body.notes)?body.notes:[],
     },
   };
