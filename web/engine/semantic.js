@@ -185,10 +185,56 @@ function repeatedCylinders(cylinders) {
   return groups;
 }
 
+function collinearCenters(cylinders) {
+  if (cylinders.length < 3) return false;
+  const p0=cylinders[0].center_mm, p1=cylinders[1].center_mm;
+  if (!Array.isArray(p0) || !Array.isArray(p1)) return false;
+  const base=[p1[0]-p0[0],p1[1]-p0[1],p1[2]-p0[2]];
+  const baseNorm=Math.hypot(...base);
+  if (baseNorm <= EPS) return false;
+  for (let i=2;i<cylinders.length;i++) {
+    const p=cylinders[i].center_mm;
+    if (!Array.isArray(p)) return false;
+    const v=[p[0]-p0[0],p[1]-p0[1],p[2]-p0[2]];
+    const cross=[
+      base[1]*v[2]-base[2]*v[1],
+      base[2]*v[0]-base[0]*v[2],
+      base[0]*v[1]-base[1]*v[0],
+    ];
+    if (Math.hypot(...cross) > 1e-5*Math.max(1,baseNorm,Math.hypot(...v))) return false;
+  }
+  const t=cylinders.map(c => {
+    const p=c.center_mm;
+    return ((p[0]-p0[0])*base[0]+(p[1]-p0[1])*base[1]+(p[2]-p0[2])*base[2])/(baseNorm*baseNorm);
+  }).sort((a,b)=>a-b);
+  const gaps=t.slice(1).map((v,i)=>v-t[i]);
+  const mean=gaps.reduce((a,b)=>a+b,0)/gaps.length;
+  return mean > EPS && gaps.every(g=>Math.abs(g-mean)<=1e-4*Math.max(1,Math.abs(mean)));
+}
+
+function circularCenters(cylinders) {
+  if (cylinders.length < 3) return false;
+  const axis=normalizeAxis(cylinders[0].axis);
+  if (!axis || !cylinders.every(c=>parallelAxes(axis,c.axis) && Array.isArray(c.center_mm))) return false;
+  const p0=cylinders[0].center_mm;
+  const pts=cylinders.map(c => c.center_mm);
+  const centroid=pts.reduce((o,p)=>o.map((v,i)=>v+p[i]/pts.length),[0,0,0]);
+  const radial=pts.map(p => {
+    const v=[p[0]-centroid[0],p[1]-centroid[1],p[2]-centroid[2]];
+    const axial=v[0]*axis[0]+v[1]*axis[1]+v[2]*axis[2];
+    return Math.hypot(v[0]-axial*axis[0],v[1]-axial*axis[1],v[2]-axial*axis[2]);
+  });
+  const r=radial.reduce((a,b)=>a+b,0)/radial.length;
+  if (r <= EPS || !radial.every(v=>Math.abs(v-r)<=1e-4*Math.max(1,r))) return false;
+  const axialSpread=pts.map(p=>(p[0]-p0[0])*axis[0]+(p[1]-p0[1])*axis[1]+(p[2]-p0[2])*axis[2]);
+  return Math.max(...axialSpread)-Math.min(...axialSpread) <= 1e-4*Math.max(1,r);
+}
+
 function surfaceRelations(surfaces) {
   const cylinders=surfaces.filter(x=>x.type==="cylinder" && finite(x.radius_mm));
   const cones=surfaces.filter(x=>x.type==="cone" && Array.isArray(x.axis) && Array.isArray(x.center_mm));
-  return cylindricalRelations(cylinders,cones,surfaces).map((r, i) => ({
+  const analytic=cylindricalRelations(cylinders,cones,surfaces);
+  return analytic.map((r, i) => ({
     ...r,
     relation_id:"relation-"+i,
     evidence:"analytic_surface_geometry",
@@ -196,7 +242,7 @@ function surfaceRelations(surfaces) {
   }));
 }
 
-function featureCandidates(body, topo) {
+function featureCandidates(body, topo, stableRelations) {
   const out=[];
   const s=body.bbox?.size ?? [0,0,0];
   const volume=body.volume;
@@ -219,7 +265,7 @@ function featureCandidates(body, topo) {
   const surfaces=body.geometric_surfaces ?? [];
   const cylinders=surfaces.filter(x=>x.type==="cylinder" && finite(x.radius_mm));
   const cones=surfaces.filter(x=>x.type==="cone" && Array.isArray(x.axis) && Array.isArray(x.center_mm));
-  const relations=cylindricalRelations(cylinders,cones,surfaces);
+  const relations=stableRelations ?? surfaceRelations(surfaces);
 
   for (const c of cylinders) {
     const axial = Math.max(...s);
@@ -300,15 +346,81 @@ function featureCandidates(body, topo) {
   }
   if (repeatedMembers.size >= 3) {
     const members=[...repeatedMembers.values()];
+    const subtype = collinearCenters(members)
+      ? "possible_linear_cylindrical_pattern"
+      : circularCenters(members)
+        ? "possible_circular_cylindrical_pattern"
+        : "possible_repeated_cylindrical_pattern";
     out.push({
       type:"pattern_feature_candidate",
-      subtype:"possible_repeated_cylindrical_pattern",
+      subtype,
       surfaces:members.map(x=>x.index),
       diameter_mm:2*members[0].radius_mm,
       axes:members.map(x=>x.axis ?? null),
       centers_mm:members.map(x=>x.center_mm ?? null),
-      confidence:0.78,
+      confidence:subtype==="possible_repeated_cylindrical_pattern" ? 0.78 : 0.84,
       method:"parallel_equal_radius_cylindrical_surface_repetition",
+      needs_topology_confirmation:true
+    });
+  }
+
+  // A planar face with several shared B-Rep edges to neighboring faces is a
+  // conservative recess/pocket signal. Concavity is intentionally not inferred
+  // from face orientation alone.
+  const adjacency=faceAdjacency(surfaces);
+  const adjacencyByFace=new Map();
+  for (const rel of adjacency) {
+    for (const face of rel.faces) {
+      const other=rel.faces[0]===face ? rel.faces[1] : rel.faces[0];
+      const list=adjacencyByFace.get(face) ?? [];
+      list.push({face:other,shared_edges:rel.shared_edges});
+      adjacencyByFace.set(face,list);
+    }
+  }
+  for (const floor of surfaces.filter(x=>x.type==="plane")) {
+    const neighbors=adjacencyByFace.get(floor.index) ?? [];
+    const wallSurfaces=neighbors
+      .map(x=>surfaces.find(s=>s.index===x.face))
+      .filter(Boolean)
+      .filter(x=>x.type==="plane" || x.type==="cylinder" || x.type==="cone" || x.type==="bspline" || x.type==="bezier");
+    if (wallSurfaces.length < 3) continue;
+    const relationIds=relations
+      .filter(r=>r.type==="cylindrical_boundary_planes" && (r.planes ?? []).includes(floor.index))
+      .map(r=>r.relation_id);
+    out.push({
+      type:"pocket_feature_candidate",
+      subtype:"possible_pocket_or_recess",
+      floor_surface:floor.index,
+      wall_surfaces:wallSurfaces.map(x=>x.index),
+      shared_brep_edges:neighbors.reduce((n,x)=>n+x.shared_edges,0),
+      evidence:relationIds.map(relation_id=>({source:"relation",relation_id})),
+      confidence:0.7,
+      method:"planar_floor_plus_multiple_shared_brep_neighbors",
+      needs_topology_confirmation:true
+    });
+  }
+
+  // A cylindrical face attached to planar faces may represent an external boss
+  // or an internal bore. Without a reliable inside/outside test, keep both
+  // interpretations explicit rather than misclassifying the feature.
+  for (const c of cylinders) {
+    const neighbors=adjacencyByFace.get(c.index) ?? [];
+    const planes=neighbors
+      .map(x=>surfaces.find(s=>s.index===x.face))
+      .filter(x=>x?.type==="plane");
+    if (!planes.length) continue;
+    const boundaryRelation=relations.find(r=>r.type==="cylindrical_boundary_planes" && r.surface===c.index);
+    out.push({
+      type:"boss_feature_candidate",
+      subtype:"possible_cylindrical_boss_or_bore",
+      surface_index:c.index,
+      support_or_termination_planes:planes.map(x=>x.index),
+      diameter_mm:2*c.radius_mm,
+      axis:c.axis ?? null,
+      center_mm:c.center_mm ?? null,
+      confidence:planes.length>=2 ? 0.72 : 0.64,
+      method:"cylindrical_face_plus_shared_brep_planar_boundaries",
+      evidence:boundaryRelation ? [{source:"relation",relation_id:boundaryRelation.relation_id}] : [],
       needs_topology_confirmation:true
     });
   }
@@ -408,7 +520,7 @@ function semanticBody(body, index) {
       analytic_surfaces:body.geometric_surfaces ?? [],
       principal_axes:principalAxes(body),
     },
-    features:featureCandidates(body,topo),
+    features:featureCandidates(body,topo, surfaceRelations(body.geometric_surfaces ?? [])),
     relations:surfaceRelations(body.geometric_surfaces ?? []),
     quality:{
       closed:!!body.closed,
