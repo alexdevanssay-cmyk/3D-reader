@@ -3,6 +3,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.js";
 import { engravingMask, thicknessHistogram, thicknessStats } from "./engine/thickness.js";
 import { summarize } from "./engine/summary.js";
+import { buildSemantic3D, SEMANTIC_VERSION } from "./engine/semantic.js";
 
 // ---------------------------------------------------------------- units
 
@@ -833,6 +834,8 @@ async function exportXlsx() {
   await withThickness();
   const { buildXlsx, STYLE } = await import("./xlsx.js");
   const data = exportableResult(r);
+  const semantic = buildSemantic3D(data);
+  $("reader3d-semantic-result").textContent = JSON.stringify(semantic).replace(/</g, "\\u003c");
   const s = data.summary;
   const pct = (v) => (v == null ? null : { value: v, style: STYLE.percent });
   const summary = [
@@ -2082,8 +2085,8 @@ async function openUrl(url) {
 // window.reader3d: for scripts and browser-driving AI agents.
 //   await reader3d.analyze(fileOrUrl) -> results (same JSON as the export)
 window.reader3d = {
-  version: 1,
-  get result() {
+  version: 1,\n  semanticVersion: SEMANTIC_VERSION,
+  get semantic() {\n    return state.result ? buildSemantic3D(exportableResult(state.result)) : null;\n  },\n  get result() {
     return state.result ? exportableResult(state.result) : null;
   },
   get status() {
