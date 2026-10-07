@@ -8,7 +8,7 @@
 export const SEMANTIC_VERSION = "1.0";
 
 const EPS = 1e-9;
-const FEATURE_SCHEMA_VERSION = "2.0";
+const FEATURE_SCHEMA_VERSION = "3.0";
 
 function finite(v) { return typeof v === "number" && Number.isFinite(v); }
 function dist(a, b) { const x=a[0]-b[0], y=a[1]-b[1], z=a[2]-b[2]; return Math.hypot(x,y,z); }
@@ -199,7 +199,18 @@ function featureCandidates(body, topo) {
   }
 
   for (const r of relations) {
-    if (r.type==="coaxial_cylinder_cone") {
+    if (r.type==="cylindrical_boundary_planes") {
+      out.push({
+        type:"cylindrical_boundary_relation",
+        surface_index:r.surface,
+        plane_indices:r.planes,
+        shared_edges:r.shared_edges,
+        confidence:r.confidence,
+        method:r.method,
+        interpretation:"cylindrical_face_shares_brep_edges_with_planar_faces",
+        needs_topology_confirmation:false
+      });
+    } else if (r.type==="coaxial_cylinder_cone") {
       out.push({
         type:"stepped_cylindrical_feature_candidate",
         subtype:"possible_countersink_or_taper_transition",
