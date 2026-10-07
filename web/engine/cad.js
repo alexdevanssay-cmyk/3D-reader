@@ -936,7 +936,7 @@ function openBody(ctx, name, shape, color) {
 }
 
 /** Body object of the result contract (same fields as Body.to_dict in model.py). */
-function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], centroid, closed, color, notes, tri }) {
+function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], centroid, closed, color, notes, tri, surface_types, geometric_surfaces }) {
   const mesh = { positions: new Float32Array(tri.verts), indices: tri.indices };
   // The display copy is float32. When that rounded the vertices, the double-precision
   // ones are kept for the oriented envelope (summary.js), which the Python engine
@@ -956,6 +956,8 @@ function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], 
     color: color ? [...color] : null,
     triangles: tri.triangles,
     notes,
+    surface_types: surface_types ?? null,
+    geometric_surfaces: geometric_surfaces ?? [],
     mesh,
   };
 }
