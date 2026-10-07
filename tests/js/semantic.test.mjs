@@ -177,8 +177,8 @@ test("feature schema advances with conservative blend/chamfer/pattern candidates
 
 test("semantic bodies expose analytic relations separately from inferred features", () => {
   const source = "web/engine/semantic.js";
-  assert.ok(source.includes("relations:cylindricalRelations("));
-  assert.ok(source.includes("features:featureCandidates(body,topo)"));
+  assert.ok(source.includes("relations:surfaceRelations("));
+  assert.ok(source.includes("features:featureCandidates(body,topo,"));
 });
 
 
