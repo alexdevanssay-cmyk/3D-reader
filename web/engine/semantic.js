@@ -75,8 +75,51 @@ function axisDistance(a, b) {
   return Math.hypot(d[0]-axial*aa[0],d[1]-axial*aa[1],d[2]-axial*aa[2]);
 }
 
-function cylindricalRelations(cylinders, cones) {
+function samePoint(a,b,tol=1e-6) {
+  return Array.isArray(a) && Array.isArray(b) && a.length===b.length && a.every((v,i)=>Math.abs(v-b[i])<=tol*Math.max(1,Math.abs(v),Math.abs(b[i])));
+}
+
+function edgeKey(edge) {
+  return Array.isArray(edge) && edge.length===6 ? edge.map(v=>Number(v).toPrecision(12)).join(",") : null;
+}
+
+function faceAdjacency(surfaces) {
+  const owners=new Map();
+  for (const face of surfaces) {
+    for (const edge of (face.edge_signatures ?? [])) {
+      const key=edgeKey(edge);
+      if (!key) continue;
+      const list=owners.get(key) ?? [];
+      list.push(face.index);
+      owners.set(key,list);
+    }
+  }
+  const pairs=new Map();
+  for (const list of owners.values()) {
+    const unique=[...new Set(list)];
+    if (unique.length<2) continue;
+    for(let i=0;i<unique.length;i++) for(let j=i+1;j<unique.length;j++) {
+      const k=unique[i]<unique[j] ? unique[i]+":"+unique[j] : unique[j]+":"+unique[i];
+      pairs.set(k,(pairs.get(k)||0)+1);
+    }
+  }
+  return [...pairs.entries()].map(([key,shared_edges])=>{
+    const [a,b]=key.split(":").map(Number);
+    return {faces:[a,b],shared_edges};
+  });
+}
+
+function cylindricalRelations(cylinders, cones, surfaces) {
   const relations=[];
+  const adjacency=faceAdjacency(surfaces);
+  const neighbors=new Map();
+  for(const rel of adjacency){
+    for(const [a,b] of [[rel.faces[0],rel.faces[1]],[rel.faces[1],rel.faces[0]]]){
+      const list=neighbors.get(a)??[];
+      list.push({face:b,shared_edges:rel.shared_edges});
+      neighbors.set(a,list);
+    }
+  }
   for (let i=0;i<cylinders.length;i++) {
     for (let j=i+1;j<cylinders.length;j++) {
       const a=cylinders[i], b=cylinders[j];
@@ -94,6 +137,17 @@ function cylindricalRelations(cylinders, cones) {
         diameter_mm:c.diameter_mm,
         cone_ref_radius_mm:cone.ref_radius_mm ?? null,
         confidence:0.9,
+      });
+    }
+    const adjacent_planes=(neighbors.get(c.index)??[]).map(x=>surfaces.find(f=>f.index===x.face)).filter(f=>f?.type==="plane");
+    if(adjacent_planes.length){
+      relations.push({
+        type:"cylindrical_boundary_planes",
+        surface:c.index,
+        planes:adjacent_planes.map(f=>f.index),
+        shared_edges:(neighbors.get(c.index)??[]).filter(x=>adjacent_planes.some(f=>f.index===x.face)).reduce((n,x)=>n+x.shared_edges,0),
+        confidence:0.88,
+        method:"shared_brep_edges"
       });
     }
   }
@@ -123,7 +177,7 @@ function featureCandidates(body, topo) {
   const surfaces=body.geometric_surfaces ?? [];
   const cylinders=surfaces.filter(x=>x.type==="cylinder" && finite(x.radius_mm));
   const cones=surfaces.filter(x=>x.type==="cone" && Array.isArray(x.axis) && Array.isArray(x.center_mm));
-  const relations=cylindricalRelations(cylinders,cones);
+  const relations=cylindricalRelations(cylinders,cones,surfaces);
 
   for (const c of cylinders) {
     const axial = Math.max(...s);
