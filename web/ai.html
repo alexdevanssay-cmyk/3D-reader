@@ -65,7 +65,7 @@ reader3d analyze part.step --json</pre>
   </table>
 
   <h2>3D Semantic JSON</h2>
-  <p>The AI-facing semantic contract is exposed in <code>#reader3d-semantic-result</code> and as <code>window.reader3d.semantic</code>.
+  <p><strong>V2 feature layer:</strong> CAD bodies may now expose analytic surfaces (cylinder radius/axis/centre, cone angle, sphere radius, torus radii) and conservative feature candidates such as <code>possible_hole_or_bore</code>. A candidate always carries a confidence, a detection method, and may require topology confirmation.</p>\n\n  <p>The AI-facing semantic contract is exposed in <code>#reader3d-semantic-result</code> and as <code>window.reader3d.semantic</code>.
   It is versioned independently from the raw measurement result: <code>schema = 3d-semantic-json</code>,
   <code>schema_version = 1.0</code>. It contains model/body metrology, topology, principal axes and conservative geometric feature candidates.
   Tessellation buffers are deliberately excluded from this payload.</p>
