@@ -28,8 +28,8 @@ export function mount({ page, reader }) {
           <span id="ai-status" class="muted small">Non connecté</span>
         </div>
         <div class="row" style="flex-wrap:wrap">
-          <label class="field">Gateway
-            <input id="ai-gateway" type="url" placeholder="https://votre-gateway.example/api/ai" style="min-width:360px">
+          <label class="field">OpenAI Responses Gateway
+            <input id="ai-gateway" type="url" placeholder="/api/ai" style="min-width:360px">
           </label>
           <label class="field">Provider
             <select id="ai-provider">${PROVIDERS.map(([v,l]) => `<option value="${v}">${l}</option>`).join("")}</select>
@@ -60,6 +60,7 @@ export function mount({ page, reader }) {
   const savedGateway = localStorage.getItem("reader3d.ai.gateway");
   const savedModel = localStorage.getItem("reader3d.ai.model");
   if (savedGateway) $("ai-gateway").value = savedGateway;
+  else $("ai-gateway").value = new URL("/api/ai", location.origin).href;
   if (savedModel) $("ai-model").value = savedModel;
   for (const message of messages) add(message.role, message.content);
 
@@ -101,7 +102,7 @@ export function mount({ page, reader }) {
   }
 
   async function send(content) {
-    const gatewayUrl = $("ai-gateway").value.trim();
+    const gatewayUrl = $("ai-gateway").value.trim() || new URL("/api/ai", location.origin).href;
     localStorage.setItem("reader3d.ai.gateway", gatewayUrl);
     localStorage.setItem("reader3d.ai.model", $("ai-model").value.trim());
     if (!gatewayUrl) throw new Error("Renseignez l'URL du AI Gateway.");
