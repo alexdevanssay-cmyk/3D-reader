@@ -47,7 +47,7 @@ test("builds the versioned semantic contract without changing the raw result", (
 
   assert.equal(result.schema, "3d-semantic-json");
   assert.equal(result.schema_version, "1.0");
-  assert.equal(result.feature_schema_version, "6.0");
+  assert.equal(result.feature_schema_version, "7.0");
   assert.equal(result.model.body_count, 1);
   assert.equal(result.bodies[0].metrics.volume_mm3, 1000);
   assert.deepEqual(result.bodies[0].topology, {
@@ -168,7 +168,7 @@ test("keeps feature intent provisional even when analytic evidence is strong", (
 
 test("feature schema advances with conservative blend/chamfer/pattern candidates", () => {
   const source = "web/engine/semantic.js";
-  assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "6.0"'));
+  assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "7.0"'));
   assert.ok(source.includes('type:"fillet_feature_candidate"'));
   assert.ok(source.includes('type:"chamfer_feature_candidate"'));
   assert.ok(source.includes('type:"pattern_feature_candidate"'));
@@ -293,4 +293,33 @@ test("emits provisional fillet and chamfer candidates from analytic adjacency", 
   const features=result.bodies[0].features;
   assert.ok(features.some(f=>f.type==="fillet_feature_candidate" && f.needs_topology_confirmation));
   assert.ok(features.some(f=>f.type==="chamfer_feature_candidate" && f.needs_topology_confirmation));
+});
+
+test("adds V4 evidence quality metadata and stable feature ids", () => {
+  const result = buildSemantic3D({
+    file: "evidence.step", kind: "cad", engine: "browser",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [body({
+      geometric_surfaces: [
+        { index: 0, type: "cylinder", radius_mm: 5, diameter_mm: 10, axis: [0,0,1], center_mm: [0,0,0],
+          edge_signatures: [[0,0,0,1,0,0],[0,0,0,0,1,0]], wire_count: 2, edge_count: 2 },
+        { index: 1, type: "plane", edge_signatures: [[0,0,0,1,0,0]] },
+        { index: 2, type: "plane", edge_signatures: [[0,0,0,0,1,0]] },
+      ],
+    })],
+  });
+  const bodyResult = result.bodies[0];
+  assert.ok(bodyResult.features.length > 0);
+  assert.ok(bodyResult.features.every(f => typeof f.feature_id === "string"));
+  assert.ok(bodyResult.features.every(f => ["evidenced", "provisional"].includes(f.status)));
+  assert.equal(bodyResult.quality.evidence.relation_count, bodyResult.relations.length);
+  assert.equal(bodyResult.quality.evidence.feature_count, bodyResult.features.length);
+  assert.equal(bodyResult.quality.evidence.confidence_policy,
+    "geometric_evidence_does_not_prove_design_intent");
+  assert.equal(bodyResult.quality.evidence.validation_error_count, 0);
+  assert.ok(bodyResult.features.every(f => /^feature-[0-9a-f]{8}$/.test(f.feature_id)));
+  assert.ok(bodyResult.features.every(f => Number.isFinite(f.confidence) && f.confidence >= 0 && f.confidence <= 1));
+  assert.ok(bodyResult.features.every(f => typeof f.method === "string" && f.method.length > 0));
+  assert.ok(bodyResult.features.every(f => f.status !== "provisional" || f.needs_topology_confirmation === true));
+  assert.ok(bodyResult.features.every(f => f.evidence_count === f.evidence.length));
 });
