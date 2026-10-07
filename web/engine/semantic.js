@@ -188,8 +188,9 @@ function repeatedCylinders(cylinders) {
 function surfaceRelations(surfaces) {
   const cylinders=surfaces.filter(x=>x.type==="cylinder" && finite(x.radius_mm));
   const cones=surfaces.filter(x=>x.type==="cone" && Array.isArray(x.axis) && Array.isArray(x.center_mm));
-  return cylindricalRelations(cylinders,cones,surfaces).map(r => ({
+  return cylindricalRelations(cylinders,cones,surfaces).map((r, i) => ({
     ...r,
+    relation_id:"relation-"+i,
     evidence:"analytic_surface_geometry",
     confirmed_by_shared_brep_edges: r.type==="cylindrical_boundary_planes"
   }));
@@ -283,9 +284,33 @@ function featureCandidates(body, topo) {
         cone_semi_angle_rad: cone.semi_angle_rad ?? null,
         confidence: coneAngle > 0 && coneAngle < Math.PI / 4 ? 0.82 : 0.68,
         method: "coaxial_cylinder_cone_analytic_surfaces",
+        evidence: [{source:"relation", relation_id:r.relation_id}],
         needs_topology_confirmation: true
       });
     }
+  }
+
+  // Promote repeated, parallel, equal-radius cylinders to a conservative
+  // pattern candidate. Do not infer linear/circular intent until the centers
+  // support a stronger pattern classification.
+  const repeated = repeatedCylinders(cylinders);
+  const repeatedMembers = new Map();
+  for (const pair of repeated) {
+    for (const cylinder of pair) repeatedMembers.set(cylinder.index, cylinder);
+  }
+  if (repeatedMembers.size >= 3) {
+    const members=[...repeatedMembers.values()];
+    out.push({
+      type:"pattern_feature_candidate",
+      subtype:"possible_repeated_cylindrical_pattern",
+      surfaces:members.map(x=>x.index),
+      diameter_mm:2*members[0].radius_mm,
+      axes:members.map(x=>x.axis ?? null),
+      centers_mm:members.map(x=>x.center_mm ?? null),
+      confidence:0.78,
+      method:"parallel_equal_radius_cylindrical_surface_repetition",
+      needs_topology_confirmation:true
+    });
   }
 
   // Promote coaxial cylinders to a pattern/step relation while retaining the
@@ -307,6 +332,7 @@ function featureCandidates(body, topo) {
       radii_mm: r.radii_mm ?? [a.radius_mm, b.radius_mm],
       confidence: r.type === "coaxial_cylinders" ? 0.88 : 0.9,
       method: "coaxial_analytic_surface_relation",
+      evidence: [{source:"relation", relation_id:r.relation_id}],
       needs_topology_confirmation: true
     });
   }
@@ -320,6 +346,7 @@ function featureCandidates(body, topo) {
         shared_edges:r.shared_edges,
         confidence:r.confidence,
         method:r.method,
+        evidence:[{source:"relation", relation_id:r.relation_id}],
         interpretation:"cylindrical_face_shares_brep_edges_with_planar_faces",
         needs_topology_confirmation:false
       });
