@@ -745,6 +745,7 @@ function solidBody(ctx, name, solid, color, notes) {
   let volume = 0;
   let centroid = null;
   let surfaceArea = 0;
+  const surfaceTypes = { plane: 0, cylinder: 0, cone: 0, sphere: 0, torus: 0, bspline: 0, bezier: 0, other: 0 };
   try {
     const faces = Math.max(1, countChildren(ctx, solid, TopAbs_FACE));
     let done = 0;
@@ -771,7 +772,7 @@ function solidBody(ctx, name, solid, color, notes) {
             bf.delete();
           }
         }
-        surfaceArea += area(ctx, face);
+        surfaceArea += area(ctx, face);\n        countSurfaceType(oc, face, surfaceTypes);
       } finally {
         release(oc, face);
       }
@@ -798,12 +799,7 @@ function solidBody(ctx, name, solid, color, notes) {
     centroid,
     closed: true,
     color,
-    notes,
-    tri,
-  });
-}
-
-/** A plane, cylinder, cone or sphere (see GPROP_EPS). */
+    notes,\n    surface_types: surfaceTypes,\n    tri,\n  });\n}\n\n/** Count OpenCascade surface classes for the semantic layer. */\nfunction countSurfaceType(oc, face, counts) {\n  const surface = new oc.BRepAdaptor_Surface_2(face, true);\n  try {\n    const T = oc.GeomAbs_SurfaceType;\n    switch (surface.GetType()) {\n      case T.GeomAbs_Plane: counts.plane++; break;\n      case T.GeomAbs_Cylinder: counts.cylinder++; break;\n      case T.GeomAbs_Cone: counts.cone++; break;\n      case T.GeomAbs_Sphere: counts.sphere++; break;\n      case T.GeomAbs_Torus: counts.torus++; break;\n      case T.GeomAbs_BSplineSurface: counts.bspline++; break;\n      case T.GeomAbs_BezierSurface: counts.bezier++; break;\n      default: counts.other++;\n    }\n  } finally {\n    surface.delete();\n  }\n}\n\n/** A plane, cylinder, cone or sphere (see GPROP_EPS). */
 function analyticFace(oc, face) {
   const { GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Sphere } = oc.GeomAbs_SurfaceType;
   const surface = new oc.BRepAdaptor_Surface_2(face, true);
