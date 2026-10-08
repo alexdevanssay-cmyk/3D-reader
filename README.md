@@ -48,7 +48,10 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   the AI of the page *IA / analyse* (the gateway, or a local Ollama), from the geometry,
   the formula, the trend and the similar parts of the history: a proposal, shown with
   its breakdown and range, used in the quote only when the user clicks « Utiliser cette
-  valeur » (then traced as « estimation IA validée »).
+  valeur » (then traced as « estimation IA validée »). « Banc d'essai IA » backtests that
+  estimate on the history (each record left out of its own similar parts) against the
+  formula: mean errors by island and source, paced for the free quota of the gateway,
+  resumable, exported as CSV.
 - Export of the results to **Excel** (.xlsx, one value per cell: a row per body, a
   column per quantity, plus a summary sheet), CSV (`;` and decimal comma in French)
   and JSON.

@@ -328,6 +328,9 @@ table.bodies .open { color: var(--warn); }
 .ccycle-compare { margin: 4px 0; padding-left: 18px; }
 .ccycle-compare li, .ccycle-ia ul li { margin: 2px 0; }
 .ccycle-ia ul { padding-left: 18px; }
+/* Chiffrage: the backtest of the AI on the history of cycle times (backtest.js). */
+.cbacktest-reading { margin: 8px 0; font-size: 13px; }
+.cbacktest-error { color: var(--error-text); }
 /* "Fermer le corps" under an open body of the bodies table. */
 .close-row td { padding-top: 0; border-top: 0; }
 .close-row .close-body { font-size: 12px; color: var(--accent); }

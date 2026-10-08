@@ -11,8 +11,9 @@ import { filledFields, orderValues, programmeFor, programmeOf, readSeriesOrder }
 import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, demandeComparee, label as traceLabel, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
 import { compareCycles, countHistory, exportHistory, importHistory, mergeHistory, productionRecord } from "./history.js";
 import {
-  SIMILAR, adoptEstimate, adoptedEstimate, anonymiseCycleData, cycleData, cycleNumbers, cycleQuestion, cycleText, fitCycleData, forgetAdoption, localCycleRules, readCycleAnswer, undoAdoption,
+  SIMILAR, adoptEstimate, adoptedEstimate, anonymiseCycleData, cycleData, cycleNumbers, cycleQuestion, cycleText, fitCycleData, forgetAdoption, localCycleRules, readCycleAnswer, recordCycleData, undoAdoption,
 } from "./ai-cycle.js";
+import { DEFAULT_INTERVAL_S, backtestCsv, backtestItems, backtestReading, backtestRows, fingerprint, leaveOneOut, runBacktest, summarizeBacktest } from "./backtest.js";
 import { askJSON, numbersLabel, savedAI } from "../ai-workspace.js";
 import * as store from "./store.js";
 
@@ -396,6 +397,19 @@ async function onClick(event) {
     render();
   } else if (action === "undo-cycle") {
     undoCycle();
+    render();
+  } else if (action === "backtest") {
+    startBacktest();
+  } else if (action === "cancel-backtest") {
+    backtestJob?.controller.abort();
+  } else if (action === "export-backtest") {
+    const rows = backtestRows(backtestItems(store.loadHistorique()), store.loadBancEssai().resultats, settings);
+    // The BOM makes spreadsheet software read the references as UTF-8.
+    download("banc_essai_ia.csv", new Blob([`\ufeff${backtestCsv(rows)}`], { type: "text/csv;charset=utf-8" }));
+  } else if (action === "clear-backtest") {
+    if (backtestJob || !confirm("Effacer les résultats du banc d'essai IA ?\n\nIls ne sont gardés que dans ce navigateur : exportez-les d'abord (CSV) pour les conserver. L'historique, le chiffrage et les paramètres ne changent pas.")) return;
+    store.saveBancEssai(null);
+    message = { kind: "ok", text: "Résultats du banc d'essai IA effacés." };
     render();
   } else if (action === "export-historique") {
     download("historique_cycles.json", new Blob([JSON.stringify(exportHistory(store.loadHistorique()), null, 2)], { type: "application/json" }));
@@ -1533,7 +1547,7 @@ function cycleButton(r) {
   const n = store.loadHistorique().length;
   const sent = Math.min(n, SIMILAR);
   return `<div class="crow ccycle-ask">
-      <button type="button" class="small" data-action="estimate-cycle"${cycleJob ? " disabled" : ""}>Estimer le temps de cycle avec l'IA</button>
+      <button type="button" class="small" data-action="estimate-cycle"${cycleJob || backtestJob ? " disabled" : ""}>Estimer le temps de cycle avec l'IA</button>
       ${busy ? `<span id="ccycle-status" class="small muted" role="status">Estimation en cours…</span> <button type="button" class="small" data-action="cancel-cycle">Annuler</button>` : ""}
       <label class="check small"><input type="checkbox" data-pref="cycle-similar"${sendSimilar() ? " checked" : ""}> Envoyer les pièces similaires de l'historique</label>
     </div>
@@ -1549,7 +1563,7 @@ function cycleButton(r) {
  * valeur".
  */
 async function estimateCycle() {
-  if (cycleJob) return;
+  if (cycleJob || backtestJob) return;
   const c = compute();
   const r = c?.results.find((x) => x.piece.key === c.selected);
   if (!r?.route) return;
@@ -1886,10 +1900,191 @@ function comparisonHtml(pieces) {
     <p class="small muted">Formule : temps de cycle de coulée = base + coef × (kg coulés par cycle)^exposant + s/mm² × module², recalculé avec les coefficients actuels de Paramètres, et pour chaque pièce son poids, son module, sa mise au mille et ses pièces par cycle enregistrés (ceux estimés pour l'îlot quand ils manquent ; module inconnu : 0).${trend ? " Tendance : la même formule avec les coefficients du fichier de tendances, pour les îlots qu'il donne." : ""} Écart = (estimation − réel) / réel ; écart moyen = moyenne des écarts en valeur absolue. Rien n'est appliqué au chiffrage ni aux paramètres.</p>`;
 }
 
+// --------------------------------------------------------------------------- backtest of the AI on the history
+
+let backtestJob = null; // the run in progress: {controller, done, total, ref (of the record asked), waitUntil (ms) | null, start}
+
+/** Seconds as a French wait: "12 s", "3 min", "2 h 5 min". */
+function waitLabel(seconds) {
+  const s = Math.max(1, Math.ceil(seconds));
+  if (s < 90) return `${s} s`;
+  const m = Math.round(s / 60);
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ""}`;
+}
+
+/** Where the run is: the record asked, or the wait before the next request. */
+function backtestStatus(job) {
+  const at = `Pièce ${Math.min(job.done + 1, job.total)} sur ${job.total}${job.ref ? ` (${job.ref})` : ""}`;
+  return job.waitUntil
+    ? `${at} : prochaine demande dans ${waitLabel((job.waitUntil - Date.now()) / 1000)}, au rythme du quota en ligne…`
+    : `${at} : estimation en cours… ${Math.round((Date.now() - job.start) / 1000)} s`;
+}
+
+function showBacktestStatus() {
+  const status = el?.chiffrage.querySelector("#cbacktest-status");
+  if (status && backtestJob) status.textContent = backtestStatus(backtestJob);
+}
+
+/** The card of the history drawn again alone (a result of the backtest): what is being typed in the other cards is kept. */
+function refreshHistory() {
+  const card = el?.chiffrage.querySelector("#chistorique");
+  if (pointerDown) pending = true;
+  else if (card && page === "chiffrage") card.outerHTML = historyCard();
+}
+
+/**
+ * One record of the backtest asked of the AI of the IA page (ai-workspace.js
+ * askJSON, never its local fallback: all the answers of a run from the same
+ * AI): its data (ai-cycle.js recordCycleData) with the similar parts of the
+ * history without it (backtest.js leaveOneOut), anonymised for the gateway as
+ * the estimate of a piece. Resolves to {result (kept with the backtest:
+ * estimate, range, confidence; or why the answer could not be used), quota, usage}.
+ */
+async function estimateRecord(item, signal) {
+  const x = item.record;
+  const data = recordCycleData(x, { settings, history: sendSimilar() ? leaveOneOut(store.loadHistorique(), x) : [], trend: trendSettings() });
+  const question = cycleQuestion(data);
+  const answer = await askJSON("cycle_time", ({ budget, local, anonymize, model }) => {
+    const anonymous = anonymize ? anonymiseCycleData(data, { file: x.fichier_3d ?? null }) : null;
+    return {
+      context: fitCycleData(anonymous ? anonymous.data : data, budget),
+      question: anonymous ? anonymous.text(question) : question,
+      ...(local ? { system: localCycleRules(model) } : {}),
+    };
+  }, { signal, fallback: false });
+  const sent = answer.sent.context;
+  const result = { empreinte: fingerprint(x), date: new Date().toISOString(), fournisseur: answer.provider ?? null, modele: answer.model ?? null, similaires: sent.pieces_similaires?.length ?? 0 };
+  try {
+    const e = readCycleAnswer(answer.output, sent);
+    Object.assign(result, { estimation_s: e.estimation_s, fourchette_s: e.fourchette_s, confiance: e.confiance });
+  } catch (err) {
+    result.erreur = err.message;
+  }
+  return { result, quota: answer.quota, usage: answer.usage };
+}
+
+/**
+ * "Banc d'essai IA": the records of the history with a weight and a modulus
+ * not estimated yet, one after another (backtest.js runBacktest), each result
+ * kept in this browser as it comes; stopped on a refusal for quota or an
+ * error, resumed where it stopped.
+ */
+async function startBacktest() {
+  if (backtestJob || cycleJob) return;
+  const items = backtestItems(store.loadHistorique());
+  if (!items.length) return;
+  const banc = store.loadBancEssai();
+  const job = { controller: new AbortController(), done: 0, total: items.length, ref: null, waitUntil: null, start: Date.now() };
+  backtestJob = job;
+  Object.assign(banc, { arret: null, enCours: true });
+  store.saveBancEssai(banc);
+  const timer = setInterval(showBacktestStatus, 1000);
+  render();
+  let outcome;
+  try {
+    outcome = await runBacktest(items, {
+      results: banc.resultats,
+      local: savedAI().provider === "ollama",
+      notBefore: banc.prochaine,
+      signal: job.controller.signal,
+      estimate: estimateRecord,
+      onResult: (item, result) => {
+        banc.resultats[item.key] = result;
+        store.saveBancEssai(banc);
+        refreshHistory();
+      },
+      onProgress: ({ done, total, item, waitUntil }) => {
+        Object.assign(job, { done, total, ref: item.record.ref ?? null, waitUntil, start: Date.now() });
+        // The pace kept: a run resumed after a reload waits as this one would have.
+        if (waitUntil) store.saveBancEssai(Object.assign(banc, { prochaine: waitUntil }));
+        showBacktestStatus();
+      },
+    });
+  } catch (err) {
+    outcome = { status: "error", message: err?.message || String(err), retryAfter: null, next: banc.prochaine };
+  } finally {
+    clearInterval(timer);
+    backtestJob = null;
+  }
+  banc.prochaine = outcome.next;
+  banc.enCours = false;
+  banc.arret = outcome.status === "done" ? null : { statut: outcome.status, message: outcome.message, date: new Date().toISOString(), reprise: outcome.retryAfter !== null ? outcome.next : null };
+  store.saveBancEssai(banc);
+  render();
+}
+
+/** Why the last run stopped (statut "interrompu": the page was closed during it), and what "Reprendre" does. */
+function stopText(arret, left) {
+  const resume = `« Reprendre » continue avec ${left > 1 ? `les ${left} pièces restantes` : "la pièce restante"}`;
+  if (arret.statut === "cancelled") return `Banc d'essai annulé : les résultats obtenus sont gardés. ${resume}.`;
+  if (arret.statut === "interrompu") return `Banc d'essai interrompu : la page a été fermée ou rechargée pendant la série ; les résultats obtenus sont gardés. ${resume}.`;
+  const when = arret.reprise > Date.now() ? `, pas avant ${new Date(arret.reprise).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })} (le délai du quota)` : "";
+  if (arret.statut === "quota") return `Banc d'essai arrêté par le quota en ligne : ${arret.message} ${resume}${when}.`;
+  return `Banc d'essai arrêté : ${arret.message} ${resume}, en commençant par la pièce de l'erreur.`;
+}
+
+/**
+ * The part "Banc d'essai IA" of the card of the history: the run (progress,
+ * cancel, resume), the table of each record with its time, the formula and
+ * the estimate of the AI, the mean errors by island and source, the result in
+ * plain French, the CSV export.
+ */
+function backtestHtml(pieces) {
+  const items = backtestItems(pieces);
+  const banc = store.loadBancEssai();
+  const rows = backtestRows(items, banc.resultats, settings);
+  const s = summarizeBacktest(rows);
+  const job = backtestJob;
+  const left = rows.filter((x) => !x.resultat).length;
+  const any = rows.some((x) => x.resultat);
+  const local = savedAI().provider === "ollama";
+  const arret = banc.arret ?? (banc.enCours ? { statut: "interrompu" } : null);
+  const stop = job || !left || !arret ? "" : stopText(arret, left);
+  const label = job ? "Banc d'essai IA en cours" : !any ? "Banc d'essai IA" : left ? `Reprendre le banc d'essai IA (${plural(left, "pièce")} à estimer)` : "Banc d'essai IA terminé";
+  const ia = (x) => {
+    if (x.ia) return `${sec(x.ia.valeur)} <small class="muted">(${nf(x.ia.min, 0)}–${nf(x.ia.max, 0)})</small>`;
+    if (x.resultat?.erreur) return `<span class="cbacktest-error" title="${esc(x.resultat.erreur)}">réponse inutilisable</span>`;
+    return `<span class="muted">${job ? "à estimer" : "—"}</span>`;
+  };
+  const table = any || job ? `<div class="cscroll"><table class="ctable compact cbacktest">
+      <thead><tr><th>Pièce</th><th>Îlot</th><th>Source</th><th class="num">Temps de référence</th><th class="num">Formule</th><th class="num">Écart</th><th class="num">IA (fourchette)</th><th class="num">Écart</th><th>Dans la fourchette</th></tr></thead>
+      <tbody>${rows.map((x) => `<tr><td>${esc(x.record.ref ?? "—")}</td><td>${esc(x.record.ilot)}</td><td>${esc(x.record.source)}</td><td class="num">${sec(x.reference)}</td><td class="num">${x.formule ? sec(x.formule.valeur) : "—"}</td><td class="num">${x.formule ? signedPct(x.formule.ecart) : "—"}</td><td class="num">${ia(x)}</td><td class="num">${x.ia ? signedPct(x.ia.ecart) : "—"}</td><td>${x.ia ? (x.ia.dedans ? "oui" : "non") : "—"}</td></tr>`).join("")}</tbody></table></div>` : "";
+  const group = (name, x) => `<tr${name === "Toutes les pièces" ? ' class="total"' : ""}><td>${name}</td><td class="num">${x.n}</td><td class="num">${x.formule ? pct(x.formule.emap) : "—"}</td><td class="num">${pct(x.ia.emap)}</td><td class="num">${x.dedans} sur ${x.n}</td></tr>`;
+  const summary = s.total.n ? `<div class="cscroll"><table class="ctable compact cbacktest-summary">
+      <thead><tr><th>Pièces estimées</th><th class="num">Nombre</th><th class="num">Écart moyen : formule</th><th class="num">Écart moyen : IA</th><th class="num">Dans la fourchette IA</th></tr></thead>
+      <tbody>${[
+        ...s.ilots.map((x) => group(`Îlot <strong>${esc(x.ilot)}</strong>`, x)),
+        ...s.sources.map((x) => group(x.source === "devis" ? "Temps de devis" : "Temps mesurés en production", x)),
+        group("Toutes les pièces", s.total),
+      ].join("")}</tbody></table></div>` : "";
+  const reading = backtestReading(s);
+  // The AIs that gave the results (the AI of the IA page may have changed between two runs).
+  const ais = new Map();
+  for (const x of rows) {
+    const name = x.resultat && [x.resultat.fournisseur, x.resultat.modele].filter(Boolean).join(" · ");
+    if (name) ais.set(name, (ais.get(name) ?? 0) + 1);
+  }
+  return `<h4>Banc d'essai IA</h4>
+    <div class="crow cbacktest-ask">
+      <button type="button" class="small" data-action="backtest"${job || cycleJob || !left ? " disabled" : ""}>${label}</button>
+      ${job ? `<span id="cbacktest-status" class="small muted" role="status">${esc(backtestStatus(job))}</span> <button type="button" class="small" data-action="cancel-backtest">Annuler</button>` : ""}
+      <button type="button" class="small" data-action="export-backtest"${any ? "" : " disabled"}>Exporter les résultats (CSV)</button>
+      <button type="button" class="small" data-action="clear-backtest"${any && !job ? "" : " disabled"}>Effacer les résultats…</button>
+    </div>
+    ${stop ? `<p class="cmsg warn">${esc(stop)}</p>` : ""}
+    ${table}
+    ${summary}
+    ${reading && any ? `<p class="cbacktest-reading">${esc(reading)}</p>` : ""}
+    ${ais.size ? `<p class="small">Réponses de : ${[...ais].map(([name, n]) => `${esc(name)} (${plural(n, "pièce")})`).join(", ")}.</p>` : ""}
+    <p class="small muted">Pour chaque enregistrement qui a un poids et un module (${plural(items.length, "pièce")} sur ${pieces.length}) : la formule de l'îlot avec les coefficients actuels de Paramètres, et l'estimation de l'IA de la page IA / analyse (${aiChoice()}), demandée comme avec « Estimer le temps de cycle avec l'IA » mais sans l'enregistrement : ni son temps, ni lui ou un autre de même référence parmi les pièces semblables${sendSimilar() ? "" : " (case « Envoyer les pièces similaires de l'historique » décochée : aucune n'est envoyée)"}. Écart = (estimation − temps de référence) / temps de référence ; écart moyen = moyenne des écarts en valeur absolue, sur les pièces que l'IA a estimées. ${local
+      ? "Ollama local : aucun quota, mais plus lent — de quelques secondes à quelques minutes par pièce selon le PC."
+      : `Une demande à la fois, une toutes les ${DEFAULT_INTERVAL_S} s puis au rythme que permet le quota renvoyé par la passerelle (offre gratuite de Groq : 30 requêtes et 8 000 tokens par minute), sans repli sur le modèle local. Un refus pour quota arrête la série : « Reprendre » la continue où elle s'est arrêtée.`} Résultats gardés dans ce navigateur, même après un rechargement ; rien n'est appliqué au chiffrage ni aux paramètres.</p>`;
+}
+
 /**
  * Card "Historique des temps de cycle": the records kept in this browser by
- * source and island, their import, export and erasing, and the real times
- * measured in production against the estimates.
+ * source and island, their import, export and erasing, the real times
+ * measured in production against the estimates, and the backtest of the AI.
  */
 function historyCard() {
   const pieces = store.loadHistorique();
@@ -1905,6 +2100,7 @@ function historyCard() {
       <thead><tr><th>Îlot</th><th class="num">Devis</th><th class="num">Production</th></tr></thead>
       <tbody>${n.ilots.map((x) => `<tr><td><strong>${esc(x.ilot)}</strong>${settings.processes[x.ilot] ? ` ${esc(settings.processes[x.ilot].famille)}` : ""}</td><td class="num">${x.devis}</td><td class="num">${x.production}</td></tr>`).join("")}</tbody></table></div>` : ""}
     ${comparisonHtml(pieces)}
+    ${backtestHtml(pieces)}
     <p class="small muted">Fichier JSON « reader3d-historique-cycles », version 1 : temps de cycle de devis passés (source « devis ») et temps mesurés en production (source « production »). Un enregistrement de même référence et même source remplace le précédent. L'historique est gardé dans ce navigateur, jamais envoyé ; l'export reprend tout, temps mesurés compris. Données confidentielles : ne pas publier.</p>
   </section>`;
 }

@@ -1,8 +1,9 @@
 // What the costing pages keep in this browser (localStorage): the data read
 // from the costing workbook and from the metal prices file, the settings
 // (TRS, islands, methods...), the inputs of the current quote and the history
-// of cycle times (history.js). Saved at every change, so they are back when
-// the page is opened again. Nothing is sent anywhere.
+// of cycle times (history.js) and the results of the backtest of the AI on it
+// (backtest.js). Saved at every change, so they are back when the page is
+// opened again. Nothing is sent anywhere.
 //
 // The settings are layers, resolved value by value at each loading (so a
 // re-imported workbook or a new trends file is taken into account):
@@ -33,6 +34,7 @@ const KEYS = {
   tendances: "reader3d.chiffrage.tendances.v1", // {fileName, importedAt, values, completed: [path]}
   quote: "reader3d.chiffrage.quote.v1",
   historique: "reader3d.chiffrage.historique.v1", // {pieces: [record]}: cycle times of past quotes and of production (history.js)
+  bancEssai: "reader3d.chiffrage.banc-essai-ia.v1", // {resultats: {key: result}, prochaine, arret, enCours}: backtest of the AI (backtest.js)
 };
 
 // Densities of the alloys (g/cm³), to get the weight of the part from its volume.
@@ -83,6 +85,18 @@ export function loadHistorique() {
 }
 /** The history of cycle times replaced by the records `pieces` (none: erased); false when kept for this visit only. */
 export const saveHistorique = (pieces) => write(KEYS.historique, pieces?.length ? { pieces } : null);
+
+/**
+ * The backtest of the AI on the history (backtest.js, ui.js): {resultats: {key:
+ * result}, prochaine (ms: the earliest next request), arret (why the last run
+ * stopped) | null, enCours (a run started and not ended: the page was closed)}.
+ */
+export function loadBancEssai() {
+  const b = read(KEYS.bancEssai);
+  return { resultats: b?.resultats && typeof b.resultats === "object" ? b.resultats : {}, prochaine: Number.isFinite(b?.prochaine) ? b.prochaine : 0, arret: b?.arret ?? null, enCours: !!b?.enCours };
+}
+/** The backtest replaced by `banc` (null: erased); false when kept for this visit only. */
+export const saveBancEssai = (banc) => write(KEYS.bancEssai, banc);
 
 // --------------------------------------------------------------------------- settings: the layers
 

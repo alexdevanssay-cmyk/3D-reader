@@ -6,11 +6,12 @@
 // numbers of the answer that come from none of these data. A proposal: the
 // quote uses it only once a person adopts it ("Utiliser cette valeur",
 // ui.js), as a cycle typed in, traced "estimation IA validée" (provenance.js).
-// Pure functions, no DOM.
+// The same data for a record of the history, to backtest the AI on it
+// (recordCycleData, backtest.js). Pure functions, no DOM.
 
 import { anonymizer, checkContextNumbers } from "../engine/ai-context.js";
-import { similarParts } from "./history.js";
-import { castingCycle } from "./routes.js";
+import { formulaCycle, similarParts } from "./history.js";
+import { castingCycle, estimateMiseAuMille, piecesPerCycle } from "./routes.js";
 
 // The schema of the answer: the same as the gateway's (api/ai.js CYCLE_SCHEMA).
 export const CYCLE_SCHEMA = {
@@ -108,26 +109,90 @@ export function cycleData(r, { settings, history = [], trend = null, serie = nul
       kg_coules_par_cycle: round(kgFormula),
     },
     ...(trendCycle !== null && Number.isFinite(trendCycle) ? { tendance: { valeur_s: round(trendCycle), ecart_formule_pct: trendCycle ? round(((e.cycle - trendCycle) / trendCycle) * 100) : null } } : {}),
-    ...(similar.length ? {
-      pieces_similaires: similar.map(({ record: x, score, reason }, i) => known({
-        ref: x.ref ?? `sans référence ${i + 1}`,
-        ilot: x.ilot,
-        source: x.source,
-        temps_cycle_s: round(x.temps_cycle_s),
-        pieces_par_cycle: x.pieces_par_cycle,
-        poids_kg: round(x.poids_kg),
-        module_mm: positive(x.module_mm),
-        noyaux: typeof x.noyaux === "boolean" ? x.noyaux : null,
-        mise_au_mille: positive(x.mise_au_mille),
-        score: Math.round(score * 100) / 100,
-        raison: reason,
-      })),
+    ...(similar.length ? { pieces_similaires: similarData(similar) } : {}),
+  };
+}
+
+/** The similar parts (history.js:similarParts) as they are sent: their time and source, never their 3D file. */
+const similarData = (similar) => similar.map(({ record: x, score, reason }, i) => known({
+  ref: x.ref ?? `sans référence ${i + 1}`,
+  ilot: x.ilot,
+  source: x.source,
+  temps_cycle_s: round(x.temps_cycle_s),
+  pieces_par_cycle: x.pieces_par_cycle,
+  poids_kg: round(x.poids_kg),
+  module_mm: positive(x.module_mm),
+  noyaux: typeof x.noyaux === "boolean" ? x.noyaux : null,
+  mise_au_mille: positive(x.mise_au_mille),
+  score: Math.round(score * 100) / 100,
+  raison: reason,
+}));
+
+/**
+ * The data of a record of the history `x` (history.js) for the same estimate,
+ * as cycleData gives them for a piece of the quote: for the backtest of the AI
+ * (backtest.js). Its own time is never sent (no cycle of the quote); its
+ * mise au mille and pieces per cycle, else the island's estimates of them, as
+ * history.js:formulaCycle. `history`: the records it may be compared with,
+ * without itself (backtest.js leaveOneOut). The formula and its terms only
+ * when the island is in the settings.
+ *   opts: {settings (effective), history, trend, k}
+ */
+export function recordCycleData(x, { settings, history = [], trend = null, k = SIMILAR } = {}) {
+  const code = x.ilot;
+  const p = settings.processes?.[code];
+  const module = x.module_mm > 0 ? x.module_mm : 0;
+  const miseAuMille = x.mise_au_mille ?? (p ? estimateMiseAuMille(p, { poids: x.poids_kg, toileMini: x.toile_mini_mm ?? 0, epaisseurMax: x.epaisseur_max_mm ?? 0 }).value : null);
+  const parCycle = x.pieces_par_cycle ?? (p && miseAuMille ? piecesPerCycle(p, x.poids_kg * miseAuMille) : null);
+  const formula = p?.cycle ? formulaCycle(x, settings) : null;
+  const kgCycle = miseAuMille && parCycle ? x.poids_kg * miseAuMille * parCycle : null;
+  const trendCycle = trend?.processes?.[code]?.cycle ? formulaCycle(x, trend) : null;
+  const similar = history.length ? similarParts(history, { ilot: code, poids_kg: x.poids_kg, module_mm: module || null, noyaux: x.noyaux }, { k }) : [];
+  const box = Array.isArray(x.encombrement_mm) && x.encombrement_mm.length === 3 ? x.encombrement_mm : null;
+  return {
+    schema: "3d-reader-cycle-time",
+    schema_version: "1.0",
+    lecture_seule: true,
+    note: "Données d'une pièce de l'historique pour estimer son temps de cycle de coulée. Temps en secondes par cycle de l'îlot (toutes les pièces de la grappe).",
+    piece: known({
+      nom: x.ref ?? "Pièce",
+      poids_kg: round(x.poids_kg),
+      poids_source: "historique",
+      module_mm: positive(module),
+      toile_mini_mm: positive(x.toile_mini_mm),
+      epaisseur_max_mm: positive(x.epaisseur_max_mm),
+      plus_grande_dimension_mm: box ? round(Math.max(...box)) : null,
+      encombrement_mm: box ? box.map(round) : null,
+      volume_cm3: positive(x.volume_cm3),
+      surface_cm2: positive(x.surface_cm2),
+      noyaux: typeof x.noyaux === "boolean" ? x.noyaux : null,
+      sable_kg: x.noyaux ? positive(x.sable_kg) : null,
+    }),
+    coulee: known({
+      ilot: code,
+      libelle: p?.famille ?? null,
+      mise_au_mille: positive(miseAuMille),
+      kg_coules_par_piece: miseAuMille ? round(x.poids_kg * miseAuMille) : null,
+      pieces_par_cycle: parCycle,
+      kg_coules_par_cycle: kgCycle ? round(kgCycle) : null,
+      serie: positive(x.serie),
+    }),
+    ...(formula !== null ? {
+      formule: {
+        valeur_s: round(formula),
+        expression: FORMULA,
+        termes_s: { base: round(p.cycle.base), poids: round(p.cycle.parKg * kgCycle ** (p.cycle.exposant ?? 1)), module: round((p.cycle.parModule2 || 0) * module ** 2) },
+        pieces_par_cycle: parCycle,
+        kg_coules_par_cycle: round(kgCycle),
+      },
     } : {}),
+    ...(trendCycle !== null && Number.isFinite(trendCycle) ? { tendance: { valeur_s: round(trendCycle), ecart_formule_pct: formula !== null && trendCycle ? round(((formula - trendCycle) / trendCycle) * 100) : null } } : {}),
+    ...(similar.length ? { pieces_similaires: similarData(similar) } : {}),
   };
 }
 
 /** The question asked with the data. */
-export const cycleQuestion = (data) => `Estime le temps de cycle de coulée de cette pièce sur l'îlot ${data.coulee.ilot} (${data.coulee.libelle}).`;
+export const cycleQuestion = (data) => `Estime le temps de cycle de coulée de cette pièce sur l'îlot ${data.coulee.ilot}${data.coulee.libelle ? ` (${data.coulee.libelle})` : ""}.`;
 
 /**
  * The data for the AI gateway without the names that tell the part or the
@@ -175,7 +240,7 @@ export function fitCycleData(data, maxChars = Infinity) {
     }
     if (level.detail === false) {
       delete out.note;
-      delete out.formule.termes_s;
+      delete out.formule?.termes_s; // a record of an island not in the settings has no formula
       for (const k of ["encombrement_mm", "volume_cm3", "surface_cm2"]) delete out.piece[k];
     }
     if (n) out.compaction = { niveau: n + 1, omis: LEVELS.slice(1, n + 1).map((l) => l.omis) };

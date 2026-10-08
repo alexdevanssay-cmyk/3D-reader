@@ -285,8 +285,8 @@ export function gatewayLabel({ provider, model, quota } = {}) {
 
 /**
  * A request to the gateway `url` with the access code `code`: its JSON
- * answer, or an Error with its message (in French), the HTTP status and
- * whether an access code is needed (codeRequired).
+ * answer, or an Error with its message (in French), the HTTP status, whether
+ * an access code is needed (codeRequired) and when to ask again (retryAfter, s).
  */
 async function fetchGateway(url, code, init = {}) {
   if (!url) throw new Error(`Renseignez l'adresse de la passerelle : collez son adresse Vercel (${GATEWAY_EXAMPLE}, voir api/README.md), ou choisissez « Ollama local ».`);
@@ -302,6 +302,8 @@ async function fetchGateway(url, code, init = {}) {
     const error = new Error((typeof data.error === "string" ? data.error : data.error?.message) || `La passerelle répond par une erreur HTTP ${response.status}.`);
     error.codeRequired = !!data.access_code_required;
     error.status = response.status;
+    // When to ask again after a refusal for quota (s), as the gateway tells it.
+    if (Number.isFinite(data.retry_after)) error.retryAfter = data.retry_after;
     throw error;
   }
   return data;
@@ -414,11 +416,14 @@ async function askOllamaJSON({ system, question, context }, { base, model }, sig
  * model})` gives what is sent within `budget` characters: {context, question,
  * system (the instructions of the local model `model`)}; the gateway has its
  * own instructions for the task. When the gateway refuses for its free quota,
- * Ollama answers, if it can and the box "Repli automatique" is ticked, as for
- * the questions of the IA page. Resolves to {output, provider, model, quota,
- * sent (what was built for the AI that answered), local, notice}.
+ * Ollama answers, if it can and the box "Repli automatique" is ticked (or
+ * `fallback`, when given: false for the backtest of the history, whose
+ * answers must all come from the same AI), as for the questions of the IA
+ * page. Resolves to {output, provider, model, quota, usage (tokens of the
+ * gateway's answer), sent (what was built for the AI that answered), local,
+ * notice}.
  */
-export async function askJSON(task, build, { signal } = {}) {
+export async function askJSON(task, build, { signal, fallback } = {}) {
   const ai = savedAI();
   // Ollama, its address and model of the IA page; `quota`: the refusal of the gateway it answers in place of, told when it cannot.
   const askLocal = async (ollama, quota = null) => {
@@ -433,7 +438,7 @@ export async function askJSON(task, build, { signal } = {}) {
     if (problem) throw quota ?? new Error(problem);
     const sent = build({ budget: LOCAL_CONTEXT_CHARS, local: true, anonymize: false, model: ollama.model });
     const output = await askOllamaJSON(sent, { base, model: ollama.model }, signal);
-    return { output, provider: "Ollama", model: ollama.model, quota: null, sent, local: true };
+    return { output, provider: "Ollama", model: ollama.model, quota: null, usage: null, sent, local: true };
   };
   if (ai.provider === "ollama") return askLocal(ai.ollama);
   const { url, code, model } = ai.gateway;
@@ -453,10 +458,10 @@ export async function askJSON(task, build, { signal } = {}) {
     });
     const output = data.output ?? data.text;
     if (typeof output !== "string" || !output.trim()) throw new Error("La passerelle a renvoyé une réponse vide : réessayez.");
-    return { output, provider: data.provider ?? null, model: data.model ?? null, quota: data.quota ?? null, sent, local: false };
+    return { output, provider: data.provider ?? null, model: data.model ?? null, quota: data.quota ?? null, usage: data.usage ?? null, sent, local: false };
   } catch (err) {
     // The free quota reached: the local model, when it answers (its own address and model).
-    if (err?.name === "AbortError" || !QUOTA_STATUSES.includes(err?.status) || !ai.fallback) throw err;
+    if (err?.name === "AbortError" || !QUOTA_STATUSES.includes(err?.status) || !(fallback ?? ai.fallback)) throw err;
     return { ...(await askLocal(ai.ollama, err)), notice: `Quota en ligne atteint : réponse du modèle local (${ai.ollama.model})` };
   }
 }

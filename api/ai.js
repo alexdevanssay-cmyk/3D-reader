@@ -7,7 +7,7 @@
 //
 //   GET  /api/ai  the public configuration: provider, model, context budget,
 //                 whether an access code is needed (never a secret)
-//   POST /api/ai  {task, model, context, messages} -> {output, provider, model, quota}
+//   POST /api/ai  {task, model, context, messages} -> {output, provider, model, quota, usage}
 //
 // The context is sent once, compacted by the page to the budget given by GET
 // (the free plan of Groq allows 8,000 tokens a minute), as data between
@@ -299,6 +299,12 @@ function quotaOf(headers) {
   return Object.values(quota).some((v) => v !== null) ? quota : null;
 }
 
+/** The tokens an answer took (its usage): {prompt_tokens, completion_tokens, total_tokens}; null without them. The page paces its backtest with them. */
+function usageOf(data) {
+  const usage = Object.fromEntries(["prompt_tokens", "completion_tokens", "total_tokens"].map((k) => [k, Number.isFinite(data?.usage?.[k]) ? data.usage[k] : null]));
+  return Object.values(usage).some((v) => v !== null) ? usage : null;
+}
+
 /** A short French message for a refusal of the provider; its own text is logged, never sent back. */
 function providerError(status, data, headers, config) {
   const name = config.name;
@@ -495,11 +501,13 @@ export default async function handler(req, res) {
     if (effort) body.reasoning_effort = effort;
     if (json) body.response_format = { type: "json_schema", json_schema: { name: json.name, strict: true, schema: json.schema } };
     const { data, headers } = await complete(config, body);
+    const usage = usageOf(data);
     return reply(res, 200, {
       output: answerOf(data, !!json, config),
       provider: config.name,
       model: typeof data?.model === "string" && data.model ? data.model : model,
       quota: quotaOf(headers),
+      ...(usage ? { usage } : {}),
     });
   } catch (error) {
     if (error instanceof HttpError) {

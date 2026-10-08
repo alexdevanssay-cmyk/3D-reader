@@ -4,7 +4,8 @@
 // below the values typed in, traced values, Excel export; the traced values
 // read by the AI page (task "Chiffrage"), read only, and its answers kept
 // with the quote (sheet "Analyses IA" of the export); the cycle time estimated
-// by the AI, used in the quote once adopted, and undone.
+// by the AI, used in the quote once adopted, and undone; the backtest of the
+// AI on the history of cycle times, against a stand-in gateway.
 // With a made-up workbook (tests/js/costing-fixture.mjs).
 //
 //   npm run build && node --test tests/e2e/costing.test.mjs
@@ -794,6 +795,155 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const overflow = await page.evaluate(() => [...document.querySelectorAll('#ccycle-ia')].flatMap((card) => [card, ...card.querySelectorAll('button, .cscroll, p')])
       .filter((x) => x.offsetParent).map((x) => [x.textContent.trim().slice(0, 30) || x.className, Math.round(x.getBoundingClientRect().right)]).filter(([, right]) => right > 375));
     assert.deepEqual(overflow, []);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('backtest of the AI on the history: paced against the stand-in gateway, kept over a reload, stopped by its quota and resumed, read and exported', { timeout: 180_000 }, async (t) => {
+    // A stand-in for the AI gateway (CORS as it does it): an estimate from the weight sent; the request number `refuse` refused for quota.
+    const requests = [];
+    let refuse = 0;
+    const cors = (req, res) => {
+      if (req.headers.origin) res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
+      if (req.method !== 'OPTIONS') return false;
+      res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET,POST', 'Access-Control-Allow-Headers': 'Content-Type, Accept' });
+      res.end();
+      return true;
+    };
+    const gateway = createServer(async (req, res) => {
+      if (cors(req, res)) return;
+      res.setHeader('Content-Type', 'application/json');
+      if (req.method === 'GET') return res.end(JSON.stringify({ provider: 'Groq', model: 'openai/gpt-oss-120b', models: [], context_chars: 9000, access_code_required: false }));
+      let text = '';
+      for await (const chunk of req) text += chunk;
+      requests.push(JSON.parse(text));
+      if (requests.length === refuse) {
+        res.writeHead(429, { 'Retry-After': '1' });
+        return res.end(JSON.stringify({ error: 'Quota de Groq (offre gratuite) atteint. Réessayez dans 1 s.', retry_after: 1 }));
+      }
+      const e = Math.round(requests.at(-1).context.piece.poids_kg * 100 + 100);
+      res.end(JSON.stringify({ output: JSON.stringify({
+        estimation_s: e, fourchette_s: [e - 20, e + 20], confiance: 'moyenne',
+        decomposition: [{ etape: 'Solidification', secondes: e - 40, justification: 'règle de Chvorinov' }, { etape: 'Ouverture et éjection', secondes: 40, justification: 'extraction' }],
+        comparaison: { formule_commentaire: '', tendance_commentaire: '', pieces_similaires_commentaire: '' },
+        pieces_similaires_utilisees: [], hypotheses: [], a_verifier: [],
+      }), provider: 'Groq', model: 'openai/gpt-oss-120b', quota: { requests_remaining_day: 1000 - requests.length, tokens_limit_minute: 8000, tokens_remaining_minute: 7800 }, usage: { total_tokens: 100 } }));
+    });
+    await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => {
+      gateway.closeAllConnections();
+      gateway.close(resolve);
+    }));
+    // A history (made-up values): BX-1 quoted and measured, an island without the settings' formula of the quote, a record without modulus (not run).
+    const record = (over) => ({
+      ref: 'BX-1', fichier_3d: 'bx1_confidentiel.stp', source: 'devis', ilot: 'CG3', temps_cycle_s: 210, pieces_par_cycle: 1, trs: 0.8, poids_kg: 1, module_mm: 3,
+      volume_cm3: 370, surface_cm2: 1100, encombrement_mm: [120, 80, 30], noyaux: false, sable_kg: null, serie: 600, mise_au_mille: 1.7, ...over,
+    });
+    const history = [
+      record(), record({ source: 'production', temps_cycle_s: 190 }), record({ ref: 'BX-2', temps_cycle_s: 260, poids_kg: 1.6, module_mm: 4 }),
+      record({ ref: 'BX-3', ilot: 'BPR', temps_cycle_s: 150, poids_kg: 2.2, module_mm: 5 }), record({ ref: 'BX-4', temps_cycle_s: 90, poids_kg: 0.4, module_mm: null }),
+    ];
+    writeFileSync(join(dir, 'historique-banc.json'), JSON.stringify({ schema: 'reader3d-historique-cycles', version: 1, pieces: history }));
+
+    const context = await browser.newContext({ locale: 'fr-FR', acceptDownloads: true });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    page.on('dialog', (d) => d.accept());
+    await page.goto(`${base}?lang=fr`);
+    await page.evaluate((url) => {
+      localStorage.setItem('reader3d.ai.provider', 'openai');
+      localStorage.setItem('reader3d.ai.gateway', url);
+    }, `http://127.0.0.1:${gateway.address().port}/api/ai`);
+    await page.click('.tab[data-page="chiffrage"]');
+    const text = (selector = '#chistorique') => page.textContent(selector).then((x) => x.replace(/[  ]/g, ' '));
+    const waitText = (re) => page.waitForFunction((source) => new RegExp(source).test(document.getElementById('chistorique')?.textContent.replace(/[  ]/g, ' ')), re.source);
+    const kept = () => page.evaluate(() => Object.keys(JSON.parse(localStorage.getItem('reader3d.chiffrage.banc-essai-ia.v1') ?? '{}').resultats ?? {}).length);
+    await page.setInputFiles('#page-chiffrage input[data-file="historique"]', join(dir, 'historique-banc.json'));
+    await waitText(/Historique :\s*5 enregistrements/);
+    assert.match(await text(), /Pour chaque enregistrement qui a un poids et un module \(4 pièces sur 5\)/);
+    assert.match(await text(), /IA de la page IA \/ analyse \(passerelle en ligne, noms anonymisés\)/);
+    assert.match(await text(), /Une demande à la fois, une toutes les 20 s puis au rythme que permet le quota renvoyé par la passerelle/);
+    assert.equal(await page.isDisabled('#chistorique [data-action="export-backtest"]'), true);
+
+    // The run: one record, then the wait the quota of the gateway sets (6 s at least); a reload during it.
+    await page.click('#chistorique [data-action="backtest"]');
+    await page.waitForSelector('#cbacktest-status');
+    assert.equal(await page.isDisabled('#chistorique [data-action="backtest"]'), true);
+    assert.equal((await page.textContent('#chistorique [data-action="backtest"]')).trim(), "Banc d'essai IA en cours");
+    await page.waitForFunction(() => /Pièce 2 sur 4 \(BX-1\) : prochaine demande dans \d s, au rythme du quota en ligne/.test(document.getElementById('cbacktest-status')?.textContent));
+    assert.equal(await kept(), 1);
+    await page.reload();
+    await page.waitForSelector('#chistorique .cbacktest');
+    assert.equal(requests.length, 1);
+    assert.match(await text(), /Banc d'essai interrompu : la page a été fermée ou rechargée pendant la série ; les résultats obtenus sont gardés\. « Reprendre » continue avec les 3 pièces restantes\./);
+    assert.equal((await page.textContent('#chistorique [data-action="backtest"]')).trim(), "Reprendre le banc d'essai IA (3 pièces à estimer)");
+    assert.match(await text(), /Sur 1 pièce chiffrée \(1 temps de devis\), l'IA s'écarte en moyenne de 4,8 % du temps de référence, la formule de [\d,]+ %\./);
+
+    // Resumed: the second record, then the third refused for quota: stopped cleanly, two left.
+    refuse = 3;
+    await page.click('#chistorique [data-action="backtest"]');
+    await waitText(/Banc d'essai arrêté par le quota en ligne : Quota de Groq \(offre gratuite\) atteint\. Réessayez dans 1 s\. « Reprendre » continue avec les 2 pièces restantes/);
+    assert.deepEqual([requests.length, await kept()], [3, 2]);
+    // Resumed again: the record refused first, then the last one.
+    await page.click('#chistorique [data-action="backtest"]');
+    await waitText(/Banc d'essai IA terminé/);
+    assert.deepEqual([requests.length, await kept()], [5, 4]);
+    assert.equal(await page.isDisabled('#chistorique [data-action="backtest"]'), true);
+
+    // What was sent: the task, the record anonymised, never its own time nor a record of its reference.
+    for (const request of requests) {
+      assert.equal(request.task, 'cycle_time');
+      const data = request.context;
+      assert.equal(data.piece.nom, 'Pièce');
+      assert.equal('cycle_devis' in data, false);
+      assert.ok(data.pieces_similaires.length >= 2);
+      assert.ok(data.pieces_similaires.every((x) => x.poids_kg !== data.piece.poids_kg && /^Historique \d$/.test(x.ref)), JSON.stringify(data.pieces_similaires));
+      assert.doesNotMatch(JSON.stringify(request), /BX-\d|bx1_confidentiel/);
+    }
+    assert.deepEqual(requests.map((x) => x.context.piece.poids_kg), [1, 1, 1.6, 1.6, 2.2]);
+    assert.equal('formule' in requests[4].context, true, 'BPR: the formula of the settings');
+
+    // The table: each record with its time, the formula, the AI and its range, the errors; the summary; the reading.
+    const rows = await page.$$eval('#chistorique .cbacktest tbody tr', (trs) => trs.map((tr) => [...tr.cells].map((td) => td.textContent.replace(/[  ]/g, ' '))));
+    assert.deepEqual(rows.map((r) => [r[0], r[1], r[2], r[3], r[6], r[7], r[8]]), [
+      ['BX-1', 'CG3', 'devis', '210 s', '200 s (180–220)', '-4,8 %', 'oui'],
+      ['BX-1', 'CG3', 'production', '190 s', '200 s (180–220)', '+5,3 %', 'oui'],
+      ['BX-2', 'CG3', 'devis', '260 s', '260 s (240–280)', '0,0 %', 'oui'],
+      ['BX-3', 'BPR', 'devis', '150 s', '320 s (300–340)', '+113,3 %', 'non'],
+    ]);
+    assert.ok(rows.every((r) => /^\d[\d ]*(,\d)? s$/.test(r[4]) && /^[+-]?\d+,\d %$/.test(r[5])), JSON.stringify(rows));
+    const summary = await page.$$eval('#chistorique .cbacktest-summary tbody tr', (trs) => trs.map((tr) => [...tr.cells].map((td) => td.textContent.replace(/[  ]/g, ' '))));
+    assert.deepEqual(summary.map((r) => [r[0], r[1], r[3], r[4]]), [
+      ['Îlot BPR', '1', '113,3 %', '0 sur 1'], ['Îlot CG3', '3', '3,3 %', '3 sur 3'],
+      ['Temps de devis', '3', '39,4 %', '2 sur 3'], ['Temps mesurés en production', '1', '5,3 %', '1 sur 1'], ['Toutes les pièces', '4', '30,8 %', '3 sur 4'],
+    ]);
+    const reading = await text('#chistorique .cbacktest-reading');
+    assert.match(await text(), /Réponses de : Groq · openai\/gpt-oss-120b \(4 pièces\)\./);
+    assert.match(reading, /^Sur 4 pièces chiffrées \(3 temps de devis, 1 temps mesuré en production\), l'IA s'écarte en moyenne de 30,8 % du temps de référence, la formule de [\d,]+ %\. Le temps de référence est dans la fourchette de l'IA pour 3 pièces sur 4 \(75 %\)\. Sur les seuls temps mesurés \(1\) : l'IA 5,3 %, la formule [\d,]+ %\. Les temps « devis » sont des estimations des chiffreurs, pas des mesures/);
+
+    // The CSV export.
+    const [download] = await Promise.all([page.waitForEvent('download'), page.click('#chistorique [data-action="export-backtest"]')]);
+    assert.equal(download.suggestedFilename(), 'banc_essai_ia.csv');
+    const csv = readFileSync(await download.path(), 'utf8').split('\r\n');
+    assert.equal(csv[0], '﻿reference;ilot;source;temps_reference_s;formule_s;ecart_formule_pct;ia_s;ia_min_s;ia_max_s;ecart_ia_pct;dans_fourchette;confiance;fournisseur;modele;date;erreur');
+    assert.match(csv[1], /^"BX-1";"CG3";"devis";210;[\d,]+;-?[\d,]+;200;180;220;-4,8;oui;"moyenne";"Groq";"openai\/gpt-oss-120b";"\d{4}-\d\d-\d\dT[\d:.]+Z";$/);
+    assert.equal(csv.length, 6);
+
+    // A phone: the card within 375 px (its tables scroll inside it).
+    await page.setViewportSize({ width: 375, height: 800 });
+    const overflow = await page.evaluate(() => [...document.querySelectorAll('#chistorique')].flatMap((card) => [card, ...card.querySelectorAll('button, .cscroll, p')])
+      .filter((x) => x.offsetParent).map((x) => [x.textContent.trim().slice(0, 30) || x.className, Math.round(x.getBoundingClientRect().right)]).filter(([, right]) => right > 375));
+    assert.deepEqual(overflow, []);
+
+    // With Ollama: no quota, slower, said so. Erased: back to the start.
+    await page.evaluate(() => localStorage.setItem('reader3d.ai.provider', 'ollama'));
+    await page.reload();
+    await page.waitForSelector('#chistorique .cbacktest');
+    assert.match(await text(), /IA de la page IA \/ analyse \(Ollama local \(qwen3:8b\)\)[\s\S]*Ollama local : aucun quota, mais plus lent — de quelques secondes à quelques minutes par pièce selon le PC/);
+    await page.click('#chistorique [data-action="clear-backtest"]');
+    await page.waitForFunction(() => document.querySelector('#chistorique [data-action="backtest"]')?.textContent.trim() === "Banc d'essai IA");
+    assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.chiffrage.banc-essai-ia.v1')), null);
     assert.deepEqual(errors, []);
     await context.close();
   });
