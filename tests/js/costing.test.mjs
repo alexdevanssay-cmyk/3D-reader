@@ -4,7 +4,7 @@
 //
 //   node --test tests/js/costing.test.mjs
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
+import { before, describe, test } from 'node:test';
 
 import { readCostingWorkbook, readIndicesWorkbook } from '../../web/chiffrage/workbook.js';
 import { centreRates, indexAverage, minimumMargin, quote, saleMetalPrice } from '../../web/chiffrage/model.js';
@@ -14,9 +14,10 @@ import { heatTreatmentOf, programmeOf, readSeriesOrder } from '../../web/chiffra
 import { DEFAULT_TOOLING, coefOf, estimateTooling, steelToolCost } from '../../web/chiffrage/tooling.js';
 import { DEFAULT_CORES, boxSize, coreBoxCost, coresPerPiece } from '../../web/chiffrage/cores.js';
 import {
-  DEFAULT_DENSITIES, adoptTendance, clearSaisies, clearSetting, clearTendances, defaultSettings, exportSaisies, importTendances,
-  loadSettings, loadSettingsLayers, mergeSettings, migrateSettings, setSetting, validateTendances,
+  DEFAULT_DENSITIES, adoptTendance, clearSaisies, clearSetting, clearTendances, defaultQuote, defaultSettings, exportSaisies, importTendances,
+  loadSettings, loadSettingsLayers, mergeSettings, migrateSettings, saveBase, saveIndices, saveQuote, setSetting, validateTendances,
 } from '../../web/chiffrage/store.js';
+import { QUOTE_KEYS, SOURCES, derive, missing, pieceKeys, resolve, summarize, traced, weakest } from '../../web/chiffrage/provenance.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -762,3 +763,307 @@ function countLeaves(o) {
   if (o && typeof o === 'object') return Object.values(o).reduce((n, x) => n + countLeaves(x), 0);
   return 1;
 }
+
+// --------------------------------------------------------------------------- traced values (provenance.js)
+
+// The Chiffrage page computes and traces the quote (ui.js:compute): loaded
+// here with the storage above and a window without 3D model (or a stub of one).
+let ui;
+const PART = { poids: 1.2, toileMini: 5, epaisseurMax: 10, moduleMm: 3, dimMax: 250 };
+const ORDER = readSeriesOrder(seriesOrderWorkbook(), 'RFQ.xlsm');
+const PARTS_3D = [
+  { index: 0, name: 'A', closed: true, volume: 450000, area: 90000, bboxSize: [200, 120, 60], thickness: { min: 5, max: 12, detected: 5 } },
+  { index: 1, name: 'B', closed: true, volume: 120000, area: 30000, bboxSize: [80, 60, 40], thickness: { min: 4, max: 6, detected: 4 } },
+  { index: 2, name: 'C', closed: true, volume: 30000, area: 15000, bboxSize: [60, 30, 20], thickness: null },
+];
+
+/**
+ * ui.js:compute() on the fixture: the quote `quote` (pieces: the inputs of
+ * each piece, by default the part typed in), the 3D model `p3d` ({file, parts,
+ * selected}) if any, the settings and trends set by `setup`.
+ */
+function computed({ quote = {}, p3d = null, setup = () => {}, workbook = base } = {}) {
+  storage.clear();
+  saveBase(workbook);
+  saveIndices({ ...indices, source: 'classeur', fileName: 'test.xlsm', importedAt: workbook.source.importedAt });
+  setup();
+  saveQuote({ ...defaultQuote(workbook, indices), pieces: { manuel: PART }, pieceFile: p3d?.file ?? null, ...quote });
+  globalThis.window.reader3d = p3d ? { part: () => p3d } : undefined;
+  ui.reload();
+  return ui.compute();
+}
+
+// Every trace of a quote: [key, trace, section] (section: the quote or a piece).
+const allTraces = (c) => [c.trace, ...c.results.map((r) => r.trace)].flatMap((T) => Object.entries(T ?? {}).map(([k, t]) => [k, t, T]));
+const AUTHORITIES = ['hard', 'evidence', 'soft_prior', 'default_code', 'calcul'];
+const LEVELS = ['haute', 'moyenne', 'faible', 'nulle'];
+
+describe('traced values of a quote (provenance.js)', () => {
+  before(async () => {
+    globalThis.window ??= { addEventListener() {} };
+    ui = await import('../../web/chiffrage/ui.js');
+  });
+
+  test('resolve: the first value in the order of the registry, a trend never above a current value, never the AI', () => {
+    const typed = traced(0.6, { type: 'parametres', unite: '%', ref: 'settings.trs.CG3' });
+    const trend = traced(0.7, { type: 'tendance', unite: '%', ref: 'settings.trs.CG3' });
+    const ai = traced(0.9, { type: 'ia', unite: '%', ref: 'réponse du modèle' });
+    let t = resolve([ai, traced('', { type: 'saisie' }), traced(Number.NaN, { type: 'rfq' }), typed, trend]);
+    assert.deepEqual([t.valeur, t.autorite, t.niveau, t.source.type], [0.6, 'hard', 2, 'parametres']);
+    assert.deepEqual(t.alternatives.map((a) => [a.source, a.valeur]), [['tendance', 0.7]], 'the AI is not even an alternative');
+    close(t.ecart_tendance.ecart_rel, -1 / 7, 1e-12, 'deviation from the trend');
+    assert.equal(t.ecart_tendance.tendance, 0.7);
+    assert.equal(t.ecart_tendance.alerte, false, '14 % < 15 %');
+    assert.deepEqual(t.alertes, []);
+    assert.equal(t.validation_requise, false);
+    t = resolve([typed, trend], { seuil: 0.1 });
+    assert.equal(t.ecart_tendance.alerte, true);
+    assert.deepEqual(t.alertes.map((a) => a.type), ['ecart_tendance']);
+    // A trend first in the list never wins over a hard value.
+    t = resolve([trend, typed]);
+    assert.deepEqual([t.valeur, t.autorite], [0.6, 'hard']);
+    assert.ok(t.alertes.some((a) => a.type === 'divergence'));
+    // Only a trend: retained, a soft prior to validate. Only the AI: nothing.
+    t = resolve([null, trend]);
+    assert.deepEqual([t.valeur, t.autorite, t.niveau, t.validation_requise], [0.7, 'soft_prior', 4, true]);
+    assert.equal(resolve([ai]), null);
+    // A default of the code: a hypothesis to validate, with its alert.
+    t = traced(0.75, { type: 'defaut_code', unite: '%', ref: 'routes.js:DEFAULT_TRS.CG3' });
+    assert.deepEqual([t.autorite, t.niveau, t.validation_requise, t.alertes.map((a) => a.type)], ['default_code', null, true, ['defaut_code']]);
+    // Divergent current sources: the weight typed in and the one measured.
+    t = resolve([traced(1.2, { type: 'saisie', unite: 'kg', ref: 'q.poids' }), traced(1.5, { type: 'geometrie', unite: 'kg', ref: '3D' })]);
+    assert.equal(t.valeur, 1.2);
+    assert.deepEqual(t.alertes.map((a) => a.type), ['divergence']);
+    assert.equal(t.validation_requise, true);
+  });
+
+  test('a computed value: the confidence of its weakest input, a validation when an input needs one', () => {
+    const a = traced(2, { type: 'saisie', ref: 'a' });
+    const b = traced(3, { type: 'tendance', ref: 'b' });
+    const x = derive(6, { ref: 'a × b', entrees: { a, b } });
+    assert.deepEqual([x.source.type, x.autorite, x.niveau, x.source.entrees], ['calcul', 'calcul', null, ['a', 'b']]);
+    assert.deepEqual([x.confiance.niveau, x.validation_requise], ['moyenne', true]);
+    const y = derive(8, { ref: 'x + a', entrees: { x, a } });
+    assert.equal(y.confiance.niveau, 'moyenne');
+    assert.match(y.confiance.raison, /^entrée la plus faible : x ← b \(/);
+    assert.deepEqual(derive(2, { entrees: { a } }).confiance.niveau, 'haute');
+    assert.equal(derive(2, { entrees: { a }, plafond: ['moyenne', 'estimation'] }).confiance.niveau, 'moyenne');
+    assert.equal(derive(0, { entrees: { a, m: missing('', 'manque') } }).confiance.niveau, 'nulle');
+    assert.equal(weakest('haute', 'faible', 'moyenne'), 'faible');
+  });
+
+  test('every output of the registry is traced, completely, on the fixture', () => {
+    const scenarios = {
+      auto: computed(),
+      chosen: computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', cycle: 300, empreintes: 2, miseAuMille: 1.5, mode: '1*8', outillagePrix: 15000 } } } }),
+      cycleOnly: computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', miseAuMille: 1.5, empreintes: 2 } } } }),
+      cores: computed({ quote: { pieces: { manuel: { ...PART, procede: 'BPR', noyaux: true, cores: [{ nom: 'N1', masse: 0.6, qte: 2, type: 1, complexite: 'Simple' }], tth: 'T6' } } } }),
+      set: computed({ p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0, 1, 2] } }),
+    };
+    for (const [name, c] of Object.entries(scenarios)) {
+      for (const key of QUOTE_KEYS) assert.ok(c.trace[key], `${name}: ${key}`);
+      assert.ok(c.results.length && c.results.every((r) => r.final), name);
+      for (const r of c.results) for (const key of pieceKeys(r.route.process)) assert.ok(r.trace[key], `${name}, ${r.piece.name}: ${key}`);
+      for (const [key, t, T] of allTraces(c)) {
+        const what = `${name}: ${key}`;
+        assert.ok(t.valeur !== undefined && typeof t.unite === 'string', what);
+        assert.ok(SOURCES[t.source.type] && t.source.type !== 'ia', what);
+        assert.ok(typeof t.source.ref === 'string' && t.source.ref, what);
+        assert.ok(AUTHORITIES.includes(t.autorite), what);
+        assert.equal(t.niveau, SOURCES[t.source.type].niveau, what);
+        assert.ok(LEVELS.includes(t.confiance.niveau) && t.confiance.raison, what);
+        assert.ok(t.ecart_tendance === null || (typeof t.ecart_tendance.tendance === 'number' && 'ecart_rel' in t.ecart_tendance && typeof t.ecart_tendance.alerte === 'boolean'), what);
+        assert.ok(Array.isArray(t.alternatives) && t.alternatives.every((a) => SOURCES[a.source] && 'valeur' in a), what);
+        assert.ok(Array.isArray(t.hypotheses) && Array.isArray(t.alertes) && typeof t.validation_requise === 'boolean', what);
+        // A computed value names its inputs, each one traced (in its piece or in the quote).
+        if (t.source.type === 'calcul') {
+          assert.ok(t.source.entrees.length, what);
+          for (const e of t.source.entrees) assert.ok(T[e] ?? c.trace[e] ?? (key === 'ensemble.prix.vente' && /^piece\.prix\.vente \[/.test(e)), `${what}: input ${e}`);
+        }
+      }
+    }
+    // An island chosen with its cycle only estimated: the estimate of the cavities it uses is traced too.
+    const r = scenarios.cycleOnly.results[0];
+    assert.deepEqual([r.trace['piece.cycle'].source.type, r.trace['piece.empreintes'].source.type], ['calcul', 'saisie']);
+    assert.ok(r.trace['piece.empreintes.estimee'] && r.trace['piece.miseAuMille.estimee'] && r.trace['parametres.cycle']);
+    assert.equal(scenarios.chosen.results[0].trace['parametres.cycle'], undefined, 'the cycle typed in: its coefficients are not used');
+  });
+
+  test('the traces describe the values computed and change none of them', () => {
+    for (const c of [computed(), computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', cycle: 300, empreintes: 2, miseAuMille: 1.5, outillagePrix: 15000 } } } }), computed({ p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0, 1] } })]) {
+      const T = c.trace;
+      assert.equal(T['devis.densite'].valeur, c.density);
+      assert.equal(T['devis.volumeTotal'].valeur, c.volumeTotal);
+      assert.equal(T['devis.metal.coursVente'].valeur, c.metal.coursVente);
+      close(T['devis.metal.prixVente'].valeur, (c.metal.coursVente + c.metal.p1020Vente + c.metal.premiumVente) * (1 + c.metal.pafVente), 1e-12, 'sale metal');
+      for (const r of c.results) {
+        const casting = r.route.operations.find((o) => o.code === r.route.process);
+        const P = r.trace;
+        const code = r.route.process;
+        assert.equal(T['devis.marge'].valeur, r.finalInput.marge);
+        assert.equal(T['devis.tailleSerie'].valeur, r.finalInput.tailleSerie);
+        assert.equal(T['devis.metal.prixAchat'].valeur, r.final.metalAchat);
+        assert.deepEqual(
+          [P['piece.poids'].valeur, P['piece.ilot'].valeur, P['piece.miseAuMille'].valeur, P['piece.kgCast'].valeur, P['piece.empreintes'].valeur, P['piece.cycle'].valeur],
+          [r.part.poids, code, r.route.miseAuMille, r.final.kgCast, casting.parCycle, casting.cycle],
+        );
+        assert.deepEqual(
+          [P[`centre.${code}.trs`].valeur, P[`centre.${code}.taux`].valeur, P[`centre.${code}.mode`].valeur, P['piece.va'].valeur, P['piece.outillage.total'].valeur, P['piece.prix.pri'].valeur, P['piece.prix.vente'].valeur],
+          [casting.trs, r.finalRates.get(code).rate, r.finalRates.get(code).mode, r.final.va, r.route.outillage, r.final.pri, r.final.years[0].prixVente],
+        );
+      }
+      if (c.ensemble) assert.equal(T['ensemble.prix.vente'].valeur, c.ensemble.years[0].prixVente);
+    }
+  });
+
+  test('non-regression: the prices of the fixture are those computed before the traces', () => {
+    // [PRI, sale price of the first year] of each piece, and of the set: ui.js:compute of the
+    // previous version (settings layers), on the same quotes of the made-up workbook.
+    const quotes = {
+      auto: [{}, [[20.75780697404318, 26.46674353599491]]],
+      weightOnly: [{ quote: { pieces: { manuel: { poids: 2.5 } } } }, [[26.277257213553643, 32.38843564494282]]],
+      chosen: [{ quote: { pieces: { manuel: { ...PART, procede: 'CG3', cycle: 300, empreintes: 2, miseAuMille: 1.5, mode: '1*8', outillagePrix: 15000 } } } }, [[35.28293020434457, 44.659882872969575]]],
+      options: [{ quote: { tailleSerie: 0, outillageInclus: false, margeOutillage: 0.1, marge: 0.2, pieces: { manuel: { poids: 3, toileMini: 6, epaisseurMax: 20, moduleMm: 5, dimMax: 300, tth: 'T6', tthMode: 'masselotte', noyaux: true, cores: [{ nom: 'N1', masse: 0.6, qte: 2, type: 1, complexite: 'Simple' }], tribo: true, redressage: true, composants: [{ designation: 'x', qte: 2, prix: 1.5, marge: 0.1 }] } } } }, [[65.1473914433648, 82.56064146233092]]],
+      rfq: [{ quote: { serie: ORDER, alliage: 'AS9U3', month: ORDER.matiere.month, coursAchat: 2800, moqs: ORDER.moqs, tailleSerie: 1500, volumes: [1000, 1500, 1500, 800], annees: 4, premiereAnnee: 2027, volumeAnnuel: 1500 } }, [[28.166450045385446, 40.044076231320005]]],
+      noSalePrice: [{ quote: { month: '2031-01', coursAchat: null, premiumVente: null, pafVente: null } }, [[7.003774744773435, 10.541749447754384]]],
+      infeasible: [{ quote: { pieces: { manuel: { ...PART, toileMini: 2, procede: 'CG3', outillagePrix: 0 } } } }, [[52.14792795076022, 63.504747039077316]]],
+      set: [{ p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0, 1, 2] } }, [[11.091035960092366, 15.438109167927696], [5.977220337898361, 10.127444309780895], [4.216476889965296, 8.26811384620635]], 33.83366732391494],
+    };
+    const settingsAndTrends = () => {
+      setSetting('trs.CG3', 0.6, base);
+      setSetting('trs.CG4', 0.7, base);
+      importTendances({ trs: { CG3: 0.7, SSP: 0.5, CG4: 0.9 }, marge: 0.3, densities: { AS7G03: 2.7 }, processes: { CG4: { cycle: { base: 70 } } }, tooling: { taux: { ax3: 90 } } }, 't.json');
+      setSetting('energy.elecNouveau', 0, base);
+      setSetting('seuilTendance', 0.05, base);
+    };
+    const withSettings = {
+      auto: [{ setup: settingsAndTrends }, [[20.580820346729986, 26.203069487255032]]],
+      chosen: [{ setup: settingsAndTrends, quote: quotes.chosen[0].quote }, [[35.12646183578544, 43.7969838525228]]],
+      set: [{ setup: settingsAndTrends, p3d: quotes.set[0].p3d }, [[11.00412473199484, 15.004779983792963], [5.8556538799771385, 9.654205730135697], [3.9162006318333185, 7.588855165018256]], 32.24784087894692],
+    };
+    for (const [name, [args, expected, set]] of [...Object.entries(quotes), ...Object.entries(withSettings).map(([n, x]) => [`${n} (settings and trends)`, x])]) {
+      const c = computed(args);
+      assert.equal(c.results.length, expected.length, name);
+      c.results.forEach((r, i) => {
+        close(r.final.pri, expected[i][0], 1e-12, `${name}: PRI of ${r.piece.name}`);
+        close(r.final.years[0].prixVente, expected[i][1], 1e-12, `${name}: price of ${r.piece.name}`);
+      });
+      if (set) close(c.ensemble.years[0].prixVente, set, 1e-12, `${name}: price of the set`);
+    }
+  });
+
+  test('a TRS typed in Paramètres beats the trend, either order: hard, with its deviation from the trend', () => {
+    const quote = { pieces: { manuel: { ...PART, procede: 'CG3' } } };
+    const trs = (setup) => {
+      const c = computed({ quote, setup });
+      return [c.results[0].trace['centre.CG3.trs'], c.results[0].final.years[0].prixVente];
+    };
+    const typeIn = () => setSetting('trs.CG3', 0.6, base);
+    const importTrend = () => importTendances({ trs: { CG3: 0.7 } }, 'tendances.json');
+    const [first, price] = trs(() => (typeIn(), importTrend()));
+    const [then, priceThen] = trs(() => (importTrend(), typeIn()));
+    const [alone, priceAlone] = trs(typeIn);
+    for (const t of [first, then]) {
+      assert.deepEqual([t.valeur, t.autorite, t.niveau, t.source.type, t.source.ref], [0.6, 'hard', 2, 'parametres', 'settings.trs.CG3']);
+      assert.ok(t.source.date);
+      assert.deepEqual(t.alternatives.map((a) => [a.source, a.valeur]), [['tendance', 0.7]]);
+      assert.equal(t.ecart_tendance.tendance, 0.7);
+      close(t.ecart_tendance.ecart_rel, -1 / 7, 1e-12, 'deviation');
+      assert.equal(t.ecart_tendance.alerte, false);
+      assert.deepEqual([t.confiance.niveau, t.validation_requise, t.alertes], ['haute', false, []]);
+    }
+    assert.equal(alone.ecart_tendance, null);
+    assert.equal(price, priceAlone, 'the trend changes nothing');
+    assert.equal(priceThen, priceAlone);
+    // Beyond the threshold set in Paramètres: an alert.
+    const [over] = trs(() => (typeIn(), importTrend(), setSetting('seuilTendance', 0.1, base)));
+    assert.equal(over.ecart_tendance.alerte, true);
+    assert.deepEqual(over.alertes.map((a) => a.type), ['ecart_tendance']);
+    // Nothing typed in: the trend, a soft prior to validate; no trend either: the default of the code, with its alert.
+    const [trend] = trs(importTrend);
+    assert.deepEqual([trend.valeur, trend.autorite, trend.niveau, trend.source.fichier, trend.validation_requise], [0.7, 'soft_prior', 4, 'tendances.json', true]);
+    const [code] = trs(() => {});
+    assert.deepEqual([code.valeur, code.autorite, code.validation_requise, code.alertes.map((a) => a.type)], [DEFAULT_TRS.CG3, 'default_code', true, ['defaut_code']]);
+  });
+
+  test('the confidence of a price is that of its weakest input', () => {
+    for (const c of [computed(), computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', cycle: 300, empreintes: 2, miseAuMille: 1.5 } } } }), computed({ quote: { month: '2031-01' } })]) {
+      const r = c.results[0];
+      const at = (k) => r.trace[k] ?? c.trace[k];
+      for (const key of ['piece.prix.vente', 'piece.prix.pri', 'piece.kgCast', 'devis.metal.prixVente', 'devis.metal.prixAchat']) {
+        const t = at(key);
+        const inputs = t.source.entrees.map(at);
+        assert.equal(t.confiance.niveau, weakest(...inputs.map((x) => x.confiance.niveau)), key);
+        assert.equal(t.validation_requise, inputs.some((x) => x.validation_requise), key);
+      }
+    }
+    // The code defaults of the islands make the estimates weak; a price is never above them.
+    const r = computed().results[0];
+    assert.equal(r.trace['piece.cycle'].confiance.niveau, 'faible');
+    assert.equal(r.trace['piece.prix.vente'].confiance.niveau, 'faible');
+    assert.match(r.trace['piece.prix.vente'].confiance.raison, /^entrée la plus faible : piece\.prix\.pri ← /);
+  });
+
+  test('a missing sale price: 0 used, nil confidence and an alert, down to the price', () => {
+    const c = computed({ quote: { month: '2031-01' } });
+    const t = c.trace['devis.metal.coursVente'];
+    assert.deepEqual([t.valeur, t.autorite, t.confiance.niveau, t.validation_requise], [0, 'default_code', 'nulle', true]);
+    assert.deepEqual(t.alertes.map((a) => a.type), ['repli_zero']);
+    assert.match(t.alertes[0].message, /cours de vente indisponible.*0 utilisé/);
+    assert.equal(c.trace['devis.metal.prixVente'].confiance.niveau, 'nulle');
+    const price = c.results[0].trace['piece.prix.vente'];
+    assert.deepEqual([price.confiance.niveau, price.validation_requise], ['nulle', true]);
+    const sum = summarize([{ piece: null, trace: c.trace }, { piece: 'Pièce', trace: c.results[0].trace }]);
+    assert.ok(sum.alertes.some((a) => a.cle === 'devis.metal.coursVente' && a.type === 'repli_zero'));
+    assert.ok(sum.aValider >= sum.aValiderCalcul && sum.aValiderCalcul > 0);
+    // The indices have the month: their average, no alert.
+    const ok = computed().trace['devis.metal.coursVente'];
+    assert.deepEqual([ok.source.type, ok.autorite, ok.confiance.niveau, ok.alertes], ['indices', 'hard', 'haute', []]);
+    // Month of the customer request, missing from the indices: the request's own sale price.
+    const rfq = computed({ quote: { serie: ORDER, month: ORDER.matiere.month } }).trace['devis.metal.coursVente'];
+    assert.deepEqual([rfq.valeur, rfq.source.type, rfq.niveau, rfq.source.fichier, rfq.alertes], [ORDER.matiere.coursVente, 'rfq', 1, 'RFQ.xlsm', []]);
+  });
+
+  test('a centre without rate, a price typed at 0, an island imposed out of reach: alerts', () => {
+    // The CG3 centre without any cost: rate 0.
+    const workbook = structuredClone(base);
+    const cg3 = workbook.centres.find((x) => x.code === 'CG3');
+    for (const m of Object.values(cg3.modes)) m.costs = m.costs.map(() => 0);
+    cg3.annual = Object.fromEntries(Object.keys(cg3.annual).map((k) => [k, 0]));
+    cg3.invest = { structure: 0, composant: 0, dureeStructure: 0, dureeComposant: 0 };
+    const c = computed({ workbook, quote: { pieces: { manuel: { ...PART, procede: 'CG3', outillagePrix: 0 } } } });
+    const T = c.results[0].trace;
+    assert.deepEqual([T['centre.CG3.taux'].valeur, T['centre.CG3.taux'].confiance.niveau], [0, 'nulle']);
+    assert.deepEqual(T['centre.CG3.taux'].alertes.map((a) => a.type), ['repli_zero']);
+    assert.ok(T['piece.va'].alertes.some((a) => a.type === 'repli_zero' && /CG3/.test(a.message)));
+    assert.equal(T['piece.prix.vente'].confiance.niveau, 'nulle');
+    assert.deepEqual(T['piece.outillage.total'].alertes.map((a) => a.type), ['saisie_ignoree']);
+    const out = computed({ quote: { pieces: { manuel: { ...PART, toileMini: 2, procede: 'CG3' } } } }).results[0].trace['piece.ilot'];
+    assert.deepEqual([out.valeur, out.source.type, out.validation_requise], ['CG3', 'saisie', true]);
+    assert.deepEqual(out.alertes.map((a) => a.type), ['infaisable']);
+  });
+
+  test('a 3D model: geometry as evidence, the weight typed in above the one measured, divergent sources', () => {
+    const p3d = { file: 'support.step', parts: [PARTS_3D[0]], selected: [0] };
+    let r = computed({ p3d, quote: { pieces: {} } }).results[0];
+    assert.deepEqual([r.trace['piece.volume3d'].autorite, r.trace['piece.volume3d'].niveau, r.trace['piece.volume3d'].source.fichier], ['evidence', 3, 'support.step']);
+    assert.deepEqual([r.trace['piece.toileMini'].source.type, r.trace['piece.toileMini'].valeur], ['geometrie', 5]);
+    const weight = r.trace['piece.poids'];
+    assert.deepEqual([weight.source.type, weight.source.entrees], ['calcul', ['piece.volume3d', 'devis.densite']]);
+    close(weight.valeur, (PARTS_3D[0].volume / 1e6) * DEFAULT_DENSITIES.AS7G03, 1e-12, 'weight from the 3D model');
+    assert.notEqual(weight.confiance.niveau, 'haute', 'the 3D model taken as it is: rough or machined not said');
+    // Typed in: it wins; 25 % from the 3D weight: divergent sources.
+    r = computed({ p3d, quote: { pieces: { '0:A': { poids: 0.9 } } } }).results[0];
+    const typed = r.trace['piece.poids'];
+    assert.deepEqual([typed.valeur, typed.autorite, typed.source.type], [0.9, 'hard', 'saisie']);
+    assert.deepEqual(typed.alternatives.map((a) => a.source), ['calcul']);
+    assert.deepEqual(typed.alertes.map((a) => a.type), ['divergence']);
+    assert.equal(typed.validation_requise, true);
+    // A body without wall thickness: 0 used, said.
+    const c = computed({ p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0, 1, 2] } });
+    const thin = c.results[2].trace['piece.toileMini'];
+    assert.deepEqual([thin.valeur, thin.confiance.niveau, thin.alertes.map((a) => a.type)], [0, 'nulle', ['repli_zero']]);
+    // The set: computed from the prices of its pieces.
+    assert.deepEqual(c.trace['ensemble.prix.vente'].source.entrees, ['piece.prix.vente [A]', 'piece.prix.vente [B]', 'piece.prix.vente [C]']);
+  });
+});

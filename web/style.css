@@ -307,6 +307,20 @@ table.bodies .open { color: var(--warn); }
 .ctrend { display: block; margin-top: 2px; color: var(--warn); font-size: 11px; white-space: normal; }
 @media (max-width: 700px) { .cgrid { grid-template-columns: 1fr; } }
 .ctable td.bad { color: var(--error-text); }
+/* Chiffrage: traced values (provenance.js), the banner "N valeurs à valider / N alertes" and the card "Traçabilité". */
+.ctrace-banner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ctrace-banner.clean { background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.ctrace details > summary { cursor: pointer; font-size: 13px; margin: 8px 0; }
+.ctrace .ctable td { vertical-align: top; }
+.ctable tr.calert td:first-child { box-shadow: inset 3px 0 var(--warn); }
+.calerts { margin: 6px 0; padding-left: 18px; }
+.calerts li { margin: 2px 0; }
+.cnote { display: block; margin-top: 2px; font-size: 11px; white-space: normal; }
+.cconf { font-size: 11px; line-height: 16px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--border); white-space: nowrap; }
+.cconf.haute { border-color: var(--ok); color: var(--ok); }
+.cconf.moyenne { border-color: var(--accent); color: var(--accent); }
+.cconf.faible { border-color: var(--warn); color: var(--warn); }
+.cconf.nulle { border-color: var(--error-text); color: var(--error-text); }
 /* "Fermer le corps" under an open body of the bodies table. */
 .close-row td { padding-top: 0; border-top: 0; }
 .close-row .close-body { font-size: 12px; color: var(--accent); }

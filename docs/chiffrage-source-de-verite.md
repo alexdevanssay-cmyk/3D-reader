@@ -381,6 +381,7 @@ Créer `web/chiffrage/provenance.js`. Pour chaque sortie, il décrit les sources
   - vérifie qu'un candidat `soft_prior` n'est jamais retenu quand un candidat `hard` existe ;
   - n'accepte jamais de candidat `reasoning_only`.
 - Une valeur dérivée (kgCast, coût d'un centre, prix) a `source.type = 'calcul'` et la liste de ses entrées. Sa confiance est la plus faible de celles des entrées. Une validation lui est requise si l'une des entrées en requiert une.
+- **Mis en œuvre (`provenance.js`).** `traced`, `resolve`, `derive`, `fromSetting` (provenance tirée des couches de `store.js`) et `settingsGroup` (paramètres d'une estimation, regroupés). Les candidats sont passés dans l'ordre du registre : le premier non vide est celui que le calcul a utilisé. Une tendance n'est jamais retenue devant une valeur `hard`, une réponse de l'IA jamais. Écarts : `ecart_tendance` (seuil réglable dans Paramètres, 15 % par défaut) et alerte « sources divergentes » entre sources actuelles. La validation humaine n'est pas encore stockée (`validation_requise` est un booléen) : voir l'étape 8.
 
 ### Étape 5 : produire la trace pour chaque sortie
 `compute()` et `computePiece()` renvoient `out.trace`, un objet `{ cle: ValeurTracee }`. Correspondance :
@@ -397,6 +398,8 @@ Créer `web/chiffrage/provenance.js`. Pour chaque sortie, il décrit les sources
 | Mois, cours, typologie, cours de vente, prix d'achat, PAF, premium | `ui.js:compute`, `model.js:indexAverage/saleMetalPrice` | `devis.metal.*` |
 | Marge, marge mini, volumes, taille de série, MOQ, prix cible | `ui.js:computePiece`, `ui.js:compute`, `ui.js:moqPrices` | `devis.marge`, `devis.volumes`, `devis.tailleSerie`, `devis.moq[i]` |
 | PRI, prix, marges, projection, écart cible | `model.js:quote`, `ui.js:aggregate` | `piece.prix.*`, `ensemble.prix.*` (valeurs dérivées) |
+
+**Mis en œuvre, en partie.** `ui.js:compute` produit `out.trace` (clés `devis.*`, `parametres.prix`, `ensemble.prix.vente`) et `computePiece` produit `r.trace` (clés `piece.*`, `centre.<code>.mode/trs/taux`, `parametres.*`), après le calcul : les valeurs ne changent pas (test de non-régression sur le classeur de test). Registre des sorties obligatoires : `QUOTE_KEYS` et `pieceKeys(code)`. Une estimation non retenue qu'une autre utilise (mise au mille ou empreintes estimées pour le cycle) est tracée sous `….estimee`. Pas encore tracés : masse de la page 3D, finition et classement des îlots, noyaux et boîtes une par une, marges résultantes, projection et MOQ.
 
 ### Étape 6 : propagation cohérente (écart n° 9)
 - Passer les surcharges (mise au mille, empreintes, cycle, mode, prix d'outillage) à `buildRoute`.
@@ -417,6 +420,7 @@ Créer `web/chiffrage/provenance.js`. Pour chaque sortie, il décrit les sources
   - colonne « Source » dans Synthèse et Gammes ;
   - en-tête qui cite les fichiers (classeur, indices, JSON, RFQ) et leurs dates ;
   - export marqué « non validé » tant qu'une validation requise manque, et mention de confidentialité.
+- **Mis en œuvre, en partie.** Alertes : défaut du code, repli à 0, valeur manquante, écart à la tendance, sources divergentes, îlot imposé infaisable, saisie ignorée. Bandeau « N valeurs à valider / N alertes » et carte « Traçabilité » repliable dans Chiffrage. Export : onglet « Traçabilité » (fichiers et dates en en-tête, statut, une ligne par clé) et statut dans la Synthèse. Restent : le statut de validation stocké dans le devis (`q.validations`) avec l'empreinte des entrées, la colonne « Source » dans Synthèse et Gammes.
 
 ### Étape 9 : consommation par la tâche IA « Chiffrage », en lecture seule
 - `contextForCurrentTask` ajoute `costing_trace` : une copie figée des valeurs tracées (valeur, unité, autorité, source, confiance, écart, hypothèses, statut de validation), plus les trois meilleures routes avec leurs raisons.

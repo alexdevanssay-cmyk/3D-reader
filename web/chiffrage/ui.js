@@ -8,6 +8,7 @@ import { bestRoutes, buildRoute, rankRoutes } from "./routes.js";
 import { estimateTooling } from "./tooling.js";
 import { coreBoxCost, coresPerPiece, newCore } from "./cores.js";
 import { programmeOf, readSeriesOrder } from "./rfq.js";
+import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, label as traceLabel, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
 import * as store from "./store.js";
 
 let el = null;
@@ -20,6 +21,7 @@ let settings = layers.effective;
 let q = store.loadQuote(base, indices);
 let message = null; // {kind: "ok" | "error", text}
 let thicknessBusy = false;
+let traceOpen = false; // detail of the traced values unfolded (card "Traçabilité")
 
 export function mount(targets) {
   el = targets;
@@ -63,6 +65,14 @@ export function mount(targets) {
 function reloadSettings() {
   layers = store.loadSettingsLayers(base);
   settings = layers.effective;
+}
+
+/** The data files, the settings and the quote read again from this browser's storage (tests). */
+export function reload() {
+  base = store.loadBase();
+  indices = store.loadIndices();
+  reloadSettings();
+  q = store.loadQuote(base, indices);
 }
 
 export function show(name) {
@@ -260,6 +270,7 @@ async function onClick(event) {
     if (m === null) message = { kind: "error", text: "Pas de marge qui donne ce taux mini." };
     else {
       q.marge = m;
+      q.margeMini = { valeur: m, tauxMini: settings.tauxMini };
       store.saveQuote(q);
       message = { kind: "ok", text: `Marge sur VA fixée à ${pct(m, 2)} : marge sur VA de la première année = ${pct(settings.tauxMini)}.` };
     }
@@ -318,6 +329,13 @@ async function onClick(event) {
   } else if (action === "export-tendances") {
     const t = store.exportTendances();
     if (t) download(t.fileName || "tendances.json", new Blob([JSON.stringify(t.values, null, 2)], { type: "application/json" }));
+  } else if (action === "show-trace") {
+    traceOpen = true;
+    render();
+    el.chiffrage.querySelector("#ctrace")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } else if (action === "toggle-trace") {
+    // Clicked before the details element toggles: kept open or closed at the next rendering.
+    traceOpen = !button.parentElement.open;
   } else if (action === "export-xlsx") {
     exportXlsx().catch((err) => {
       message = { kind: "error", text: err.message };
@@ -458,8 +476,12 @@ function selectedPieces(p3d, all) {
   return all.filter((p) => chosen.has(p.index));
 }
 
-/** Everything the page shows, from the data, the settings and the inputs. */
-function compute() {
+/**
+ * Everything the page shows, from the data, the settings and the inputs, with
+ * the trace of its values (provenance.js): out.trace for the quote, r.trace
+ * for each piece. Exported for the tests.
+ */
+export function compute() {
   if (!base) return null;
   const p3d = window.reader3d?.part?.() ?? null;
   // Another 3D file: the inputs of the pieces of the previous one do not apply.
@@ -501,14 +523,25 @@ function compute() {
   }
   const rates = centreRates(base, { modes: settings.modes, energy });
   const common = { density, years, volumes, volumeTotal, sale, metal, energy, rates };
-  const results = pieces.map((piece) => computePiece(piece, common));
+  // Where each value comes from: traced after the computation, it changes none of them.
+  const ctx = traceContext(p3d);
+  common.trace = traceQuote(ctx, common);
+  const results = pieces.map((piece) => computePiece(piece, common, ctx));
   const out = { p3d, allPieces, pieces, selected, results, ...common };
-  if (selected === "ensemble") out.ensemble = aggregate(results.filter((r) => r.final), years);
+  if (selected === "ensemble") {
+    out.ensemble = aggregate(results.filter((r) => r.final), years);
+    out.trace["ensemble.prix.vente"] = traceEnsemble(results, out.ensemble);
+  }
   return out;
 }
 
-/** Quote of one piece: its features, the routes, the retained route and its costing. */
-function computePiece(piece, { density, years, volumes, volumeTotal, metal, energy, rates }) {
+/** What the traces read: the quote, the data files, the settings and their layers. */
+function traceContext(p3d) {
+  return { q, base, indices, layers, settings, seuil: settings.seuilTendance ?? SEUIL_TENDANCE, p3dFile: p3d?.file ?? null };
+}
+
+/** Quote of one piece: its features, the routes, the retained route and its costing; and their trace (out.trace). */
+function computePiece(piece, { density, years, volumes, volumeTotal, metal, energy, rates, trace }, ctx) {
   const inputs = pieceInputs(piece.key);
   const auto = {
     poids: piece.volume ? (piece.volume / 1e6) * density : null,
@@ -560,7 +593,8 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
     tthCoef: settings.tth[inputs.tth]?.coef ?? 1,
   };
   const out = { piece, inputs, auto, part, density };
-  if (!(part.poids > 0)) return out;
+  const traced = () => ((out.trace = tracePiece(out, ctx, trace)), out);
+  if (!(part.poids > 0)) return traced();
 
   const ranked = rankRoutes(rates, base.lists, part, settings, quoteBase);
   const best = bestRoutes(ranked, 3);
@@ -570,7 +604,7 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
   // The route retained: the best one, or the island chosen in the page.
   const chosen = inputs.procede !== "auto" && settings.processes[inputs.procede] && rates.has(inputs.procede);
   const code = chosen ? inputs.procede : best[0]?.process;
-  if (!code) return out;
+  if (!code) return traced();
   const process = settings.processes[code];
   const finition =
     inputs.finition !== "auto" && process.finitions.includes(inputs.finition)
@@ -622,7 +656,7 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
     margeOutillages: 0,
   };
   out.final = quote(finalRates, base.lists, out.finalInput);
-  return out;
+  return traced();
 }
 
 /** The whole set: sums of the pieces, year by year. */
@@ -747,7 +781,10 @@ function renderQuote() {
       <p>Aucune pièce sélectionnée : cochez au moins un corps fermé dans la liste des corps de la page Analyse 3D, ou choisissez une pièce ci-dessus.</p></section></div></div>`;
   }
 
+  const sections = traceSections(c);
+  const traces = summarize(sections);
   return `<div class="cpage">${messageHtml()}
+  ${traceBanner(traces)}
   <div class="cgrid">
     ${sourcesCard()}
     <section class="ccard">
@@ -795,6 +832,7 @@ function renderQuote() {
   ${ensemble ? ensembleDetailCard(c) : detailCard(r)}
   ${seriesCard(c)}
   ${projectionCard(c, ensemble ? c.ensemble : r?.final)}
+  ${traceCard(sections, traces)}
   <p class="cactions">
     <button type="button" data-action="export-xlsx"${c.results.some((x) => x.final) ? "" : " disabled"}>Exporter le chiffrage (Excel)</button>
     <button type="button" data-action="reset-quote">Nouveau chiffrage</button>
@@ -1174,6 +1212,83 @@ function projectionCard(c, f) {
   </section>`;
 }
 
+// --------------------------------------------------------------------------- traceability
+
+/** The traced values shown: those of the quote, and of the pieces shown (one, or every piece of the set). */
+function traceSections(c) {
+  const shown = c.selected === "ensemble" ? c.results : c.results.filter((r) => r.piece.key === c.selected);
+  return [{ piece: null, trace: c.trace }, ...shown.map((r) => ({ piece: r.piece.name, trace: r.trace }))];
+}
+
+const plural = (n, word) => `${n} ${word}${n > 1 ? "s" : ""}`;
+const signedPct = (v) => (Number.isFinite(v) ? `${v > 0 ? "+" : ""}${pct(v)}` : "");
+
+/** A traced value as text, by its unit ("%": a fraction). */
+function traceText(v, unite) {
+  if (v === null || v === undefined) return "—";
+  if (typeof v !== "number") return String(v);
+  if (unite === "%") return pct(v);
+  if (unite === "€") return eur(v, Math.abs(v) >= 1000 ? 0 : 3);
+  if (unite === "kg") return `${nf(v, 3)} kg`;
+  if (unite === "s") return `${nf(v, 0)} s`;
+  if (unite === "pièces") return nf(v, 0);
+  if (unite === "valeurs") return plural(v, "valeur");
+  if (unite.startsWith("€/kg")) return `${nf(v, 4)} ${unite}`;
+  if (!unite) return nf(v, Number.isInteger(v) ? 0 : 2);
+  return `${nf(v, 2)} ${unite}`;
+}
+const traceValue = (v, unite) => esc(traceText(v, unite));
+
+/** "N valeurs à valider / N alertes", at the top of the quote. */
+function traceBanner(sum) {
+  const alerts = sum.alertes.length;
+  return `<p class="cmsg ctrace-banner ${sum.aValider || alerts ? "warn" : "clean"}">Traçabilité : <strong>${plural(sum.aValider, "valeur")} à valider / ${plural(alerts, "alerte")}</strong>
+    <button type="button" class="small" data-action="show-trace">Voir le détail</button></p>`;
+}
+
+function traceRow(cle, t) {
+  const s = t.source;
+  const name = TRACE_SOURCES[s.type]?.label ?? s.type;
+  const details = [s.ref && `Référence : ${s.ref}`, s.entrees?.length && `Entrées : ${s.entrees.join(", ")}`].filter(Boolean).join("\n");
+  const notes = [
+    ...t.alternatives.map((a) => `autre source : ${TRACE_SOURCES[a.source]?.label ?? a.source} ${traceValue(a.valeur, t.unite)}${Number.isFinite(a.ecart_rel) ? ` (écart ${signedPct(a.ecart_rel)})` : ""}`),
+    ...t.hypotheses.map(esc),
+  ];
+  const e = t.ecart_tendance;
+  return `<tr${t.alertes.length ? ' class="calert"' : ""}>
+    <td>${esc(traceLabel(cle))} <small class="muted">${esc(cle)}</small>${t.alertes.map((a) => `<small class="ctrend">${esc(ALERTES[a.type] ?? a.type)} : ${esc(a.message)}</small>`).join("")}</td>
+    <td class="num">${traceValue(t.valeur, t.unite)}</td>
+    <td title="${esc(details)}">${esc(name)}${s.fichier ? ` « ${esc(s.fichier)} »` : ""}${s.date ? `, ${dateLabel(s.date)}` : ""}${notes.map((n) => `<small class="muted cnote">${n}</small>`).join("")}</td>
+    <td>${esc(t.autorite)}${t.niveau ? ` (N${t.niveau})` : ""}</td>
+    <td><span class="cconf ${esc(t.confiance.niveau)}">${esc(t.confiance.niveau)}</span><small class="muted cnote">${esc(t.confiance.raison)}</small></td>
+    <td class="num${e?.alerte ? " bad" : ""}">${e ? `${signedPct(e.ecart_rel)} <small class="muted">tendance ${traceValue(e.tendance, e.chemin ? "" : t.unite)}${e.chemin ? ` (${esc(e.chemin)})` : ""}</small>` : "—"}</td>
+    <td>${t.validation_requise ? "<strong>oui</strong>" : "non"}</td>
+  </tr>`;
+}
+
+/** Card "Traçabilité": the alerts, and every traced value (collapsible). */
+function traceCard(sections, sum) {
+  const rows = sections
+    .map(({ piece, trace }) => {
+      const entries = Object.entries(trace ?? {});
+      return entries.length ? `<tr class="sub"><td colspan="7">${piece === null ? "Devis" : `Pièce : ${esc(piece)}`}</td></tr>${entries.map(([cle, t]) => traceRow(cle, t)).join("")}` : "";
+    })
+    .join("");
+  const MAX = 20;
+  const alerts = sum.alertes.slice(0, MAX).map((a) => `<li><strong>${esc(a.label)}</strong>${a.piece ? ` (${esc(a.piece)})` : ""} — ${esc(ALERTES[a.type] ?? a.type)} : ${esc(a.message)}</li>`).join("");
+  return `<section class="ccard ctrace" id="ctrace">
+    <h3>Traçabilité</h3>
+    <p class="small">${plural(sum.valeurs, "valeur")} tracée${sum.valeurs > 1 ? "s" : ""} : <strong>${plural(sum.aValider, "valeur")} à valider</strong>${sum.aValiderCalcul ? ` (dont ${sum.aValiderCalcul} calculée${sum.aValiderCalcul > 1 ? "s" : ""} à partir de valeurs à valider)` : ""}, <strong>${plural(sum.alertes.length, "alerte")}</strong>.</p>
+    ${alerts ? `<ul class="calerts small">${alerts}${sum.alertes.length > MAX ? `<li>… et ${plural(sum.alertes.length - MAX, "autre alerte")} : voir le détail.</li>` : ""}</ul>` : ""}
+    <details${traceOpen ? " open" : ""}><summary data-action="toggle-trace">Détail des valeurs : valeur, source, autorité, confiance, écart à la tendance, validation requise</summary>
+      <div class="cscroll"><table class="ctable compact">
+        <thead><tr><th>Valeur tracée</th><th class="num">Valeur</th><th>Source</th><th>Autorité</th><th>Confiance</th><th class="num">Écart à la tendance</th><th>Validation requise</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+    </details>
+    <p class="small muted">Ordre des sources : commande client et saisies du devis, puis Paramètres, classeur et indices (hard), puis géométrie 3D (evidence), puis tendances du fichier de paramètres calés (soft_prior), qui ne remplacent jamais une valeur actuelle. Défaut du code : valeur neutre, à remplacer par une valeur de l'entreprise. Une valeur calculée a la confiance de sa plus faible entrée et demande une validation si l'une d'elles en demande une. Écart à la tendance signalé au-delà de ${pct(settings.seuilTendance ?? SEUIL_TENDANCE, 0)} (Paramètres). Aucune valeur ne vient de l'IA.</p>
+  </section>`;
+}
+
 // Where each setting comes from (store.js layers): its label, and its letter in the tables.
 const SOURCES = { saisie: ["saisie", "S"], classeur: ["classeur", "C"], tendance: ["tendance", "T"], defaut: ["défaut", "D"] };
 
@@ -1219,6 +1334,7 @@ function settingsSourcesCard() {
       <input type="file" data-file="tendances" accept=".json,application/json" hidden>${t ? ` <button type="button" class="small" data-action="export-tendances">Exporter les tendances</button>` : ""}</div>
     ${base ? `<div class="crow"><span>Classeur de chiffrage :</span> <strong>${esc(base.source?.fileName)} — importé le ${dateLabel(base.source?.importedAt)}</strong></div>` : ""}
     ${migrated}
+    <div class="cfields">${field("Seuil d'alerte : écart à la tendance", sinput("seuilTendance", settings.seuilTendance, { kind: "pct" }), "% — au-delà, le chiffrage signale l'écart (carte Traçabilité)")}</div>
     <p class="small muted">Chaque valeur vient de la première source qui en a une : <span class="csrc saisie">saisie</span> dans cette page (enregistrée dans ce navigateur dès qu'elle est saisie), puis <span class="csrc classeur">classeur</span> de chiffrage, puis <span class="csrc tendance">tendance</span> du fichier de paramètres calés (une indication tirée des devis passés : elle ne remplace jamais une saisie ni une valeur du classeur), puis <span class="csrc defaut">défaut</span> du code (valeur neutre, à ajuster). Dans les tableaux : S, C, T, D. Un champ vidé n'est plus une saisie : il reprend la valeur de la source suivante (0 ne s'obtient qu'en tapant 0). Quand une valeur s'écarte de la tendance, la tendance et l'écart s'affichent sous le champ, avec « Adopter la tendance ».</p>
     <div class="crow"><span class="small">Paramètres par défaut :</span>
       <button type="button" class="small" data-action="clear-saisies"${n ? "" : " disabled"}>Effacer mes saisies (les tendances restent)…</button>
@@ -1391,6 +1507,9 @@ async function exportXlsx() {
   const P = (v) => (Number.isFinite(v) ? { value: v, style: STYLE.percent } : null);
   const T = (v) => (typeof v === "number" ? { value: v, style: STYLE.totalNumber } : { value: v, style: STYLE.totalText });
   const casting = (r) => r.route?.operations.find((o) => o.code === r.route.process);
+  const sections = traceSections(c);
+  const traces = summarize(sections);
+  const status = traces.aValider ? `non validé : ${plural(traces.aValider, "valeur")} à valider, ${plural(traces.alertes.length, "alerte")} (onglet Traçabilité)` : `${plural(traces.alertes.length, "alerte")}, aucune validation requise`;
 
   // Synthesis: the quote, one row per piece, the total of the set.
   const synthese = [
@@ -1402,6 +1521,7 @@ async function exportXlsx() {
     ["Volume annuel", q.volumeAnnuel], ["Durée du programme (ans)", q.annees], ["Marge sur VA", P(q.marge ?? settings.marge)],
     ["Prototype", q.prototype ? "oui (volumes proto, sans prix cible)" : "non"],
     ["Outillage", q.outillageInclus === false ? "chiffré à part (non compris dans le prix pièce)" : "inclus dans le prix pièce (amorti sur le programme)"],
+    ["Traçabilité", status],
     [],
     ["Pièce", "Poids (kg)", "Toile mini (mm)", "Écritures / détails fins", "Épaisseur maxi (mm)", "Îlot", "Finition", "Fonctionnement", "Cycle (s)", "Pièces / cycle", "TRS", "Mise au mille", "Traitement thermique", "Outillage (€)", "Outillage amorti / pièce (€)", "VA PRI (€)", "Matière + PAF (€)", "PRI complet (€)", "Prix de vente (€)", "Marge sur VA"].map(H),
   ];
@@ -1466,6 +1586,39 @@ async function exportXlsx() {
     for (const x of [prices.base, ...prices.moqs]) serie.push([x.tailleSerie, x.miseEnRoute, x.prixVente, P(x.margeVaPct), q.prixCible > 0 ? x.prixVente - q.prixCible : null]);
   }
 
+  // Traceability: one row per traced value; the data files and their dates in the header.
+  const t = layers.tendances;
+  const fileRow = (what, name, date) => [what, name ?? "aucun", date ? dateLabel(date) : null];
+  const tracabilite = [
+    [H("Traçabilité du chiffrage"), null, null],
+    fileRow("Classeur de chiffrage", base.source?.fileName, base.source?.importedAt),
+    fileRow("Indices matière", indices ? `${indices.fileName ?? ""} (${indices.source === "fichier" ? "fichier des cours" : "copie du classeur"})` : null, indices?.importedAt),
+    fileRow("Tendances (paramètres calés)", t?.fileName, t?.importedAt),
+    fileRow("Demande client (RFQ)", q.serie?.fileName, q.serie?.importedAt),
+    ["Saisies de Paramètres", plural(Object.keys(layers.saisies.values).length, "valeur")],
+    ["Modèle 3D", c.p3d?.file ?? "aucun"],
+    ["Date de l'export", new Date().toLocaleString("fr-FR")],
+    ["Statut", status],
+    ["Seuil d'écart à la tendance", P(settings.seuilTendance ?? SEUIL_TENDANCE)],
+    ["Ordre des sources", "commande client et saisies du devis, puis Paramètres, classeur et indices (hard) ; géométrie 3D (evidence) ; tendances (soft_prior), jamais au-dessus d'une valeur actuelle ; défaut du code : hypothèse à valider ; aucune valeur ne vient de l'IA"],
+    ["Confidentialité", "document interne : taux, coûts et marges de l'entreprise"],
+    [],
+    ["Pièce", "Clé", "Valeur tracée", "Valeur", "Unité", "Source", "Référence", "Fichier", "Date", "Entrées", "Autorité", "Niveau", "Confiance", "Raison", "Tendance", "Écart à la tendance", "Autres sources", "Hypothèses", "Alertes", "Validation requise"].map(H),
+  ];
+  for (const { piece, trace } of sections) {
+    for (const [cle, x] of Object.entries(trace ?? {})) {
+      const percent = x.unite === "%";
+      const e = x.ecart_tendance;
+      tracabilite.push([
+        piece ?? "Devis", cle, traceLabel(cle), typeof x.valeur === "number" && percent ? P(x.valeur) : x.valeur, x.unite,
+        TRACE_SOURCES[x.source.type]?.label ?? x.source.type, x.source.ref, x.source.fichier ?? null, x.source.date ? dateLabel(x.source.date) : null, x.source.entrees?.join(", ") || null,
+        x.autorite, x.niveau, x.confiance.niveau, x.confiance.raison, e ? (percent ? P(e.tendance) : e.tendance) : null, e ? P(e.ecart_rel) : null,
+        x.alternatives.map((a) => `${TRACE_SOURCES[a.source]?.label ?? a.source} : ${traceText(a.valeur, x.unite)}`).join(" ; ") || null,
+        x.hypotheses.join(" ; ") || null, x.alertes.map((a) => `${ALERTES[a.type] ?? a.type} : ${a.message}`).join(" ; ") || null, x.validation_requise ? "oui" : "non",
+      ]);
+    }
+  }
+
   const bytes = buildXlsx([
     { name: "Synthèse", rows: synthese, widths: [32, 14, 14, 20, 16, 34, 22, 14, 10, 12, 8, 12, 22, 14, 16, 12, 14, 14, 14, 12] },
     { name: "Gammes", rows: gammes, header: true, widths: [28, 10, 34, 14, 12, 14, 10, 18, 14, 14] },
@@ -1473,6 +1626,7 @@ async function exportXlsx() {
     { name: "Outillage", rows: outillage, widths: [28, 42, 60, 14] },
     { name: "Commande série", rows: serie, widths: [26, 24, 22, 14, 22, 12, 12, 12, 12, 12, 12, 12] },
     { name: "Solutions", rows: solutions, header: true, widths: [28, 8, 40, 10, 12, 14, 12, 12, 18, 12, 14] },
+    { name: "Traçabilité", rows: tracabilite, widths: [24, 26, 34, 14, 10, 18, 40, 22, 16, 40, 12, 8, 10, 40, 12, 12, 30, 50, 60, 10] },
   ]);
   const name = (q.reference || c.p3d?.file?.replace(/\.[^.]+$/, "") || "piece").replace(/[^\w.-]+/g, "_");
   download(`chiffrage_${name}.xlsx`, new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));

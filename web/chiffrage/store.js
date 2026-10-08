@@ -97,6 +97,7 @@ function codeSettings() {
     coefSecurite: 0.1,
     heuresChangementCoulee: 8,
     heuresChangementFinition: 1,
+    seuilTendance: 0.15, // deviation from the trend above which the trace of the quote raises an alert (provenance.js)
   };
 }
 
@@ -255,6 +256,7 @@ const RULES = [
   { re: /^operations\.[^.]+\.chargeKg$/, test: (v) => v > 0, message: "charge supérieure à 0 kg" },
   { re: /^processes\.[^.]+\.miseAuMille$/, test: (v) => v > 0, message: "mise au mille supérieure à 0" },
   { re: /^modes\.[^.]+$/, test: (v) => MODES.includes(v), message: `fonctionnement ${MODES.join(", ")}` },
+  { re: /^seuilTendance$/, test: (v) => v >= 0, message: "seuil positif ou nul" },
 ];
 const ruleOf = (path) => RULES.find((r) => r.re.test(path));
 

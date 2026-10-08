@@ -1,7 +1,7 @@
 // End-to-end test of the costing pages of the built site (dist/): import of
 // the costing workbook and of a prices file, the three best routes, choice of
 // an island in the drop-down lists, settings kept after a reload, trends file
-// below the values typed in, Excel export.
+// below the values typed in, traced values, Excel export.
 // With a made-up workbook (tests/js/costing-fixture.mjs).
 //
 //   npm run build && node --test tests/e2e/costing.test.mjs
@@ -75,6 +75,18 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(new Set(islands).size, 3);
     assert.match(await page.textContent('#page-chiffrage'), /PRI complet/);
 
+    // Traceability: the banner at the top, the card of the traced values (folded until asked for).
+    assert.match(await page.textContent('#page-chiffrage .ctrace-banner'), /Traçabilité : \d+ valeurs? à valider \/ \d+ alertes?/);
+    assert.equal(await page.isVisible('#page-chiffrage #ctrace table'), false);
+    await page.click('#page-chiffrage [data-action="show-trace"]');
+    await page.waitForSelector('#page-chiffrage #ctrace details[open] table');
+    const traced = await page.textContent('#page-chiffrage #ctrace');
+    for (const key of ['devis.alliage', 'devis.densite', 'devis.marge', 'devis.metal.coursVente', 'devis.metal.prixAchat', 'piece.poids', 'piece.miseAuMille', 'piece.kgCast', 'piece.cycle', 'piece.empreintes', 'piece.outillage.total', 'piece.prix.vente']) {
+      assert.ok(traced.includes(key), key);
+    }
+    assert.match(await page.locator('#page-chiffrage #ctrace tr', { hasText: 'piece.poids' }).textContent(), /1,200 kg\s*saisie du devis\s*hard \(N1\)\s*haute/);
+    assert.match(traced, /défaut du code : valeur par défaut du code/);
+
     // Island and cycle time chosen in the drop-down lists.
     await page.selectOption('#page-chiffrage [data-bind="p.procede"]', 'CG3');
     await page.waitForFunction(() => document.querySelector('#page-chiffrage [data-bind="p.cycle"]'));
@@ -147,6 +159,12 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const settingsCell = (bind) => page.locator(`#page-parametres td:has(> .cval [data-bind="${bind}"])`);
     assert.equal(await page.inputValue('#page-parametres [data-bind="s.trs.CG3"]'), '60', 'the value typed in stays');
     assert.match(await settingsCell('s.trs.CG3').textContent(), /^S\s*tendance 70 %, écart [-−]14,3 %\s*Adopter la tendance$/);
+    // In the quote, the TRS traced: typed in Paramètres (hard), the trend and the deviation beside it.
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage #ctrace');
+    assert.match(await page.locator('#page-chiffrage #ctrace tr', { hasText: 'centre.CG3.trs' }).textContent(), /60,0 %\s*saisie Paramètres[\s\S]*hard \(N2\)\s*haute[\s\S]*[-−]14,3 %\s*tendance 70,0 %\s*non/);
+    await page.click('.tab[data-page="parametres"]');
+    await page.waitForSelector('#page-parametres [data-bind="s.trs.CG3"]');
     assert.equal(await page.inputValue('#page-parametres [data-bind="s.trs.SSP"]'), '50', 'nothing typed in: the trend');
     assert.equal(await settingsCell('s.trs.SSP').locator('.csrc').textContent(), 'T');
     assert.equal(await page.textContent('#page-parametres label:has([data-bind="s.marge"]) .csrc'), 'classeur');
@@ -215,11 +233,20 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const [download] = await Promise.all([page.waitForEvent('download'), page.click('#page-chiffrage [data-action="export-xlsx"]')]);
     const files = unzipSync(new Uint8Array(readFileSync(await download.path())));
     const workbook = strFromU8(files['xl/workbook.xml']);
-    for (const name of ['Synthèse', 'Gammes', 'Projection', 'Outillage', 'Commande série', 'Solutions']) assert.match(workbook, new RegExp(`name="${name}"`));
+    for (const name of ['Synthèse', 'Gammes', 'Projection', 'Outillage', 'Commande série', 'Solutions', 'Traçabilité']) assert.match(workbook, new RegExp(`name="${name}"`));
     const synthese = strFromU8(files['xl/worksheets/sheet1.xml']);
     assert.match(synthese, /CG3 — Coquille gravité \(traditionnel\)/);
     assert.match(synthese, /Mise au mille/);
+    assert.match(synthese, /non validé : \d+ valeurs à valider/);
     assert.match(strFromU8(files['xl/worksheets/sheet2.xml']), /CG3/);
+    // The sheet "Traçabilité": the data files and their dates, then one row per traced value.
+    const tracabilite = strFromU8(files['xl/worksheets/sheet7.xml']);
+    for (const text of ['Classeur de chiffrage', 'chiffrage.xlsm', 'Indices matière', 'VALEURS MB LME.xlsx', 'Tendances (paramètres calés)', 'Demande client (RFQ)', 'RFQ.xlsm', 'Statut', 'non validé']) {
+      assert.ok(tracabilite.includes(text), text);
+    }
+    for (const column of ['Clé', 'Valeur', 'Source', 'Autorité', 'Confiance', 'Écart à la tendance', 'Hypothèses', 'Alertes', 'Validation requise']) assert.ok(tracabilite.includes(`<t xml:space="preserve">${column}</t>`), column);
+    for (const key of ['devis.metal.coursVente', 'devis.tailleSerie', 'centre.CG3.trs', 'piece.cycle', 'piece.prix.vente']) assert.ok(tracabilite.includes(`>${key}<`), key);
+    assert.match(tracabilite, /RFQ\.xlsm<\/t><\/is><\/c><c r="C\d+"[^>]*><is><t xml:space="preserve">\d\d\/\d\d\/\d{4}/, 'the date of the customer request');
 
     // A new tab of the 3D page: its own quote, without the series order; the workbook and the indices are shared.
     await page.click('.doc-tab-new');
@@ -253,7 +280,11 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.waitForSelector('#page-chiffrage [data-bind="q.piece"]');
     // Wall thickness of each piece (bracket 5 mm, pin 8 mm across).
     await page.click('#page-chiffrage [data-action="thickness"]');
-    await page.waitForFunction(() => /5,00 mm/.test(document.getElementById('page-chiffrage').textContent), null, { timeout: 60_000 });
+    // In the rows of the pieces (the card of the traced values has other sizes in mm, such as 45,00 mm).
+    await page.waitForFunction(() => {
+      const rows = [...document.querySelectorAll('#page-chiffrage .ctable tbody tr')].map((tr) => tr.textContent);
+      return rows.some((t) => /Équerre/.test(t) && /5,00 mm/.test(t)) && rows.some((t) => /Pin/.test(t) && /8,00 mm/.test(t));
+    }, null, { timeout: 60_000 });
 
     // The set: one row per piece and the total.
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.piece"]'), 'tout');
@@ -262,6 +293,9 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(rows.some((t) => /Pin/.test(t) && /8,00 mm/.test(t)), rows.join('\n'));
     assert.ok(rows.some((t) => /Ensemble \(2 pièces chiffrées\)/.test(t)), rows.join('\n'));
     assert.match(await page.textContent('#page-chiffrage'), /Prix de l'ensemble/);
+    // The traced values of the set: the quote, each piece, the price of the set.
+    const traced = await page.textContent('#page-chiffrage #ctrace');
+    for (const text of ['Pièce : Équerre', 'Pièce : Pin', 'ensemble.prix.vente', 'piece.volume3d', 'géométrie 3D']) assert.ok(traced.includes(text), text);
 
     // One piece: its casting parameters and its estimated mise au mille; the 3D page follows.
     const volumeAll = await page.textContent('#total-volume');
