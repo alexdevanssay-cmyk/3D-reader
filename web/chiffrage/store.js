@@ -162,32 +162,72 @@ export function mergeSettings(settings, extra) {
   return out;
 }
 
-/** Put `value` at `keys` of the settings `root`; not where the place does not exist (row of a shorter table, value instead of a group). */
+/**
+ * Put `value` at `keys` of the settings `root`; not where the place does not
+ * exist (row of a shorter table, value instead of a group): false then.
+ */
 function place(root, keys, value) {
   let o = root;
   for (const k of keys.slice(0, -1)) {
-    if (Array.isArray(o) && !(Number(k) < o.length)) return;
+    if (Array.isArray(o) && !(Number(k) < o.length)) return false;
     if (o[k] === null || o[k] === undefined) o[k] = {};
-    else if (typeof o[k] !== "object") return;
+    else if (typeof o[k] !== "object") return false;
     o = o[k];
   }
   const last = keys.at(-1);
-  if (Array.isArray(o) && !(Number(last) < o.length)) return;
+  if (Array.isArray(o) && !(Number(last) < o.length)) return false;
   // A table saved whole over another one: its rows completed by those below.
   const below = o[last];
   if (Array.isArray(value) && Array.isArray(below) && isPlain(below[0])) value = value.map((x, i) => (isPlain(x) ? { ...(below[i] ?? below.at(-1)), ...x } : x));
   o[last] = value;
+  return true;
+}
+
+/** The keys of the table of rows (bands of hours, weight coefficients, steel types) a row of which `keys` addresses in the settings `s`; else null. */
+function tableOf(s, keys) {
+  for (let n = 1; n < keys.length; n++) {
+    const t = at(s, keys.slice(0, n));
+    if (Array.isArray(t)) return isPlain(t[0]) && /^\d+$/.test(keys[n]) ? keys.slice(0, n) : null;
+    if (t === null || typeof t !== "object") return null;
+  }
+  return null;
 }
 
 /**
  * The effective settings: at each place, the value typed in (saisies: {path:
  * {value}}), else the workbook's, else the trend's, else the code's. A trend
  * never takes the place of a current value (typed, or of the workbook).
+ *
+ * A value typed in a row of a table applies to a table of the length it was
+ * typed in (`rows`; saved before: the code's): row i of a table of other
+ * bands is another band. Where the trends give that table with another
+ * length than the code's one a row of which is typed in, the table of the
+ * code is used there, the trend's is ignored (report.ignored: the paths of
+ * those tables). A typed value with no place (its row is not in the table
+ * used, or the table is not the one it was typed in; a value in place of a
+ * group) is not applied (report.unapplied: its path).
  */
-export function resolveSettings({ code = codeSettings(), workbook = {}, tendances = null, saisies = {} } = {}) {
+export function resolveSettings({ code = codeSettings(), workbook = {}, tendances = null, saisies = {} } = {}, report = {}) {
+  const current = mergeSettings(code, workbook); // the settings without the trends
   const s = clone(mergeSettings(mergeSettings(code, tendances), workbook));
-  for (const [path, e] of byDepth(Object.entries(saisies))) {
-    if (e?.value !== null && e?.value !== undefined) place(s, path.split("."), clone(e.value));
+  const entries = byDepth(Object.entries(saisies)).filter(([, e]) => e?.value !== null && e?.value !== undefined);
+  // [the keys of its table, the length of the table it was typed in] of a value typed in a row; else [].
+  const rowOf = (path, e) => {
+    const table = tableOf(current, path.split("."));
+    return table ? [table, Number.isInteger(e.rows) ? e.rows : at(current, table).length] : [];
+  };
+  report.ignored = [];
+  for (const [path, e] of entries) {
+    const [table, rows] = rowOf(path, e);
+    if (!table || at(s, table).length === rows || at(current, table).length !== rows || !Array.isArray(at(tendances, table))) continue;
+    at(s, table.slice(0, -1))[table.at(-1)] = clone(at(current, table));
+    report.ignored.push(table.join("."));
+  }
+  report.unapplied = [];
+  for (const [path, e] of entries) {
+    const [table, rows] = rowOf(path, e);
+    const elsewhere = table && Number.isInteger(e.rows) && at(s, table).length !== rows; // typed in another table (saved before: placed as it was)
+    if (elsewhere || !place(s, path.split("."), clone(e.value))) report.unapplied.push(path);
   }
   return s;
 }
@@ -231,7 +271,11 @@ function loadSaisies(base) {
 
 function loadTendances() {
   const t = read(KEYS.tendances);
-  return isPlain(t?.values) ? t : null;
+  if (!isPlain(t?.values)) return null;
+  // The threshold of the alerts on the deviation from the trend is not the trends' to set (saved before it was refused).
+  if (!Object.hasOwn(t.values, "seuilTendance")) return t;
+  const { seuilTendance, ...values } = t.values;
+  return Object.keys(values).length ? { ...t, values } : null;
 }
 
 /** The typed value at `keys`, or the value saved whole that holds it (earlier versions). */
@@ -244,31 +288,43 @@ function typedAt(values, keys) {
 }
 
 /**
- * The settings and their layers: {effective, saisies, tendances,
- * provenance(path)}. provenance("trs.CG3") = {source: "saisie" | "classeur" |
- * "tendance" | "defaut", value, date?, fileName?, migrated?, trend (the
- * trend's value at that place, if any)}.
+ * The settings and their layers: {effective, saisies, tendances, ignored
+ * (tables of the trends not used: a row of them typed in, resolveSettings),
+ * unapplied (paths of typed values not applied), provenance(path)}.
+ * provenance("trs.CG3") = {source: "saisie" | "classeur" | "tendance" |
+ * "defaut", value, date?, fileName?, migrated?, from? ("tendance": a trend
+ * adopted over the workbook), trend (the trend's value at that place, if
+ * any), classeur (the workbook's), trendIgnored? (in a table of the trends
+ * not used), unapplied? (the value typed there is not applied)}.
  */
 export function loadSettingsLayers(base) {
   const code = codeSettings();
   const workbook = workbookSettings(base);
   const tendances = loadTendances();
   const saisies = loadSaisies(base);
-  const effective = resolveSettings({ code, workbook, tendances: tendances?.values, saisies: saisies.values });
+  const report = {};
+  const effective = resolveSettings({ code, workbook, tendances: tendances?.values, saisies: saisies.values }, report);
   const completed = new Set(tendances?.completed ?? []); // values the trends file did not have
   return {
     effective,
     saisies,
     tendances,
+    ignored: report.ignored,
+    unapplied: report.unapplied,
     provenance(path) {
       const keys = path.split(".");
       const value = at(effective, keys);
-      const trend = tendances && !completed.has(path) ? at(tendances.values, keys) : undefined;
+      const ignored = report.ignored.some((t) => path.startsWith(`${t}.`));
+      const trend = tendances && !completed.has(path) && !ignored ? at(tendances.values, keys) : undefined;
+      const classeur = at(workbook, keys);
       const typed = typedAt(saisies.values, keys);
-      if (typed) return { source: "saisie", value, date: typed.date, migrated: !!typed.migrated, trend };
-      if (at(workbook, keys) !== undefined) return { source: "classeur", value, fileName: base?.source?.fileName, trend };
-      if (trend !== undefined) return { source: "tendance", value, fileName: tendances.fileName, date: tendances.importedAt, trend };
-      return { source: "defaut", value };
+      const notes = { ...(ignored ? { trendIgnored: true } : {}), ...(report.unapplied.includes(path) ? { unapplied: true } : {}) };
+      if (typed && !notes.unapplied) {
+        return { source: "saisie", value, date: typed.date, migrated: !!typed.migrated, ...(typed.from ? { from: typed.from, fileName: typed.fileName } : {}), trend, classeur, ...notes };
+      }
+      if (classeur !== undefined) return { source: "classeur", value, fileName: base?.source?.fileName, trend, classeur, ...notes };
+      if (trend !== undefined) return { source: "tendance", value, fileName: tendances.fileName, date: tendances.importedAt, trend, ...notes };
+      return { source: "defaut", value, ...notes };
     },
   };
 }
@@ -300,8 +356,11 @@ export function setSetting(path, value, base = null) {
   }
   const rule = ruleOf(path);
   if (rule && !rule.test(value)) return rule.message;
+  // A row of a table: the length of the table it is typed in (resolveSettings).
+  const table = tableOf(codeSettings(), path.split("."));
+  const rows = table ? at(loadSettingsLayers(base).effective, table)?.length : undefined;
   const saisies = loadSaisies(base);
-  saisies.values[path] = { value, source: "saisie", date: new Date().toISOString() };
+  saisies.values[path] = { value, source: "saisie", date: new Date().toISOString(), ...(Number.isInteger(rows) ? { rows } : {}) };
   write(KEYS.saisies, saisies);
   return null;
 }
@@ -321,16 +380,18 @@ export function clearSetting(path, base = null) {
 
 /**
  * "Adopter la tendance": the typed value at `path` gives way to the trend.
- * Where the workbook has a value (above the trends), the trend is typed in.
+ * Where the workbook has a value (above the trends), the trend is typed in,
+ * marked as an adopted trend (from, fileName: provenance, traced to validate).
  */
 export function adoptTendance(path, base = null) {
   const keys = path.split(".");
-  const trend = at(loadTendances()?.values, keys);
+  const t = loadTendances();
+  const trend = at(t?.values, keys);
   if (trend === undefined) return;
   clearSetting(path, base);
   if (at(workbookSettings(base), keys) !== undefined) {
     const saisies = loadSaisies(base);
-    saisies.values[path] = { value: trend, source: "saisie", date: new Date().toISOString(), from: "tendance" };
+    saisies.values[path] = { value: trend, source: "saisie", date: new Date().toISOString(), from: "tendance", fileName: t.fileName };
     write(KEYS.saisies, saisies);
   }
 }
@@ -445,13 +506,21 @@ function cleanTable(v, ref, keys, report) {
   // Numbered rows ({"3": {...}}, as the typed values are exported): those rows of the default table.
   if (isPlain(v) && Object.keys(v).length && Object.keys(v).every((k) => /^\d+$/.test(k))) {
     const out = clone(ref);
+    const given = new Set();
     for (const [i, x] of Object.entries(v)) {
       if (!(Number(i) < ref.length)) report.unknown.push({ path: `${path}.${i}`, suggestion: null });
       else {
         const c = clean(x, ref[i], [...keys, i], report);
-        if (c !== undefined) out[i] = isPlain(c) ? complete(c, ref[i], i) : c;
+        if (c !== undefined) {
+          out[i] = isPlain(c) ? complete(c, ref[i], i) : c;
+          given.add(Number(i));
+        }
       }
     }
+    // The rows the file does not give: the default ones, not trends.
+    ref.forEach((row, i) => {
+      if (!given.has(i) && isPlain(row)) for (const k of Object.keys(row)) report.completed.push(`${path}.${i}.${k}`);
+    });
     return out;
   }
   if (!Array.isArray(v)) return void report.invalid.push({ path, reason: "tableau attendu" });
@@ -477,14 +546,17 @@ function cleanTable(v, ref, keys, report) {
  * A trends file (calibrated settings, whole or partial) checked against the
  * settings of the code: unknown or misspelled keys and invalid values are
  * reported and left out. Returns {values (null: nothing usable), completed,
- * report: {count, unknown: [{path, suggestion}], invalid: [{path, reason}],
- * completed: [path]}}.
+ * report: {count (the values of the file, not those completed), unknown:
+ * [{path, suggestion}], invalid: [{path, reason}], completed: [path]}}.
+ * Not the threshold of the alerts on the deviation from the trend
+ * (seuilTendance): a trend does not decide when it is far from a value.
  */
 export function validateTendances(json) {
   const report = { count: 0, unknown: [], invalid: [], completed: [] };
-  const schema = { ...codeSettings(), energy: { elecAncien: 0, elecNouveau: 0, gazAncien: 0, gazNouveau: 0 } };
+  const { seuilTendance, ...code } = codeSettings();
+  const schema = { ...code, energy: { elecAncien: 0, elecNouveau: 0, gazAncien: 0, gazNouveau: 0 } };
   const values = isPlain(json) ? clean(json, schema, [], report) ?? null : (report.invalid.push({ path: "", reason: "fichier de paramètres (objet JSON) attendu" }), null);
-  report.count = countValues(values);
+  report.count = countValues(values) - report.completed.length;
   return { values, completed: report.completed, report };
 }
 
@@ -497,6 +569,17 @@ export function importTendances(json, fileName) {
   const { values, completed, report } = validateTendances(json);
   const unknown = report.unknown.length ? ` (clés inconnues : ${report.unknown.slice(0, 8).map((u) => u.path).join(", ")})` : "";
   if (!values) throw new Error(`aucune valeur de paramètre reconnue dans ce fichier${unknown}`);
+  // A table of another length than the one rows of which are typed in: not used there (resolveSettings), said now.
+  const code = codeSettings();
+  report.warnings = [];
+  for (const [path, e] of Object.entries(read(KEYS.saisies)?.values ?? {})) {
+    const table = tableOf(code, path.split("."));
+    const rows = table && (Number.isInteger(e?.rows) ? e.rows : at(code, table).length);
+    const trend = table && at(values, table);
+    if (!Array.isArray(trend) || trend.length === rows || report.warnings.some((x) => x.path === table.join("."))) continue;
+    const kept = rows === at(code, table).length ? "le tableau par défaut est gardé là où des lignes sont saisies dans Paramètres" : "les lignes saisies dans Paramètres ne sont plus appliquées";
+    report.warnings.push({ path: table.join("."), reason: `${trend.length} lignes au lieu de ${rows} : ${kept}` });
+  }
   write(KEYS.tendances, { fileName, importedAt: new Date().toISOString(), values, completed });
   return report;
 }
@@ -562,6 +645,7 @@ export function defaultQuote(base, indices) {
     composants: [],
     serie: null, // series order of the customer request (rfq.js)
     serieAvant: null, // {field: value} the fields of the quote before a request filled them (back with "Retirer")
+    serieValeurs: null, // {field: value} what an earlier request wrote that the current one does not, still in the fields
     serieRetiree: null, // {fileName, fields: {field: value}, avant}: request removed, fields still holding its values
     moqs: [], // order quantities, largest first
     prixCible: null,

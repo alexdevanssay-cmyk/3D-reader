@@ -202,7 +202,10 @@ export function derive(valeur, { entrees = {}, plafond = null, ...opts } = {}) {
 /**
  * A setting (path "trs.CG3") traced from the layers of store.js: typed in
  * Paramètres, workbook, trend or default of the code; the trend, when a
- * current value is above it, as an alternative with its deviation.
+ * current value is above it, as an alternative with its deviation. A value
+ * typed in that may be a trend (taken over from the previous version, which
+ * mixed inputs and the calibrated file; a trend adopted over the workbook):
+ * to validate, with the workbook's value it is above as an alternative.
  *   ctx: {layers, base, seuil}
  */
 export function fromSetting(ctx, path, { unite = "", hypotheses = [] } = {}) {
@@ -210,14 +213,40 @@ export function fromSetting(ctx, path, { unite = "", hypotheses = [] } = {}) {
   const p = layers.provenance(path);
   const ref = `settings.${path}`;
   const t = layers.tendances;
+  const fichier = base?.source?.fileName;
+  const known = (v) => hasValue(v) && typeof v !== "object";
+  const notUsed = p.trendIgnored ? ["tableau du fichier de tendances non utilisé ici : une ligne en est saisie dans Paramètres, sur un tableau d'un autre nombre de lignes"] : [];
+  const adopted = p.source === "saisie" && p.from === "tendance";
+  const migrated = p.source === "saisie" && p.migrated && !adopted;
+  const instead = known(p.classeur) ? ` à la place de la valeur du classeur (${show(p.classeur, unite)})` : "";
+  const typed = () => {
+    if (adopted) {
+      const what = `tendance${p.fileName ? ` du fichier « ${p.fileName} »` : ""} adoptée dans Paramètres${p.date ? ` le ${day(p.date)}` : ""}${instead}`;
+      return traced(p.value, { type: "parametres", unite, ref, date: p.date, raison: what, hypotheses: [...hypotheses, what], validation: true });
+    }
+    if (migrated) {
+      return traced(p.value, {
+        type: "parametres", unite, ref, date: p.date, confiance: "moyenne", raison: "reprise de la version précédente : saisie ou fichier calé, indiscernables",
+        hypotheses: [...hypotheses, "reprise des paramètres enregistrés par la version précédente"], validation: true,
+      });
+    }
+    return traced(p.value, { type: "parametres", unite, ref, date: p.date, raison: `saisie dans Paramètres${p.date ? ` le ${day(p.date)}` : ""}`, hypotheses: [...hypotheses, ...notUsed] });
+  };
   const chosen = {
-    saisie: () => traced(p.value, { type: "parametres", unite, ref, date: p.date, raison: `saisie dans Paramètres${p.date ? ` le ${day(p.date)}` : ""}`, hypotheses: p.migrated ? [...hypotheses, "reprise des paramètres enregistrés par la version précédente"] : hypotheses }),
-    classeur: () => traced(p.value, { type: "classeur", unite, ref, fichier: p.fileName ?? base?.source?.fileName, date: base?.source?.importedAt, hypotheses }),
+    saisie: typed,
+    classeur: () => traced(p.value, { type: "classeur", unite, ref, fichier: p.fileName ?? fichier, date: base?.source?.importedAt, hypotheses: [...hypotheses, ...notUsed] }),
     tendance: () => traced(p.value, { type: "tendance", unite, ref, fichier: p.fileName, date: p.date, hypotheses }),
-    defaut: () => traced(p.value, { type: "defaut_code", unite, ref, hypotheses }),
+    defaut: () => traced(p.value, { type: "defaut_code", unite, ref, hypotheses: [...hypotheses, ...notUsed] }),
   }[p.source]();
   const trend = p.source !== "tendance" && hasValue(p.trend) ? traced(p.trend, { type: "tendance", unite, ref, fichier: t?.fileName, date: t?.importedAt }) : null;
-  return resolve([chosen, trend], { seuil: ctx.seuil }) ?? chosen;
+  const workbook = (adopted || migrated) && known(p.classeur) ? traced(p.classeur, { type: "classeur", unite, ref: `classeur : ${path}`, fichier, date: base?.source?.importedAt }) : null;
+  const out = resolve([chosen, trend, workbook], { seuil: ctx.seuil }) ?? chosen;
+  // Taken over, the same value as the trend: it came from the calibrated file, most likely, and is now above the workbook.
+  if (migrated && hasValue(p.trend) && (typeof p.value === "object" ? JSON.stringify(p.trend) === JSON.stringify(p.value) : same(p.trend, p.value))) {
+    alert(out, "divergence", `valeur reprise de la version précédente égale à la tendance${t?.fileName ? ` « ${t.fileName} »` : ""} : sans doute venue du fichier de paramètres calés, elle passe avant ${known(p.classeur) ? `le classeur (${show(p.classeur, unite)})` : "le classeur"} ; effacez-la dans Paramètres si c'est le cas`);
+    out.validation_requise = true;
+  }
+  return out;
 }
 
 /**
@@ -382,18 +411,28 @@ export const pieceKeys = (code) => [
 /**
  * Counts of traced values: sections [{piece (name, or null for the quote),
  * trace}] -> {valeurs, aValider, aValiderCalcul (computed from values to
- * validate), alertes: [{piece, cle, label, type, message}]}.
+ * validate), alertes: [{cle, label, type, message, pieces}], occurrences}.
+ * An alert repeated by several pieces (a setting of their island...) counts
+ * once, with the names of the pieces (none: an alert of the quote);
+ * occurrences: the alerts of every piece.
  */
 export function summarize(sections) {
-  const out = { valeurs: 0, aValider: 0, aValiderCalcul: 0, alertes: [] };
+  const out = { valeurs: 0, aValider: 0, aValiderCalcul: 0, alertes: [], occurrences: 0 };
+  const groups = new Map();
   for (const { piece, trace } of sections) {
     for (const [cle, t] of Object.entries(trace ?? {})) {
       out.valeurs++;
       if (t.validation_requise) out.aValider++;
       if (t.validation_requise && t.source.type === "calcul") out.aValiderCalcul++;
-      for (const a of t.alertes) out.alertes.push({ piece, cle, label: label(cle), ...a });
+      for (const a of t.alertes) {
+        out.occurrences++;
+        const id = `${cle}|${a.type}|${a.message}`;
+        if (!groups.has(id)) groups.set(id, { cle, label: label(cle), ...a, pieces: [] });
+        if (piece !== null && piece !== undefined) groups.get(id).pieces.push(piece);
+      }
     }
   }
+  out.alertes = [...groups.values()];
   return out;
 }
 
@@ -509,10 +548,21 @@ export function traceQuote(ctx, c) {
   const setting = fromSetting(ctx, "marge", { unite: "%" });
   if (hasValue(q.marge)) {
     const mini = q.margeMini && same(q.margeMini.valeur, q.marge);
-    if (mini) T["parametres.tauxMini"] = fromSetting(ctx, "tauxMini", { unite: "%" });
+    // The minimum rate the margin was solved for; when Paramètres has another one since, that one as an alternative.
+    const stale = mini && hasValue(q.margeMini.tauxMini) && !same(q.margeMini.tauxMini, settings.tauxMini);
+    if (stale) {
+      T["parametres.tauxMini"] = resolve([
+        traced(q.margeMini.tauxMini, { type: "saisie", unite: "%", ref: "q.margeMini.tauxMini", raison: "taux mini de Paramètres au moment du calcul de la marge mini" }),
+        fromSetting(ctx, "tauxMini", { unite: "%" }),
+      ], { seuil, comparer: () => true });
+    } else if (mini) T["parametres.tauxMini"] = fromSetting(ctx, "tauxMini", { unite: "%" });
     const typed = mini
       ? derive(q.marge, { unite: "%", ref: "model.js:solveMargin (bouton « Marge mini »)", entrees: { "parametres.tauxMini": T["parametres.tauxMini"] }, hypotheses: [`marge qui donne un taux de marge sur VA de ${show(q.margeMini.tauxMini, "%")} la première année, avec les entrées de ce moment`] })
       : traced(q.marge, { type: "saisie", unite: "%", ref: "q.marge" });
+    if (stale) {
+      alert(typed, "divergence", `marge mini calculée avec un taux mini de ${show(q.margeMini.tauxMini, "%")}, Paramètres : ${show(settings.tauxMini, "%")} : relancez « Marge mini »`);
+      typed.validation_requise = true;
+    }
     T["devis.marge"] = resolve([typed, setting], { seuil, comparer: () => false });
   } else T["devis.marge"] = setting;
 
@@ -828,6 +878,16 @@ export function tracePiece(r, ctx, devis) {
 }
 
 /**
+ * The name of each piece of `pieces` in the traces: its own, unique; two
+ * bodies of the same name (instances of a screw...) with their number.
+ */
+export function pieceNames(pieces) {
+  const count = new Map();
+  for (const p of pieces) count.set(p.name, (count.get(p.name) ?? 0) + 1);
+  return new Map(pieces.map((p, i) => [p, count.get(p.name) > 1 ? `${p.name} (corps ${Number.isInteger(p.index) ? p.index + 1 : i + 1})` : p.name]));
+}
+
+/**
  * Traces of the whole set (keys "ensemble.*"): the pieces costed
  * (ui.js:aggregate), those not costed left out. With a customer request that
  * gives a weight or a mise au mille: the weight and the mise au mille of the
@@ -837,9 +897,10 @@ export function tracePiece(r, ctx, devis) {
 export function traceEnsemble(ctx, results, ensemble) {
   const T = {};
   const serie = ctx.q.serie;
+  const name = pieceNames(results.map((r) => r.piece));
   const done = results.filter((r) => r.final);
-  const left = results.filter((r) => !r.final).map((r) => r.piece.name);
-  const of = (key) => Object.fromEntries(done.map((r) => [`${key} [${r.piece.name}]`, r.trace?.[key]]));
+  const left = results.filter((r) => !r.final).map((r) => name.get(r.piece));
+  const of = (key) => Object.fromEntries(done.map((r) => [`${key} [${name.get(r.piece)}]`, r.trace?.[key]]));
   const asked = new Set(demandeComparee(serie).map((d) => d.grandeur));
   if (asked.has("poids") || asked.has("miseAuMille")) {
     T["ensemble.poids"] = compareDemande(derive(ensemble.poids, { unite: "kg", ref: "ui.js:aggregate (somme des poids des pièces chiffrées)", entrees: of("piece.poids") }), serie, "poids");

@@ -110,8 +110,11 @@ const LEVELS = [
  */
 export function traceForAI(snapshot, { mask = false, maxChars = Infinity } = {}) {
   if (!snapshot) return null;
+  // An alert shared by several pieces once, with the first of them and how many others.
+  const PIECES = 5;
   const alertes = snapshot.alertes.map((a) => ({
-    ...(a.piece ? { piece: a.piece } : {}), cle: a.cle, type: ALERTES[a.type] ?? a.type, message: mask && isInternal(a.cle, unitOf(snapshot, a)) ? maskNumbers(a.message) : a.message,
+    ...(a.pieces?.length ? { pieces: a.pieces.slice(0, PIECES), ...(a.pieces.length > PIECES ? { autres_pieces: a.pieces.length - PIECES } : {}) } : {}),
+    cle: a.cle, type: ALERTES[a.type] ?? a.type, message: mask && isInternal(a.cle, unitOf(snapshot, a)) ? maskNumbers(a.message) : a.message,
   }));
   const build = (n) => {
     const level = LEVELS[n];
@@ -152,9 +155,9 @@ export function traceForAI(snapshot, { mask = false, maxChars = Infinity } = {})
   return out;
 }
 
-/** The unit of the value an alert is about. */
+/** The unit of the value an alert is about (of its first piece; none: of the quote). */
 function unitOf(snapshot, a) {
-  const trace = a.piece === null ? snapshot.devis.trace : snapshot.pieces.find((p) => p.nom === a.piece)?.trace;
+  const trace = a.pieces?.length ? snapshot.pieces.find((p) => p.nom === a.pieces[0])?.trace : snapshot.devis.trace;
   return trace?.[a.cle]?.unite ?? "";
 }
 

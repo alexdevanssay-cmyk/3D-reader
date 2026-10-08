@@ -7,14 +7,14 @@ import { centreRates, indexAverage, quote, saleMetalPrice, solveMargin as minimu
 import { bestRoutes, buildRoute, rankRoutes } from "./routes.js";
 import { estimateTooling } from "./tooling.js";
 import { coreBoxCost, coresPerPiece, newCore } from "./cores.js";
-import { filledFields, orderValues, programmeFor, programmeOf, readSeriesOrder } from "./rfq.js";
-import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, demandeComparee, label as traceLabel, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
+import { filledFields, orderValues, programmeFor, programmeOf, readSeriesOrder, sameProgramme } from "./rfq.js";
+import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, demandeComparee, label as traceLabel, pieceNames, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
 import { compareCycles, countHistory, exportHistory, importHistory, mergeHistory, productionRecord } from "./history.js";
 import {
   SIMILAR, adoptEstimate, adoptedEstimate, anonymiseCycleData, cycleData, cycleNumbers, cycleQuestion, cycleText, fitCycleData, forgetAdoption, localCycleRules, readCycleAnswer, recordCycleData, undoAdoption,
 } from "./ai-cycle.js";
 import { DEFAULT_INTERVAL_S, backtestCsv, backtestItems, backtestReading, backtestRows, fingerprint, leaveOneOut, resultOf, runBacktest, summarizeBacktest } from "./backtest.js";
-import { askJSON, numbersLabel, savedAI } from "../ai-workspace.js";
+import { addressSpace, askJSON, numbersLabel, savedAI } from "../ai-workspace.js";
 import * as store from "./store.js";
 
 let el = null;
@@ -137,7 +137,7 @@ const monthLabel = (m) => {
 };
 const dateLabel = (iso) => (iso ? new Date(iso).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" }) : "—");
 // Inputs of the user (the others are defaults from the workbook).
-const USER_FIELDS = ["client", "reference", "designation", "plan", "volumeAnnuel", "annees", "premiereAnnee", "volumes", "pieces", "pieceFile", "serie", "serieAvant", "serieRetiree", "moqs", "prixCible", "serieEnergie", "outillageInclus", "margeOutillage", "prototype"];
+const USER_FIELDS = ["client", "reference", "designation", "plan", "volumeAnnuel", "annees", "premiereAnnee", "volumes", "pieces", "pieceFile", "serie", "serieAvant", "serieValeurs", "serieRetiree", "moqs", "prixCible", "serieEnergie", "outillageInclus", "margeOutillage", "prototype"];
 // Inputs of each piece (q.pieces[key]); null: from the 3D model or estimated.
 const PIECE_DEFAULTS = {
   poids: null, toileMini: null, epaisseurMax: null, moduleMm: null, dimMax: null,
@@ -350,7 +350,11 @@ async function onClick(event) {
     store.saveQuote(q);
     render();
   } else if (action === "reset-quote") {
-    if (!confirm("Effacer les saisies de ce chiffrage ?")) return;
+    // Said: what the quote holds besides the fields typed in, kept nowhere else.
+    const n = q.analysesIA?.length ?? 0;
+    const aiCycle = Object.values(q.pieces ?? {}).some((p) => p?.estimationCycleIA || p?.cycleIA);
+    if (!confirm(`Effacer ce chiffrage ?\n\nSont effacés : les saisies${q.serie ? `, la demande client « ${q.serie.fileName} »` : ""}${n ? `, ${plural(n, "analyse")} IA` : ""}${aiCycle ? ", les estimations IA du temps de cycle" : ""}. Ils ne sont gardés que dans ce navigateur : exportez d'abord le chiffrage (Excel) pour les conserver. L'historique des temps de cycle et les Paramètres ne changent pas.`)) return;
+    cycleJob?.controller.abort();
     store.resetQuote();
     q = store.defaultQuote(base, indices);
     render();
@@ -364,14 +368,29 @@ async function onClick(event) {
     render();
   } else if (action === "clear-tendances") {
     const t = layers.tendances;
-    if (!t || !confirm(`Effacer les tendances importées (« ${t.fileName} », ${store.countValues(t.values)} valeurs) ?\n\nSont conservés : vos saisies de Paramètres et le classeur de chiffrage. Les valeurs qui venaient des tendances reprennent la valeur par défaut du code.`)) return;
+    if (!t || !confirm(`Effacer les tendances importées (« ${t.fileName} », ${trendCount(t)} valeurs) ?\n\nSont conservés : vos saisies de Paramètres et le classeur de chiffrage. Les valeurs qui venaient des tendances reprennent la valeur par défaut du code.`)) return;
     store.clearTendances();
     reloadSettings();
     message = { kind: "ok", text: `Tendances « ${t.fileName} » effacées.` };
     render();
   } else if (action === "adopt-trend") {
-    store.adoptTendance(button.dataset.path, base);
+    // The value it replaces: said before (a value typed in is lost) and after.
+    const { path, shownValue, shownTrend } = button.dataset;
+    const before = layers.provenance(path);
+    const was = before.source === "saisie" ? `saisie du ${dateLabel(before.date)}` : "classeur";
+    if (before.source === "saisie" && !confirm(`Adopter la tendance pour ${path} ?\n\nLa valeur saisie ${shownValue} (${was}) est remplacée par la tendance ${shownTrend}${before.classeur !== undefined ? ", gardée comme une saisie au-dessus du classeur" : ""}. Pour revenir, ressaisissez ${shownValue}.`)) return;
+    store.adoptTendance(path, base);
     reloadSettings();
+    message = { kind: "ok", text: `Tendance adoptée pour ${path} : ${shownTrend} remplace ${shownValue} (${was}). Ressaisissez ${shownValue} pour revenir.` };
+    render();
+  } else if (action === "clear-setting" || action === "clear-table-saisies" || action === "clear-migrated-trends") {
+    // Typed values of Paramètres erased: one not applied, those of the rows of a table, those taken over equal to the trend.
+    const paths = action === "clear-setting" ? [button.dataset.path]
+      : action === "clear-table-saisies" ? Object.keys(layers.saisies.values).filter((path) => path.startsWith(`${button.dataset.path}.`))
+      : migratedLikeTrend();
+    for (const path of paths) store.clearSetting(path, base);
+    reloadSettings();
+    message = { kind: "ok", text: `${paths.length > 1 ? `${paths.length} saisies effacées` : "Saisie effacée"} : ${paths.join(", ")}.` };
     render();
   } else if (action === "export-saisies") {
     download("parametres_saisis.json", new Blob([JSON.stringify(store.exportSaisies(base), null, 2)], { type: "application/json" }));
@@ -383,8 +402,10 @@ async function onClick(event) {
     render();
     el.chiffrage.querySelector("#ctrace")?.scrollIntoView({ behavior: "smooth", block: "start" });
   } else if (action === "toggle-trace") {
-    // Clicked before the details element toggles: kept open or closed at the next rendering.
-    traceOpen = !button.parentElement.open;
+    // Opened by the page, not by the details element: the rows of the traced values are built only when open.
+    event.preventDefault();
+    traceOpen = !traceOpen;
+    render();
   } else if (action === "save-feedback") {
     saveFeedback();
     render();
@@ -465,7 +486,7 @@ async function importFile(target) {
       const prog = programmeOf(order, { proto: q.prototype });
       message = {
         kind: "ok",
-        text: `${q.prototype ? "Demande de prototypes" : "Commande série"} « ${file.name} » importée : ${prog ? `${prog.annees} an${prog.annees > 1 ? "s" : ""} à partir de ${prog.premiereAnnee}, ${nf(prog.volumes.reduce((a, b) => a + b, 0), 0)} pièces` : "pas de volume série"}${order.moqs.length ? `, MOQ ${order.moqs.join(" / ")}` : ""}${order.targetPrice ? `, prix cible ${eur(order.targetPrice, 2)}` : ""}.`,
+        text: `${q.prototype ? "Demande de prototypes" : "Commande série"} « ${file.name} » importée : ${prog ? `${prog.annees} an${prog.annees > 1 ? "s" : ""} à partir de ${prog.premiereAnnee}, ${nf(prog.volumes.reduce((a, b) => a + b, 0), 0)} pièces` : `pas de volume ${q.prototype ? "proto" : "série"}`}${order.moqs.length ? `, MOQ ${order.moqs.join(" / ")}` : ""}${order.targetPrice ? `, prix cible ${eur(order.targetPrice, 2)}` : ""}.`,
       };
     } else if (target.dataset.file === "tendances") {
       // The calibrated settings file: its own layer, below the typed values and the workbook (store.js).
@@ -495,7 +516,9 @@ function tendancesMessage(name, report) {
   if (report.unknown.length) text += ` Clés inconnues, ignorées : ${list(report.unknown, (u) => `${u.path}${u.suggestion ? ` (vouliez-vous dire « ${u.suggestion} » ?)` : ""}`)}.`;
   if (report.invalid.length) text += ` Valeurs refusées : ${list(report.invalid, (x) => `${x.path || "fichier"} (${x.reason})`)}.`;
   if (report.completed.length) text += ` Lignes de tableau incomplètes, complétées par les valeurs par défaut : ${list(report.completed, (p) => p)}.`;
-  return { kind: report.unknown.length || report.invalid.length || report.completed.length ? "warn" : "ok", text };
+  const warnings = report.warnings ?? [];
+  if (warnings.length) text += ` Tableaux d'un autre nombre de lignes que celui de vos saisies : ${list(warnings, (w) => `${w.path} (${w.reason})`)}.`;
+  return { kind: report.unknown.length || report.invalid.length || report.completed.length || warnings.length ? "warn" : "ok", text };
 }
 
 /** What an imported history file brought, and what of it was left out (records refused, values and fields ignored). */
@@ -525,6 +548,8 @@ function switchProgramme() {
       kind: "warn",
       text: `Volumes saisis conservés : les volumes ${q.prototype ? "proto" : "série"} de la demande client (${plural(ignored.annees, "an")} à partir de ${ignored.premiereAnnee}, ${nf(ignored.volumes.reduce((a, b) => a + b, 0), 0)} pièces) ne les remplacent pas. Réimportez la demande pour les reprendre.`,
     };
+  } else if (q.serie && !programmeOf(q.serie, { proto: q.prototype })) {
+    message = { kind: "warn", text: `La demande client « ${q.serie.fileName} » n'a pas de volumes ${q.prototype ? "proto" : "série"} : volumes actuels conservés, saisissez-les.` };
   }
 }
 
@@ -538,14 +563,28 @@ const orderLists = () => ({
 /**
  * Take the series order of a customer request into the quote (rfq.js:orderValues).
  * The values it replaces are kept as they were before the first request
- * (q.serieAvant), to put them back when the request is removed.
+ * (q.serieAvant), to put them back when the request is removed; also after a
+ * request removed whose values are still there ("Retirer" with no choice
+ * yet: q.serieRetiree). The fields an earlier request filled that this one
+ * does not, still with its values, are kept too (q.serieValeurs): "Retirer"
+ * lists them. A quote saved in this state by an earlier version has already
+ * lost the values of before the import: nothing can bring them back.
  */
 function applySeriesOrder(order) {
   const values = orderValues(order, orderLists());
   const avant = { ...q.serieAvant };
+  const r = q.serieRetiree;
+  if (r) {
+    const fresh = store.defaultQuote(base, indices);
+    for (const k of stillFilled(r)) if (!(k in avant)) avant[k] = k in (r.avant ?? {}) ? r.avant[k] : fresh[k];
+  }
   for (const k of Object.keys(values)) if (!(k in avant)) avant[k] = q[k] ?? null;
+  // What the earlier requests wrote and the fields still hold, where this one writes nothing.
+  const earlier = { ...q.serieValeurs, ...(q.serie ? orderValues(q.serie, orderLists(), { proto: q.prototype }) : {}), ...(r ? r.fields : {}) };
+  const kept = filledFields(q, earlier).filter((k) => !(k in values));
   q.serie = order;
   q.serieAvant = avant;
+  q.serieValeurs = kept.length ? Object.fromEntries(kept.map((k) => [k, earlier[k]])) : null;
   q.serieRetiree = null;
   Object.assign(q, JSON.parse(JSON.stringify(values)));
   // The same alloy as the material of the 3D analysis (its mass).
@@ -565,29 +604,44 @@ const ORDER_RANK = Object.keys(ORDER_FIELDS);
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
 /**
- * "Retirer": the request is removed. The fields it filled keep their values
- * until the user puts back those of before the import or keeps them
- * (q.serieRetiree, card "Commande série"): never left without a word.
+ * "Retirer": the request is removed. The fields it filled (or an earlier
+ * request, q.serieValeurs) keep their values until the user puts back those
+ * of before the import or keeps them (q.serieRetiree, card "Commande
+ * série"): never left without a word. What of the request the price used
+ * besides those fields (its heat treatment, energy prices, sale metal price
+ * for a month missing from the indices) is said too.
  */
 function removeSeriesOrder() {
   const order = q.serie;
-  const values = orderValues(order, orderLists(), { proto: q.prototype });
+  // A field is filled when it still holds the value a request wrote (not a value typed since).
+  const values = { ...q.serieValeurs, ...orderValues(order, orderLists(), { proto: q.prototype }) };
   const avant = q.serieAvant ?? {};
   // Still the request's value, and not the one the field already had before the import.
   const filled = filledFields(q, values)
     .filter((k) => !(k in avant) || !sameJson(avant[k], values[k]))
     .sort((a, b) => ORDER_RANK.indexOf(a) - ORDER_RANK.indexOf(b));
+  // What the price took from the request, read before it goes (the conditions of compute()).
+  const energie = q.serieEnergie !== false && (order.elec > 0 || order.gaz > 0);
+  const m = order.matiere;
+  const sale = indices && base ? saleMetalPrice(indices, base.lists, { month: q.month, typology: q.typologie, index: q.cours }) : { cours: null };
+  const venteDemande = sale.cours === null && m?.coursVente > 0 && m.month === q.month;
   q.serie = null;
   q.serieAvant = null;
+  q.serieValeurs = null;
   q.serieRetiree = filled.length
     ? { fileName: order.fileName, fields: Object.fromEntries(filled.map((k) => [k, values[k]])), avant: Object.fromEntries(filled.filter((k) => k in avant).map((k) => [k, avant[k]])) }
     : null;
   store.saveQuote(q);
   // Its heat treatment was the one of the pieces without a choice of their own (pieceInputs): no longer.
   const tth = order.tth ? ` Son traitement thermique (${order.tth}) ne s'applique plus aux pièces sans traitement choisi : choisissez-le pour chaque pièce s'il le faut.` : "";
+  const prices = [
+    energie ? ` Ses prix de l'énergie (élec ${nf(order.elec ?? 0, 0)}, gaz ${nf(order.gaz ?? 0, 0)} €/MWh) ne s'appliquent plus : ceux de Paramètres (sinon du classeur) reprennent.` : "",
+    venteDemande ? ` Le cours de vente venait de la demande (mois ${monthLabel(q.month)} absent des indices) : il est maintenant indisponible (0 €/t) ; importez des indices pour ce mois ou changez la date d'application des cours.` : "",
+  ].join("");
+  const after = `${tth}${prices}`;
   message = filled.length
-    ? { kind: "warn", text: `Demande client « ${order.fileName} » retirée. Ces champs gardent les valeurs qu'elle avait remplies : ${fieldNames(filled)}. Vérifiez-les, ou remettez les valeurs d'avant l'import (carte « Commande série »).${tth}` }
-    : { kind: tth ? "warn" : "ok", text: `Demande client « ${order.fileName} » retirée.${tth}` };
+    ? { kind: "warn", text: `Demande client « ${order.fileName} » retirée. Ces champs gardent les valeurs qu'elle avait remplies : ${fieldNames(filled)}. Vérifiez-les, ou remettez les valeurs d'avant l'import (carte « Commande série »).${after}` }
+    : { kind: after ? "warn" : "ok", text: `Demande client « ${order.fileName} » retirée.${after}` };
 }
 
 /** The fields still holding the values of the request removed (q.serieRetiree). */
@@ -637,9 +691,10 @@ function selectedPieces(p3d, all) {
 export function compute({ save = true } = {}) {
   if (!base) return null;
   const p3d = window.reader3d?.part?.() ?? null;
-  // Another 3D file: the inputs of the pieces of the previous one do not apply.
+  // Another 3D file: the inputs of the pieces of the previous one do not apply. No model
+  // (not opened again yet after a reload): they are kept for it, the piece typed in is costed.
   const file = p3d?.file ?? null;
-  if (file !== (q.pieceFile ?? null)) {
+  if (file !== null && file !== (q.pieceFile ?? null)) {
     q.pieceFile = file;
     q.pieces = {};
     if (save) store.saveQuote(q);
@@ -689,9 +744,10 @@ export function compute({ save = true } = {}) {
   return out;
 }
 
-/** What the traces read: the quote, the data files, the settings and their layers. */
+/** What the traces read: the quote, the data files, the settings and their layers; the threshold typed in Paramètres, else the code's, never a trend's. */
 function traceContext(p3d) {
-  return { q, base, indices, layers, settings, seuil: settings.seuilTendance ?? SEUIL_TENDANCE, p3dFile: p3d?.file ?? null };
+  const seuil = ["saisie", "defaut"].includes(layers.provenance("seuilTendance").source) ? settings.seuilTendance ?? SEUIL_TENDANCE : SEUIL_TENDANCE;
+  return { q, base, indices, layers, settings, seuil, p3dFile: p3d?.file ?? null };
 }
 
 /** Quote of one piece: its features, the routes, the retained route and its costing; and their trace (out.trace). */
@@ -908,13 +964,14 @@ export function costingSnapshot({ tab } = {}) {
       raisons: [...x.reasons, ...x.warnings],
     }));
   };
-  const sections = [{ piece: null, trace: c.trace ?? {} }, ...c.results.map((r) => ({ piece: r.piece.name, trace: r.trace ?? {} }))];
+  const name = pieceNames(c.results.map((r) => r.piece));
+  const sections = [{ piece: null, trace: c.trace ?? {} }, ...c.results.map((r) => ({ piece: name.get(r.piece), trace: r.trace ?? {} }))];
   const sum = summarize(sections);
   const file = (name, date, extra = {}) => (name || date ? { nom: name ?? null, date: date ?? null, ...extra } : null);
   const t = layers.tendances;
   return deepFreeze(structuredClone({
     devis: { ensemble: c.selected === "ensemble", trace: c.trace ?? {} },
-    pieces: c.results.map((r) => ({ nom: r.piece.name, chiffree: !!r.final, trace: r.trace ?? {}, routes: routes(r) })),
+    pieces: c.results.map((r) => ({ nom: name.get(r.piece), chiffree: !!r.final, trace: r.trace ?? {}, routes: routes(r) })),
     alertes: sum.alertes,
     resume: { valeurs: sum.valeurs, a_valider: sum.aValider, alertes: sum.alertes.length },
     fichiers: {
@@ -1048,7 +1105,7 @@ function renderQuote() {
     <section class="ccard">
       <h3>${ensemble ? "Ensemble" : "Pièce"}</h3>
       <div class="cfields">
-        ${field("Prototype", checkbox("q.prototype", q.prototype, "chiffrage de prototypes"), q.prototype ? "volumes proto de la demande, sans prix cible ni gains de productivité" : "")}
+        ${field("Prototype", checkbox("q.prototype", q.prototype, "chiffrage de prototypes"), q.prototype ? prototypeHint() : "")}
         ${field("Client", input("q.client", q.client, { kind: "text" }))}
         ${field("Référence", input("q.reference", q.reference, { kind: "text" }))}
         ${field("Désignation", input("q.designation", q.designation, { kind: "text" }))}
@@ -1099,6 +1156,13 @@ function renderQuote() {
     <button type="button" data-action="reset-quote">Nouveau chiffrage</button>
   </p>
   </div>`;
+}
+
+/** Under the box "Prototype" ticked: where the volumes come from. */
+function prototypeHint() {
+  const proto = q.serie ? programmeOf(q.serie, { proto: true }) : null;
+  if (proto && sameProgramme(q, proto)) return "volumes proto de la demande, sans prix cible ni gains de productivité";
+  return `sans prix cible ni gains de productivité — ${proto ? "volumes saisis, pas ceux de la demande" : "saisissez les volumes des prototypes"}`;
 }
 
 /** Inputs of one piece: geometry (from the 3D model unless typed in) and options. */
@@ -1526,7 +1590,7 @@ function projectionCard(c, f) {
 // confidential history leaves the site only with their consent, remembered).
 const SIMILAR_KEY = "reader3d.ai.cycleSimilar";
 const SIMILAR_ONLINE_KEY = "reader3d.ai.cycleSimilarOnline";
-let cycleJob = null; // the estimate in progress: {key (of its piece), tab, file, controller, start}
+let cycleJob = null; // the estimate in progress: {key (of its piece), tab, file, quote, controller, start}
 let cycleError = null; // {key, text}: why the last estimate of the piece `key` failed
 
 const localAI = () => savedAI().provider === "ollama";
@@ -1552,10 +1616,20 @@ function setSendSimilar(on) {
   }
 }
 
+/** Where Ollama runs (the address of the IA page): this PC, or a device of the local network, by its name. */
+function ollamaPlace() {
+  const url = savedAI().ollama.base;
+  try {
+    return addressSpace(url) === "loopback" ? "sur ce PC" : `sur ${new URL(url).hostname} (réseau local)`;
+  } catch {
+    return "local"; // an address that does not read
+  }
+}
+
 /** The box "Envoyer les pièces similaires de l'historique", for the AI chosen on the IA page. */
 function similarBox() {
   const title = localAI()
-    ? "Les pièces les plus semblables de l'historique, avec leur temps de cycle, sont données au modèle local (Ollama) : rien ne quitte le site."
+    ? `Les pièces les plus semblables de l'historique, avec leur temps de cycle, sont données au modèle Ollama ${ollamaPlace()} : rien ne quitte le site.`
     : "Les pièces les plus semblables de l'historique partent à la passerelle en ligne avec leur temps de cycle, leur poids, leur module, leurs pièces par cycle et leur mise au mille (références anonymisées avec les noms). Décochée par défaut ; une fois cochée, ce choix est gardé dans ce navigateur.";
   return `<label class="check small" title="${esc(title)}"><input type="checkbox" data-pref="cycle-similar"${sendSimilar() ? " checked" : ""}> Envoyer les pièces similaires de l'historique${localAI() ? "" : " à la passerelle"}</label>`;
 }
@@ -1564,7 +1638,7 @@ function similarBox() {
 function aiChoice() {
   const ai = savedAI();
   return ai.provider === "ollama"
-    ? `Ollama local (${esc(ai.ollama.model)})`
+    ? `Ollama ${esc(ollamaPlace())} (${esc(ai.ollama.model)})`
     : `passerelle en ligne${ai.gateway.url ? "" : " (adresse à renseigner dans la page IA / analyse)"}${ai.anonymize ? ", noms anonymisés" : ""}`;
 }
 
@@ -1575,7 +1649,7 @@ function cycleButton(r) {
   const sent = Math.min(n, SIMILAR);
   return `<div class="crow ccycle-ask">
       <button type="button" class="small" data-action="estimate-cycle"${cycleJob || backtestJob ? " disabled" : ""}>Estimer le temps de cycle avec l'IA</button>
-      ${busy ? `<span id="ccycle-status" class="small muted" role="status">Estimation en cours…</span> <button type="button" class="small" data-action="cancel-cycle">Annuler</button>` : ""}
+      ${busy ? `<span id="ccycle-status" class="small muted" role="status">Estimation en cours…<span class="ctick" aria-hidden="true"></span></span> <button type="button" class="small" data-action="cancel-cycle">Annuler</button>` : ""}
       ${similarBox()}
     </div>
     <p class="small muted">IA de la page IA / analyse : ${aiChoice()}. Historique : ${n ? `${plural(n, "enregistrement")}, ${!sendSimilar() ? "non envoyé" : sent > 1 ? `les ${sent} plus semblables envoyés` : "envoyé"}` : "aucun enregistrement"}. Une proposition : rien n'est appliqué sans votre validation.</p>`;
@@ -1600,12 +1674,13 @@ async function estimateCycle() {
   const names = namesOf(q);
   const file = c.p3d?.file ?? null;
   const label = Number.isInteger(r.piece.index) ? `Corps ${r.piece.index + 1}` : "Pièce";
-  const job = { key: r.piece.key, tab: store.currentQuoteTab(), file, controller: new AbortController(), start: Date.now() };
+  const job = { key: r.piece.key, tab: store.currentQuoteTab(), file, quote: q, controller: new AbortController(), start: Date.now() };
   cycleJob = job;
   cycleError = null;
+  // The seconds, out of the live region's text (aria-hidden): not read out every second.
   const timer = setInterval(() => {
-    const status = el?.chiffrage.querySelector("#ccycle-status");
-    if (status) status.textContent = `Estimation en cours… ${Math.round((Date.now() - job.start) / 1000)} s`;
+    const tick = el?.chiffrage.querySelector("#ccycle-status .ctick");
+    if (tick) tick.textContent = ` ${Math.round((Date.now() - job.start) / 1000)} s`;
   }, 1000);
   render();
   let anonymous = null;
@@ -1622,9 +1697,9 @@ async function estimateCycle() {
     const estimate = readCycleAnswer(answer.output, sent);
     const unknown = cycleNumbers(estimate, sent, [answer.sent.question]);
     const legend = anonymous ? anonymous.legend(answer.output) : [];
-    // The quote it is about: the tab and the 3D file of the question.
-    if (store.currentQuoteTab() !== job.tab || (window.reader3d?.part?.()?.file ?? null) !== job.file) {
-      message = { kind: "warn", text: "Estimation IA du temps de cycle abandonnée : l'onglet ou le modèle 3D a changé pendant la demande." };
+    // The quote it is about: the tab, the 3D file and the quote of the question (not a new one, "Nouveau chiffrage").
+    if (store.currentQuoteTab() !== job.tab || (window.reader3d?.part?.()?.file ?? null) !== job.file || q !== job.quote) {
+      message = { kind: "warn", text: "Estimation IA du temps de cycle abandonnée : l'onglet, le modèle 3D ou le chiffrage a changé pendant la demande." };
       return;
     }
     const { avertissements, ...rest } = estimate;
@@ -1652,7 +1727,9 @@ async function estimateCycle() {
       answer: [cycleText(record), legend.length ? `Noms réels : ${legend.map(([l, n]) => `${l} = ${n}`).join(" ; ")}` : ""].filter(Boolean).join("\n\n"),
     });
   } catch (err) {
-    cycleError = { key: job.key, text: err?.name === "AbortError" ? "Estimation annulée." : err?.message || String(err) };
+    // Cancelled by "Nouveau chiffrage": said, not shown with the piece of the new quote.
+    if (q !== job.quote) message = { kind: "warn", text: "Estimation IA du temps de cycle abandonnée : le chiffrage a changé pendant la demande." };
+    else cycleError = { key: job.key, text: err?.name === "AbortError" ? "Estimation annulée." : err?.message || String(err) };
   } finally {
     clearInterval(timer);
     cycleJob = null;
@@ -1764,10 +1841,11 @@ function cycleCard(r) {
 
 // --------------------------------------------------------------------------- traceability
 
-/** The traced values shown: those of the quote, and of the pieces shown (one, or every piece of the set). */
+/** The traced values shown: those of the quote, and of the pieces shown (one, or every piece of the set), by their unique names. */
 function traceSections(c) {
+  const name = pieceNames(c.results.map((r) => r.piece));
   const shown = c.selected === "ensemble" ? c.results : c.results.filter((r) => r.piece.key === c.selected);
-  return [{ piece: null, trace: c.trace }, ...shown.map((r) => ({ piece: r.piece.name, trace: r.trace }))];
+  return [{ piece: null, trace: c.trace }, ...shown.map((r) => ({ piece: name.get(r.piece), trace: r.trace }))];
 }
 
 const plural = (n, word) => `${n} ${word}${n > 1 ? "s" : ""}`;
@@ -1819,24 +1897,40 @@ function traceRow(cle, t) {
   </tr>`;
 }
 
-/** Card "Traçabilité": the alerts, and every traced value (collapsible). */
+/** The pieces an alert is about: the name of the only one, else how many (their names in the title). */
+const alertPieces = (a) => (a.pieces.length > 1 ? ` <span title="${esc(a.pieces.join(", "))}">(${plural(a.pieces.length, "pièce")})</span>` : a.pieces.length ? ` (${esc(a.pieces[0])})` : "");
+
+/** Values typed in Paramètres not applied, tables of the trends not used (store.js resolveSettings): said, each with "Effacer". */
+function settingsNotApplied() {
+  const unapplied = layers.unapplied ?? [];
+  const ignored = layers.ignored ?? [];
+  return [
+    unapplied.length ? `<p class="cmsg warn csettings-unapplied">Saisie${unapplied.length > 1 ? "s" : ""} de Paramètres non appliquée${unapplied.length > 1 ? "s" : ""} : leur ligne n'est pas dans le tableau utilisé (un tableau des tendances d'un autre nombre de lignes, ou effacé) : ${unapplied.map((path) => `${esc(path)} <button type="button" class="small" data-action="clear-setting" data-path="${esc(path)}">Effacer</button>`).join(" ")}</p>` : "",
+    ignored.length ? `<p class="cmsg warn csettings-ignored">Tableau${ignored.length > 1 ? "x" : ""} du fichier de tendances non utilisé${ignored.length > 1 ? "s" : ""} : ${ignored.map((path) => `${esc(path)} <button type="button" class="small" data-action="clear-table-saisies" data-path="${esc(path)}">Effacer les saisies de ce tableau</button>`).join(" ")}. Des lignes y sont saisies dans Paramètres sur le tableau par défaut, et celui des tendances a un autre nombre de lignes : la ligne n d'un tableau n'est pas la ligne n de l'autre.</p>` : "",
+  ].join("");
+}
+
+/** Card "Traçabilité": the alerts, and every traced value (collapsible: its rows built only when unfolded). */
 function traceCard(sections, sum) {
-  const rows = sections
-    .map(({ piece, trace }) => {
-      const entries = Object.entries(trace ?? {});
-      return entries.length ? `<tr class="sub"><td colspan="7">${piece === null ? "Devis" : `Pièce : ${esc(piece)}`}</td></tr>${entries.map(([cle, t]) => traceRow(cle, t)).join("")}` : "";
-    })
-    .join("");
+  const rows = traceOpen
+    ? sections
+      .map(({ piece, trace }) => {
+        const entries = Object.entries(trace ?? {});
+        return entries.length ? `<tr class="sub"><td colspan="7">${piece === null ? "Devis" : `Pièce : ${esc(piece)}`}</td></tr>${entries.map(([cle, t]) => traceRow(cle, t)).join("")}` : "";
+      })
+      .join("")
+    : "";
   const MAX = 20;
-  const alerts = sum.alertes.slice(0, MAX).map((a) => `<li><strong>${esc(a.label)}</strong>${a.piece ? ` (${esc(a.piece)})` : ""} — ${esc(ALERTES[a.type] ?? a.type)} : ${esc(a.message)}</li>`).join("");
+  const alerts = sum.alertes.slice(0, MAX).map((a) => `<li><strong>${esc(a.label)}</strong>${alertPieces(a)} — ${esc(ALERTES[a.type] ?? a.type)} : ${esc(a.message)}</li>`).join("");
   return `<section class="ccard ctrace" id="ctrace">
     <h3>Traçabilité</h3>
-    <p class="small">${plural(sum.valeurs, "valeur")} tracée${sum.valeurs > 1 ? "s" : ""} : <strong>${plural(sum.aValider, "valeur")} à valider</strong>${sum.aValiderCalcul ? ` (dont ${sum.aValiderCalcul} calculée${sum.aValiderCalcul > 1 ? "s" : ""} à partir de valeurs à valider)` : ""}, <strong>${plural(sum.alertes.length, "alerte")}</strong>.</p>
+    <p class="small">${plural(sum.valeurs, "valeur")} tracée${sum.valeurs > 1 ? "s" : ""} : <strong>${plural(sum.aValider, "valeur")} à valider</strong>${sum.aValiderCalcul ? ` (dont ${sum.aValiderCalcul} calculée${sum.aValiderCalcul > 1 ? "s" : ""} à partir de valeurs à valider)` : ""}, <strong>${plural(sum.alertes.length, "alerte")}</strong>${sum.occurrences > sum.alertes.length ? ` (${sum.occurrences} en comptant chaque pièce)` : ""}.</p>
     ${alerts ? `<ul class="calerts small">${alerts}${sum.alertes.length > MAX ? `<li>… et ${plural(sum.alertes.length - MAX, "autre alerte")} : voir le détail.</li>` : ""}</ul>` : ""}
+    ${settingsNotApplied()}
     <details${traceOpen ? " open" : ""}><summary data-action="toggle-trace">Détail des valeurs : valeur, source, autorité, confiance, écart à la tendance, validation requise</summary>
-      <div class="cscroll"><table class="ctable compact">
+      ${traceOpen ? `<div class="cscroll"><table class="ctable compact">
         <thead><tr><th>Valeur tracée</th><th class="num">Valeur</th><th>Source</th><th>Autorité</th><th>Confiance</th><th class="num">Écart à la tendance</th><th>Validation requise</th></tr></thead>
-        <tbody>${rows}</tbody></table></div>
+        <tbody>${rows}</tbody></table></div>` : ""}
     </details>
     <p class="small muted">Ordre des sources : commande client et saisies du devis, puis Paramètres, classeur et indices (hard), puis géométrie 3D (evidence), puis tendances du fichier de paramètres calés (soft_prior), qui ne remplacent jamais une valeur actuelle. Défaut du code : valeur neutre, à remplacer par une valeur de l'entreprise. Une valeur calculée a la confiance de sa plus faible entrée et demande une validation si l'une d'elles en demande une. Écart à la tendance signalé au-delà de ${pct(settings.seuilTendance ?? SEUIL_TENDANCE, 0)} (Paramètres). Une valeur de l'IA n'entre dans le devis que validée par une personne : une saisie du devis, source « estimation IA validée » (temps de cycle) ; non validée, elle n'est qu'une autre source.</p>
   </section>`;
@@ -1895,13 +1989,22 @@ function feedbackCard(c, r) {
   </section>`;
 }
 
-/** The settings of the trends file over the code's, for the islands it gives cycle coefficients for; null without any. */
-function trendSettings() {
+/**
+ * The settings of the trend's cycle, for the islands the trends file gives
+ * cycle coefficients for: the coefficients of the file, the others those of
+ * Paramètres (effective settings), so that the trend's cycle differs from the
+ * formula only by what the file gives; coefficients: {island: [keys of the
+ * file]}. null without any. Exported for the tests.
+ */
+export function trendSettings() {
   const t = layers.tendances?.values;
-  const islands = Object.keys(t?.processes ?? {}).filter((code) => t.processes[code]?.cycle);
+  const islands = Object.keys(t?.processes ?? {}).filter((code) => t.processes[code]?.cycle && settings.processes[code]);
   if (!islands.length) return null;
-  const s = store.resolveSettings({ tendances: t });
-  return { ...s, processes: Object.fromEntries(islands.filter((code) => s.processes[code]).map((code) => [code, s.processes[code]])) };
+  return {
+    ...settings,
+    processes: Object.fromEntries(islands.map((code) => [code, { ...settings.processes[code], cycle: { ...settings.processes[code].cycle, ...t.processes[code].cycle } }])),
+    coefficients: Object.fromEntries(islands.map((code) => [code, Object.keys(t.processes[code].cycle)])),
+  };
 }
 
 /** The real cycle times measured in production against the estimates (history.js:compareCycles), and the mean errors per island. */
@@ -1924,7 +2027,7 @@ function comparisonHtml(pieces) {
     <div class="cscroll"><table class="ctable compact chisto-ilots">
       <thead><tr><th>Îlot</th><th class="num">Pièces mesurées</th>${cols.map(([, , label]) => `<th class="num">Écart moyen : ${label}</th>`).join("")}</tr></thead>
       <tbody>${summary}</tbody></table></div>
-    <p class="small muted">Formule : temps de cycle de coulée = base + coef × (kg coulés par cycle)^exposant + s/mm² × module², recalculé avec les coefficients actuels de Paramètres, et pour chaque pièce son poids, son module, sa mise au mille et ses pièces par cycle enregistrés (ceux estimés pour l'îlot quand ils manquent ; module inconnu : 0).${trend ? " Tendance : la même formule avec les coefficients du fichier de tendances, pour les îlots qu'il donne." : ""} Écart = (estimation − réel) / réel ; écart moyen = moyenne des écarts en valeur absolue. Rien n'est appliqué au chiffrage ni aux paramètres.</p>`;
+    <p class="small muted">Formule : temps de cycle de coulée = base + coef × (kg coulés par cycle)^exposant + s/mm² × module², recalculé avec les coefficients actuels de Paramètres, et pour chaque pièce son poids, son module, sa mise au mille et ses pièces par cycle enregistrés (ceux estimés pour l'îlot quand ils manquent ; module inconnu : 0).${trend ? ` Tendance : la même formule avec les coefficients du fichier de tendances (${esc(Object.entries(trend.coefficients).map(([code, keys]) => `${code} : ${keys.join(", ")}`).join(" ; "))}), les autres ceux de Paramètres, pour les îlots qu'il donne.` : ""} Écart = (estimation − réel) / réel ; écart moyen = moyenne des écarts en valeur absolue. Rien n'est appliqué au chiffrage ni aux paramètres.</p>`;
 }
 
 // --------------------------------------------------------------------------- backtest of the AI on the history
@@ -1939,17 +2042,27 @@ function waitLabel(seconds) {
   return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ""}`;
 }
 
-/** Where the run is: the record asked, or the wait before the next request. */
+/**
+ * Where the run is: the record asked, or the wait before the next request:
+ * [before, tick, after], tick the time that changes every second (left out
+ * of what a screen reader reads: aria-hidden).
+ */
 function backtestStatus(job) {
   const at = `Pièce ${Math.min(job.done + 1, job.total)} sur ${job.total}${job.ref ? ` (${job.ref})` : ""}`;
   return job.waitUntil
-    ? `${at} : prochaine demande dans ${waitLabel((job.waitUntil - Date.now()) / 1000)}, au rythme du quota en ligne…`
-    : `${at} : estimation en cours… ${Math.round((Date.now() - job.start) / 1000)} s`;
+    ? [`${at} : `, `prochaine demande dans ${waitLabel((job.waitUntil - Date.now()) / 1000)}, `, "au rythme du quota en ligne…"]
+    : [`${at} : estimation en cours…`, ` ${Math.round((Date.now() - job.start) / 1000)} s`, ""];
 }
+const statusHtml = ([before, tick, after]) => `${esc(before)}<span class="ctick" aria-hidden="true">${esc(tick)}</span>${esc(after)}`;
 
+/** The status of the run: only its time changed when the rest is the same (the live region is not read again every second). */
 function showBacktestStatus() {
   const status = el?.chiffrage.querySelector("#cbacktest-status");
-  if (status && backtestJob) status.textContent = backtestStatus(backtestJob);
+  if (!status || !backtestJob) return;
+  const parts = backtestStatus(backtestJob);
+  const tick = status.querySelector(".ctick");
+  if (tick && status.textContent === `${parts[0]}${tick.textContent}${parts[2]}`) tick.textContent = parts[1];
+  else status.innerHTML = statusHtml(parts);
 }
 
 /** The card of the history drawn again alone (a result of the backtest): what is being typed in the other cards is kept. */
@@ -2122,7 +2235,7 @@ function backtestHtml(pieces) {
   return `<h4>Banc d'essai IA</h4>
     <div class="crow cbacktest-ask">
       <button type="button" class="small" data-action="backtest"${job || cycleJob || !left ? " disabled" : ""}>${label}</button>
-      ${job ? `<span id="cbacktest-status" class="small muted" role="status">${esc(backtestStatus(job))}</span> <button type="button" class="small" data-action="cancel-backtest">Annuler</button>` : ""}
+      ${job ? `<span id="cbacktest-status" class="small muted" role="status">${statusHtml(backtestStatus(job))}</span> <button type="button" class="small" data-action="cancel-backtest">Annuler</button>` : ""}
       <button type="button" class="small" data-action="export-backtest"${any ? "" : " disabled"}>Exporter les résultats (CSV)</button>
       <button type="button" class="small" data-action="clear-backtest"${any && !job ? "" : " disabled"}>Effacer les résultats…</button>
       ${similarBox()}
@@ -2173,20 +2286,33 @@ const SOURCES = { saisie: ["saisie", "S"], classeur: ["classeur", "C"], tendance
 function sinput(path, value, opts = {}) {
   const p = layers.provenance(path);
   const [label, letter] = SOURCES[p.source];
+  const shown = (v) => (typeof v !== "number" ? String(v) : opts.kind === "pct" ? `${(v * 100).toLocaleString("fr-FR", { maximumFractionDigits: 2 })} %` : v.toLocaleString("fr-FR", { maximumFractionDigits: 4 }));
   const title = {
-    saisie: `Saisie du ${dateLabel(p.date)}${p.migrated ? " (reprise des paramètres enregistrés par la version précédente)" : ""}`,
+    saisie: p.from === "tendance"
+      ? `Tendance${p.fileName ? ` du fichier « ${p.fileName} »` : ""} adoptée le ${dateLabel(p.date)}${p.classeur !== undefined ? ` (classeur : ${shown(p.classeur)})` : ""}`
+      : `Saisie du ${dateLabel(p.date)}${p.migrated ? " (reprise des paramètres enregistrés par la version précédente)" : ""}`,
     classeur: `Valeur du classeur de chiffrage${p.fileName ? ` « ${p.fileName} »` : ""}`,
     tendance: `Tendance du fichier « ${p.fileName} », importé le ${dateLabel(p.date)}`,
     defaut: "Valeur par défaut du code (neutre, à ajuster)",
-  }[p.source];
+  }[p.source] + (p.trendIgnored ? " — tableau du fichier de tendances non utilisé ici (des lignes en sont saisies)" : "");
   let trend = "";
   if (p.source !== "tendance" && typeof p.trend === "number" && typeof p.value === "number" && p.trend !== p.value) {
-    const shown = (v) => (opts.kind === "pct" ? `${(v * 100).toLocaleString("fr-FR", { maximumFractionDigits: 2 })} %` : v.toLocaleString("fr-FR", { maximumFractionDigits: 4 }));
     const sign = p.value > p.trend ? "+" : "";
     const gap = p.trend ? `${sign}${pct((p.value - p.trend) / Math.abs(p.trend))}` : `${sign}${shown(p.value - p.trend)}`;
-    trend = `<small class="ctrend">tendance ${shown(p.trend)}, écart ${gap} <button type="button" class="small" data-action="adopt-trend" data-path="${esc(path)}">Adopter la tendance</button></small>`;
+    trend = `<small class="ctrend">tendance ${shown(p.trend)}, écart ${gap} <button type="button" class="small" data-action="adopt-trend" data-path="${esc(path)}" data-shown-value="${esc(shown(p.value))}" data-shown-trend="${esc(shown(p.trend))}">Adopter la tendance</button></small>`;
   }
   return `<span class="cval">${input(`s.${path}`, value, opts)}<span class="csrc ${p.source}" title="${esc(title)}">${opts.compact ? letter : label}</span></span>${trend}`;
+}
+
+/** The number of values of the trends `t`, those completed by the defaults left out. */
+const trendCount = (t) => store.countValues(t.values) - (t.completed?.length ?? 0);
+
+/** The values taken over from the previous version (migrated) equal to the trend at the same place: most likely from the calibrated file. */
+function migratedLikeTrend() {
+  if (!layers.tendances) return [];
+  return Object.entries(layers.saisies.values)
+    .filter(([path, e]) => e.migrated && layers.provenance(path).trend !== undefined && sameJson(layers.provenance(path).trend, e.value))
+    .map(([path]) => path);
 }
 
 /** Paramètres: the typed values, the trends file and the workbook, and how they take precedence. */
@@ -2194,18 +2320,24 @@ function settingsSourcesCard() {
   const n = Object.keys(layers.saisies.values).length;
   const t = layers.tendances;
   const plural = (k, word) => `${k} ${word}${k > 1 ? "s" : ""}`;
-  const migrated = layers.saisies.migratedAt && n && !t
-    ? `<p class="cmsg warn">Les paramètres enregistrés par la version précédente ont été repris comme saisies (${plural(n, "valeur")}) : celles égales aux valeurs par défaut ou du classeur ont été retirées, et les champs qui étaient vides reprennent la source suivante. Si un fichier de paramètres calés avait été importé, ses valeurs font partie de ces saisies : réimportez-le comme tendances, puis effacez les saisies que vous ne voulez pas garder.</p>`
+  // Values taken over from the previous version: inputs and the calibrated file it mixed, told apart by nobody.
+  const taken = Object.values(layers.saisies.values).filter((e) => e.migrated).length;
+  const likeTrend = migratedLikeTrend();
+  const migrated = taken
+    ? `<p class="cmsg warn cmigrated">Les paramètres enregistrés par la version précédente ont été repris comme saisies (${plural(taken, "valeur")}) : celles égales aux valeurs par défaut ou du classeur ont été retirées, et les champs qui étaient vides reprennent la source suivante. Si un fichier de paramètres calés avait été importé, ses valeurs font partie de ces saisies : réimportez-le comme tendances, puis effacez les saisies que vous ne voulez pas garder.${likeTrend.length
+      ? ` ${likeTrend.length > 1 ? `${likeTrend.length} valeurs reprises sont égales` : "Une valeur reprise est égale"} à la tendance au même endroit, sans doute venue${likeTrend.length > 1 ? "s" : ""} du fichier calé, et passe${likeTrend.length > 1 ? "nt" : ""} avant le classeur : ${esc(likeTrend.join(", "))}. <button type="button" class="small" data-action="clear-migrated-trends">Effacer ${likeTrend.length > 1 ? `ces ${likeTrend.length} saisies` : "cette saisie"} (le classeur, sinon la tendance, reprend)</button>`
+      : ""}</p>`
     : "";
   return `<section class="ccard">
     <h3>Origine des paramètres</h3>
     <div class="crow"><span>Mes saisies :</span> <strong>${n ? `${plural(n, "valeur")} saisie${n > 1 ? "s" : ""} dans cette page` : "aucune"}</strong>
       <button type="button" class="small" data-action="export-saisies"${n ? "" : " disabled"}>Exporter mes saisies</button></div>
-    <div class="crow" data-drop="tendances" title="Glissez un fichier de paramètres calés (.json) ici pour l'importer comme tendances"><span>Tendances :</span> <strong>${t ? `${esc(t.fileName)} — importé le ${dateLabel(t.importedAt)} — ${plural(store.countValues(t.values), "valeur")}` : "aucune"}</strong>
+    <div class="crow" data-drop="tendances" title="Glissez un fichier de paramètres calés (.json) ici pour l'importer comme tendances"><span>Tendances :</span> <strong>${t ? `${esc(t.fileName)} — importé le ${dateLabel(t.importedAt)} — ${plural(trendCount(t), "valeur")}` : "aucune"}</strong>
       <button type="button" class="small" data-action="import-tendances">Importer des tendances (fichier de paramètres calés)…</button>
       <input type="file" data-file="tendances" accept=".json,application/json" hidden>${t ? ` <button type="button" class="small" data-action="export-tendances">Exporter les tendances</button>` : ""}</div>
     ${base ? `<div class="crow"><span>Classeur de chiffrage :</span> <strong>${esc(base.source?.fileName)} — importé le ${dateLabel(base.source?.importedAt)}</strong></div>` : ""}
     ${migrated}
+    ${settingsNotApplied()}
     <div class="cfields">${field("Seuil d'alerte : écart à la tendance", sinput("seuilTendance", settings.seuilTendance, { kind: "pct" }), "% — au-delà, le chiffrage signale l'écart (carte Traçabilité)")}</div>
     <p class="small muted">Chaque valeur vient de la première source qui en a une : <span class="csrc saisie">saisie</span> dans cette page (enregistrée dans ce navigateur dès qu'elle est saisie), puis <span class="csrc classeur">classeur</span> de chiffrage, puis <span class="csrc tendance">tendance</span> du fichier de paramètres calés (une indication tirée des devis passés : elle ne remplace jamais une saisie ni une valeur du classeur), puis <span class="csrc defaut">défaut</span> du code (valeur neutre, à ajuster). Dans les tableaux : S, C, T, D. Un champ vidé n'est plus une saisie : il reprend la valeur de la source suivante (0 ne s'obtient qu'en tapant 0). Quand une valeur s'écarte de la tendance, la tendance et l'écart s'affichent sous le champ, avec « Adopter la tendance ».</p>
     <div class="crow"><span class="small">Paramètres par défaut :</span>

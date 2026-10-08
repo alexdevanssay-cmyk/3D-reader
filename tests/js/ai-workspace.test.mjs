@@ -82,7 +82,7 @@ function syntheticContext() {
         { nom: "Carter Dupont", chiffree: true, valeurs: { "piece.poids": { valeur: 1.2, unite: "kg", ref: 'q.pieces["0:Carter Dupont"].poids', hypotheses: ["boîte à noyau « Noyau central » : 1 200 €"] } } },
         { nom: "Vis", chiffree: true, valeurs: {} },
       ],
-      alertes: [{ piece: "Vis", cle: "piece.poids", type: "saisie ignorée", message: "Vis : poids saisi pour Carter Dupont" }],
+      alertes: [{ pieces: ["Vis", "Carter Dupont"], cle: "piece.poids", type: "saisie ignorée", message: "Vis : poids saisi pour Carter Dupont" }],
     },
   };
 }
@@ -110,7 +110,7 @@ test("the names sent online: neutral labels in place of the file, the bodies, th
   assert.deepEqual(trace.pieces.map((p) => p.nom), ["Corps 1", "Corps 3"]);
   assert.equal(trace.pieces[0].valeurs["piece.poids"].ref, 'q.pieces["0:Corps 1"].poids');
   assert.deepEqual(trace.pieces[0].valeurs["piece.poids"].hypotheses, ["boîte à noyau « Noyau 1 » : 1 200 €"]);
-  assert.deepEqual(trace.alertes[0], { piece: "Corps 3", cle: "piece.poids", type: "saisie ignorée", message: "Corps 3 : poids saisi pour Corps 1" });
+  assert.deepEqual(trace.alertes[0], { pieces: ["Corps 3", "Corps 1"], cle: "piece.poids", type: "saisie ignorée", message: "Corps 3 : poids saisi pour Corps 1" });
   assert.deepEqual([trace.fichiers.classeur.nom, trace.fichiers.rfq.nom, trace.fichiers.indices], ["classeur de chiffrage", "demande client", null]);
   assert.equal(trace.devis.valeurs["devis.alliage"].source, "classeur « classeur de chiffrage »");
   assert.equal(trace.pieces[0].valeurs["piece.poids"].valeur, 1.2);
@@ -161,4 +161,25 @@ test("the conversation sent online: never what the local model answered (real na
   assert.deepEqual(onlineMessages(messages).map((m) => m.content), ["Résume la pièce.", "Une boîte.", "Et les faces ?", "Six faces."]);
   assert.deepEqual(onlineMessages(messages.slice(0, 4)).map((m) => m.content), ["Résume la pièce.", "Une boîte."]);
   assert.deepEqual(onlineMessages([]), []);
+});
+
+test("the conversation sent online: an answer given with the internal amounts of the costing only while they may go, to the same gateway", () => {
+  const gateway = "https://exemple.vercel.app/api/ai";
+  const messages = [
+    { role: "user", content: "Pourquoi ce prix ?" },
+    { role: "assistant", content: "Le prix de vente est masqué." },
+    { role: "user", content: "Et le détail ?" },
+    { role: "assistant", content: "Taux du centre : 42,5 €/h ; prix de vente 26,47 €.", amounts: true, gateway },
+    { role: "user", content: "Et les faces ?" },
+    { role: "assistant", content: "Six faces." },
+  ];
+  // The box unticked since: neither the answer nor its question.
+  assert.deepEqual(onlineMessages(messages, { amounts: false, gateway }).map((m) => m.content), ["Pourquoi ce prix ?", "Le prix de vente est masqué.", "Et les faces ?", "Six faces."]);
+  assert.deepEqual(onlineMessages(messages).map((m) => m.content), ["Pourquoi ce prix ?", "Le prix de vente est masqué.", "Et les faces ?", "Six faces."]);
+  // Ticked, but another gateway: not either.
+  assert.deepEqual(onlineMessages(messages, { amounts: true, gateway: "https://autre.vercel.app/api/ai" }).length, 4);
+  // Ticked, the same gateway: the whole conversation.
+  assert.deepEqual(onlineMessages(messages, { amounts: true, gateway }), messages);
+  // An answer of the local model: never, whatever the box.
+  assert.deepEqual(onlineMessages([{ role: "user", content: "Q" }, { role: "assistant", content: "R", local: true }], { amounts: true, gateway }), []);
 });

@@ -194,7 +194,7 @@ export function orderValues(order, lists = {}, { proto = !!order.prototype } = {
   }
   if (order.targetPrice) out.prixCible = order.targetPrice;
   if (order.client) out.client = order.client;
-  // "MZ-0681155 - K.451.256G LABLE PLATE RIGHT": reference, then designation.
+  // "AB-0000001 - X.000.000A SUPPORT DROIT": reference, then designation.
   const m = /^(\S+)\s+-\s+(.+)$/.exec(order.reference);
   if (m) [out.reference, out.designation] = [m[1], m[2]];
   else if (order.reference) out.reference = order.reference;

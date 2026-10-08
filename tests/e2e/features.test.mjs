@@ -418,6 +418,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.fill('#ai-input', 'Combien de noyaux ?');
     await page.press('#ai-input', 'Enter');
     await page.waitForSelector('#ai-chat .ai-thought:not([hidden])', { timeout: 30_000 });
+    // Rewritten at every word: not read out by a screen reader (the folded reasoning is).
+    assert.equal(await page.getAttribute('#ai-chat .ai-thought', 'aria-hidden'), 'true');
     assert.match(await page.textContent('#ai-chat .ai-thought'), /je vérifie les corps fermés\.$/);
     await page.waitForFunction(() => /Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
     assert.equal(chats[2].think, true);

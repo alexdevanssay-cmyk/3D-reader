@@ -43,6 +43,8 @@ const positive = (v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? 
 /** `o` without its empty fields (null, undefined). */
 const known = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined));
 const fr = (v, digits = 0) => v.toLocaleString("fr-FR", { maximumFractionDigits: digits });
+/** The cycle coefficients of island `code` the trends file gives (ui.js:trendSettings), the others being those of Paramètres. */
+const trendCoefficients = (trend, code) => (trend?.coefficients?.[code]?.length ? { coefficients_tendance: trend.coefficients[code] } : {});
 
 /**
  * What the model is given to estimate the casting cycle of piece `r` (a
@@ -108,7 +110,7 @@ export function cycleData(r, { settings, history = [], trend = null, serie = nul
       pieces_par_cycle: e.parCycle,
       kg_coules_par_cycle: round(kgFormula),
     },
-    ...(trendCycle !== null && Number.isFinite(trendCycle) ? { tendance: { valeur_s: round(trendCycle), ecart_formule_pct: trendCycle ? round(((e.cycle - trendCycle) / trendCycle) * 100) : null } } : {}),
+    ...(trendCycle !== null && Number.isFinite(trendCycle) ? { tendance: { valeur_s: round(trendCycle), ecart_formule_pct: trendCycle ? round(((e.cycle - trendCycle) / trendCycle) * 100) : null, ...trendCoefficients(trend, code) } } : {}),
     ...(similar.length ? { pieces_similaires: similarData(similar) } : {}),
   };
 }
@@ -186,7 +188,7 @@ export function recordCycleData(x, { settings, history = [], trend = null, k = S
         kg_coules_par_cycle: round(kgCycle),
       },
     } : {}),
-    ...(trendCycle !== null && Number.isFinite(trendCycle) ? { tendance: { valeur_s: round(trendCycle), ecart_formule_pct: formula !== null && trendCycle ? round(((formula - trendCycle) / trendCycle) * 100) : null } } : {}),
+    ...(trendCycle !== null && Number.isFinite(trendCycle) ? { tendance: { valeur_s: round(trendCycle), ecart_formule_pct: formula !== null && trendCycle ? round(((formula - trendCycle) / trendCycle) * 100) : null, ...trendCoefficients(trend, code) } } : {}),
     ...(similar.length ? { pieces_similaires: similarData(similar) } : {}),
   };
 }

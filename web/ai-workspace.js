@@ -43,7 +43,7 @@ import { anonymizer, buildAIContext, checkContextNumbers, compactAIContext, summ
 
 const PROVIDERS = [
   ["openai", "En ligne via la passerelle (Groq…)"], // value of earlier versions, kept in this browser's storage
-  ["ollama", "Ollama local (sur ce PC)"],
+  ["ollama", "Ollama local (ce PC ou le réseau local)"],
 ];
 const OLLAMA_URL = "http://localhost:11434";
 const OLLAMA_MODEL = "qwen3:8b";
@@ -132,10 +132,13 @@ const unionNames = (a, b) => [...a, ...b.filter((x) => !a.some((y) => y.name ===
  * The messages of a conversation that may go to the gateway: not the
  * exchanges the local model answered (`local`), nor their question. It was
  * given the real names and, for the costing, the internal amounts: its answer
- * may quote them.
+ * may quote them. Nor the exchanges the gateway answered with the internal
+ * amounts of the costing (`amounts`: the box ticked then), unless the box is
+ * ticked now (`amounts`) and the gateway is the same (`gateway`, its address).
  */
-export function onlineMessages(messages) {
-  return messages.filter((m, i) => !(m.local || (m.role !== "assistant" && messages[i + 1]?.local)));
+export function onlineMessages(messages, { amounts = false, gateway = null } = {}) {
+  const left = (m) => m?.local || (m?.amounts && !(amounts && m.gateway === gateway));
+  return messages.filter((m, i) => !(left(m) || (m.role !== "assistant" && left(messages[i + 1]))));
 }
 
 function writeConversation(key, conversation) {
@@ -881,6 +884,8 @@ export function mount({ page, reader }) {
     const local = isLocal();
     const askedTask = task;
     const costing = askedTask === "costing";
+    // The internal amounts of the costing sent to the gateway (box ticked): its address, else null.
+    const amountsSent = costing && !local && $("ai-amounts").checked ? $("ai-url").value.trim() : null;
     store.set(localStorage, KEYS.provider, provider());
     store.set(localStorage, local ? KEYS.ollama : KEYS.gateway, $("ai-url").value.trim() || null);
     const wanted = $("ai-model").value.trim();
@@ -908,6 +913,9 @@ export function mount({ page, reader }) {
     const thoughtLine = document.createElement("div");
     thoughtLine.className = "ai-thought";
     thoughtLine.hidden = true;
+    // Rewritten at every word: not read out by a screen reader (the folded reasoning stays readable), nor the answer until it is complete.
+    thoughtLine.setAttribute("aria-hidden", "true");
+    answerBox.parentElement.setAttribute("aria-busy", "true");
     answerBox.after(thoughtLine);
     let thought = "";
     let folded = false;
@@ -1000,7 +1008,8 @@ export function mount({ page, reader }) {
         // The names of the quote of the tab, whatever the task: a question may name the customer.
         const { costingNames } = await import("./chiffrage/ui.js");
         quoteNames = costingNames({ tab: tabId });
-        let online = { question, history: recent(onlineMessages(conversation.messages)) };
+        // Not what was answered with the internal amounts of the costing, unless they may go now, to this gateway.
+        let online = { question, history: recent(onlineMessages(conversation.messages, { amounts: $("ai-amounts").checked, gateway: $("ai-url").value.trim() })) };
         if ($("ai-anon").checked) {
           // Before the compaction: the labels count in the budget. With the names this conversation
           // replaced before: one changed since in the quote may be in its history.
@@ -1029,6 +1038,7 @@ export function mount({ page, reader }) {
       foldThought();
       answerBox.classList.remove("ai-thinking");
       answerBox.textContent = formatAnswer(output) || "(réponse vide)";
+      answerBox.parentElement.removeAttribute("aria-busy");
       // Costing: every number of the answer must be in the trace the model was given.
       let check = null;
       if (costing) {
@@ -1038,9 +1048,10 @@ export function mount({ page, reader }) {
       // Every task with a part: the numbers that come from none of the data sent (informative).
       const numbers = sent.no_model_loaded ? [] : checkContextNumbers(answerText(output), sent, asked).inconnus;
       const legend = names ? names.legend(formatAnswer(output)) : [];
-      // An answer of the local model is marked: it never goes online with the conversation (onlineMessages).
+      // An answer of the local model is marked: it never goes online with the conversation (onlineMessages);
+      // one of the gateway given the internal amounts of the costing too, with the gateway: not without the box ticked.
       const message = {
-        role: "assistant", content: withoutThinking(output), ...(localModel ? { local: true } : {}),
+        role: "assistant", content: withoutThinking(output), ...(localModel ? { local: true } : {}), ...(amountsSent !== null && !localModel ? { amounts: true, gateway: amountsSent } : {}),
         ...(check ? { costing: check } : {}), ...(numbers.length ? { numbers } : {}), ...(notice ? { notice } : {}), ...(legend.length ? { names: legend } : {}),
       };
       signal.throwIfAborted();

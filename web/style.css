@@ -306,7 +306,7 @@ table.bodies .open { color: var(--warn); }
 .csrc.saisie { border-color: var(--accent); color: var(--accent); }
 .csrc.classeur { border-color: var(--ok); color: var(--ok); }
 .csrc.tendance { border-color: var(--warn); color: var(--warn); }
-.csrc.defaut { opacity: .65; }
+.csrc.defaut { border-style: dashed; }
 .ctrend { display: block; margin-top: 2px; color: var(--warn); font-size: 11px; white-space: normal; }
 @media (max-width: 700px) { .cgrid { grid-template-columns: 1fr; } }
 .ctable td.bad { color: var(--error-text); }

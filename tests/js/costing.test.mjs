@@ -696,10 +696,57 @@ describe('settings layers: typed values, workbook, trends, defaults', () => {
     assert.deepEqual(file, { tooling: { bandes: { 3: { ax3: 70 } } }, trs: { CG3: 0.6 } });
     // The export imported as trends: the same values.
     storage.clear();
-    importTendances(JSON.parse(JSON.stringify(file)), 'saisies.json');
+    const report = importTendances(JSON.parse(JSON.stringify(file)), 'saisies.json');
     const t = loadSettings(base);
     assert.equal(t.tooling.bandes[3].ax3, 70);
     assert.deepEqual(t.tooling.bandes[4], DEFAULT_TOOLING.bandes[4]);
+    // Only the values of the file are trends: the other rows of the table, and of row 3, stay the defaults of the code.
+    assert.equal(report.count, 2);
+    const layers = loadSettingsLayers(base);
+    assert.equal(layers.provenance('tooling.bandes.0.ax3').source, 'defaut');
+    assert.equal(layers.provenance('tooling.bandes.9.scan').source, 'defaut');
+    assert.equal(layers.provenance('tooling.bandes.3.ax5').source, 'defaut');
+    assert.deepEqual(pick(layers.provenance('tooling.bandes.3.ax3'), ['source', 'fileName']), { source: 'tendance', fileName: 'saisies.json' });
+  });
+
+  test('a row typed in a table: never moved to another row by a trends table of another length', () => {
+    storage.clear();
+    const last = DEFAULT_TOOLING.bandes.length - 1;
+    setSetting(`tooling.bandes.${last}.ax3`, 77, base);
+    // No trends: the value typed in, the same prices as the settings of version 1 with it.
+    const typed = v1Load(base, null);
+    typed.tooling.bandes[last].ax3 = 77;
+    assert.deepEqual(pricesOf(loadSettings(base)), pricesOf(typed));
+    // A shorter table in the trends (made-up bands): the table of the code where a row of it is typed in, said.
+    const shorter = { tooling: { bandes: [{ max: 100, ax3: 11 }, { max: 1000, ax3: 11 }, { max: 1e9, ax3: 11 }] } };
+    const report = importTendances(shorter, 'courtes.json');
+    assert.deepEqual(report.warnings.map((w) => w.path), ['tooling.bandes']);
+    assert.match(report.warnings[0].reason, new RegExp(`^3 lignes au lieu de ${last + 1} : le tableau par défaut est gardé`));
+    let layers = loadSettingsLayers(base);
+    assert.equal(layers.effective.tooling.bandes.length, last + 1);
+    assert.equal(layers.effective.tooling.bandes[last].ax3, 77);
+    assert.deepEqual(layers.effective.tooling.bandes[0], DEFAULT_TOOLING.bandes[0]);
+    assert.deepEqual([layers.ignored, layers.unapplied], [['tooling.bandes'], []]);
+    assert.deepEqual(pick(layers.provenance(`tooling.bandes.${last}.ax3`), ['source', 'value', 'trend', 'trendIgnored']), { source: 'saisie', value: 77, trend: undefined, trendIgnored: true });
+    assert.deepEqual(pick(layers.provenance('tooling.bandes.0.ax3'), ['source', 'trendIgnored']), { source: 'defaut', trendIgnored: true });
+    assert.deepEqual(pricesOf(layers.effective), pricesOf(typed), 'the trend changes nothing there');
+    // A longer one: the same.
+    importTendances({ tooling: { bandes: Array.from({ length: last + 3 }, (_, i) => ({ max: (i + 1) * 100, ax3: 5 })) } }, 'longues.json');
+    layers = loadSettingsLayers(base);
+    assert.deepEqual([layers.effective.tooling.bandes.length, layers.effective.tooling.bandes[last].ax3, layers.ignored], [last + 1, 77, ['tooling.bandes']]);
+    // The trends' table used where no row of it is typed in.
+    clearSetting(`tooling.bandes.${last}.ax3`, base);
+    layers = loadSettingsLayers(base);
+    assert.deepEqual([layers.effective.tooling.bandes.length, layers.ignored, layers.provenance('tooling.bandes.0.ax3').source], [last + 3, [], 'tendance']);
+    // A row typed in that table: kept on it; the trends erased, not applied to the row of the same number of the code's table.
+    setSetting(`tooling.bandes.${last + 2}.ax3`, 33, base);
+    layers = loadSettingsLayers(base);
+    assert.deepEqual([layers.effective.tooling.bandes[last + 2].ax3, layers.unapplied], [33, []]);
+    clearTendances();
+    layers = loadSettingsLayers(base);
+    assert.deepEqual([layers.effective.tooling.bandes.length, layers.unapplied], [last + 1, [`tooling.bandes.${last + 2}.ax3`]]);
+    assert.equal(layers.provenance(`tooling.bandes.${last + 2}.ax3`).unapplied, true);
+    assert.deepEqual(pricesOf(layers.effective), pricesOf(v1Load(base, null)));
   });
 
   test('migration of the saved settings of version 1: only the choices, the same prices', () => {
@@ -782,7 +829,7 @@ describe('settings layers: typed values, workbook, trends, defaults', () => {
     assert.equal(values.marge, undefined);
     assert.deepEqual(values.tth.T61, { label: 'T61', coef: 1.05, cycle: '' });
     assert.ok(report.completed.includes('tooling.bandes.0.ax5'));
-    assert.equal(report.count, countLeaves(values));
+    assert.equal(report.count, countLeaves(values) - report.completed.length, 'the values of the file, not those completed by the defaults');
     // Applied: every value of the tables is a number, the die and the core box are costed.
     storage.clear();
     importTendances({ tooling: { bandes: [{ max: 150, ax3: 12 }], coefPoids: [{ coef: 1.3 }] }, cores: { types: [{ prixKg: 9 }] } }, 't.json');
@@ -792,6 +839,19 @@ describe('settings layers: typed values, workbook, trends, defaults', () => {
     assert.ok(Number.isFinite(coreBoxCost({ masse: 1, qte: 1, type: 0, complexite: 'Moyen' }, s.cores, s.tooling).total));
     assert.equal(loadSettingsLayers(base).provenance('tooling.bandes.0.ax3').source, 'tendance');
     assert.equal(loadSettingsLayers(base).provenance('tooling.bandes.0.ax5').source, 'defaut', 'completed, not from the file');
+  });
+
+  test('the threshold of the alerts on the trend is not set by a trends file', () => {
+    const { values, report } = validateTendances({ seuilTendance: 10, trs: { CG3: 0.3 } });
+    assert.deepEqual(report.unknown, [{ path: 'seuilTendance', suggestion: null }]);
+    assert.deepEqual(values, { trs: { CG3: 0.3 } });
+    // Trends saved before: the threshold left out when they are read.
+    storage.clear();
+    storage.set('reader3d.chiffrage.tendances.v1', JSON.stringify({ fileName: 'ancien.json', importedAt: '2026-01-01T00:00:00.000Z', values: { seuilTendance: 10, trs: { CG3: 0.3 } }, completed: [] }));
+    const layers = loadSettingsLayers(base);
+    assert.equal(layers.effective.seuilTendance, defaultSettings(base).seuilTendance);
+    assert.equal(layers.provenance('seuilTendance').source, 'defaut');
+    assert.deepEqual(layers.tendances.values, { trs: { CG3: 0.3 } });
   });
 
   test('a file without any known value is refused and the trends are kept', () => {
@@ -1056,6 +1116,111 @@ describe('traced values of a quote (provenance.js)', () => {
     assert.deepEqual([trend.valeur, trend.autorite, trend.niveau, trend.source.fichier, trend.validation_requise], [0.7, 'soft_prior', 4, 'tendances.json', true]);
     const [code] = trs(() => {});
     assert.deepEqual([code.valeur, code.autorite, code.validation_requise, code.alertes.map((a) => a.type)], [DEFAULT_TRS.CG3, 'default_code', true, ['defaut_code']]);
+  });
+
+  test('a trends file does not set the threshold of the deviations from it: the alert stays', () => {
+    const quote = { pieces: { manuel: { ...PART, procede: 'CG3' } } };
+    const c = computed({ quote, setup: () => (setSetting('trs.CG3', 0.9, base), importTendances({ seuilTendance: 10, trs: { CG3: 0.3 } }, 't.json')) });
+    const t = c.results[0].trace['centre.CG3.trs'];
+    assert.equal(t.valeur, 0.9);
+    assert.equal(t.ecart_tendance.alerte, true);
+    assert.equal(t.ecart_tendance.seuil, defaultSettings(base).seuilTendance);
+    assert.ok(t.alertes.some((a) => a.type === 'ecart_tendance'));
+  });
+
+  test('settings of version 1 equal to the trends imported since: to validate, said above the workbook, the same prices', () => {
+    // The calibrated file imported by the previous version (made-up values): merged into its settings, then imported again as trends.
+    const calibrated = { marge: 0.33, trs: { CG3: 0.55 } };
+    const quote = { pieces: { manuel: { ...PART, procede: 'CG3' } } };
+    const c = computed({ quote, setup: () => (storage.set(V1, JSON.stringify(calibrated)), importTendances(calibrated, 'cale.json')) });
+    const layers = loadSettingsLayers(base);
+    assert.deepEqual(pick(layers.provenance('marge'), ['source', 'migrated', 'trend', 'classeur']), { source: 'saisie', migrated: true, trend: 0.33, classeur: base.defaults.marge });
+    const typed = computed({ quote, setup: () => (setSetting('marge', 0.33, base), setSetting('trs.CG3', 0.55, base)) });
+    assert.equal(c.results[0].final.years[0].prixVente, typed.results[0].final.years[0].prixVente, 'nothing changes in the price');
+    const marge = c.trace['devis.marge'];
+    assert.deepEqual([marge.valeur, marge.source.type, marge.confiance.niveau, marge.validation_requise], [0.33, 'parametres', 'moyenne', true]);
+    assert.match(marge.confiance.raison, /reprise de la version précédente : saisie ou fichier calé, indiscernables/);
+    assert.ok(marge.alertes.some((a) => a.type === 'divergence' && /égale à la tendance « cale\.json »[\s\S]*passe avant le classeur \(12 %\)/.test(a.message)), JSON.stringify(marge.alertes));
+    assert.deepEqual(marge.alternatives.map((a) => [a.source, a.valeur]), [['tendance', 0.33], ['classeur', base.defaults.marge]]);
+    const trs = c.results[0].trace['centre.CG3.trs'];
+    assert.deepEqual([trs.confiance.niveau, trs.validation_requise], ['moyenne', true]);
+    assert.ok(trs.alertes.some((a) => a.type === 'divergence'));
+    // Typed in now, the same values: what they were before.
+    const now = typed.trace['devis.marge'];
+    assert.deepEqual([now.confiance.niveau, now.validation_requise, now.alertes], ['haute', false, []]);
+  });
+
+  test('"Adopter la tendance" over the workbook: traced as an adopted trend, to validate, the value of the workbook beside it', () => {
+    const c = computed({ setup: () => (importTendances({ marge: 0.3 }, 't.json'), adoptTendance('marge', base)) });
+    assert.deepEqual(pick(loadSettingsLayers(base).provenance('marge'), ['source', 'from', 'fileName', 'classeur']), { source: 'saisie', from: 'tendance', fileName: 't.json', classeur: base.defaults.marge });
+    const typed = computed({ setup: () => setSetting('marge', 0.3, base) });
+    assert.equal(c.results[0].final.years[0].prixVente, typed.results[0].final.years[0].prixVente);
+    const t = c.trace['devis.marge'];
+    assert.deepEqual([t.valeur, t.source.type, t.validation_requise], [0.3, 'parametres', true]);
+    assert.match(t.confiance.raison, /^tendance du fichier « t\.json » adoptée dans Paramètres le \d\d\/\d\d\/\d{4} à la place de la valeur du classeur \(12 %\)$/);
+    assert.ok(t.hypotheses.some((h) => /adoptée dans Paramètres/.test(h)));
+    assert.ok(t.alternatives.some((a) => a.source === 'classeur' && a.valeur === base.defaults.marge));
+    assert.ok(t.alertes.some((a) => a.type === 'divergence'));
+  });
+
+  test('"Marge mini": the trace cites the minimum rate the margin was solved for, and says when Paramètres has another one', () => {
+    const margeMini = { valeur: 0.2, tauxMini: 0.1 };
+    let c = computed({ quote: { marge: 0.2, margeMini }, setup: () => setSetting('tauxMini', 0.12, base) });
+    const rate = c.trace['parametres.tauxMini'];
+    assert.deepEqual([rate.valeur, rate.source.type, rate.source.ref], [0.1, 'saisie', 'q.margeMini.tauxMini']);
+    assert.deepEqual(rate.alternatives.map((a) => [a.source, a.valeur]), [['parametres', 0.12]]);
+    const marge = c.trace['devis.marge'];
+    assert.equal(marge.valeur, 0.2);
+    assert.ok(marge.alertes.some((a) => a.type === 'divergence' && a.message === 'marge mini calculée avec un taux mini de 10 %, Paramètres : 12 % : relancez « Marge mini »'), JSON.stringify(marge.alertes));
+    assert.equal(marge.validation_requise, true);
+    // The same rate: as before, no alert.
+    c = computed({ quote: { marge: 0.2, margeMini: { valeur: 0.2, tauxMini: base.defaults.tauxMini } } });
+    assert.equal(c.trace['parametres.tauxMini'].source.type, 'classeur');
+    assert.ok(!c.trace['devis.marge'].alertes.some((a) => a.type === 'divergence'));
+  });
+
+  test('an alert of the settings shared by the pieces of a set counts once, with the pieces', () => {
+    const parts = ['A1', 'A2', 'A3', 'A4'].map((name, index) => ({ ...PARTS_3D[0], index, name }));
+    const c = computed({ p3d: { file: 'asm.step', parts, selected: [0, 1, 2, 3] } });
+    const sum = summarize([{ piece: null, trace: c.trace }, ...c.results.map((r) => ({ piece: r.piece.name, trace: r.trace }))]);
+    const ids = sum.alertes.map((a) => `${a.cle}|${a.type}|${a.message}`);
+    assert.equal(new Set(ids).size, ids.length, 'each alert once');
+    assert.ok(sum.occurrences > sum.alertes.length);
+    assert.equal(sum.occurrences, sum.alertes.reduce((n, a) => n + Math.max(1, a.pieces.length), 0));
+    const shared = sum.alertes.find((a) => a.cle === 'parametres.cycle');
+    assert.deepEqual(shared.pieces, ['A1', 'A2', 'A3', 'A4']);
+    assert.ok(sum.alertes.filter((a) => !a.pieces.length).every((a) => a.cle.startsWith('devis.') || a.cle.startsWith('ensemble.') || a.cle.startsWith('parametres.prix')));
+  });
+
+  test('two bodies of the same name: each one in the set, under its own name', () => {
+    const parts = [{ ...PARTS_3D[0], name: 'Corps' }, { ...PARTS_3D[2], name: 'Corps' }];
+    const c = computed({ p3d: { file: 'asm.step', parts, selected: [0, 2] } });
+    const set = c.trace['ensemble.prix.vente'];
+    assert.deepEqual(set.source.entrees, ['piece.prix.vente [Corps (corps 1)]', 'piece.prix.vente [Corps (corps 3)]']);
+    assert.equal(set.confiance.niveau, weakest(...c.results.map((r) => r.trace['piece.prix.vente'].confiance.niveau)));
+    assert.equal(set.validation_requise, c.results.some((r) => r.trace['piece.prix.vente'].validation_requise));
+    assert.deepEqual(ui.costingSnapshot().pieces.map((p) => p.nom), ['Corps (corps 1)', 'Corps (corps 3)']);
+  });
+
+  test('the cycle of the trend: the coefficients of the trends file, the others those of Paramètres', () => {
+    computed({ setup: () => (importTendances({ processes: { CG3: { cycle: { base: 50 } } } }, 't.json'), setSetting('processes.CG3.cycle.parKg', 7, base)) });
+    const t = ui.trendSettings();
+    assert.deepEqual(t.processes.CG3.cycle, { ...DEFAULT_PROCESSES.CG3.cycle, base: 50, parKg: 7 });
+    assert.deepEqual(Object.keys(t.processes), ['CG3']);
+    assert.deepEqual(t.coefficients, { CG3: ['base'] });
+    computed();
+    assert.equal(ui.trendSettings(), null);
+  });
+
+  test('no 3D model opened yet (after a reload): the inputs of the pieces of the last one are kept for it', () => {
+    computed({ quote: { pieceFile: 'asm.step', pieces: { manuel: PART, '0:A': { cycleReel: 99, cycleIA: { valeur: 120 } } } } });
+    const saved = JSON.parse(storage.get('reader3d.chiffrage.quote.v1'));
+    assert.equal(saved.pieceFile, 'asm.step');
+    assert.deepEqual(saved.pieces['0:A'], { cycleReel: 99, cycleIA: { valeur: 120 } });
+    // Another file: they do not apply.
+    globalThis.window.reader3d = { part: () => ({ file: 'autre.step', parts: PARTS_3D, selected: [0] }) };
+    ui.compute();
+    assert.deepEqual(JSON.parse(storage.get('reader3d.chiffrage.quote.v1')).pieces, {});
   });
 
   test('the confidence of a price is that of its weakest input', () => {

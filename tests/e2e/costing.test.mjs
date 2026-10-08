@@ -37,6 +37,8 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     writeFileSync(join(dir, 'chiffrage.xlsm'), costingWorkbook());
     writeFileSync(join(dir, 'VALEURS MB LME.xlsx'), indicesWorkbook(100));
     writeFileSync(join(dir, 'RFQ.xlsm'), seriesOrderWorkbook());
+    // A request without prototype volumes.
+    writeFileSync(join(dir, 'RFQ sans proto.xlsm'), seriesOrderWorkbook({ go: { I9: 0 } }));
     // A calibrated settings file (made-up values), with a misspelled key.
     writeFileSync(join(dir, 'tendances.json'), JSON.stringify({ trs: { CG3: 0.7, SSP: 0.5 }, procceses: { CG3: { qualite: 9 } } }));
     server = createStaticServer(DIST);
@@ -167,6 +169,8 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // In the quote, the TRS traced: typed in Paramètres (hard), the trend and the deviation beside it.
     await page.click('.tab[data-page="chiffrage"]');
     await page.waitForSelector('#page-chiffrage #ctrace');
+    await page.click('#page-chiffrage [data-action="show-trace"]'); // folded since the reload
+    await page.waitForSelector('#page-chiffrage #ctrace details[open] table');
     assert.match(await page.locator('#page-chiffrage #ctrace tr', { hasText: 'centre.CG3.trs' }).textContent(), /60,0 %\s*saisie Paramètres[\s\S]*hard \(N2\)\s*haute[\s\S]*[-−]14,3 %\s*tendance 70,0 %\s*non/);
     await page.click('.tab[data-page="parametres"]');
     await page.waitForSelector('#page-parametres [data-bind="s.trs.CG3"]');
@@ -183,9 +187,13 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.fill('#page-parametres [data-bind="s.trs.CG3"]', '65');
     await page.dispatchEvent('#page-parametres [data-bind="s.trs.CG3"]', 'change');
     await page.waitForSelector('#page-parametres [data-action="adopt-trend"][data-path="trs.CG3"]');
+    // The value typed in is lost: a confirmation says it, and the message how to come back.
+    const adopt = new Promise((resolve) => page.once('dialog', (d) => resolve(d.message()) || d.accept()));
     await page.click('#page-parametres [data-action="adopt-trend"][data-path="trs.CG3"]');
+    assert.match(await adopt, /^Adopter la tendance pour trs\.CG3 \?\n\nLa valeur saisie 65 % \(saisie du \d\d\/\d\d\/\d{4}\s\d\d:\d\d\) est remplacée par la tendance 70 %\. Pour revenir, ressaisissez 65 %\.$/);
     await page.waitForFunction(() => document.querySelector('#page-parametres [data-bind="s.trs.CG3"]')?.value === '70');
     assert.equal(await page.locator('#page-parametres [data-action="adopt-trend"]').count(), 0);
+    assert.match(await page.textContent('#page-parametres .cmsg.ok'), /^Tendance adoptée pour trs\.CG3 : 70 % remplace 65 % \(saisie du [^)]+\)\. Ressaisissez 65 % pour revenir\.$/);
     // "Paramètres par défaut": erasing the trends says what is kept; the default of the code comes back.
     const dialog = new Promise((resolve) => page.once('dialog', (d) => resolve(d.message()) || d.accept()));
     await page.click('#page-parametres [data-action="clear-tendances"]');
@@ -298,7 +306,11 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // "Retirer" the request: the fields it filled are said, kept until the values of before the import are put back.
     await page.click('#page-chiffrage [data-action="remove-rfq"]');
     await page.waitForFunction(() => /Commande série :\s*aucune/.test(document.getElementById('page-chiffrage').textContent));
-    assert.match(await page.textContent('#page-chiffrage'), /Demande client « RFQ\.xlsm » retirée\. Ces champs gardent les valeurs qu'elle avait remplies : client, référence, désignation, n° de plan, [^.]*alliage/);
+    const removed = (await page.textContent('#page-chiffrage .cmsg.warn')).replace(/[\u202f\u00a0]/g, ' ');
+    assert.match(removed, /Demande client « RFQ\.xlsm » retirée\. Ces champs gardent les valeurs qu'elle avait remplies : client, référence, désignation, n° de plan, [^.]*alliage/);
+    // What else of the request the price used, said: its energy prices, its sale metal price (a month missing from the indices).
+    assert.match(removed, /Ses prix de l'énergie \(élec 150, gaz 60 €\/MWh\) ne s'appliquent plus : ceux de Paramètres \(sinon du classeur\) reprennent\./);
+    assert.match(removed, /Le cours de vente venait de la demande \(mois mars 2026 absent des indices\) : il est maintenant indisponible \(0 €\/t\)/);
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.client"]'), 'ACME RAIL');
     await page.click('#page-chiffrage [data-action="restore-before-rfq"]');
     await page.waitForFunction(() => document.querySelector('#page-chiffrage [data-bind="q.client"]')?.value === '');
@@ -308,6 +320,61 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.coursAchat"]'), '2500');
     assert.equal(await material(), 'AS7G03 (2,68)');
 
+    // Imported again after "Retirer" with no choice, then removed again: the values of before the first import are still offered.
+    const importRfq = async (name) => {
+      await page.setInputFiles('#page-chiffrage input[data-file="rfq"]', join(dir, name));
+      await page.waitForFunction((n) => document.getElementById('page-chiffrage').textContent.includes(`« ${n} » importée`), name);
+    };
+    await importRfq('RFQ.xlsm');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.client"]'), 'ACME RAIL');
+    await page.click('#page-chiffrage [data-action="remove-rfq"]');
+    await page.waitForSelector('#page-chiffrage [data-action="restore-before-rfq"]');
+    await importRfq('RFQ.xlsm');
+    await page.click('#page-chiffrage [data-action="remove-rfq"]');
+    await page.waitForFunction(() => /Commande série :\s*aucune/.test(document.getElementById('page-chiffrage').textContent));
+    assert.match(await page.textContent('#page-chiffrage'), /Ces champs gardent les valeurs qu'elle avait remplies : client, référence/);
+    assert.equal(await page.textContent('#page-chiffrage [data-action="restore-before-rfq"]'), "Remettre les valeurs d'avant l'import");
+    await page.click('#page-chiffrage [data-action="restore-before-rfq"]');
+    await page.waitForFunction(() => document.querySelector('#page-chiffrage [data-bind="q.client"]')?.value === '');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.alliage"]'), 'AS7G03');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.coursAchat"]'), '2500');
+
+    // A request without prototype volumes, "Prototype" ticked: said, the volumes kept, no hint that they are the request's.
+    await importRfq('RFQ sans proto.xlsm');
+    await page.check('#page-chiffrage [data-bind="q.prototype"]');
+    await page.waitForFunction(() => /La demande client « RFQ sans proto\.xlsm » n'a pas de volumes proto : volumes actuels conservés, saisissez-les\./.test(document.getElementById('page-chiffrage').textContent));
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.volumes.1"]'), '1500');
+    const hint = await page.textContent('#page-chiffrage label.cf:has([data-bind="q.prototype"]) small');
+    assert.equal(hint, 'sans prix cible ni gains de productivité — saisissez les volumes des prototypes');
+    assert.doesNotMatch(await page.textContent('#page-chiffrage'), /volumes proto de la demande/);
+
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('settings of an earlier version: taken over as values typed in, said; those equal to the trends imported since, offered to erase', { timeout: 60_000 }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    // The calibrated file imported by the previous version (made-up values): merged into its settings.
+    const calibrated = { marge: 0.33, trs: { CG3: 0.55 } };
+    await page.evaluate((v) => localStorage.setItem('reader3d.chiffrage.settings.v1', JSON.stringify(v)), calibrated);
+    writeFileSync(join(dir, 'cale.json'), JSON.stringify(calibrated));
+    await page.reload();
+    await page.click('.tab[data-page="parametres"]');
+    await page.waitForSelector('#page-parametres .cmigrated');
+    assert.match(await page.textContent('#page-parametres .cmigrated'), /repris comme saisies \(2 valeurs\)/);
+    // The file imported again as trends: still said, the values equal to the trend named, with a button to erase them.
+    await page.setInputFiles('#page-parametres input[data-file="tendances"]', join(dir, 'cale.json'));
+    await page.waitForFunction(() => /Tendances « cale\.json » importées/.test(document.getElementById('page-parametres').textContent));
+    assert.match(await page.textContent('#page-parametres .cmigrated'), /2 valeurs reprises sont égales à la tendance au même endroit, sans doute venues du fichier calé, et passent avant le classeur : marge, trs\.CG3\./);
+    await page.click('#page-parametres [data-action="clear-migrated-trends"]');
+    await page.waitForFunction(() => /2 saisies effacées : marge, trs\.CG3\./.test(document.getElementById('page-parametres').textContent));
+    assert.equal(await page.locator('#page-parametres .cmigrated').count(), 0);
+    assert.equal(await page.inputValue('#page-parametres [data-bind="s.marge"]'), '33');
+    assert.equal(await page.textContent('#page-parametres label:has([data-bind="s.marge"]) .csrc'), 'tendance');
     assert.deepEqual(errors, []);
     await context.close();
   });
@@ -412,6 +479,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(Math.abs(number(cells[3]) - (formula + 100)) <= 0.1, `${cells[3]} vs ${formula + 100}`);
     assert.ok(Math.abs(number(cells[5]) - (formula - 50)) <= 0.1, `trend ${cells[5]} vs ${formula - 50}`);
     assert.deepEqual(await page.$$eval('#chistorique .chisto thead th', (ths) => ths.map((th) => th.textContent)), ['Référence', 'Îlot', 'Réel', 'Formule', 'Écart', 'Tendance', 'Écart']);
+    assert.match(await text('#chistorique'), /Tendance : la même formule avec les coefficients du fichier de tendances \(CG3 : base\), les autres ceux de Paramètres/);
 
     // Kept after a reload; exported as a history file, the time measured with the geometry of the part.
     await page.reload();
@@ -591,15 +659,26 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(gatewayRequests[1].context.costing_trace.pieces[0].valeurs['piece.prix.vente'].valeur, price.valeur);
     assert.equal(await reply.locator('.ai-check').getAttribute('class'), 'ai-check ok');
     assert.equal(await costingStorage(), stored);
+    // The box unticked since: the answer given with the amounts, and its question, no longer go with the conversation.
+    const sentHistory = (request) => request.messages.map((m) => m.content).join('\n');
+    await page.uncheck('#ai-amounts');
+    await ask('Et le moule ?');
+    assert.doesNotMatch(sentHistory(gatewayRequests[2]), /Et le détail \?/);
+    assert.doesNotMatch(sentHistory(gatewayRequests[2]), new RegExp(fr(price.valeur).replace(/\s/g, '\\s')));
+    assert.match(sentHistory(gatewayRequests[2]), /Pourquoi ce prix \?[\s\S]*Et le moule \?$/);
+    // Ticked again (the same gateway): they go again.
+    await page.check('#ai-amounts');
+    await ask("Et l'outillage ?");
+    assert.match(sentHistory(gatewayRequests[3]), /Et le détail \?/);
 
     // The answers keep their label and their check after a reload.
     await page.reload();
     await page.waitForSelector('#ai-chat .ai-label');
-    assert.equal(await page.locator('#ai-chat .ai-label').count(), 4);
+    assert.equal(await page.locator('#ai-chat .ai-label').count(), 6);
     assert.equal(await page.locator('#ai-chat .ai-check.bad').count(), 1);
 
     // The Excel export of the quote: the answers of the AI in their own sheet, none of their values applied.
-    assert.deepEqual((await analyses()).map((a) => a.provider), ['Ollama', 'Ollama', 'Groq', 'Groq']);
+    assert.deepEqual((await analyses()).map((a) => a.provider), ['Ollama', 'Ollama', 'Groq', 'Groq', 'Groq', 'Groq']);
     await page.click('.tab[data-page="chiffrage"]');
     await page.waitForSelector('#page-chiffrage [data-action="export-xlsx"]:not([disabled])');
     const [download] = await Promise.all([page.waitForEvent('download'), page.click('#page-chiffrage [data-action="export-xlsx"]')]);
@@ -618,6 +697,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // with `locked`, asking for an access code as api/ai.js does.
     const requests = [];
     let locked = false;
+    let delay = 0; // ms before the answer
     const cors = (req, res) => {
       if (req.headers.origin) res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
       if (req.method !== 'OPTIONS') return false;
@@ -637,6 +717,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       }
       const request = JSON.parse(text);
       requests.push(request);
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
       const f = request.context.formule.valeur_s;
       const e = Math.round(f * 1.1);
       const similar = request.context.pieces_similaires ?? [];
@@ -784,6 +865,10 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(requests.length, 2);
     assert.equal(requests[1].context.cycle_devis.source, 'estimation IA validée');
     assert.match(await text('#ccycle-ia'), new RegExp(`Utilisée dans le devis : ${e} s, estimation du \\d\\d/\\d\\d/\\d{4} \\d\\d:\\d\\d validée le`));
+    // The detail of the traced values, folded since the reload: built when unfolded.
+    assert.equal(await page.locator('#page-chiffrage #ctrace table').count(), 0);
+    await page.click('#page-chiffrage #ctrace summary');
+    await page.waitForSelector('#page-chiffrage #ctrace details[open] table');
     assert.match(await page.locator('#page-chiffrage #ctrace tr', { hasText: 'piece.cycle' }).first().textContent(), /estimation IA validée/);
 
     // The new estimate adopted in place of the first, then "Ne plus utiliser cette valeur": the formula and the
@@ -799,8 +884,13 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // The box unticked: no similar part sent.
     await page.uncheck('#page-chiffrage [data-pref="cycle-similar"]');
     await waitText(/Historique : 4 enregistrements, non envoyé\./); // with the real time kept above
+    delay = 1500;
     await page.click('#page-chiffrage [data-action="estimate-cycle"]');
+    // The seconds of the estimate in progress: out of what a screen reader reads.
+    await page.waitForSelector('#ccycle-status');
+    assert.deepEqual(await page.$eval('#ccycle-status', (x) => [x.getAttribute('role'), x.querySelector('.ctick')?.getAttribute('aria-hidden')]), ['status', 'true']);
     await page.waitForFunction(() => !document.querySelector('#ccycle-status'));
+    delay = 0;
     assert.equal(requests.length, 3);
     assert.equal('pieces_similaires' in requests[2].context, false);
     assert.match(await text('#ccycle-ia'), /Pièces semblables \(0 envoyée\)/);
@@ -824,6 +914,20 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const overflow = await page.evaluate(() => [...document.querySelectorAll('#ccycle-ia')].flatMap((card) => [card, ...card.querySelectorAll('button, .cscroll, p')])
       .filter((x) => x.offsetParent).map((x) => [x.textContent.trim().slice(0, 30) || x.className, Math.round(x.getBoundingClientRect().right)]).filter(([, right]) => right > 375));
     assert.deepEqual(overflow, []);
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    // "Nouveau chiffrage" while an estimate is asked: the confirmation says what is erased; the estimate is not
+    // written into the new quote.
+    delay = 2000;
+    await page.click('#page-chiffrage [data-action="estimate-cycle"]');
+    await page.waitForSelector('#ccycle-status');
+    const reset = new Promise((resolve) => page.once('dialog', (d) => resolve(d.message()) || d.accept()));
+    await page.click('#page-chiffrage [data-action="reset-quote"]');
+    assert.match(await reset, /^Effacer ce chiffrage \?\n\nSont effacés : les saisies, \d+ analyses IA, les estimations IA du temps de cycle\. Ils ne sont gardés que dans ce navigateur : exportez d'abord le chiffrage \(Excel\) pour les conserver\. L'historique des temps de cycle et les Paramètres ne changent pas\.$/);
+    await waitText(/Estimation IA du temps de cycle abandonnée : le chiffrage a changé pendant la demande\./);
+    assert.equal(await page.locator('#ccycle-ia').count(), 0);
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.reference"]'), '');
+    assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('reader3d.chiffrage.quote.v1') ?? '{}').analysesIA ?? []), []);
     assert.deepEqual(errors, []);
     await context.close();
   });
@@ -928,6 +1032,8 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.isDisabled('#chistorique [data-action="backtest"]'), true);
     assert.equal((await page.textContent('#chistorique [data-action="backtest"]')).trim(), "Banc d'essai IA en cours");
     await page.waitForFunction(() => /Pièce 2 sur 4 \(BX-1\) : prochaine demande dans \d s, au rythme du quota en ligne/.test(document.getElementById('cbacktest-status')?.textContent));
+    // The countdown, rewritten every second, out of what a screen reader reads.
+    assert.match(await page.$eval('#cbacktest-status .ctick[aria-hidden="true"]', (x) => x.textContent), /^prochaine demande dans \d s, $/);
     assert.equal(await kept(), 1);
     await page.reload();
     await page.waitForSelector('#chistorique .cbacktest');
@@ -1008,7 +1114,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.evaluate(() => localStorage.setItem('reader3d.ai.provider', 'ollama'));
     await page.reload();
     await page.waitForSelector('#chistorique .cbacktest');
-    assert.match(await text(), /IA de la page IA \/ analyse \(Ollama local \(qwen3:8b\)\)[\s\S]*Ollama local : aucun quota, mais plus lent — de quelques secondes à quelques minutes par pièce selon le PC/);
+    assert.match(await text(), /IA de la page IA \/ analyse \(Ollama sur ce PC \(qwen3:8b\)\)[\s\S]*Ollama local : aucun quota, mais plus lent — de quelques secondes à quelques minutes par pièce selon le PC/);
     await page.click('#chistorique [data-action="clear-backtest"]');
     await page.waitForFunction(() => document.querySelector('#chistorique [data-action="backtest"]')?.textContent.trim() === "Banc d'essai IA");
     assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.chiffrage.banc-essai-ia.v1')), null);
@@ -1043,7 +1149,9 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(rows.some((t) => /Pin/.test(t) && /8,00 mm/.test(t)), rows.join('\n'));
     assert.ok(rows.some((t) => /Ensemble \(2 pièces chiffrées\)/.test(t)), rows.join('\n'));
     assert.match(await page.textContent('#page-chiffrage'), /Prix de l'ensemble/);
-    // The traced values of the set: the quote, each piece, the price of the set.
+    // The traced values of the set: the quote, each piece, the price of the set (the detail built when unfolded).
+    await page.click('#page-chiffrage [data-action="show-trace"]');
+    await page.waitForSelector('#page-chiffrage #ctrace details[open] table');
     const traced = await page.textContent('#page-chiffrage #ctrace');
     for (const text of ['Pièce : Équerre', 'Pièce : Pin', 'ensemble.prix.vente', 'piece.volume3d', 'géométrie 3D']) assert.ok(traced.includes(text), text);
 
@@ -1079,6 +1187,21 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const files = unzipSync(new Uint8Array(readFileSync(await download.path())));
     const synthese = strFromU8(files['xl/worksheets/sheet1.xml']);
     for (const text of ['Équerre', 'Pin', 'TOTAL ensemble', 'named_assembly.step']) assert.ok(synthese.includes(text), text);
+
+    // A real cycle time typed for a piece; the page reloaded on Chiffrage, before the model is opened again: kept for it.
+    await page.click('#page-chiffrage [data-action="piece"]');
+    await page.waitForSelector('#page-chiffrage [data-bind="p.cycleReel"]');
+    await page.fill('#page-chiffrage [data-bind="p.cycleReel"]', '123');
+    await page.dispatchEvent('#page-chiffrage [data-bind="p.cycleReel"]', 'change');
+    const realCycles = () => page.evaluate(() => Object.values(JSON.parse(localStorage.getItem('reader3d.chiffrage.quote.v1')).pieces ?? {}).map((p) => p.cycleReel).filter(Boolean));
+    await page.waitForFunction(() => /"cycleReel":123/.test(localStorage.getItem('reader3d.chiffrage.quote.v1')));
+    await page.reload();
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage .ccard');
+    assert.deepEqual(await realCycles(), [123]);
+    await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: 180_000 });
+    assert.deepEqual(await realCycles(), [123]);
     assert.deepEqual(errors, []);
     await context.close();
   });

@@ -530,7 +530,7 @@ export function anonymizer(context, names = []) {
       const trace = out.costing_trace;
       if (trace) {
         trace.pieces = (trace.pieces ?? []).map((p) => ({ ...p, nom: whole(p.nom) }));
-        trace.alertes = (trace.alertes ?? []).map((a) => (a.piece ? { ...a, piece: whole(a.piece) } : a));
+        trace.alertes = (trace.alertes ?? []).map((a) => (a.pieces ? { ...a, pieces: a.pieces.map(whole) } : a));
         for (const [k, f] of Object.entries(trace.fichiers ?? {})) if (f?.nom) trace.fichiers[k] = { ...f, nom: whole(f.nom) };
       }
       return out;
