@@ -457,18 +457,23 @@ test("V6 readiness reads the closedness of the semantic body", () => {
   assert.ok(holed(false).unresolved_constraints.includes("body_not_confirmed_closed"));
 });
 
-test("a counterbore depends on the operations of its bore, in the plan and in the V5 sequence", () => {
+/** A bore (surface 0) along Z with its counterbore (surface 1) and their planar faces. */
+function counterboredHole() {
   const e=(z,r)=>[r,0,z,r,0,z];
+  return [
+    {index:0,type:"cylinder",radius_mm:5,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[e(0,5),e(10,5)]},
+    {index:1,type:"cylinder",radius_mm:8,axis:[0,0,1],center_mm:[0,0,10],edge_signatures:[e(10,8),e(20,8)]},
+    {index:2,type:"plane",edge_signatures:[e(0,5)]},
+    {index:3,type:"plane",edge_signatures:[e(10,5),e(10,8)]},
+    {index:4,type:"plane",edge_signatures:[e(20,8)]},
+  ];
+}
+
+test("a counterbore depends on the operations of its bore, in the plan and in the V5 sequence", () => {
   const result = buildSemantic3D({
     file:"counterbore.step", kind:"cad", engine:"browser",
     summary:{volume:1000,area:600,bodies:1,solids:1},
-    bodies:[body({ geometric_surfaces:[
-      {index:0,type:"cylinder",radius_mm:5,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[e(0,5),e(10,5)]},
-      {index:1,type:"cylinder",radius_mm:8,axis:[0,0,1],center_mm:[0,0,10],edge_signatures:[e(10,8),e(20,8)]},
-      {index:2,type:"plane",edge_signatures:[e(0,5)]},
-      {index:3,type:"plane",edge_signatures:[e(10,5),e(10,8)]},
-      {index:4,type:"plane",edge_signatures:[e(20,8)]},
-    ] })],
+    bodies:[body({ geometric_surfaces:counterboredHole() })],
   });
   const {manufacturing, manufacturing_plan:plan}=result.bodies[0];
   const opById=new Map(manufacturing.operations.map(o=>[o.operation_id,o]));
@@ -489,6 +494,28 @@ test("a counterbore depends on the operations of its bore, in the plan and in th
     const expected=[...new Set(plan.dependencies.filter(d=>d.to===step.operation_id).map(d=>d.from))].sort();
     assert.deepEqual([...step.depends_on].sort(),expected);
   }
+});
+
+test("V6 planned order keeps every operation after those it depends on, beside a pocket", () => {
+  // The counterbored hole, and a planar pocket candidate (no tool axis) elsewhere on the part.
+  const w=(x)=>[x,50,0,x,51,0];
+  const result = buildSemantic3D({
+    file:"counterbore-pocket.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({ geometric_surfaces:[
+      ...counterboredHole(),
+      {index:5,type:"plane",edge_signatures:[w(0),w(1),w(2)]},
+      ...[0,1,2].map(x=>({index:6+x,type:"plane",edge_signatures:[w(x)]})),
+    ] })],
+  });
+  const {manufacturing, manufacturing_plan:plan}=result.bodies[0];
+  assert.ok(manufacturing.operations.some(o=>o.operation==="pocket_milling"));
+  // The setup without a tool axis comes after the drilling setup.
+  assert.deepEqual(plan.setups.map(s=>s.compatibility),["common_tool_axis","axis_unknown"]);
+  const step=new Map(plan.planned_order.map(s=>[s.operation_id,s.step]));
+  const related=plan.dependencies.filter(d=>d.reason==="feature_relation");
+  assert.ok(related.length>0);
+  for (const d of related) assert.ok(step.get(d.from)<step.get(d.to), d.from+" -> "+d.to);
 });
 
 test("keeps V6 planning deterministic across repeated semantic builds", () => {

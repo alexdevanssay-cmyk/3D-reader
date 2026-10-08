@@ -186,7 +186,11 @@ function readiness(body, operations, setups, dependencies) {
 export function buildManufacturingPlan(body) {
   const manufacturing = body?.manufacturing ?? {};
   const operations = Array.isArray(manufacturing.operations) ? manufacturing.operations : [];
-  const groups = setupCompatibility(operations);
+  // The setup without a tool axis comes last. Numbered by first appearance it
+  // would come first (pocket candidates lead the precedence order) and put its
+  // counterbores and chamfers before the drillings they finish. The sort is
+  // stable: the axis setups keep their order.
+  const groups = setupCompatibility(operations).sort((a, b) => !a.axis - !b.axis);
   const setups = groups.map(setupCandidate);
   const dependencies = operationDependencyGraph(operations);
   const setupOf = new Map();
