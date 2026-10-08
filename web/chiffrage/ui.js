@@ -548,9 +548,10 @@ function selectedPieces(p3d, all) {
 /**
  * Everything the page shows, from the data, the settings and the inputs, with
  * the trace of its values (provenance.js): out.trace for the quote, r.trace
- * for each piece. Exported for the tests.
+ * for each piece. Exported for the tests. save: false for a computation that
+ * must change nothing in this browser's storage (costingSnapshot).
  */
-export function compute() {
+export function compute({ save = true } = {}) {
   if (!base) return null;
   const p3d = window.reader3d?.part?.() ?? null;
   // Another 3D file: the inputs of the pieces of the previous one do not apply.
@@ -558,7 +559,7 @@ export function compute() {
   if (file !== (q.pieceFile ?? null)) {
     q.pieceFile = file;
     q.pieces = {};
-    store.saveQuote(q);
+    if (save) store.saveQuote(q);
   }
   const allPieces = piecesOf(p3d);
   const pieces = selectedPieces(p3d, allPieces);
@@ -760,6 +761,82 @@ function aggregate(results, years) {
     autresVendus: total((r) => r.final.composants.sold + r.final.sousTraitance.sold + r.final.emballage.sold),
     years: ys,
   };
+}
+
+// --------------------------------------------------------------------------- read-only snapshot (AI page)
+
+/** `o` and everything it holds made read-only. */
+function deepFreeze(o) {
+  if (o && typeof o === "object" && !Object.isFrozen(o)) {
+    Object.freeze(o);
+    for (const v of Object.values(o)) deepFreeze(v);
+  }
+  return o;
+}
+
+/**
+ * The costing of the quote shown, read only, for the AI page (task
+ * "Chiffrage", web/ai-workspace.js): the traced values of the quote and of
+ * each piece costed, its three best routes with their reasons, the alerts,
+ * and the data files with their dates. A deep-frozen copy, computed on a copy
+ * of the quote: nothing is saved and nothing in it leads back to the quote
+ * or the settings (the AI explains, it never sets a value). Works without the
+ * costing page having been opened: the data files, the settings and the quote
+ * of the tab `tab` of the 3D page are then read from this browser's storage.
+ * null without a costing workbook.
+ *   {devis: {ensemble, trace}, pieces: [{nom, chiffree, trace, routes}],
+ *    alertes, resume: {valeurs, a_valider, alertes}, fichiers: {classeur, indices, tendances, rfq}}
+ */
+export function costingSnapshot({ tab } = {}) {
+  if (!el) {
+    if (tab !== undefined) store.setQuoteTab(tab);
+    base = store.loadBase();
+    indices = store.loadIndices();
+    layers = store.loadSettingsLayers(base);
+    settings = layers.effective;
+    q = store.loadQuote(base, indices);
+  }
+  if (!base) return null;
+  const [quoteShown, keyShown] = [q, currentKey];
+  q = structuredClone(q);
+  let c;
+  try {
+    c = compute({ save: false });
+  } finally {
+    [q, currentKey] = [quoteShown, keyShown];
+  }
+  const routes = (r) => {
+    const best = r.best ?? [];
+    // The island retained when it was chosen in the page outside the three best.
+    const shown = r.route && !best.some((b) => b.process === r.route.process) ? [...best, r.route] : best;
+    return shown.map((x, i) => ({
+      rang: best.includes(x) ? i + 1 : null,
+      ilot: x.process,
+      famille: x.famille,
+      finition: x.finition,
+      retenue: x.process === r.route?.process,
+      faisable: x.feasible,
+      qualite: x.qualite,
+      prix: Number.isFinite(x.prix) ? x.prix : null, // PRI + tooling per piece (€): the ranking is by quality / price
+      raisons: [...x.reasons, ...x.warnings],
+    }));
+  };
+  const sections = [{ piece: null, trace: c.trace ?? {} }, ...c.results.map((r) => ({ piece: r.piece.name, trace: r.trace ?? {} }))];
+  const sum = summarize(sections);
+  const file = (name, date, extra = {}) => (name || date ? { nom: name ?? null, date: date ?? null, ...extra } : null);
+  const t = layers.tendances;
+  return deepFreeze(structuredClone({
+    devis: { ensemble: c.selected === "ensemble", trace: c.trace ?? {} },
+    pieces: c.results.map((r) => ({ nom: r.piece.name, chiffree: !!r.final, trace: r.trace ?? {}, routes: routes(r) })),
+    alertes: sum.alertes,
+    resume: { valeurs: sum.valeurs, a_valider: sum.aValider, alertes: sum.alertes.length },
+    fichiers: {
+      classeur: file(base.source?.fileName, base.source?.importedAt),
+      indices: indices ? file(indices.fileName, indices.importedAt, { source: indices.source === "fichier" ? "fichier des cours" : "copie du classeur" }) : null,
+      tendances: t ? file(t.fileName, t.importedAt) : null,
+      rfq: q.serie ? file(q.serie.fileName, q.serie.importedAt) : null,
+    },
+  }));
 }
 
 /** Thinnest wall text, with the lettering below the floor in brackets. */

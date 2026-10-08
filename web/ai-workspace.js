@@ -9,6 +9,13 @@
 // loopback-network permission of Chrome and Edge, Firefox "Device apps and
 // services") or devices of the local network ("Local network" /
 // local-network). diagnoseOllama() tells which one is missing.
+//
+// Task "Chiffrage": the model is given the traced values of the quote shown
+// (costing_trace, from chiffrage/ui.js costingSnapshot), read only. It
+// explains, it never sets a value: no answer is applied to the quote or the
+// settings. Every number of its answer must be in the trace, or the answer is
+// marked "non vérifiée". The AI gateway gets the internal amounts masked,
+// unless the user ticks the box that sends them.
 
 import { buildAIContext, compactAIContext, summaryAIContext } from "./engine/ai-context.js";
 
@@ -21,6 +28,7 @@ const OLLAMA_MODEL = "qwen3:8b";
 // The context of a local model is kept small: its window (num_ctx) and the
 // time to read the prompt on a CPU grow with it.
 const LOCAL_CONTEXT_CHARS = 12000;
+const LOCAL_TRACE_CHARS = 8000; // of which the costing trace (task "Chiffrage"), the geometry having the rest
 const LOCAL_HISTORY = 6; // messages of the conversation sent again with a question
 const MAX_WINDOW = 16384; // largest window (tokens) asked of Ollama
 
@@ -33,7 +41,8 @@ const TASKS = [
   ["costing", "Chiffrage"],
 ];
 
-const KEYS = { gateway: "reader3d.ai.gateway", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider", messages: "reader3d.ai.messages", think: "reader3d.ai.think" };
+const KEYS = { gateway: "reader3d.ai.gateway", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider", messages: "reader3d.ai.messages", think: "reader3d.ai.think", amounts: "reader3d.ai.costingAmounts" };
+const COSTING_LABEL = "Raisonnement IA — aucune valeur n'est appliquée";
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -68,15 +77,47 @@ export function formatAnswer(content) {
   }
   if (!parsed || typeof parsed !== "object") return text;
   const list = (title, items) => (Array.isArray(items) && items.length ? `${title} :\n- ${items.map((i) => (typeof i === "string" ? i : JSON.stringify(i))).join("\n- ")}` : "");
+  // Task "Chiffrage": the reasoning of the model on the traced values, each item citing a key of the trace.
+  const a = parsed.analyse_chiffrage;
+  const analyse = a && typeof a === "object"
+    ? [
+      list("Explications", a.explications),
+      list("Écarts signalés", a.ecarts_signales?.map?.((e) => (e && typeof e === "object" ? `${e.cle} : ${e.commentaire}` : e))),
+      list("Questions", a.questions),
+      list("Hypothèses", a.hypotheses),
+    ].filter(Boolean).join("\n")
+    : "";
   return [
     parsed.conclusion ?? "",
     list("Observations", parsed.observations),
     list("Inférences", parsed.inferences),
     list("Recommandations", parsed.recommendations),
     list("Incertitudes", parsed.uncertainties),
-    parsed.quote ? `Chiffrage :\n${JSON.stringify(parsed.quote, null, 2)}` : "",
+    analyse ? `Analyse du chiffrage :\n${analyse}` : "",
     parsed.needs_human_validation ? "Validation humaine requise." : "",
   ].filter(Boolean).join("\n\n");
+}
+
+/**
+ * The part of an answer that is about the costing, whose numbers are checked
+ * against the trace: analyse_chiffrage of an answer of the gateway (JSON),
+ * else the whole text (the plain text of Ollama).
+ */
+export function costingText(content) {
+  const text = withoutThinking(content);
+  let parsed = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  if (!parsed || typeof parsed !== "object") return text;
+  const strings = [];
+  (function walk(v) {
+    if (typeof v === "string") strings.push(v);
+    else if (v && typeof v === "object") Object.values(v).forEach(walk);
+  })(parsed.analyse_chiffrage);
+  return strings.join("\n");
 }
 
 /** State of the browser permission for this site to reach applications on this device (Chrome/Edge 142+, Firefox 153+), or null. */
@@ -176,8 +217,14 @@ function contextWindow(chars, reserve = 2048) {
 
 const seconds = (ns) => Math.round((ns ?? 0) / 1e9);
 
+// Rules of the task "Chiffrage" for the local model: it explains the traced values, it never sets one.
+const COSTING_RULES = `Tâche « Chiffrage » : le contexte contient costing_trace, les valeurs du devis en cours (devis, pièces, îlots classés), chacune avec sa trace : valeur, unité, source, autorité, confiance, écart à la tendance, autres sources, validation requise ; et les alertes. Elles sont en lecture seule : ta réponse est un raisonnement, aucune valeur n'est appliquée au devis ni aux paramètres.
+Explique les valeurs et leurs sources, signale les écarts et les valeurs à valider, pose les questions utiles, énonce tes hypothèses. Cite la clé de chaque valeur dont tu parles (par exemple piece.prix.vente).
+N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux. Ne cite que des nombres présents dans costing_trace, tels quels ou arrondis, sans en calculer de nouveaux : une réponse qui contient un autre nombre est marquée « non vérifiée ».
+Si costing_trace est null, aucun classeur de chiffrage n'est importé : dis-le et propose de l'importer dans la page Chiffrage.`;
+
 /** Instructions of the local model: plain French text, laid out only when the question is about the part. */
-function systemPrompt(model, where = "sur ce PC") {
+function systemPrompt(model, where = "sur ce PC", costing = false) {
   return `Tu es l'assistant d'ingénierie de 3D Reader, pour une fonderie d'aluminium. Tu es un modèle de langage (${model}) qui tourne en local ${where} avec Ollama : aucune donnée n'est envoyée sur Internet.
 Réponds en français, en texte simple (jamais de JSON), de façon claire et concise.
 Pour une conversation ou une question générale (fonderie, procédés, chiffrage, méthode), réponds directement et brièvement.
@@ -185,7 +232,7 @@ Pour une question sur la pièce, organise la réponse en courtes sections, celle
 N'utilise que le contexte fourni (analyse géométrique et sémantique de la pièce, connaissances fonderie). N'invente jamais de dimensions, de paramètres de procédé, de propriétés matière, de prix, de taux, de temps de cycle, de nombre de noyaux, de probabilités de défaut, d'attaques, de masselottes ni de résultats de simulation.
 Pour la fonderie, cite les identifiants de sources fournis et dis clairement quand une conclusion demande une simulation de remplissage/solidification ou une validation fonderie.
 Si le contexte est partiel (champ "compaction"), dis-le quand cela limite la réponse.
-Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.`;
+Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.${costing ? `\n${COSTING_RULES}` : ""}`;
 }
 
 /** The answer without a model's hidden reasoning (<think>…</think>, written by older Ollama versions). */
@@ -218,6 +265,7 @@ export function mount({ page, reader }) {
             <input id="ai-model" spellcheck="false">
           </label>
           <label class="check" id="ai-think-field" title="Le modèle raisonne avant de répondre : réponses plus sûres, mais bien plus lentes sur un PC sans carte graphique. Le raisonnement s'affiche sous la réponse."><input type="checkbox" id="ai-think"> Réflexion du modèle (plus lent)</label>
+          <label class="check" id="ai-amounts-field" hidden title="Sans cette case, la passerelle reçoit la trace du chiffrage sans les montants internes (taux, coûts, prix, marges, pertes au feu, TRS) : leurs sources et leurs écarts relatifs seulement. Le modèle local (Ollama) reçoit toujours la trace complète, rien ne quitte le site."><input type="checkbox" id="ai-amounts"> Envoyer les montants internes du chiffrage à la passerelle</label>
           <button id="ai-test" class="btn" type="button">Tester la connexion</button>
         </div>
         <div class="ai-row ai-tasks" role="group" aria-label="Type d'analyse">
@@ -265,6 +313,7 @@ export function mount({ page, reader }) {
     $("ai-model").value = savedModel || (local ? OLLAMA_MODEL : "");
     $("ai-model").placeholder = local ? OLLAMA_MODEL : "modèle par défaut du gateway";
     $("ai-think-field").hidden = !local;
+    $("ai-amounts-field").hidden = local || task !== "costing";
   }
   {
     const saved = store.get(localStorage, KEYS.provider);
@@ -272,9 +321,12 @@ export function mount({ page, reader }) {
     $("ai-provider").value = saved === "openai_compatible" ? "ollama" : saved === "openai" || saved === "ollama" ? saved : "ollama";
     showProvider();
     $("ai-think").checked = store.get(localStorage, KEYS.think) === "1";
+    // Consent to send the internal amounts: kept for this browser tab only (sessionStorage), never for good.
+    $("ai-amounts").checked = store.get(sessionStorage, KEYS.amounts) === "1";
   }
 
-  function bubble(role, text = "") {
+  /** A message of the conversation; an answer of the task "Chiffrage" (costing) under its label. */
+  function bubble(role, text = "", costing = false) {
     const box = document.createElement("div");
     box.className = `ai-msg ${role === "user" ? "ai-user" : role === "error" ? "ai-error" : "ai-assistant"}`;
     const who = document.createElement("strong");
@@ -282,19 +334,46 @@ export function mount({ page, reader }) {
     const body = document.createElement("div");
     body.className = "ai-text";
     body.textContent = text;
-    box.append(who, body);
+    box.append(who);
+    if (costing) {
+      const label = document.createElement("div");
+      label.className = "ai-label";
+      label.textContent = COSTING_LABEL;
+      box.append(label);
+    }
+    box.append(body);
     $("ai-chat").append(box);
     $("ai-chat").scrollTop = $("ai-chat").scrollHeight;
     return body;
   }
-  for (const m of messages) bubble(m.role, m.role === "assistant" ? formatAnswer(m.content) : m.content);
+
+  /** Under the label of a costing answer: whether every number it cites is in the trace sent (chiffrage/ai-trace.js checkNumbers). */
+  function showCheck(body, check) {
+    const line = document.createElement("div");
+    line.className = `ai-check ${check.verifiee ? "ok" : "bad"}`;
+    const n = check.inconnus.length;
+    line.textContent = check.verifiee
+      ? check.nombres ? "Vérifiée : chaque nombre cité figure dans la trace du chiffrage." : "Aucun nombre cité."
+      : `Réponse non vérifiée : ${n > 1 ? `${n} nombres absents` : "un nombre absent"} de la trace du chiffrage (${check.inconnus.join(" ; ")}).`;
+    body.before(line);
+  }
+
+  for (const m of messages) {
+    const body = bubble(m.role, m.role === "assistant" ? formatAnswer(m.content) : m.content, !!m.costing);
+    if (m.costing) showCheck(body, m.costing);
+  }
 
   function setStatus(text) {
     $("ai-status").textContent = text;
   }
 
-  /** The context of the question: the part shown, or none (general questions are allowed without a model). */
-  function contextForCurrentTask() {
+  /**
+   * The context of the question: the part shown, or none (general questions
+   * are allowed without a model); for the task "Chiffrage", the traced values
+   * of the quote (costing_trace, read only): smaller for the local model, its
+   * internal amounts masked for the gateway unless the box is ticked.
+   */
+  async function contextForCurrentTask(local) {
     const semantic = reader.semantic;
     const aiTask = task === "costing" ? "manufacturing_analysis" : task;
     const context = semantic ? buildAIContext(semantic, { task: aiTask }) : {
@@ -308,18 +387,16 @@ export function mount({ page, reader }) {
       warnings: [],
     };
     if (task !== "costing") return context;
-    return {
-      ...context,
-      costing_inputs: reader.part?.() || null,
-      costing_contract: {
-        currency: "EUR",
-        quantity_required: true,
-        machine_hourly_rate_required: true,
-        material_price_required: true,
-        finishing_price_required: false,
-        assumptions_must_be_explicit: true,
-      },
-    };
+    let snapshot = null;
+    let problem = null;
+    try {
+      snapshot = (await reader.costing?.()) ?? null;
+    } catch (err) {
+      problem = `trace du chiffrage indisponible : ${err?.message || err}`;
+    }
+    const { traceForAI } = await import("./chiffrage/ai-trace.js");
+    const costingTrace = traceForAI(snapshot, local ? { maxChars: LOCAL_TRACE_CHARS } : { mask: !$("ai-amounts").checked });
+    return { ...context, costing_trace: costingTrace, ...(problem ? { costing_note: problem } : {}) };
   }
 
   let timing = ""; // time spent by Ollama on the last answer, shown with it
@@ -331,9 +408,10 @@ export function mount({ page, reader }) {
     const problem = await diagnoseOllama(base, model);
     if (problem) throw new Error(problem);
     // General questions: a summary of the part (read in seconds on a CPU); the analysis tasks: the detail.
+    // The costing trace is kept whole by the compaction (the geometry has the room it leaves).
     const compact = context.no_model_loaded ? context : task === "general" ? summaryAIContext(context) : compactAIContext(context, { maxChars: LOCAL_CONTEXT_CHARS });
     const space = addressSpace(base);
-    const system = `${systemPrompt(model, space === "loopback" ? "sur ce PC" : "sur un appareil du réseau local")}\n\nCONTEXTE :\n${JSON.stringify(compact)}`;
+    const system = `${systemPrompt(model, space === "loopback" ? "sur ce PC" : "sur un appareil du réseau local", task === "costing")}\n\nCONTEXTE :\n${JSON.stringify(compact)}`;
     const think = $("ai-think").checked;
     const reserve = think ? 4096 : 2048; // room for the answer, and for the reasoning written before it
     let history = messages.slice(-LOCAL_HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
@@ -432,7 +510,7 @@ export function mount({ page, reader }) {
         provider: "openai",
         model: $("ai-model").value.trim() || undefined,
         context,
-        messages: [...messages, { role: "user", content: question }],
+        messages: [...messages.map(({ role, content }) => ({ role, content })), { role: "user", content: question }],
       }),
       signal,
     });
@@ -445,15 +523,15 @@ export function mount({ page, reader }) {
   }
 
   async function send(question) {
-    const context = contextForCurrentTask();
     const local = isLocal();
+    const costing = task === "costing";
     store.set(localStorage, KEYS.provider, provider());
     store.set(localStorage, local ? KEYS.ollama : KEYS.gateway, $("ai-url").value.trim() || null);
     store.set(localStorage, `${KEYS.model}.${provider()}`, $("ai-model").value.trim() || null);
 
     bubble("user", question);
     // Until the first words arrive: "Réflexion en cours…", in grey italics.
-    const answerBox = bubble("assistant", "Réflexion en cours…");
+    const answerBox = bubble("assistant", "Réflexion en cours…", costing);
     answerBox.classList.add("ai-thinking");
     // The model's reasoning while it is written: one grey line under the answer, its latest words;
     // folded once the answer starts.
@@ -497,6 +575,7 @@ export function mount({ page, reader }) {
     tick();
     const timer = setInterval(tick, 1000);
     try {
+      const context = await contextForCurrentTask(local);
       const output = local
         ? await askOllama(question, context, busy.signal, (text) => {
           showThought(inlineThinking(text));
@@ -512,8 +591,15 @@ export function mount({ page, reader }) {
       foldThought();
       answerBox.classList.remove("ai-thinking");
       answerBox.textContent = formatAnswer(output) || "(réponse vide)";
+      // Costing: every number of the answer must be in the trace the model was given.
+      let check = null;
+      if (costing) {
+        const { checkNumbers } = await import("./chiffrage/ai-trace.js");
+        check = checkNumbers(costingText(output), context.costing_trace);
+        showCheck(answerBox, check);
+      }
       // Only answered questions are kept: a failed one is not sent again with the next.
-      messages.push({ role: "user", content: question }, { role: "assistant", content: withoutThinking(output) });
+      messages.push({ role: "user", content: question }, { role: "assistant", content: withoutThinking(output), ...(check ? { costing: check } : {}) });
       saveMessages();
       setStatus(`Réponse en ${Math.round((performance.now() - start) / 1000)} s${local && timing ? ` (${timing})` : ""}`);
       timing = "";
@@ -535,6 +621,7 @@ export function mount({ page, reader }) {
   }
 
   $("ai-think").addEventListener("change", () => store.set(localStorage, KEYS.think, $("ai-think").checked ? "1" : null));
+  $("ai-amounts").addEventListener("change", () => store.set(sessionStorage, KEYS.amounts, $("ai-amounts").checked ? "1" : null));
 
   $("ai-provider").addEventListener("change", () => {
     store.set(localStorage, KEYS.provider, provider());
@@ -566,6 +653,7 @@ export function mount({ page, reader }) {
     button.addEventListener("click", () => {
       task = button.dataset.task;
       page.querySelectorAll(".ai-task").forEach((b) => b.setAttribute("aria-pressed", String(b === button)));
+      $("ai-amounts-field").hidden = isLocal() || task !== "costing";
       setStatus(`Tâche : ${button.textContent}`);
       $("ai-input").focus();
     });

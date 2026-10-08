@@ -15,9 +15,10 @@ import { DEFAULT_TOOLING, coefOf, estimateTooling, steelToolCost } from '../../w
 import { DEFAULT_CORES, boxSize, coreBoxCost, coresPerPiece } from '../../web/chiffrage/cores.js';
 import {
   DEFAULT_DENSITIES, GENERIC_DENSITY, adoptTendance, clearSaisies, clearSetting, clearTendances, defaultQuote, defaultSettings, exportSaisies, importTendances,
-  loadSettings, loadSettingsLayers, mergeSettings, migrateSettings, saveBase, saveIndices, saveQuote, setSetting, validateTendances,
+  loadSettings, loadSettingsLayers, mergeSettings, migrateSettings, saveBase, saveIndices, saveQuote, setQuoteTab, setSetting, validateTendances,
 } from '../../web/chiffrage/store.js';
 import { DEMANDE, QUOTE_KEYS, SOURCES, demandeComparee, derive, missing, pieceKeys, resolve, summarize, traced, weakest } from '../../web/chiffrage/provenance.js';
+import { MASQUE, checkNumbers, isInternal, maskNumbers, numbersOf, traceForAI } from '../../web/chiffrage/ai-trace.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -1216,5 +1217,213 @@ describe('traced values of a quote (provenance.js)', () => {
     assert.deepEqual([thin.valeur, thin.confiance.niveau, thin.alertes.map((a) => a.type)], [0, 'nulle', ['repli_zero']]);
     // The set: computed from the prices of its pieces.
     assert.deepEqual(c.trace['ensemble.prix.vente'].source.entrees, ['piece.prix.vente [A]', 'piece.prix.vente [B]', 'piece.prix.vente [C]']);
+  });
+});
+
+// --------------------------------------------------------------------------- the costing read by the AI page
+
+// The AI page (task "Chiffrage") reads a frozen snapshot of the quote
+// (ui.js:costingSnapshot), sends it to a model (ai-trace.js:traceForAI) and
+// checks the numbers of the answer against it (checkNumbers).
+describe('the costing read by the AI page (read only)', () => {
+  before(async () => {
+    globalThis.window ??= { addEventListener() {} };
+    ui ??= await import('../../web/chiffrage/ui.js');
+  });
+
+  /** Every object of `o` frozen. */
+  const deeplyFrozen = (o) => !(o && typeof o === 'object') || (Object.isFrozen(o) && Object.values(o).every(deeplyFrozen));
+  /** ui.js:costingSnapshot() after computed(): storage set up as the Chiffrage page would find it. */
+  const snapshotOf = (opts) => {
+    const c = computed(opts);
+    return [ui.costingSnapshot(), c];
+  };
+
+  test('costingSnapshot: the traces of the quote and of its pieces, the best routes, the alerts and the data files', () => {
+    const [s, c] = snapshotOf();
+    assert.deepEqual(Object.keys(s), ['devis', 'pieces', 'alertes', 'resume', 'fichiers']);
+    assert.equal(s.devis.ensemble, false);
+    for (const key of QUOTE_KEYS) assert.deepEqual(s.devis.trace[key], c.trace[key], key);
+    assert.equal(s.pieces.length, 1);
+    const [p] = s.pieces;
+    const r = c.results[0];
+    assert.deepEqual([p.nom, p.chiffree], ['Pièce', true]);
+    assert.deepEqual(p.trace, JSON.parse(JSON.stringify(r.trace)));
+    // The values are those of the page: the same prices.
+    assert.equal(p.trace['piece.prix.vente'].valeur, r.final.years[0].prixVente);
+    assert.equal(p.trace['piece.prix.pri'].valeur, r.final.pri);
+    // The three best islands, ranked, the one retained marked, with what the ranking used.
+    assert.deepEqual(p.routes.map((x) => [x.rang, x.ilot, x.finition, x.retenue]), r.best.map((b, i) => [i + 1, b.process, b.finition, b.process === r.route.process]));
+    assert.ok(p.routes.every((x) => x.faisable && Number.isFinite(x.qualite) && x.prix > 0 && Array.isArray(x.raisons)));
+    assert.equal(p.routes.filter((x) => x.retenue).length, 1);
+    // The alerts and the counts of the Traçabilité card.
+    const sum = summarize([{ piece: null, trace: c.trace }, { piece: 'Pièce', trace: r.trace }]);
+    assert.deepEqual(s.alertes, sum.alertes);
+    assert.deepEqual(s.resume, { valeurs: sum.valeurs, a_valider: sum.aValider, alertes: sum.alertes.length });
+    assert.deepEqual(s.fichiers, {
+      classeur: { nom: 'test.xlsm', date: base.source.importedAt },
+      indices: { nom: 'test.xlsm', date: base.source.importedAt, source: 'copie du classeur' },
+      tendances: null,
+      rfq: null,
+    });
+    // With a customer request and trends: their files and dates.
+    const [withFiles] = snapshotOf({ quote: { serie: ORDER }, setup: () => importTendances({ trs: { CG3: 0.7 } }, 'tendances.json') });
+    assert.deepEqual([withFiles.fichiers.rfq.nom, withFiles.fichiers.rfq.date], ['RFQ.xlsm', ORDER.importedAt]);
+    assert.equal(withFiles.fichiers.tendances.nom, 'tendances.json');
+    // A set: every piece, the values of the set with those of the quote.
+    const [set, cs] = snapshotOf({ p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0, 1, 2] } });
+    assert.deepEqual([set.devis.ensemble, set.pieces.map((x) => x.nom)], [true, ['A', 'B', 'C']]);
+    assert.equal(set.devis.trace['ensemble.prix.vente'].valeur, cs.ensemble.years[0].prixVente);
+  });
+
+  test('costingSnapshot: a frozen copy, computed without saving anything; null without a costing workbook', () => {
+    const [s, c] = snapshotOf();
+    assert.ok(deeplyFrozen(s));
+    assert.throws(() => {
+      s.pieces[0].trace['piece.prix.vente'].valeur = 1;
+    }, TypeError);
+    assert.throws(() => s.alertes.push({}), TypeError);
+    assert.throws(() => {
+      s.devis.trace['devis.marge'] = null;
+    }, TypeError);
+    // The page computes the same prices after it.
+    const again = ui.compute();
+    assert.deepEqual([again.results[0].final.pri, again.results[0].final.years[0].prixVente], [c.results[0].final.pri, c.results[0].final.years[0].prixVente]);
+
+    // Another 3D file than the one of the inputs of the pieces: the snapshot computes without them, and writes nothing.
+    computed({ p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0] }, quote: { pieces: { '0:A': { poids: 9 } } } });
+    globalThis.window.reader3d = { part: () => ({ file: 'autre.step', parts: PARTS_3D, selected: [0] }) };
+    const before = new Map(storage);
+    const writes = [];
+    const { setItem, removeItem } = globalThis.localStorage;
+    globalThis.localStorage.setItem = (k, v) => (writes.push(k), setItem(k, v));
+    globalThis.localStorage.removeItem = (k) => (writes.push(k), removeItem(k));
+    let other;
+    try {
+      other = ui.costingSnapshot();
+    } finally {
+      Object.assign(globalThis.localStorage, { setItem, removeItem });
+    }
+    assert.deepEqual(writes, []);
+    assert.deepEqual(new Map(storage), before);
+    assert.notEqual(other.pieces[0].trace['piece.poids'].valeur, 9, 'the inputs of the other file do not apply');
+    assert.equal(other.pieces[0].trace['piece.poids'].source.type, 'calcul');
+
+    // The quote of another tab of the 3D page (a new one: the default quote, no piece weight).
+    computed();
+    try {
+      const tab2 = ui.costingSnapshot({ tab: 2 });
+      assert.deepEqual([tab2.pieces[0].chiffree, tab2.pieces[0].trace['piece.poids'].valeur], [false, null]);
+      assert.equal(ui.costingSnapshot({ tab: 1 }).pieces[0].trace['piece.poids'].valeur, PART.poids);
+    } finally {
+      setQuoteTab(1);
+    }
+
+    // No costing workbook: nothing to read.
+    storage.clear();
+    assert.equal(ui.costingSnapshot(), null);
+    assert.equal(traceForAI(null), null);
+  });
+
+  test('the trace sent to a model: every value with its source and authority, percentages in percent, nothing more than the snapshot', () => {
+    const [s] = snapshotOf({ quote: { serie: ORDER } });
+    const t = traceForAI(s);
+    assert.equal(t.lecture_seule, true);
+    assert.equal(t.compaction, undefined);
+    assert.deepEqual(Object.keys(t.devis.valeurs), Object.keys(s.devis.trace));
+    assert.deepEqual(Object.keys(t.pieces[0].valeurs), Object.keys(s.pieces[0].trace));
+    for (const [cle, v] of [...Object.entries(t.devis.valeurs), ...Object.entries(t.pieces[0].valeurs)]) {
+      const x = s.devis.trace[cle] ?? s.pieces[0].trace[cle];
+      assert.equal(v.autorite, x.autorite, cle);
+      assert.equal(v.confiance, x.confiance.niveau, cle);
+      assert.equal(v.a_valider ?? false, x.validation_requise, cle);
+      assert.equal(v.ref, x.source.ref, cle);
+      if (typeof x.valeur === 'number') close(v.valeur, x.unite === '%' ? x.valeur * 100 : x.valeur, 5e-5, cle); // rounded: 6 significant digits, 2 decimals above 100
+    }
+    assert.equal(t.devis.valeurs['devis.marge'].valeur, 12);
+    assert.deepEqual(t.devis.valeurs['devis.rebutUsinage'].autres_sources.map((a) => [a.valeur, a.ecart_pct]), [[3, -33.3333]]);
+    assert.equal(t.alertes.length, s.alertes.length);
+    assert.ok(t.alertes.some((a) => a.cle === 'devis.rebutUsinage' && a.type === 'écart à la demande client'));
+  });
+
+  test('the trace sent to a local model fits its window: less detail, then the main values only, then fewer pieces', () => {
+    const [single] = snapshotOf();
+    const [set] = snapshotOf({ p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0, 1, 2] } });
+    for (const [s, maxChars] of [[single, 9000], [single, 6000], [set, 12000], [set, 8000], [set, 5000]]) {
+      const t = traceForAI(s, { maxChars });
+      const size = JSON.stringify(t).length;
+      assert.ok(size <= maxChars, `${size} > ${maxChars}`);
+      assert.ok(t.compaction.niveau > 1 && t.compaction.omis.length === t.compaction.niveau - 1);
+      // The prices and the island of each piece are always there.
+      for (const p of t.pieces) for (const key of ['piece.poids', 'piece.ilot', 'piece.prix.vente']) assert.ok(p.valeurs[key], `${maxChars}: ${p.nom} ${key}`);
+    }
+    // A large assembly: the first pieces only, the others counted.
+    const many = { ...set, pieces: Array.from({ length: 40 }, (_, i) => ({ ...set.pieces[i % 3], nom: `Corps ${i}` })) };
+    const t = traceForAI(many, { maxChars: 8000 });
+    assert.deepEqual([t.pieces.length, t.autres_pieces, t.compaction.niveau], [12, 28, 6]);
+  });
+
+  test('the trace sent to the AI gateway: internal amounts masked, sources and relative deviations kept', () => {
+    // A TRS typed in Paramètres for every island, a trend above it; the margin of the workbook, a trend above it.
+    const islands = Object.keys(DEFAULT_PROCESSES);
+    const setup = () => {
+      importTendances({ trs: Object.fromEntries(islands.map((k) => [k, 0.7])), marge: 0.3 }, 't.json');
+      for (const k of islands) setSetting(`trs.${k}`, 0.6, base);
+    };
+    const [s] = snapshotOf({ quote: { serie: ORDER }, setup });
+    const t = traceForAI(s, { mask: true });
+    assert.match(t.masque, /montants internes masqués/);
+    const p = t.pieces[0].valeurs;
+    const code = p['piece.ilot'].valeur;
+    for (const key of ['piece.prix.vente', 'piece.prix.pri', 'piece.va', 'piece.outillage.total', `centre.${code}.taux`, `centre.${code}.trs`]) {
+      assert.equal(p[key].valeur, MASQUE, key);
+      assert.ok(!('tendance' in (p[key].ecart_tendance ?? {})) && (p[key].autres_sources ?? []).every((a) => !('valeur' in a)), key);
+    }
+    for (const key of ['devis.marge', 'devis.metal.prixVente', 'devis.metal.coursAchat', 'devis.metal.pafAchat', 'devis.energie.elec']) assert.equal(t.devis.valeurs[key].valeur, MASQUE, key);
+    // The trend of the TRS and of the margin: their deviation in percent only.
+    assert.ok(Number.isFinite(p[`centre.${code}.trs`].ecart_tendance.ecart_pct));
+    assert.ok(Number.isFinite(t.devis.valeurs['devis.marge'].ecart_tendance.ecart_pct));
+    // Not internal: weights, island, cycle, volumes.
+    for (const key of ['piece.poids', 'piece.ilot', 'piece.cycle', 'piece.kgCast', 'piece.miseAuMille']) assert.notEqual(p[key].valeur, MASQUE, key);
+    assert.notEqual(t.devis.valeurs['devis.volumeTotal'].valeur, MASQUE);
+    assert.ok(t.pieces[0].routes.every((r) => r.prix === MASQUE));
+    // No amount of the quote anywhere in what is sent: a model citing one cannot be verified (amounts
+    // with decimals: a whole one, 60 €/MWh, may also be another number of the trace, a yield of 60 %).
+    const amounts = [...Object.entries(s.devis.trace), ...Object.entries(s.pieces[0].trace)]
+      .filter(([cle, x]) => isInternal(cle, x.unite) && typeof x.valeur === 'number')
+      .map(([cle, x]) => [cle, Math.round((x.unite === '%' ? x.valeur * 100 : x.valeur) * 100) / 100])
+      .filter(([, v]) => !Number.isInteger(v));
+    assert.ok(amounts.length >= 3, String(amounts));
+    for (const [cle, v] of amounts) {
+      const cited = v.toLocaleString('fr-FR', { maximumFractionDigits: 2 });
+      assert.equal(checkNumbers(`${cle} vaut ${cited}`, t).verifiee, false, `${cle} = ${cited}`);
+      assert.equal(checkNumbers(`${cle} vaut ${cited}`, traceForAI(s)).verifiee, true, `${cle} = ${cited} (unmasked)`);
+    }
+    assert.equal(maskNumbers('boîte à noyau « N1 » : 1 234,5 € le 08/10/2026 (CG3)'), 'boîte à noyau « N1 » : … € le 08/10/2026 (CG3)');
+  });
+
+  test('the numbers of an answer: those of the trace, rounded, verified; any other one makes it "non vérifiée"', () => {
+    const [s] = snapshotOf();
+    const t = traceForAI(s, { maxChars: 8000 });
+    const p = t.pieces[0].valeurs;
+    const fr = (v, d) => v.toLocaleString('fr-FR', { maximumFractionDigits: d });
+    const good = `1. Le prix de vente (piece.prix.vente) est de ${fr(p['piece.prix.vente'].valeur, 2)} €, soit environ ${fr(Math.round(p['piece.prix.vente'].valeur), 0)} €.
+2. Le cycle de ${p['piece.ilot'].valeur} (piece.cycle) est de ${fr(p['piece.cycle'].valeur, 0)} s pour ${p['piece.empreintes'].valeur} empreintes ; marge de ${fr(t.devis.valeurs['devis.marge'].valeur, 1)} % sur la VA.
+Le modèle 3D, l'alliage AS7G03, la 2e route, le classeur du 08/10/2026 à 12:30 et les cours M-1/M-3 ne sont pas des valeurs.`;
+    assert.deepEqual(checkNumbers(good, t), { verifiee: true, nombres: 5, inconnus: [] });
+    // An invented rate, a price computed by the model: not in the trace.
+    const bad = `${good}\nAvec un taux de 85 €/h, le prix serait de ${fr(p['piece.prix.vente'].valeur * 1.1, 2)} €.`;
+    const check = checkNumbers(bad, t);
+    assert.equal(check.verifiee, false);
+    assert.deepEqual(check.inconnus, ['85', fr(p['piece.prix.vente'].valeur * 1.1, 2)]);
+    // No trace (no costing workbook): every number is unverified; no number, nothing to check.
+    assert.deepEqual(checkNumbers('Le prix est de 12 €.', null), { verifiee: false, nombres: 1, inconnus: ['12'] });
+    assert.deepEqual(checkNumbers('Aucun classeur importé.', null), { verifiee: true, nombres: 0, inconnus: [] });
+    // How numbers are read: French and English forms, thousands, signs; rounding to two significant digits at least.
+    assert.deepEqual(numbersOf('1 234,5 € ; -12 % ; 0.75 ; 15 000 pièces ; 3D ; CG3 ; T6 ; P1020 ; 1er').map((n) => [n.valeur, n.tolerance]), [[1234.5, 0.05], [-12, 0.5], [0.75, 0.005], [15000, 500]]);
+    assert.equal(checkNumbers('15 000', { v: 15012 }).verifiee, true);
+    assert.equal(checkNumbers('15 000', { v: 15600 }).verifiee, false);
+    assert.equal(checkNumbers('300 s', { v: 302 }).verifiee, true);
+    assert.equal(checkNumbers('10', { v: 14 }).verifiee, false);
   });
 });

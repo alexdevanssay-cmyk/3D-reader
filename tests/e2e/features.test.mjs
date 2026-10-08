@@ -413,6 +413,21 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(chats[2].think, true);
     assert.equal(await page.locator('#ai-chat .ai-thought').count(), 0);
     assert.match(await page.textContent('#ai-chat .ai-thought-details'), /Voir la réflexion\s*Le volume est donné par le contexte ; je vérifie les corps fermés\./);
+    // The task "Chiffrage" (no costing workbook here): the costing trace, read only, in place of the
+    // quote and the rates the model was asked for; the answer labelled, its numbers checked.
+    await page.uncheck('#ai-think');
+    await page.click('.ai-task[data-task="costing"]');
+    await page.fill('#ai-input', 'Pourquoi ce prix ?');
+    await page.press('#ai-input', 'Enter');
+    await page.waitForSelector('#ai-chat .ai-check', { timeout: 30_000 });
+    const costing = chats[3].messages[0].content;
+    assert.match(costing, /"costing_trace":null/);
+    assert.doesNotMatch(costing, /costing_contract|costing_inputs|"quote"/);
+    assert.match(costing, /Tâche « Chiffrage »/);
+    assert.match(costing, /Ne cite que des nombres présents dans costing_trace/);
+    assert.equal(await page.textContent('#ai-chat .ai-msg:last-child .ai-label'), "Raisonnement IA — aucune valeur n'est appliquée");
+    // "7,257 cm³" is in no trace: the answer is not verified.
+    assert.match(await page.textContent('#ai-chat .ai-msg:last-child .ai-check.bad'), /Réponse non vérifiée : un nombre absent de la trace du chiffrage \(7,257\)/);
     // A new conversation forgets it.
     await page.click('#ai-clear');
     assert.equal(await page.locator('#ai-chat .ai-msg').count(), 0);

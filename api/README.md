@@ -18,6 +18,6 @@ After deployment, configure the GitHub Pages application with the public endpoin
 
 `https://<your-gateway-domain>/api/ai`
 
-The browser sends only the semantic 3D context and conversation. The OpenAI credential stays on the gateway.
+The browser sends only the semantic 3D context and conversation; for the costing task (« Chiffrage »), also the traced values of the quote (`costing_trace`, read only), with the internal amounts (rates, costs, prices, margins, losses on melting, TRS) masked unless the user ticks the box that sends them. The OpenAI credential stays on the gateway.
 
-The gateway uses the OpenAI Responses API with Structured Outputs and function calling. The functions expose only data already present in the 3D Reader semantic context.
+The gateway uses the OpenAI Responses API with Structured Outputs and function calling. The functions expose only data already present in the context sent by 3D Reader. For the costing task, the answer explains the traced values in `analyse_chiffrage`; it never sets a value.

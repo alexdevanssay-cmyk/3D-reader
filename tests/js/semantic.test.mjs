@@ -486,3 +486,22 @@ test("the compacted AI context of a large assembly fits the budget of a local mo
   assert.equal(compact.bodies[0].metrics.volume_mm3, 1000 + count - 1);
   assert.ok(compact.warnings.length <= 5);
 });
+
+test("the costing trace of the task \"Chiffrage\" is kept whole by the compaction; the geometry has the room it leaves", () => {
+  const count = 60;
+  const semantic = buildSemantic3D({
+    file: "assembly.step", kind: "cad", engine: "browser", source_unit: "mm",
+    summary: { volume: 60000, area: 36000, bodies: count, solids: count },
+    bodies: Array.from({ length: count }, (_, i) => body({ name: `Body ${i}`, volume: 1000 + i })),
+  });
+  const context = buildAIContext(semantic, { task: "manufacturing_analysis" });
+  // A trace of 6000 characters (ai-trace.js:traceForAI keeps it under 8000 for a local model).
+  const valeurs = Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`piece.valeur${i}`, { valeur: i + 0.5, unite: "kg", source: "calcul", autorite: "calcul", confiance: "moyenne" }]));
+  const costing_trace = { schema: "3d-reader-costing-trace", lecture_seule: true, pieces: [{ nom: "Pièce", valeurs }] };
+  const plain = compactAIContext(context, { maxChars: 12000 });
+  const compact = compactAIContext({ ...context, costing_trace }, { maxChars: 12000 });
+  assert.deepEqual(compact.costing_trace, costing_trace);
+  assert.ok(JSON.stringify(compact).length <= 12000, `${JSON.stringify(compact).length} characters`);
+  // Less room for the geometry: more compacted, or fewer bodies in detail.
+  assert.ok(compact.compaction.level > plain.compaction.level || compact.bodies.length < plain.bodies.length, `level ${compact.compaction.level}, ${compact.bodies.length} bodies`);
+});

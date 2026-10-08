@@ -2129,6 +2129,15 @@ window.reader3d = {
     if (state.result) setIncluded(indices.filter((i) => i >= 0 && i < state.result.bodies.length));
     return partFeatures();
   },
+  /**
+   * The costing of the tab shown, read only (chiffrage/ui.js costingSnapshot):
+   * its traced values, best routes, alerts and data files; null without a
+   * costing workbook. Also when the costing page was never opened.
+   */
+  async costing() {
+    const ui = await import("./chiffrage/ui.js");
+    return ui.costingSnapshot({ tab: activeTab?.id });
+  },
   /** Material of the part (alloy name and density g/cm³), e.g. from a customer request. */
   setMaterial(label, density) {
     setMaterial(label, density);

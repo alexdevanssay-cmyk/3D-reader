@@ -1,13 +1,15 @@
 // End-to-end test of the costing pages of the built site (dist/): import of
 // the costing workbook and of a prices file, the three best routes, choice of
 // an island in the drop-down lists, settings kept after a reload, trends file
-// below the values typed in, traced values, Excel export.
+// below the values typed in, traced values, Excel export; the traced values
+// read by the AI page (task "Chiffrage"), read only.
 // With a made-up workbook (tests/js/costing-fixture.mjs).
 //
 //   npm run build && node --test tests/e2e/costing.test.mjs
 
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
@@ -303,6 +305,142 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.coursAchat"]'), '2500');
     assert.equal(await material(), 'AS7G03 (2,68)');
 
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('IA page, task « Chiffrage »: the traced values sent read only, the numbers of the answer checked, the amounts masked for the gateway', { timeout: 120_000 }, async (t) => {
+    // Stand-ins for Ollama (/api/tags, a streamed /api/chat) and for the AI gateway, CORS as they do it.
+    const chats = [];
+    const gatewayRequests = [];
+    let answer = () => '';
+    const cors = (req, res) => {
+      if (req.headers.origin) res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
+      if (req.method !== 'OPTIONS') return false;
+      res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET,POST', 'Access-Control-Allow-Headers': 'Content-Type, Accept' });
+      res.end();
+      return true;
+    };
+    const body = (req) => new Promise((resolve) => {
+      let text = '';
+      req.on('data', (c) => (text += c));
+      req.on('end', () => resolve(JSON.parse(text)));
+    });
+    const traceOf = (system) => JSON.parse(system.slice(system.indexOf('CONTEXTE :\n') + 'CONTEXTE :\n'.length)).costing_trace;
+    const ollama = createServer(async (req, res) => {
+      if (cors(req, res)) return;
+      if (req.url === '/api/tags') {
+        res.setHeader('Content-Type', 'application/json');
+        return res.end(JSON.stringify({ models: [{ name: 'qwen3:8b' }] }));
+      }
+      const request = await body(req);
+      chats.push(request);
+      res.setHeader('Content-Type', 'application/x-ndjson');
+      res.write(`${JSON.stringify({ message: { role: 'assistant', content: answer(traceOf(request.messages[0].content)) }, done: false })}\n`);
+      res.end(`${JSON.stringify({ done: true })}\n`);
+    });
+    const gateway = createServer(async (req, res) => {
+      if (cors(req, res)) return;
+      const request = await body(req);
+      gatewayRequests.push(request);
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ output: JSON.stringify({
+        conclusion: 'Prix à valider.', observations: [], inferences: [], recommendations: [], uncertainties: [], needs_human_validation: true,
+        analyse_chiffrage: { explications: [answer(request.context.costing_trace)], ecarts_signales: [{ cle: 'devis.densite', commentaire: 'défaut du code' }], questions: [], hypotheses: [] },
+      }) }));
+    });
+    await Promise.all([ollama, gateway].map((s) => new Promise((resolve) => s.listen(0, '127.0.0.1', resolve))));
+    // Closed even when an assertion fails: a server left open would keep the test process running.
+    t.after(() => Promise.all([ollama, gateway].map((s) => new Promise((resolve) => {
+      s.closeAllConnections();
+      s.close(resolve);
+    }))));
+    const context = await browser.newContext({ locale: 'fr-FR' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+
+    // A quote of a part typed in, in the Chiffrage page.
+    await page.goto(`${base}?lang=fr`);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
+    await page.waitForSelector('#page-chiffrage .cmsg.ok');
+    for (const [bind, value] of [['p.poids', 1.2], ['p.toileMini', 5], ['p.epaisseurMax', 10], ['p.moduleMm', 3], ['p.dimMax', 250]]) {
+      await page.fill(`#page-chiffrage [data-bind="${bind}"]`, String(value));
+      await page.dispatchEvent(`#page-chiffrage [data-bind="${bind}"]`, 'change');
+    }
+    await page.waitForSelector('#page-chiffrage .ctable tr.retained');
+
+    // The AI page alone, in a new visit: the costing page is not opened, the quote is read from this browser's storage.
+    await page.goto(`${base}?lang=fr&page=ia`);
+    const costingStorage = () => page.evaluate(() => JSON.stringify(Object.entries(localStorage).filter(([k]) => k.startsWith('reader3d.chiffrage')).sort()));
+    const stored = await costingStorage();
+    await page.selectOption('#ai-provider', 'ollama');
+    await page.fill('#ai-url', `http://127.0.0.1:${ollama.address().port}`);
+    await page.click('.ai-task[data-task="costing"]');
+    assert.equal(await page.isVisible('#ai-amounts-field'), false, 'the local model gets the whole trace');
+    const fr = (v) => v.toLocaleString('fr-FR', { maximumFractionDigits: 2 });
+    const ask = async (question) => {
+      const n = await page.locator('#ai-chat .ai-check').count();
+      await page.fill('#ai-input', question);
+      await page.press('#ai-input', 'Enter');
+      await page.waitForFunction((count) => document.querySelectorAll('#ai-chat .ai-check').length > count, n, { timeout: 30_000 });
+      return page.locator('#ai-chat .ai-msg').last();
+    };
+    // The stand-in cites the sale price of the trace it was given.
+    answer = (trace) => `Le prix de vente (piece.prix.vente) est de ${typeof trace.pieces[0].valeurs['piece.prix.vente'].valeur === 'number' ? `${fr(trace.pieces[0].valeurs['piece.prix.vente'].valeur)} €` : 'masqué'}.`;
+    let reply = await ask('Pourquoi ce prix ?');
+    const system = chats[0].messages[0].content;
+    assert.doesNotMatch(system, /costing_contract|costing_inputs|"quote"/);
+    assert.match(system, /N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux\. Ne cite que des nombres présents dans costing_trace/);
+    const trace = traceOf(system);
+    assert.equal(trace.lecture_seule, true);
+    assert.equal(trace.fichiers.classeur.nom, 'chiffrage.xlsm');
+    assert.deepEqual(trace.pieces.map((p) => [p.nom, p.chiffree]), [['Pièce', true]]);
+    const price = trace.pieces[0].valeurs['piece.prix.vente'];
+    assert.ok(price.valeur > 0 && price.autorite === 'calcul');
+    assert.equal(trace.pieces[0].valeurs['piece.poids'].valeur, 1.2);
+    assert.ok(trace.pieces[0].routes.length >= 1 && trace.pieces[0].routes.some((r) => r.retenue));
+    assert.ok(system.length < 20_000, `system prompt of ${system.length} characters`);
+    assert.equal(await reply.locator('.ai-label').textContent(), "Raisonnement IA — aucune valeur n'est appliquée");
+    assert.equal(await reply.locator('.ai-check').getAttribute('class'), 'ai-check ok');
+    assert.match(await reply.locator('.ai-text').textContent(), new RegExp(`est de ${fr(price.valeur).replace(/\s/g, '\\s')} €`));
+
+    // An invented rate: the answer is marked "non vérifiée".
+    answer = () => 'Avec un taux de 85 €/h sur piece.va, le prix baisserait.';
+    reply = await ask('Et avec un autre taux ?');
+    assert.match(await reply.locator('.ai-check.bad').textContent(), /Réponse non vérifiée : un nombre absent de la trace du chiffrage \(85\)/);
+    // The AI wrote nothing: the costing data of this browser are unchanged.
+    assert.equal(await costingStorage(), stored);
+
+    // The AI gateway: the internal amounts masked, unless the box is ticked.
+    await page.selectOption('#ai-provider', 'openai');
+    await page.fill('#ai-url', `http://127.0.0.1:${gateway.address().port}/api/ai`);
+    assert.equal(await page.isVisible('#ai-amounts-field'), true);
+    assert.equal(await page.isChecked('#ai-amounts'), false);
+    answer = (trace) => `Le prix de vente (piece.prix.vente) est ${typeof trace.pieces[0].valeurs['piece.prix.vente'].valeur === 'number' ? `de ${fr(trace.pieces[0].valeurs['piece.prix.vente'].valeur)} €` : 'masqué'}.`;
+    reply = await ask('Pourquoi ce prix ?');
+    const masked = gatewayRequests[0].context.costing_trace;
+    assert.match(masked.masque, /montants internes masqués/);
+    assert.equal(masked.pieces[0].valeurs['piece.prix.vente'].valeur, 'masqué');
+    assert.equal(masked.pieces[0].valeurs['piece.poids'].valeur, 1.2);
+    assert.doesNotMatch(JSON.stringify(masked), new RegExp(`\\b${String(price.valeur).replace('.', '\\.')}\\b`));
+    assert.equal(gatewayRequests[0].context.costing_contract, undefined);
+    assert.ok(gatewayRequests[0].messages.every((m) => Object.keys(m).join() === 'role,content'));
+    assert.match(await reply.locator('.ai-text').textContent(), /Analyse du chiffrage :\nExplications :\n- Le prix de vente \(piece\.prix\.vente\) est masqué\.\nÉcarts signalés :\n- devis\.densite : défaut du code/);
+    assert.equal(await reply.locator('.ai-check').textContent(), 'Aucun nombre cité.');
+    await page.check('#ai-amounts');
+    reply = await ask('Et le détail ?');
+    assert.equal(gatewayRequests[1].context.costing_trace.masque, undefined);
+    assert.equal(gatewayRequests[1].context.costing_trace.pieces[0].valeurs['piece.prix.vente'].valeur, price.valeur);
+    assert.equal(await reply.locator('.ai-check').getAttribute('class'), 'ai-check ok');
+    assert.equal(await costingStorage(), stored);
+
+    // The answers keep their label and their check after a reload.
+    await page.reload();
+    await page.waitForSelector('#ai-chat .ai-label');
+    assert.equal(await page.locator('#ai-chat .ai-label').count(), 4);
+    assert.equal(await page.locator('#ai-chat .ai-check.bad').count(), 1);
     assert.deepEqual(errors, []);
     await context.close();
   });

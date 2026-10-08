@@ -341,6 +341,11 @@ table.bodies .open { color: var(--warn); }
 .ai-error { background: var(--error-bg); color: var(--error-text); border-color: transparent; }
 .ai-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .ai-thinking { font-style: italic; color: var(--muted); }
+/* Task "Chiffrage": the answer is reasoning only; whether its numbers are in the costing trace. */
+.ai-label { margin-bottom: 4px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.ai-check { margin-bottom: 6px; font-size: 12px; }
+.ai-check.ok { color: var(--ok); }
+.ai-check.bad { color: var(--warn); font-weight: 600; }
 /* The reasoning of the model while it is written: one line, its latest words; then folded. */
 .ai-thought { display: flex; justify-content: flex-end; overflow: hidden; white-space: nowrap; margin-top: 6px; font-size: 12px; font-style: italic; color: var(--muted); }
 .ai-thought-details { margin-top: 6px; font-size: 12px; color: var(--muted); }
