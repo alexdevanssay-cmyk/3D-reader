@@ -41,7 +41,10 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   routes (casting island × finishing) by quality / price from the geometry of the 3D model
   (weight, thinnest wall, hot spots, modulus, size), and exports the quote to Excel.
   Casting parameters are drop-down lists; TRS, islands and methods are settings kept in
-  the browser. The workbooks are read in the browser and never published.
+  the browser. The workbooks are read in the browser and never published. A history of
+  cycle times (past quotes, and times measured in production typed in for the part shown)
+  is kept in the browser too, imported and exported as JSON, and compared with the
+  cycle-time formula of the settings.
 - Export of the results to **Excel** (.xlsx, one value per cell: a row per body, a
   column per quantity, plus a summary sheet), CSV (`;` and decimal comma in French)
   and JSON.

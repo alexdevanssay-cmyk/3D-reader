@@ -310,6 +310,142 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await context.close();
   });
 
+  test('history of cycle times: import, a real time kept from the quote, compared with the formula, export, erase', { timeout: 120_000 }, async () => {
+    // A history file (made-up values): a record refused, a field unknown.
+    const record = (over) => ({
+      ref: 'H-1', fichier_3d: 'h1.stp', source: 'devis', ilot: 'CG3', temps_cycle_s: 180, pieces_par_cycle: 1, trs: 0.8, poids_kg: 1.5, module_mm: 3.5,
+      volume_cm3: 560, surface_cm2: 1600, encombrement_mm: [150, 90, 40], noyaux: false, sable_kg: null, serie: 800, mise_au_mille: 1.7, ...over,
+    });
+    writeFileSync(join(dir, 'historique.json'), JSON.stringify({ schema: 'reader3d-historique-cycles', version: 1, description: 'test', pieces: [
+      record({ atelier: 'B' }), record({ ref: 'H-2', fichier_3d: null, ilot: 'SSP', temps_cycle_s: 40, pieces_par_cycle: 4, module_mm: null, volume_cm3: null, surface_cm2: null, encombrement_mm: null }),
+      record({ ref: 'H-3', temps_cycle_s: 0 }),
+    ] }));
+    const context = await browser.newContext({ locale: 'fr-FR', acceptDownloads: true });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    await page.click('.tab[data-page="chiffrage"]');
+    const text = (selector = '#page-chiffrage') => page.textContent(selector).then((t) => t.replace(/[  ]/g, ' '));
+    const waitText = (re) => page.waitForFunction((source) => new RegExp(source).test(document.getElementById('page-chiffrage').textContent.replace(/[  ]/g, ' ')), re.source);
+
+    // Before the workbook already: the card of the history.
+    await page.waitForSelector('#page-chiffrage #chistorique');
+    assert.match(await text('#chistorique'), /Historique :\s*aucun/);
+    assert.equal(await page.isDisabled('#chistorique [data-action="export-historique"]'), true);
+    await page.setInputFiles('#page-chiffrage input[data-file="historique"]', join(dir, 'historique.json'));
+    await waitText(/Historique « historique\.json » importé/);
+    assert.match(await text('#page-chiffrage .cmsg.warn'), /^Historique « historique\.json » importé : 2 enregistrements \(2 ajoutés, 0 remplacé : même référence et même source\)\. Enregistrements refusés : H-3 \(temps_cycle_s : nombre > 0 attendu\)\. Champs inconnus, ignorés : atelier\.$/);
+    assert.match(await text('#chistorique'), /Historique :\s*2 enregistrements : 2 temps de devis, 0 temps mesuré en production/);
+    assert.deepEqual(await page.$$eval('#chistorique .chisto-count tbody tr', (trs) => trs.map((tr) => [...tr.cells].map((td) => td.textContent))), [
+      ['CG3 Coquille gravité (traditionnel)', '1', '0'], ['SSP Sous pression', '1', '0'],
+    ]);
+    assert.match(await text('#chistorique'), /Aucun temps mesuré en production/);
+    // Dropped again on its row: its records replaced, not added twice.
+    const json = readFileSync(join(dir, 'historique.json'), 'utf8');
+    await page.evaluate((content) => {
+      const zone = document.querySelector('#page-chiffrage [data-drop="historique"]');
+      const data = new DataTransfer();
+      data.items.add(new File([content], 'historique.json', { type: 'application/json' }));
+      zone.dispatchEvent(new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true }));
+    }, json);
+    await waitText(/0 ajouté, 2 remplacés/);
+    assert.match(await text('#chistorique'), /Historique :\s*2 enregistrements/);
+
+    // A part typed in, cast on CG3.
+    await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
+    await page.waitForSelector('#page-chiffrage .cmsg.ok');
+    const typeIn = async (bind, value) => {
+      await page.fill(`#page-chiffrage [data-bind="${bind}"]`, String(value));
+      await page.dispatchEvent(`#page-chiffrage [data-bind="${bind}"]`, 'change');
+    };
+    for (const [bind, value] of [['p.poids', 1.2], ['p.toileMini', 5], ['p.epaisseurMax', 10], ['p.moduleMm', 3], ['p.dimMax', 250]]) await typeIn(bind, value);
+    await page.waitForSelector('#page-chiffrage .ctable tr.retained');
+    await page.selectOption('#page-chiffrage [data-bind="p.procede"]', 'CG3');
+    await waitText(/Retour d'expérience — Pièce\s*Îlot retenu : CG3/);
+    const estimated = Number(/cycle du chiffrage (\d+) s × 1 \(estimé\)/.exec(await text('#cfeedback'))[1]);
+    // No reference nor 3D file: nothing to keep the time under.
+    assert.equal(await page.isDisabled('#cfeedback [data-action="save-feedback"]'), true);
+    assert.match(await text('#cfeedback'), /saisissez la référence \(carte Pièce\)/);
+    await typeIn('q.reference', 'REF-RETOUR');
+    await page.waitForFunction(() => /saisissez le temps mesuré/.test(document.getElementById('cfeedback').textContent));
+    const pri = async () => /PRI complet[^\d]*([\d\s,]+)/.exec(await text())[1];
+    const priBefore = await pri();
+    await typeIn('p.cycleReel', 250);
+    await page.waitForSelector('#cfeedback [data-action="save-feedback"]:not([disabled])');
+    await page.click('#cfeedback [data-action="save-feedback"]');
+    await waitText(/Temps de cycle réel enregistré dans le retour d'expérience : « REF-RETOUR », 250 s sur CG3\. Le chiffrage ne change pas\./);
+    assert.equal(await pri(), priBefore, 'the costing does not change');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.cycleReel"]'), '');
+    assert.match(await text('#cfeedback'), /Déjà enregistré pour « REF-RETOUR » : 250 s sur CG3 le \d\d\/\d\d\/\d{4}/);
+    assert.match(await text('#chistorique'), /Historique :\s*3 enregistrements : 2 temps de devis, 1 temps mesuré en production/);
+
+    // The real time against the formula of the settings: the cycle of the quote, the same values.
+    const row = async () => page.$$eval('#chistorique .chisto tbody tr', (trs) => trs.map((tr) => [...tr.cells].map((td) => td.textContent.replace(/[  ]/g, ' '))));
+    const number = (s) => Number(s.replace(/[^\d,+−-]/g, '').replace(',', '.').replace('−', '-'));
+    let [cells] = await row();
+    assert.equal((await row()).length, 1, 'the times measured in production only');
+    assert.match(cells[0], /^REF-RETOUR \d\d\/\d\d\/\d{4}/);
+    assert.deepEqual(cells.slice(1, 3), ['CG3', '250 s']);
+    const formula = number(cells[3]);
+    assert.ok(Math.abs(formula - estimated) <= 0.5, `${formula} vs ${estimated}`);
+    assert.match(cells[4], new RegExp(`^${(formula - 250) / 250 > 0 ? '\\+' : '[-−]'}\\d+,\\d %$`));
+    assert.deepEqual(await page.$$eval('#chistorique .chisto-ilots thead th', (ths) => ths.map((th) => th.textContent)), ['Îlot', 'Pièces mesurées', 'Écart moyen : formule']);
+    const summary = await page.$$eval('#chistorique .chisto-ilots tbody tr', (trs) => trs.map((tr) => [...tr.cells].map((td) => td.textContent.replace(/[  ]/g, ' '))));
+    assert.deepEqual(summary, [['CG3', '1', cells[4].replace(/^[+−-]/, '')]]);
+
+    // A cycle coefficient typed in Paramètres: the formula recomputed with it; the trends file adds its column.
+    await page.click('.tab[data-page="parametres"]');
+    await page.waitForSelector('#page-parametres [data-bind="s.processes.CG3.cycle.base"]');
+    const cycleBase = Number(await page.inputValue('#page-parametres [data-bind="s.processes.CG3.cycle.base"]'));
+    await page.fill('#page-parametres [data-bind="s.processes.CG3.cycle.base"]', String(cycleBase + 100));
+    await page.dispatchEvent('#page-parametres [data-bind="s.processes.CG3.cycle.base"]', 'change');
+    await page.waitForFunction(() => document.querySelector('#page-parametres .cval:has([data-bind="s.processes.CG3.cycle.base"]) .csrc')?.textContent === 'S');
+    writeFileSync(join(dir, 'tendances-cycle.json'), JSON.stringify({ processes: { CG3: { cycle: { base: cycleBase - 50 } } } }));
+    await page.setInputFiles('#page-parametres input[data-file="tendances"]', join(dir, 'tendances-cycle.json'));
+    await page.waitForFunction(() => /Tendances « tendances-cycle\.json » importées/.test(document.getElementById('page-parametres').textContent));
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#chistorique .chisto');
+    [cells] = await row();
+    assert.ok(Math.abs(number(cells[3]) - (formula + 100)) <= 0.1, `${cells[3]} vs ${formula + 100}`);
+    assert.ok(Math.abs(number(cells[5]) - (formula - 50)) <= 0.1, `trend ${cells[5]} vs ${formula - 50}`);
+    assert.deepEqual(await page.$$eval('#chistorique .chisto thead th', (ths) => ths.map((th) => th.textContent)), ['Référence', 'Îlot', 'Réel', 'Formule', 'Écart', 'Tendance', 'Écart']);
+
+    // Kept after a reload; exported as a history file, the time measured with the geometry of the part.
+    await page.reload();
+    await page.waitForSelector('#page-chiffrage #chistorique');
+    assert.match(await text('#chistorique'), /Historique :\s*3 enregistrements/);
+    const [download] = await Promise.all([page.waitForEvent('download'), page.click('#chistorique [data-action="export-historique"]')]);
+    assert.equal(download.suggestedFilename(), 'historique_cycles.json');
+    const exported = JSON.parse(readFileSync(await download.path(), 'utf8'));
+    assert.deepEqual([exported.schema, exported.version, exported.pieces.length], ['reader3d-historique-cycles', 1, 3]);
+    const measured = exported.pieces.find((r) => r.source === 'production');
+    const { date, mise_au_mille: mam, ...rest } = measured;
+    assert.deepEqual(rest, {
+      ref: 'REF-RETOUR', fichier_3d: null, source: 'production', ilot: 'CG3', temps_cycle_s: 250, pieces_par_cycle: 1, trs: 0.75, poids_kg: 1.2, module_mm: 3,
+      volume_cm3: null, surface_cm2: null, encombrement_mm: null, noyaux: false, sable_kg: null, serie: 1000, toile_mini_mm: 5, epaisseur_max_mm: 10,
+    });
+    assert.ok(mam > 1 && !Number.isNaN(Date.parse(date)));
+    assert.deepEqual(exported.pieces.filter((r) => r.source === 'devis').map((r) => r.ref), ['H-1', 'H-2']);
+
+    // A phone: the cards of the history within 375 px (their tables scroll inside them).
+    await page.setViewportSize({ width: 375, height: 800 });
+    const overflow = await page.evaluate(() => [...document.querySelectorAll('#chistorique, #cfeedback')].flatMap((card) => [card, ...card.querySelectorAll('button, input, .cscroll')])
+      .filter((x) => x.offsetParent).map((x) => [x.id || x.textContent.trim().slice(0, 30) || x.className, Math.round(x.getBoundingClientRect().right)]).filter(([, right]) => right > 375));
+    assert.deepEqual(overflow, []);
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    // Erased, after a confirmation that says what is lost.
+    const dialog = new Promise((resolve) => page.once('dialog', (d) => resolve(d.message()) || d.accept()));
+    await page.click('#chistorique [data-action="clear-historique"]');
+    assert.match(await dialog, /Effacer l'historique des temps de cycle \(3 enregistrements, dont 1 temps mesuré en production\)[\s\S]*exportez-le d'abord/);
+    await waitText(/Historique des temps de cycle effacé/);
+    assert.match(await text('#chistorique'), /Historique :\s*aucun/);
+    assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.chiffrage.historique.v1')), null);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
   test('IA page, task « Chiffrage »: the traced values sent read only, the numbers of the answer checked, the amounts masked for the gateway, the answers kept with the quote', { timeout: 120_000 }, async (t) => {
     // Stand-ins for Ollama (/api/tags, a streamed /api/chat) and for the AI gateway, CORS as they do it.
     const chats = [];

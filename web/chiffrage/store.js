@@ -1,8 +1,8 @@
 // What the costing pages keep in this browser (localStorage): the data read
 // from the costing workbook and from the metal prices file, the settings
-// (TRS, islands, methods...) and the inputs of the current quote. Saved at
-// every change, so they are back when the page is opened again. Nothing is
-// sent anywhere.
+// (TRS, islands, methods...), the inputs of the current quote and the history
+// of cycle times (history.js). Saved at every change, so they are back when
+// the page is opened again. Nothing is sent anywhere.
 //
 // The settings are layers, resolved value by value at each loading (so a
 // re-imported workbook or a new trends file is taken into account):
@@ -32,6 +32,7 @@ const KEYS = {
   saisies: "reader3d.chiffrage.settings.v2", // {values: {path: {value, source: "saisie", date}}, migratedAt?}
   tendances: "reader3d.chiffrage.tendances.v1", // {fileName, importedAt, values, completed: [path]}
   quote: "reader3d.chiffrage.quote.v1",
+  historique: "reader3d.chiffrage.historique.v1", // {pieces: [record]}: cycle times of past quotes and of production (history.js)
 };
 
 // Densities of the alloys (g/cm³), to get the weight of the part from its volume.
@@ -74,6 +75,14 @@ export const loadBase = () => read(KEYS.base);
 export const saveBase = (base) => write(KEYS.base, base);
 export const loadIndices = () => read(KEYS.indices);
 export const saveIndices = (indices) => write(KEYS.indices, indices);
+
+/** The records of the history of cycle times (history.js), [] when there is none. */
+export function loadHistorique() {
+  const h = read(KEYS.historique);
+  return Array.isArray(h?.pieces) ? h.pieces : [];
+}
+/** The history of cycle times replaced by the records `pieces` (none: erased); false when kept for this visit only. */
+export const saveHistorique = (pieces) => write(KEYS.historique, pieces?.length ? { pieces } : null);
 
 // --------------------------------------------------------------------------- settings: the layers
 

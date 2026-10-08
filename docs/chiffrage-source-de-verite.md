@@ -447,6 +447,25 @@ Créer `web/chiffrage/provenance.js`. Pour chaque sortie, il décrit les sources
 ### Étape 10 : sortir les règles métier du code (écart n° 12)
 Déplacer chaque constante métier dans Paramètres, ou la lire dans le classeur, avec sa provenance. Toute constante qui reste dans le code est tracée `default_code` et déclenche une alerte de validation.
 
+### Étape 11 : historique des temps de cycle et retour d'expérience
+- **Historique.** `chiffrage/history.js`, gardé dans ce navigateur (`store.js`, clé `reader3d.chiffrage.historique.v1`). Format du fichier : `{schema: "reader3d-historique-cycles", version: 1, pieces: [...]}`, un enregistrement par référence et par source : « devis » (temps chiffré dans un devis passé) ou « production » (temps mesuré).
+  - **Import** (carte « Historique des temps de cycle » de Chiffrage). L'îlot, un temps de cycle > 0 et un poids > 0 sont obligatoires ; une source absente vaut « devis ». Un enregistrement refusé est cité avec sa raison. Une valeur facultative invalide est ignorée et citée (0 est lu comme inconnu), de même que les champs inconnus.
+  - **Réimport.** Il remplace les enregistrements de même référence et de même source, sans doublon.
+  - **Export et effacement.** L'export reprend tout l'historique au même format, temps mesurés compris. L'effacement demande une confirmation.
+- **Place dans la hiérarchie.** L'historique n'est pas une source du chiffrage : aucune de ses valeurs n'entre dans un devis ni dans les paramètres. Les temps de devis sont des données historiques, comme N4. Les temps mesurés sont des preuves de production pour une pièce et un îlot (evidence), pas une règle. Un écart persistant se corrige par une personne, en saisissant de nouveaux coefficients dans Paramètres.
+- **Retour d'expérience.** La carte « Retour d'expérience » de la pièce affichée a un champ « Temps de cycle réel mesuré (s) » et le bouton « Enregistrer dans le retour d'expérience ». L'enregistrement « production » (`history.js:productionRecord`) reprend :
+  - la référence du devis, sinon le nom du fichier 3D, suivie du nom de la pièce dans un modèle de plusieurs pièces ;
+  - la géométrie : poids, module, épaisseurs, encombrement, volume, surface, noyaux et sable ;
+  - l'îlot retenu, les pièces par cycle, le TRS, la mise au mille et la taille de série du chiffrage.
+  Il ne change pas le devis.
+- **Comparaison.** Pour chaque temps mesuré, trois estimations, chacune avec son écart relatif (estimation − réel) / réel :
+  - la formule de `routes.js`, recalculée avec les coefficients actuels de Paramètres (`history.js:formulaCycle`), avec les pièces par cycle et la mise au mille de l'enregistrement ;
+  - la même formule avec les coefficients du fichier de tendances, pour les îlots dont il donne le cycle ;
+  - l'estimation de l'IA gardée avec l'enregistrement (`estimation_ia`), que l'étape suivante remplira une fois validée.
+  Un tableau donne l'écart moyen absolu par îlot et pour tous les îlots.
+- **Pièces semblables.** `history.js:similarParts(historique, pièce, {k})` classe les enregistrements : même îlot d'abord, puis par un score. Le score combine l'écart de poids en échelle logarithmique, l'écart de module et la présence de noyaux. Chaque résultat porte son score et sa raison. Rien n'est envoyé à l'IA à cette étape.
+- **Confidentialité.** Les temps de cycle sont des données de l'entreprise. Ils restent dans le navigateur et ne figurent ni dans le code ni dans les tests, qui n'emploient que des valeurs inventées.
+
 ### Tests (`tests/js/`)
 1. **Hiérarchie.** Saisir un TRS dans Paramètres, puis importer un JSON qui en contient un autre : la valeur effective reste la saisie et `ecart_tendance` est calculé. Faire l'inverse (import, puis saisie) donne le même résultat.
 2. **Prior sans valeur explicite.** Le prior est retenu avec `autorite: soft_prior` et une validation requise ; sans prior, c'est le défaut du code, avec une alerte.

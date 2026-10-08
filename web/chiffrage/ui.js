@@ -9,6 +9,7 @@ import { estimateTooling } from "./tooling.js";
 import { coreBoxCost, coresPerPiece, newCore } from "./cores.js";
 import { filledFields, orderValues, programmeFor, programmeOf, readSeriesOrder } from "./rfq.js";
 import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, demandeComparee, label as traceLabel, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
+import { compareCycles, countHistory, exportHistory, importHistory, mergeHistory, productionRecord } from "./history.js";
 import * as store from "./store.js";
 
 let el = null;
@@ -143,6 +144,7 @@ const PIECE_DEFAULTS = {
   outillageTiroirs: null, outillageComplexite: null, // slides and complexity of the die; null: the defaults of the settings
   cores: [], // sand cores (cores.js): {nom, masse kg, qte per piece, L, l, h box mm, type, tiroirs, complexite}
   composants: [],
+  cycleReel: null, // real cycle time measured in production (s), to keep in the history (Retour d'expérience); not used by the costing
 };
 function pieceInputs(key) {
   const i = { ...PIECE_DEFAULTS, ...q.pieces?.[key] };
@@ -265,7 +267,7 @@ async function onClick(event) {
   const button = event.target.closest("[data-action]");
   if (!button) return;
   const action = button.dataset.action;
-  if (action === "import-workbook" || action === "import-indices" || action === "import-tendances" || action === "import-rfq") button.parentElement.querySelector("input[data-file]")?.click();
+  if (action === "import-workbook" || action === "import-indices" || action === "import-tendances" || action === "import-rfq" || action === "import-historique") button.parentElement.querySelector("input[data-file]")?.click();
   else if (action === "thickness") {
     thicknessBusy = true;
     render();
@@ -369,6 +371,17 @@ async function onClick(event) {
   } else if (action === "toggle-trace") {
     // Clicked before the details element toggles: kept open or closed at the next rendering.
     traceOpen = !button.parentElement.open;
+  } else if (action === "save-feedback") {
+    saveFeedback();
+    render();
+  } else if (action === "export-historique") {
+    download("historique_cycles.json", new Blob([JSON.stringify(exportHistory(store.loadHistorique()), null, 2)], { type: "application/json" }));
+  } else if (action === "clear-historique") {
+    const n = countHistory(store.loadHistorique());
+    if (!n.total || !confirm(`Effacer l'historique des temps de cycle (${plural(n.total, "enregistrement")}, dont ${n.production} temps mesuré${n.production > 1 ? "s" : ""} en production) ?\n\nIl n'est gardé que dans ce navigateur : exportez-le d'abord pour le conserver. Le chiffrage et les paramètres ne changent pas.`)) return;
+    store.saveHistorique([]);
+    message = { kind: "ok", text: "Historique des temps de cycle effacé." };
+    render();
   } else if (action === "export-xlsx") {
     exportXlsx().catch((err) => {
       message = { kind: "error", text: err.message };
@@ -422,6 +435,10 @@ async function importFile(target) {
       const report = store.importTendances(JSON.parse(new TextDecoder().decode(bytes)), file.name);
       reloadSettings();
       message = tendancesMessage(file.name, report);
+    } else if (target.dataset.file === "historique") {
+      // Cycle times of past quotes and of production: merged into the history of this browser (history.js).
+      const { pieces, report } = importHistory(store.loadHistorique(), JSON.parse(new TextDecoder().decode(bytes)));
+      message = historyMessage(file.name, report, store.saveHistorique(pieces));
     }
   } catch (err) {
     message = { kind: "error", text: `${file.name} : ${err.message || err}` };
@@ -429,14 +446,29 @@ async function importFile(target) {
   render();
 }
 
+/** The first 8 of `items` as text (`label` of each), and how many others. */
+const list = (items, label) => `${items.slice(0, 8).map(label).join(", ")}${items.length > 8 ? ` et ${items.length - 8} autre${items.length > 9 ? "s" : ""}` : ""}`;
+
+// Said when the history could not be written in this browser's storage (store.js keeps it for the visit).
+const UNSAVED_HISTORY = " Le stockage de ce navigateur est plein ou bloqué : l'historique n'est gardé que pendant cette visite, exportez-le pour ne pas le perdre.";
+
 /** What an imported trends file brought, and what of it was left out (unknown keys, refused values). */
 function tendancesMessage(name, report) {
-  const list = (items, label) => `${items.slice(0, 8).map(label).join(", ")}${items.length > 8 ? ` et ${items.length - 8} autre${items.length > 9 ? "s" : ""}` : ""}`;
   let text = `Tendances « ${name} » importées : ${report.count} valeur${report.count > 1 ? "s" : ""}, appliquées là où rien n'est saisi ni lu dans le classeur.`;
   if (report.unknown.length) text += ` Clés inconnues, ignorées : ${list(report.unknown, (u) => `${u.path}${u.suggestion ? ` (vouliez-vous dire « ${u.suggestion} » ?)` : ""}`)}.`;
   if (report.invalid.length) text += ` Valeurs refusées : ${list(report.invalid, (x) => `${x.path || "fichier"} (${x.reason})`)}.`;
   if (report.completed.length) text += ` Lignes de tableau incomplètes, complétées par les valeurs par défaut : ${list(report.completed, (p) => p)}.`;
   return { kind: report.unknown.length || report.invalid.length || report.completed.length ? "warn" : "ok", text };
+}
+
+/** What an imported history file brought, and what of it was left out (records refused, values and fields ignored). */
+function historyMessage(name, report, saved) {
+  let text = `Historique « ${name} » importé : ${plural(report.count, "enregistrement")} (${report.added} ajouté${report.added > 1 ? "s" : ""}, ${report.replaced} remplacé${report.replaced > 1 ? "s" : ""} : même référence et même source).`;
+  if (report.refused.length) text += ` Enregistrements refusés : ${list(report.refused, (x) => `${x.name} (${x.reasons.join(", ")})`)}.`;
+  if (report.ignored.length) text += ` Valeurs ignorées : ${list(report.ignored, (x) => `${x.name} ${x.field} (${x.reason})`)}.`;
+  if (report.unknown.length) text += ` Champs inconnus, ignorés : ${list(report.unknown, (k) => k)}.`;
+  if (!saved) text += UNSAVED_HISTORY;
+  return { kind: report.refused.length || report.ignored.length || report.unknown.length || !saved ? "warn" : "ok", text };
 }
 
 /**
@@ -933,7 +965,8 @@ function renderQuote() {
   if (!base) {
     return `<div class="cpage">${messageHtml()}${sourcesCard()}
       <section class="ccard"><h3>Chiffrage de pièce</h3>
-      <p>Importez d'abord le classeur de chiffrage (.xlsm) : les coûts des centres de profit, les listes (alliages, coefficients, cours) et les valeurs par défaut en sont tirés.</p></section></div>`;
+      <p>Importez d'abord le classeur de chiffrage (.xlsm) : les coûts des centres de profit, les listes (alliages, coefficients, cours) et les valeurs par défaut en sont tirés.</p></section>
+      ${historyCard()}</div>`;
   }
   const c = compute();
   const lists = base.lists;
@@ -956,7 +989,8 @@ function renderQuote() {
   if (!c.selected) {
     return `<div class="cpage">${messageHtml()}<div class="cgrid">${sourcesCard()}
       <section class="ccard"><h3>Pièce</h3><div class="cfields">${pieceSelect}</div>
-      <p>Aucune pièce sélectionnée : cochez au moins un corps fermé dans la liste des corps de la page Analyse 3D, ou choisissez une pièce ci-dessus.</p></section></div></div>`;
+      <p>Aucune pièce sélectionnée : cochez au moins un corps fermé dans la liste des corps de la page Analyse 3D, ou choisissez une pièce ci-dessus.</p></section></div>
+      ${historyCard()}</div>`;
   }
 
   const sections = traceSections(c);
@@ -1011,6 +1045,8 @@ function renderQuote() {
   ${seriesCard(c)}
   ${projectionCard(c, ensemble ? c.ensemble : r?.final)}
   ${traceCard(sections, traces)}
+  ${ensemble ? "" : feedbackCard(c, r)}
+  ${historyCard()}
   <p class="cactions">
     <button type="button" data-action="export-xlsx"${c.results.some((x) => x.final) ? "" : " disabled"}>Exporter le chiffrage (Excel)</button>
     <button type="button" data-action="reset-quote">Nouveau chiffrage</button>
@@ -1511,6 +1547,110 @@ function traceCard(sections, sum) {
         <tbody>${rows}</tbody></table></div>
     </details>
     <p class="small muted">Ordre des sources : commande client et saisies du devis, puis Paramètres, classeur et indices (hard), puis géométrie 3D (evidence), puis tendances du fichier de paramètres calés (soft_prior), qui ne remplacent jamais une valeur actuelle. Défaut du code : valeur neutre, à remplacer par une valeur de l'entreprise. Une valeur calculée a la confiance de sa plus faible entrée et demande une validation si l'une d'elles en demande une. Écart à la tendance signalé au-delà de ${pct(settings.seuilTendance ?? SEUIL_TENDANCE, 0)} (Paramètres). Aucune valeur ne vient de l'IA.</p>
+  </section>`;
+}
+
+// --------------------------------------------------------------------------- history of cycle times
+
+const sec = (v) => (Number.isFinite(v) ? `${v.toLocaleString("fr-FR", { maximumFractionDigits: 1 })} s` : "—");
+
+/** The reference a real cycle time of piece `r` is kept under: the quote's, else the 3D file's; with the piece's name in a model of several. */
+function feedbackRef(c, r) {
+  const ref = q.reference?.trim() || (c.p3d?.file ?? "").replace(/\.[^.]+$/, "");
+  if (!ref) return null;
+  return c.allPieces.length > 1 ? `${ref} / ${r.piece.name}` : ref;
+}
+
+/** "Enregistrer dans le retour d'expérience": the real cycle time of the piece shown, a record "production" of the history. */
+function saveFeedback() {
+  const c = compute();
+  const r = c?.results.find((x) => x.piece.key === c.selected);
+  const ref = r?.route ? feedbackRef(c, r) : null;
+  if (!ref || !(r.inputs.cycleReel > 0)) return;
+  const record = productionRecord(r, { ref, tempsCycle: r.inputs.cycleReel, fichier: c.p3d?.file ?? null, serie: q.tailleSerie || null });
+  const before = store.loadHistorique().find((x) => x.source === "production" && x.ref === ref);
+  const saved = store.saveHistorique(mergeHistory(store.loadHistorique(), [record]).pieces);
+  pieceStore(currentKey).cycleReel = null;
+  store.saveQuote(q);
+  message = {
+    kind: saved ? "ok" : "warn",
+    text: `Temps de cycle réel enregistré dans le retour d'expérience : « ${ref} », ${sec(record.temps_cycle_s)} sur ${record.ilot}${before ? ` (remplace ${sec(before.temps_cycle_s)} sur ${before.ilot}${before.date ? ` du ${dateLabel(before.date)}` : ""})` : ""}. Le chiffrage ne change pas.${saved ? "" : UNSAVED_HISTORY}`,
+  };
+}
+
+/** Card "Retour d'expérience": the real cycle time of the piece shown, measured in production, kept in the history. */
+function feedbackCard(c, r) {
+  const route = r?.route;
+  if (!route) return "";
+  const casting = route.operations.find((o) => o.code === route.process);
+  const ref = feedbackRef(c, r);
+  const saved = ref ? store.loadHistorique().find((x) => x.source === "production" && x.ref === ref) : null;
+  const value = r.inputs.cycleReel;
+  const missing = !ref ? "saisissez la référence (carte Pièce)" : !(value > 0) ? "saisissez le temps mesuré" : "";
+  return `<section class="ccard" id="cfeedback">
+    <h3>Retour d'expérience — ${esc(r.piece.name)}</h3>
+    <p class="small">Îlot retenu : <strong>${esc(route.process)}</strong> ${esc(route.famille)} — cycle du chiffrage ${nf(casting.cycle, 0)} s × ${casting.parCycle} (${r.chosen && r.inputs.cycle > 0 ? "saisi" : "estimé"}).</p>
+    <div class="cfields">
+      ${field("Temps de cycle réel mesuré (s)", input("p.cycleReel", value, { min: 0, placeholder: "mesuré en production" }), `îlot ${esc(route.process)}, ${plural(casting.parCycle, "pièce")} par cycle`)}
+    </div>
+    <p><button type="button" class="small" data-action="save-feedback"${missing ? " disabled" : ""}>Enregistrer dans le retour d'expérience</button>${missing ? ` <small class="muted">${missing}</small>` : ""}</p>
+    ${saved ? `<p class="small">Déjà enregistré pour « ${esc(ref)} » : ${sec(saved.temps_cycle_s)} sur ${esc(saved.ilot)}${saved.date ? ` le ${dateLabel(saved.date)}` : ""}. Un nouvel enregistrement le remplace.</p>` : ""}
+    <p class="small muted">Gardé dans l'historique des temps de cycle de ce navigateur (source « production »)${ref ? ` sous la référence « ${esc(ref)} »` : ""}, avec la géométrie de la pièce (poids, module, épaisseurs, encombrement, volume, surface, noyaux) et l'îlot, les pièces par cycle, le TRS et la mise au mille du chiffrage. Rien n'est envoyé ; le temps mesuré ne change ni le chiffrage ni les paramètres.</p>
+  </section>`;
+}
+
+/** The settings of the trends file over the code's, for the islands it gives cycle coefficients for; null without any. */
+function trendSettings() {
+  const t = layers.tendances?.values;
+  const islands = Object.keys(t?.processes ?? {}).filter((code) => t.processes[code]?.cycle);
+  if (!islands.length) return null;
+  const s = store.resolveSettings({ tendances: t });
+  return { ...s, processes: Object.fromEntries(islands.filter((code) => s.processes[code]).map((code) => [code, s.processes[code]])) };
+}
+
+/** The real cycle times measured in production against the estimates (history.js:compareCycles), and the mean errors per island. */
+function comparisonHtml(pieces) {
+  const trend = trendSettings();
+  const cmp = compareCycles(pieces, settings, trend);
+  if (!cmp.rows.length) return `<p class="small">Aucun temps mesuré en production : saisissez le temps de cycle réel d'une pièce chiffrée (carte « Retour d'expérience ») pour le comparer aux estimations.</p>`;
+  const cols = [["formule", "Formule", "formule"], ...(trend ? [["tendance", "Tendance", "tendance"]] : []), ...(cmp.rows.some((x) => x.ia) ? [["ia", "Estimation IA", "estimation IA"]] : [])];
+  const est = (e) => (e ? sec(e.valeur) : "—");
+  const rows = cmp.rows
+    .map((x) => `<tr><td>${esc(x.record.ref ?? "—")}${x.record.date ? ` <small class="muted">${esc(dateLabel(x.record.date))}</small>` : ""}</td><td>${esc(x.record.ilot)}</td><td class="num">${sec(x.record.temps_cycle_s)}</td>${cols.map(([k]) => `<td class="num">${est(x[k])}</td><td class="num">${x[k] ? signedPct(x[k].ecart) : "—"}</td>`).join("")}</tr>`)
+    .join("");
+  const summary = [...cmp.ilots, ...(cmp.ilots.length > 1 ? [cmp.total] : [])]
+    .map((x) => `<tr${x.ilot === null ? ' class="total"' : ""}><td>${x.ilot === null ? "Tous les îlots" : `<strong>${esc(x.ilot)}</strong>`}</td><td class="num">${x.n}</td>${cols.map(([k]) => `<td class="num">${x[k] ? pct(x[k].emap) : "—"}</td>`).join("")}</tr>`)
+    .join("");
+  return `<h4>Retour d'expérience : temps mesurés et estimations</h4>
+    <div class="cscroll"><table class="ctable compact chisto">
+      <thead><tr><th>Référence</th><th>Îlot</th><th class="num">Réel</th>${cols.map(([, label]) => `<th class="num">${label}</th><th class="num">Écart</th>`).join("")}</tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <div class="cscroll"><table class="ctable compact chisto-ilots">
+      <thead><tr><th>Îlot</th><th class="num">Pièces mesurées</th>${cols.map(([, , label]) => `<th class="num">Écart moyen : ${label}</th>`).join("")}</tr></thead>
+      <tbody>${summary}</tbody></table></div>
+    <p class="small muted">Formule : temps de cycle de coulée = base + coef × (kg coulés par cycle)^exposant + s/mm² × module², recalculé avec les coefficients actuels de Paramètres, et pour chaque pièce son poids, son module, sa mise au mille et ses pièces par cycle enregistrés (ceux estimés pour l'îlot quand ils manquent ; module inconnu : 0).${trend ? " Tendance : la même formule avec les coefficients du fichier de tendances, pour les îlots qu'il donne." : ""} Écart = (estimation − réel) / réel ; écart moyen = moyenne des écarts en valeur absolue. Rien n'est appliqué au chiffrage ni aux paramètres.</p>`;
+}
+
+/**
+ * Card "Historique des temps de cycle": the records kept in this browser by
+ * source and island, their import, export and erasing, and the real times
+ * measured in production against the estimates.
+ */
+function historyCard() {
+  const pieces = store.loadHistorique();
+  const n = countHistory(pieces);
+  return `<section class="ccard" id="chistorique">
+    <h3>Historique des temps de cycle</h3>
+    <div class="crow" data-drop="historique" title="Glissez un fichier d'historique (.json) ici pour l'importer"><span>Historique :</span> <strong>${n.total ? `${plural(n.total, "enregistrement")} : ${n.devis} temps de devis, ${n.production} temps mesuré${n.production > 1 ? "s" : ""} en production` : "aucun"}</strong>
+      <button type="button" class="small" data-action="import-historique">Importer l'historique…</button>
+      <input type="file" data-file="historique" accept=".json,application/json" hidden>
+      <button type="button" class="small" data-action="export-historique"${n.total ? "" : " disabled"}>Exporter l'historique</button>
+      <button type="button" class="small" data-action="clear-historique"${n.total ? "" : " disabled"}>Effacer l'historique…</button></div>
+    ${n.ilots.length ? `<div class="cscroll"><table class="ctable compact chisto-count">
+      <thead><tr><th>Îlot</th><th class="num">Devis</th><th class="num">Production</th></tr></thead>
+      <tbody>${n.ilots.map((x) => `<tr><td><strong>${esc(x.ilot)}</strong>${settings.processes[x.ilot] ? ` ${esc(settings.processes[x.ilot].famille)}` : ""}</td><td class="num">${x.devis}</td><td class="num">${x.production}</td></tr>`).join("")}</tbody></table></div>` : ""}
+    ${comparisonHtml(pieces)}
+    <p class="small muted">Fichier JSON « reader3d-historique-cycles », version 1 : temps de cycle de devis passés (source « devis ») et temps mesurés en production (source « production »). Un enregistrement de même référence et même source remplace le précédent. L'historique est gardé dans ce navigateur, jamais envoyé ; l'export reprend tout, temps mesurés compris. Données confidentielles : ne pas publier.</p>
   </section>`;
 }
 
