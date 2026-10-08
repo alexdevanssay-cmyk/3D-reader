@@ -296,6 +296,7 @@ table.bodies .open { color: var(--warn); }
 .cmsg.ok { background: color-mix(in srgb, var(--ok) 14%, transparent); }
 .cmsg.error { background: var(--error-bg); color: var(--error-text); }
 .cmsg.warn { background: color-mix(in srgb, var(--warn) 16%, transparent); }
+.cmsg.lines { white-space: pre-line; } /* a message of several lines (the checklist of an unreachable Ollama) */
 .cactions { display: flex; gap: 8px; flex-wrap: wrap; }
 /* Paramètres: where each value comes from (saisie, classeur, tendance, défaut), and the trend beside a value that differs. */
 .cval { display: inline-flex; align-items: center; gap: 4px; }

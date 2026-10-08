@@ -13,7 +13,7 @@ import { compareCycles, countHistory, exportHistory, importHistory, mergeHistory
 import {
   SIMILAR, adoptEstimate, adoptedEstimate, anonymiseCycleData, cycleData, cycleNumbers, cycleQuestion, cycleText, fitCycleData, forgetAdoption, localCycleRules, readCycleAnswer, recordCycleData, undoAdoption,
 } from "./ai-cycle.js";
-import { DEFAULT_INTERVAL_S, backtestCsv, backtestItems, backtestReading, backtestRows, fingerprint, leaveOneOut, runBacktest, summarizeBacktest } from "./backtest.js";
+import { DEFAULT_INTERVAL_S, backtestCsv, backtestItems, backtestReading, backtestRows, fingerprint, leaveOneOut, resultOf, runBacktest, summarizeBacktest } from "./backtest.js";
 import { askJSON, numbersLabel, savedAI } from "../ai-workspace.js";
 import * as store from "./store.js";
 
@@ -927,6 +927,15 @@ export function costingSnapshot({ tab } = {}) {
   }));
 }
 
+/**
+ * The names of the quote of the tab `tab` of the 3D page that tell the
+ * customer or the part (namesOf), also without a costing workbook: the AI page
+ * puts their labels in their place in what it sends online, whatever its task.
+ */
+export function costingNames({ tab = store.currentQuoteTab() } = {}) {
+  return namesOf(el && tab === store.currentQuoteTab() ? q : store.savedQuote(tab) ?? {});
+}
+
 /** The names of quote `q` that tell the customer or the part, each with its neutral label (costingSnapshot noms). */
 function namesOf(q) {
   const s = q.serie ?? {};
@@ -1511,26 +1520,43 @@ function projectionCard(c, f) {
 
 // --------------------------------------------------------------------------- estimate of the cycle time by the AI
 
-// Box "Envoyer les pièces similaires de l'historique": on unless unticked, kept in this browser.
+// Box "Envoyer les pièces similaires de l'historique" (their cycle times are
+// confidential): for Ollama, on unless unticked, kept in this browser (nothing
+// leaves the site); for the gateway, off unless ticked, for this browser tab
+// only (sessionStorage), as the internal amounts of the IA page.
 const SIMILAR_KEY = "reader3d.ai.cycleSimilar";
 let cycleJob = null; // the estimate in progress: {key (of its piece), tab, file, controller, start}
 let cycleError = null; // {key, text}: why the last estimate of the piece `key` failed
 
+const localAI = () => savedAI().provider === "ollama";
+
 function sendSimilar() {
+  const local = localAI();
   try {
-    return localStorage.getItem(SIMILAR_KEY) !== "0";
+    return local ? localStorage.getItem(SIMILAR_KEY) !== "0" : sessionStorage.getItem(SIMILAR_KEY) === "1";
   } catch {
-    return true; // storage blocked: the default
+    return local; // storage blocked: the default
   }
 }
 
 function setSendSimilar(on) {
   try {
-    if (on) localStorage.removeItem(SIMILAR_KEY);
-    else localStorage.setItem(SIMILAR_KEY, "0");
+    if (localAI()) {
+      if (on) localStorage.removeItem(SIMILAR_KEY);
+      else localStorage.setItem(SIMILAR_KEY, "0");
+    } else if (on) sessionStorage.setItem(SIMILAR_KEY, "1");
+    else sessionStorage.removeItem(SIMILAR_KEY);
   } catch {
-    // storage blocked: the box is ticked again at the next rendering
+    // storage blocked: the box is back to its default at the next rendering
   }
+}
+
+/** The box "Envoyer les pièces similaires de l'historique", for the AI chosen on the IA page. */
+function similarBox() {
+  const title = localAI()
+    ? "Les pièces les plus semblables de l'historique, avec leur temps de cycle, sont données au modèle local (Ollama) : rien ne quitte le site."
+    : "Les pièces les plus semblables de l'historique partent à la passerelle en ligne avec leur temps de cycle, leur poids, leur module, leurs pièces par cycle et leur mise au mille (références anonymisées avec les noms). Décochée par défaut ; cochée, pour cet onglet du navigateur seulement.";
+  return `<label class="check small" title="${esc(title)}"><input type="checkbox" data-pref="cycle-similar"${sendSimilar() ? " checked" : ""}> Envoyer les pièces similaires de l'historique${localAI() ? "" : " à la passerelle"}</label>`;
 }
 
 /** The AI the estimate is asked of: the one chosen on the IA page. */
@@ -1549,7 +1575,7 @@ function cycleButton(r) {
   return `<div class="crow ccycle-ask">
       <button type="button" class="small" data-action="estimate-cycle"${cycleJob || backtestJob ? " disabled" : ""}>Estimer le temps de cycle avec l'IA</button>
       ${busy ? `<span id="ccycle-status" class="small muted" role="status">Estimation en cours…</span> <button type="button" class="small" data-action="cancel-cycle">Annuler</button>` : ""}
-      <label class="check small"><input type="checkbox" data-pref="cycle-similar"${sendSimilar() ? " checked" : ""}> Envoyer les pièces similaires de l'historique</label>
+      ${similarBox()}
     </div>
     <p class="small muted">IA de la page IA / analyse : ${aiChoice()}. Historique : ${n ? `${plural(n, "enregistrement")}, ${!sendSimilar() ? "non envoyé" : sent > 1 ? `les ${sent} plus semblables envoyés` : "envoyé"}` : "aucun enregistrement"}. Une proposition : rien n'est appliqué sans votre validation.</p>`;
 }
@@ -1685,7 +1711,7 @@ function cycleCard(r) {
   const e = r?.inputs.estimationCycleIA;
   const error = cycleError?.key === r?.piece.key ? cycleError.text : "";
   if (!e && !error) return "";
-  const head = `<h3>Estimation IA du temps de cycle — ${esc(r.piece.name)}</h3><p class="ai-label">Proposition IA — rien n'est appliqué sans votre validation</p>${error ? `<p class="cmsg error">${esc(error)}</p>` : ""}`;
+  const head = `<h3>Estimation IA du temps de cycle — ${esc(r.piece.name)}</h3><p class="ai-label">Proposition IA — rien n'est appliqué sans votre validation</p>${error ? `<p class="cmsg error lines">${esc(error)}</p>` : ""}`;
   if (!e) return `<section class="ccard ccycle-ia" id="ccycle-ia">${head}</section>`;
   const code = r.route?.process;
   // The estimate used in the quote: this one, or an earlier one.
@@ -1858,13 +1884,13 @@ function feedbackCard(c, r) {
   const missing = !ref ? "saisissez la référence (carte Pièce)" : !(value > 0) ? "saisissez le temps mesuré" : "";
   return `<section class="ccard" id="cfeedback">
     <h3>Retour d'expérience — ${esc(r.piece.name)}</h3>
-    <p class="small">Îlot retenu : <strong>${esc(route.process)}</strong> ${esc(route.famille)} — cycle du chiffrage ${nf(casting.cycle, 0)} s × ${casting.parCycle} (${r.chosen && r.inputs.cycle > 0 ? "saisi" : "estimé"}).</p>
+    <p class="small">Îlot retenu : <strong>${esc(route.process)}</strong> ${esc(route.famille)} — cycle du chiffrage ${nf(casting.cycle, 0)} s × ${casting.parCycle} (${!(r.chosen && r.inputs.cycle > 0) ? "estimé" : adoptedEstimate(r.inputs, route.process) ? "estimation IA validée" : "saisi"}).</p>
     <div class="cfields">
       ${field("Temps de cycle réel mesuré (s)", input("p.cycleReel", value, { min: 0, placeholder: "mesuré en production" }), `îlot ${esc(route.process)}, ${plural(casting.parCycle, "pièce")} par cycle`)}
     </div>
     <p><button type="button" class="small" data-action="save-feedback"${missing ? " disabled" : ""}>Enregistrer dans le retour d'expérience</button>${missing ? ` <small class="muted">${missing}</small>` : ""}</p>
     ${saved ? `<p class="small">Déjà enregistré pour « ${esc(ref)} » : ${sec(saved.temps_cycle_s)} sur ${esc(saved.ilot)}${saved.date ? ` le ${dateLabel(saved.date)}` : ""}. Un nouvel enregistrement le remplace.</p>` : ""}
-    <p class="small muted">Gardé dans l'historique des temps de cycle de ce navigateur (source « production »)${ref ? ` sous la référence « ${esc(ref)} »` : ""}, avec la géométrie de la pièce (poids, module, épaisseurs, encombrement, volume, surface, noyaux) et l'îlot, les pièces par cycle, le TRS et la mise au mille du chiffrage. Rien n'est envoyé ; le temps mesuré ne change ni le chiffrage ni les paramètres.</p>
+    <p class="small muted">Gardé dans l'historique des temps de cycle de ce navigateur (source « production »)${ref ? ` sous la référence « ${esc(ref)} »` : ""}, avec la géométrie de la pièce (poids, module, épaisseurs, encombrement, volume, surface, noyaux) et l'îlot, les pièces par cycle, le TRS et la mise au mille du chiffrage. L'enregistrement n'envoie rien ; comme tout l'historique, il peut partir ensuite à l'IA parmi les pièces semblables (case « Envoyer les pièces similaires de l'historique »). Le temps mesuré ne change ni le chiffrage ni les paramètres.</p>
   </section>`;
 }
 
@@ -1938,20 +1964,30 @@ function refreshHistory() {
  * AI): its data (ai-cycle.js recordCycleData) with the similar parts of the
  * history without it (backtest.js leaveOneOut), anonymised for the gateway as
  * the estimate of a piece. Resolves to {result (kept with the backtest:
- * estimate, range, confidence; or why the answer could not be used), quota, usage}.
+ * estimate, range, confidence; or why the answer could not be used: a cut one
+ * too, which would be cut again), quota, usage}.
  */
 async function estimateRecord(item, signal) {
   const x = item.record;
   const data = recordCycleData(x, { settings, history: sendSimilar() ? leaveOneOut(store.loadHistorique(), x) : [], trend: trendSettings() });
   const question = cycleQuestion(data);
-  const answer = await askJSON("cycle_time", ({ budget, local, anonymize, model }) => {
-    const anonymous = anonymize ? anonymiseCycleData(data, { file: x.fichier_3d ?? null }) : null;
-    return {
-      context: fitCycleData(anonymous ? anonymous.data : data, budget),
-      question: anonymous ? anonymous.text(question) : question,
-      ...(local ? { system: localCycleRules(model) } : {}),
-    };
-  }, { signal, fallback: false });
+  let built = null;
+  let answer;
+  try {
+    answer = await askJSON("cycle_time", ({ budget, local, anonymize, model }) => {
+      const anonymous = anonymize ? anonymiseCycleData(data, { file: x.fichier_3d ?? null }) : null;
+      built = {
+        context: fitCycleData(anonymous ? anonymous.data : data, budget),
+        question: anonymous ? anonymous.text(question) : question,
+        ...(local ? { system: localCycleRules(model) } : {}),
+      };
+      return built;
+    }, { signal, fallback: false });
+  } catch (err) {
+    if (!err?.truncated) throw err;
+    const result = { empreinte: fingerprint(x), date: new Date().toISOString(), fournisseur: null, modele: null, similaires: built?.context.pieces_similaires?.length ?? 0, erreur: err.message };
+    return { result, quota: null, usage: null };
+  }
   const sent = answer.sent.context;
   const result = { empreinte: fingerprint(x), date: new Date().toISOString(), fournisseur: answer.provider ?? null, modele: answer.model ?? null, similaires: sent.pieces_similaires?.length ?? 0 };
   try {
@@ -1973,6 +2009,14 @@ async function startBacktest() {
   if (backtestJob || cycleJob) return;
   const items = backtestItems(store.loadHistorique());
   if (!items.length) return;
+  // The gateway: what leaves the browser, said before the run.
+  if (!localAI()) {
+    const results = store.loadBancEssai().resultats;
+    const left = items.filter((item) => !resultOf(results, item)).length;
+    const similar = sendSimilar();
+    const names = savedAI().anonymize ? "références et noms anonymisés" : "références et noms en clair (case « Anonymiser les noms envoyés en ligne » décochée)";
+    if (!confirm(`Banc d'essai avec la passerelle en ligne : ${left > 1 ? `pour chacune des ${left} pièces à estimer` : "pour la pièce à estimer"}, ses données (géométrie, îlot, pièces par cycle, mise au mille, formule, sans son temps de cycle)${similar ? ` et jusqu'à ${SIMILAR} pièces semblables de l'historique avec leur temps de cycle` : ""} partent au fournisseur de la passerelle, ${names}.${similar ? " Sur toute la série, presque tous les temps de cycle de l'historique sont envoyés." : ""} Continuer ?`)) return;
+  }
   const banc = store.loadBancEssai();
   const job = { controller: new AbortController(), done: 0, total: items.length, ref: null, waitUntil: null, start: Date.now() };
   backtestJob = job;
@@ -2023,6 +2067,14 @@ function stopText(arret, left) {
   return `Banc d'essai arrêté : ${arret.message} ${resume}, en commençant par la pièce de l'erreur.`;
 }
 
+/** Where the cycle coefficients of each island of `codes` in the settings come from (store.js layers): [{code, sources: ["tendance", "defaut"...]}]. */
+function cycleSources(codes) {
+  return [...new Set(codes)].filter((code) => settings.processes[code]?.cycle).map((code) => ({
+    code,
+    sources: [...new Set(Object.keys(settings.processes[code].cycle).map((k) => layers.provenance(`processes.${code}.cycle.${k}`).source))],
+  }));
+}
+
 /**
  * The part "Banc d'essai IA" of the card of the history: the run (progress,
  * cancel, resume), the table of each record with its time, the formula and
@@ -2057,7 +2109,9 @@ function backtestHtml(pieces) {
         ...s.sources.map((x) => group(x.source === "devis" ? "Temps de devis" : "Temps mesurés en production", x)),
         group("Toutes les pièces", s.total),
       ].join("")}</tbody></table></div>` : "";
-  const reading = backtestReading(s);
+  // The formula of the trends file was fitted on past quotes: perhaps on these records.
+  const coefficients = cycleSources(items.map((x) => x.record.ilot));
+  const reading = backtestReading(s, { tendance: coefficients.some((x) => x.sources.includes("tendance")) });
   // The AIs that gave the results (the AI of the IA page may have changed between two runs).
   const ais = new Map();
   for (const x of rows) {
@@ -2070,13 +2124,14 @@ function backtestHtml(pieces) {
       ${job ? `<span id="cbacktest-status" class="small muted" role="status">${esc(backtestStatus(job))}</span> <button type="button" class="small" data-action="cancel-backtest">Annuler</button>` : ""}
       <button type="button" class="small" data-action="export-backtest"${any ? "" : " disabled"}>Exporter les résultats (CSV)</button>
       <button type="button" class="small" data-action="clear-backtest"${any && !job ? "" : " disabled"}>Effacer les résultats…</button>
+      ${similarBox()}
     </div>
-    ${stop ? `<p class="cmsg warn">${esc(stop)}</p>` : ""}
+    ${stop ? `<p class="cmsg warn lines">${esc(stop)}</p>` : ""}
     ${table}
     ${summary}
     ${reading && any ? `<p class="cbacktest-reading">${esc(reading)}</p>` : ""}
     ${ais.size ? `<p class="small">Réponses de : ${[...ais].map(([name, n]) => `${esc(name)} (${plural(n, "pièce")})`).join(", ")}.</p>` : ""}
-    <p class="small muted">Pour chaque enregistrement qui a un poids et un module (${plural(items.length, "pièce")} sur ${pieces.length}) : la formule de l'îlot avec les coefficients actuels de Paramètres, et l'estimation de l'IA de la page IA / analyse (${aiChoice()}), demandée comme avec « Estimer le temps de cycle avec l'IA » mais sans l'enregistrement : ni son temps, ni lui ou un autre de même référence parmi les pièces semblables${sendSimilar() ? "" : " (case « Envoyer les pièces similaires de l'historique » décochée : aucune n'est envoyée)"}. Écart = (estimation − temps de référence) / temps de référence ; écart moyen = moyenne des écarts en valeur absolue, sur les pièces que l'IA a estimées. ${local
+    <p class="small muted">Pour chaque enregistrement qui a un poids et un module (${plural(items.length, "pièce")} sur ${pieces.length}) : la formule de l'îlot avec les coefficients actuels de Paramètres${coefficients.length ? ` (source des coefficients du cycle : ${coefficients.map((x) => `${esc(x.code)} ${x.sources.map((k) => SOURCES[k][0]).join(" et ")}`).join(", ")})` : ""}, et l'estimation de l'IA de la page IA / analyse (${aiChoice()}), demandée comme avec « Estimer le temps de cycle avec l'IA » mais sans l'enregistrement : ni son temps, ni lui ou un autre de même référence parmi les pièces semblables${sendSimilar() ? "" : " (case « Envoyer les pièces similaires de l'historique » décochée : aucune n'est envoyée)"}. Écart = (estimation − temps de référence) / temps de référence ; écart moyen = moyenne des écarts en valeur absolue, sur les pièces que l'IA a estimées. ${local
       ? "Ollama local : aucun quota, mais plus lent — de quelques secondes à quelques minutes par pièce selon le PC."
       : `Une demande à la fois, une toutes les ${DEFAULT_INTERVAL_S} s puis au rythme que permet le quota renvoyé par la passerelle (offre gratuite de Groq : 30 requêtes et 8 000 tokens par minute), sans repli sur le modèle local. Un refus pour quota arrête la série : « Reprendre » la continue où elle s'est arrêtée.`} Résultats gardés dans ce navigateur, même après un rechargement ; rien n'est appliqué au chiffrage ni aux paramètres.</p>`;
 }
@@ -2101,7 +2156,7 @@ function historyCard() {
       <tbody>${n.ilots.map((x) => `<tr><td><strong>${esc(x.ilot)}</strong>${settings.processes[x.ilot] ? ` ${esc(settings.processes[x.ilot].famille)}` : ""}</td><td class="num">${x.devis}</td><td class="num">${x.production}</td></tr>`).join("")}</tbody></table></div>` : ""}
     ${comparisonHtml(pieces)}
     ${backtestHtml(pieces)}
-    <p class="small muted">Fichier JSON « reader3d-historique-cycles », version 1 : temps de cycle de devis passés (source « devis ») et temps mesurés en production (source « production »). Un enregistrement de même référence et même source remplace le précédent. L'historique est gardé dans ce navigateur, jamais envoyé ; l'export reprend tout, temps mesurés compris. Données confidentielles : ne pas publier.</p>
+    <p class="small muted">Fichier JSON « reader3d-historique-cycles », version 1 : temps de cycle de devis passés (source « devis ») et temps mesurés en production (source « production »). Un enregistrement de même référence et même source remplace le précédent. L'historique est gardé dans ce navigateur. Il n'est envoyé à l'IA que si la case « Envoyer les pièces similaires de l'historique » est cochée : les ${SIMILAR} enregistrements les plus semblables à la pièce estimée, avec leur temps de cycle, leur poids, leur module, leurs pièces par cycle et leur mise au mille ; pour la passerelle en ligne, la case est décochée par défaut et les références sont anonymisées avec les noms. L'export reprend tout, temps mesurés compris. Données confidentielles : ne pas publier.</p>
   </section>`;
 }
 

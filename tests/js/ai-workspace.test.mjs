@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { addressSpace, answerText, costingText, defaultGateway, formatAnswer, gatewayLabel, numbersLabel } from "../../web/ai-workspace.js";
+import { addressSpace, answerText, costingText, defaultGateway, formatAnswer, gatewayLabel, numbersLabel, onlineMessages } from "../../web/ai-workspace.js";
 import { anonymizer, checkContextNumbers } from "../../web/engine/ai-context.js";
 
 test("Ollama's address declares the address space the browser checks it against", () => {
@@ -147,4 +147,18 @@ test("the text of an answer whose numbers are checked, and the label of those th
   assert.equal(answerText("<think>12 mm</think>Volume 7,3 cm³"), "Volume 7,3 cm³");
   assert.equal(numbersLabel(["3,5"]), "1 nombre ne vient pas des données envoyées");
   assert.equal(numbersLabel(["3,5", "15"]), "2 nombres ne viennent pas des données envoyées");
+});
+
+test("the conversation sent online: never what the local model answered (real names, internal amounts), nor its question", () => {
+  const messages = [
+    { role: "user", content: "Résume la pièce." },
+    { role: "assistant", content: "Une boîte." },
+    { role: "user", content: "Quel taux pour ce centre ?" },
+    { role: "assistant", content: "Taux horaire du centre : 42,5 €/h ; client Fonderie Exemple.", local: true, notice: "Quota en ligne atteint : réponse du modèle local (qwen3:8b)" },
+    { role: "user", content: "Et les faces ?" },
+    { role: "assistant", content: "Six faces." },
+  ];
+  assert.deepEqual(onlineMessages(messages).map((m) => m.content), ["Résume la pièce.", "Une boîte.", "Et les faces ?", "Six faces."]);
+  assert.deepEqual(onlineMessages(messages.slice(0, 4)).map((m) => m.content), ["Résume la pièce.", "Une boîte."]);
+  assert.deepEqual(onlineMessages([]), []);
 });

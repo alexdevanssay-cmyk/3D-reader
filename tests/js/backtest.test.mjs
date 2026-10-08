@@ -321,12 +321,16 @@ describe('the results', () => {
       "Le temps de référence est dans la fourchette de l'IA pour 2 pièces sur 3 (67 %).",
       'Sur les seuls temps mesurés (2) : l\'IA 12,6 %, la formule 8,0 %.',
       "Les temps « devis » sont des estimations des chiffreurs, pas des mesures : l'écart à un temps de devis compare deux estimations ; seuls les temps « production » mesurent l'exactitude.",
+      "Si les coefficients de la formule ont été calés sur ces mêmes devis, son écart y est un écart d'ajustement, pas de prévision. L'IA reçoit aussi la valeur de la formule.",
       "Pas d'estimation utilisable pour 1 pièce (voir le tableau).",
     ].join(' '));
+    // Coefficients of the trends file (fitted on past quotes): said so.
+    assert.match(backtestReading(s, { tendance: true }), /La formule \(coefficients du fichier de tendances\) a pu être calée sur ces mêmes devis : son écart y est alors un écart d'ajustement, pas de prévision\. L'IA reçoit aussi la valeur de la formule\./);
     // Before any estimate, and while some are left.
     assert.equal(backtestReading(summarizeBacktest(backtestRows(items, {}, SETTINGS))), '4 pièces restent à estimer.');
     const one = summarizeBacktest(backtestRows(items, { 'production|T-BRAVO': RESULTS['production|T-BRAVO'] }, SETTINGS));
     assert.equal(backtestReading(one), "Sur 1 pièce chiffrée (1 temps mesuré en production), l'IA s'écarte en moyenne de 20,0 % du temps de référence, la formule de 1,3 %. Le temps de référence est dans la fourchette de l'IA pour 0 pièce sur 1 (0 %). 3 pièces restent à estimer.");
+    assert.equal(backtestReading(one, { tendance: true }), backtestReading(one), 'measured times only: no fitting to tell');
   });
 
   test('exported as CSV for a spreadsheet in French; a reference that looks like a formula is not run', () => {

@@ -3,7 +3,10 @@
 // (TRS, islands, methods...), the inputs of the current quote and the history
 // of cycle times (history.js) and the results of the backtest of the AI on it
 // (backtest.js). Saved at every change, so they are back when the page is
-// opened again. Nothing is sent anywhere.
+// opened again. Nothing is sent from here: the estimate of the cycle time by
+// the AI (ai-cycle.js, ui.js) gives it the records of the history most like
+// the piece only when the box "Envoyer les pièces similaires de l'historique"
+// is ticked (for the online gateway, unticked unless the user ticks it).
 //
 // The settings are layers, resolved value by value at each loading (so a
 // re-imported workbook or a new trends file is taken into account):
@@ -591,6 +594,17 @@ export function appendToQuote(id, field, entry) {
     const saved = readQuote() ?? {};
     saved[field] = [...(Array.isArray(saved[field]) ? saved[field] : []), entry];
     return saveQuote(saved);
+  } finally {
+    quoteTab = shown;
+  }
+}
+
+/** The quote of the tab `id` as it is saved (not the one in a page); null when it has none. */
+export function savedQuote(id) {
+  const shown = quoteTab;
+  quoteTab = id;
+  try {
+    return readQuote();
   } finally {
     quoteTab = shown;
   }

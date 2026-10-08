@@ -221,8 +221,14 @@ const fr = (v, digits = 1) => v.toLocaleString("fr-FR", { minimumFractionDigits:
 const pct = (v, digits = 1) => `${fr(v * 100, digits)} %`;
 const plural = (n, word, words = `${word}s`) => `${n} ${n > 1 ? words : word}`;
 
-/** The summary (summarizeBacktest) in plain French, under the table; "" before any estimate. */
-export function backtestReading(s) {
+/**
+ * The summary (summarizeBacktest) in plain French, under the table; "" before
+ * any estimate. `tendance`: cycle coefficients of the formula from the trends
+ * file, fitted on past quotes: perhaps on these very records of source
+ * "devis", where the error of the formula is then a fitting error, not one of
+ * a prediction (and the AI is given the formula's value).
+ */
+export function backtestReading(s, { tendance = false } = {}) {
   const t = s.total;
   const out = [];
   if (t.n) {
@@ -231,7 +237,10 @@ export function backtestReading(s) {
     out.push(`Le temps de référence est dans la fourchette de l'IA pour ${t.dedans} pièce${t.dedans > 1 ? "s" : ""} sur ${t.n} (${pct(t.dedans / t.n, 0)}).`);
     const measured = s.sources.find((x) => x.source === "production");
     if (measured && t.devis) out.push(`Sur les seuls temps mesurés (${measured.n}) : l'IA ${pct(measured.ia.emap)}${measured.formule ? `, la formule ${pct(measured.formule.emap)}` : ""}.`);
-    if (t.devis) out.push("Les temps « devis » sont des estimations des chiffreurs, pas des mesures : l'écart à un temps de devis compare deux estimations ; seuls les temps « production » mesurent l'exactitude.");
+    if (t.devis) {
+      out.push("Les temps « devis » sont des estimations des chiffreurs, pas des mesures : l'écart à un temps de devis compare deux estimations ; seuls les temps « production » mesurent l'exactitude.");
+      out.push(`${tendance ? "La formule (coefficients du fichier de tendances) a pu être calée sur ces mêmes devis : son écart y est alors" : "Si les coefficients de la formule ont été calés sur ces mêmes devis, son écart y est"} un écart d'ajustement, pas de prévision. L'IA reçoit aussi la valeur de la formule.`);
+    }
   }
   if (s.erreurs) out.push(`Pas d'estimation utilisable pour ${plural(s.erreurs, "pièce")} (voir le tableau).`);
   if (s.restantes) out.push(`${plural(s.restantes, "pièce reste", "pièces restent")} à estimer.`);

@@ -32,10 +32,12 @@
 //
 // One conversation per tab of the 3D page (see conversationKey). The gateway
 // gets neutral labels in place of the names of the part, of its bodies and of
-// the quote ("Pièce", "Corps 1"...: engine/ai-context.js anonymizer), unless
-// the box is unticked; Ollama always gets the real names (nothing leaves the
-// site). When the free quota of the gateway is reached, the local model
-// answers if it can (box "Repli automatique sur le modèle local").
+// the quote ("Pièce", "Corps 1"...: engine/ai-context.js anonymizer), in every
+// task, unless the box is unticked; Ollama always gets the real names
+// (nothing leaves the site). When the free quota of the gateway is reached,
+// the local model answers if it can (box "Repli automatique sur le modèle
+// local"). What the local model answered never goes online with the
+// conversation (onlineMessages): it was given the real names and amounts.
 
 import { anonymizer, buildAIContext, checkContextNumbers, compactAIContext, summaryAIContext } from "./engine/ai-context.js";
 
@@ -67,6 +69,7 @@ const TASKS = [
 const KEYS = {
   gateway: "reader3d.ai.gateway", code: "reader3d.ai.gatewayCode", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider",
   messages: "reader3d.ai.messages", think: "reader3d.ai.think", amounts: "reader3d.ai.costingAmounts", anonymize: "reader3d.ai.anonymize", fallback: "reader3d.ai.fallback",
+  codeRequired: "reader3d.ai.gatewayCodeRequired", // the gateway asked for an access code: its field shown at once
 };
 const COSTING_LABEL = "Raisonnement IA — aucune valeur n'est appliquée";
 // HTTP statuses of the gateway when the free quota of its provider is reached (api/ai.js): the local model may answer instead.
@@ -99,8 +102,10 @@ const store = {
 // kept after a reload as its quote (chiffrage/store.js); the others' as long
 // as the page (app.js forgets them when their tab is closed and when the
 // page loads again). A conversation belongs to the part it is about ({file,
-// messages}): another file opened in its tab starts a new one, so that a
-// part's conversation is never sent with another part's context.
+// messages, names}): another file opened in its tab starts a new one, so that
+// a part's conversation is never sent with another part's context. `names`:
+// the names of the quote ({name, label}) known when its questions went to the
+// gateway, replaced in its history even once changed in the quote.
 const conversationKey = (id) => (id == null || id === 1 ? KEYS.messages : `${KEYS.messages}.${id}`);
 const unsaved = new Map(); // conversations that could not be saved (storage blocked or full): kept for this visit
 
@@ -113,7 +118,24 @@ function readConversation(key) {
     data = null;
   }
   if (Array.isArray(data)) data = { messages: data }; // earlier versions: the messages alone
-  return { file: typeof data?.file === "string" ? data.file : null, messages: Array.isArray(data?.messages) ? data.messages : [] };
+  return {
+    file: typeof data?.file === "string" ? data.file : null,
+    messages: Array.isArray(data?.messages) ? data.messages : [],
+    names: Array.isArray(data?.names) ? data.names.filter((n) => typeof n?.name === "string" && typeof n?.label === "string") : [],
+  };
+}
+
+/** The names of `a`, then those of `b` that `a` does not have ([{name, label}]). */
+const unionNames = (a, b) => [...a, ...b.filter((x) => !a.some((y) => y.name === x.name))];
+
+/**
+ * The messages of a conversation that may go to the gateway: not the
+ * exchanges the local model answered (`local`), nor their question. It was
+ * given the real names and, for the costing, the internal amounts: its answer
+ * may quote them.
+ */
+export function onlineMessages(messages) {
+  return messages.filter((m, i) => !(m.local || (m.role !== "assistant" && messages[i + 1]?.local)));
 }
 
 function writeConversation(key, conversation) {
@@ -302,6 +324,8 @@ async function fetchGateway(url, code, init = {}) {
     const error = new Error((typeof data.error === "string" ? data.error : data.error?.message) || `La passerelle répond par une erreur HTTP ${response.status}.`);
     error.codeRequired = !!data.access_code_required;
     error.status = response.status;
+    // An answer cut at the length allowed (AI_MAX_TOKENS): one that cannot be used.
+    if (data.truncated) error.truncated = true;
     // When to ask again after a refusal for quota (s), as the gateway tells it.
     if (Number.isFinite(data.retry_after)) error.retryAfter = data.retry_after;
     throw error;
@@ -421,7 +445,8 @@ async function askOllamaJSON({ system, question, context }, { base, model }, sig
  * answers must all come from the same AI), as for the questions of the IA
  * page. Resolves to {output, provider, model, quota, usage (tokens of the
  * gateway's answer), sent (what was built for the AI that answered), local,
- * notice}.
+ * notice}. An access code refused: where to type it (the page that asks has no
+ * field for it), and its field shown at once on the IA page.
  */
 export async function askJSON(task, build, { signal, fallback } = {}) {
   const ai = savedAI();
@@ -443,11 +468,19 @@ export async function askJSON(task, build, { signal, fallback } = {}) {
   if (ai.provider === "ollama") return askLocal(ai.ollama);
   const { url, code, model } = ai.gateway;
   if (!url) throw new Error(`Aucune passerelle IA renseignée : dans la page IA / analyse, collez l'adresse Vercel de la passerelle (${GATEWAY_EXAMPLE}) ou choisissez « Ollama local ».`);
+  const codeAsked = (err) => {
+    if (!err?.codeRequired) return err;
+    store.set(localStorage, KEYS.codeRequired, "1");
+    const where = "dans la page IA / analyse (champ « Code d'accès »), puis relancez.";
+    return Object.assign(new Error(code ? `Code d'accès de la passerelle incorrect : corrigez-le ${where}` : `Code d'accès de la passerelle requis : saisissez-le ${where}`), { status: err.status, codeRequired: true });
+  };
   // The budget of the gateway; an older gateway, without its configuration: the default one.
   const info = await fetchGateway(url, code, { signal }).catch((err) => {
     if (err?.name === "AbortError") throw err;
+    if (err?.codeRequired) store.set(localStorage, KEYS.codeRequired, "1");
     return null; // the question tells what is wrong
   });
+  if (info) store.set(localStorage, KEYS.codeRequired, info.access_code_required ? "1" : null);
   const sent = build({ budget: info?.context_chars > 0 ? info.context_chars : GATEWAY_CONTEXT_CHARS, local: false, anonymize: ai.anonymize });
   try {
     const data = await fetchGateway(url, code, {
@@ -461,7 +494,7 @@ export async function askJSON(task, build, { signal, fallback } = {}) {
     return { output, provider: data.provider ?? null, model: data.model ?? null, quota: data.quota ?? null, usage: data.usage ?? null, sent, local: false };
   } catch (err) {
     // The free quota reached: the local model, when it answers (its own address and model).
-    if (err?.name === "AbortError" || !QUOTA_STATUSES.includes(err?.status) || !(fallback ?? ai.fallback)) throw err;
+    if (err?.name === "AbortError" || !QUOTA_STATUSES.includes(err?.status) || !(fallback ?? ai.fallback)) throw codeAsked(err);
     return { ...(await askLocal(ai.ollama, err)), notice: `Quota en ligne atteint : réponse du modèle local (${ai.ollama.model})` };
   }
 }
@@ -483,13 +516,14 @@ export function mount({ page, reader }) {
             <input id="ai-url" type="url" spellcheck="false">
           </label>
           <label class="field">Modèle
-            <input id="ai-model" spellcheck="false">
+            <input id="ai-model" spellcheck="false" list="ai-models">
+            <datalist id="ai-models"></datalist>
           </label>
           <label class="field" id="ai-code-field" hidden title="Code demandé par la passerelle (variable READER3D_ACCESS_CODE dans Vercel), gardé dans ce navigateur.">Code d'accès
             <input id="ai-code" type="password" autocomplete="off" spellcheck="false">
           </label>
           <label class="check" id="ai-think-field" title="Le modèle raisonne avant de répondre : réponses plus sûres, mais bien plus lentes sur un PC sans carte graphique. Le raisonnement s'affiche sous la réponse."><input type="checkbox" id="ai-think"> Réflexion du modèle (plus lent)</label>
-          <label class="check" id="ai-anon-field" title="Avant l'envoi à la passerelle, le nom du fichier, les noms des corps, la référence et la désignation de la pièce, les noms du client et des fichiers du chiffrage sont remplacés par « Pièce », « Corps 1 »… Le modèle local (Ollama) reçoit toujours les vrais noms : rien ne quitte le site."><input type="checkbox" id="ai-anon"> Anonymiser les noms envoyés en ligne</label>
+          <label class="check" id="ai-anon-field" title="Avant l'envoi à la passerelle, dans toutes les tâches, le nom du fichier, les noms des corps, la référence et la désignation de la pièce, les noms du client et des fichiers du chiffrage sont remplacés par « Pièce », « Corps 1 »…, dans la question et la conversation aussi. Le modèle local (Ollama) reçoit toujours les vrais noms : rien ne quitte le site, et ses réponses ne sont jamais envoyées en ligne."><input type="checkbox" id="ai-anon"> Anonymiser les noms envoyés en ligne</label>
           <label class="check" id="ai-fallback-field" title="Quand le quota gratuit de la passerelle est atteint, la question est posée au modèle local (Ollama, avec l'adresse et le modèle choisis pour lui), s'il répond."><input type="checkbox" id="ai-fallback"> Repli automatique sur le modèle local</label>
           <label class="check" id="ai-amounts-field" hidden title="Sans cette case, la passerelle reçoit la trace du chiffrage sans les montants internes (taux, coûts, prix, marges, pertes au feu, TRS) : leurs sources et leurs écarts relatifs seulement. Le modèle local (Ollama) reçoit toujours la trace complète, rien ne quitte le site."><input type="checkbox" id="ai-amounts"> Envoyer les montants internes du chiffrage à la passerelle</label>
           <button id="ai-test" class="btn" type="button">Tester la connexion</button>
@@ -520,13 +554,38 @@ export function mount({ page, reader }) {
 
   const provider = () => $("ai-provider").value;
   const isLocal = () => provider() === "ollama";
-  let codeRequired = false; // the gateway asks for an access code
+  // The gateway asks for an access code: as it said last, here or to the Chiffrage page (askJSON).
+  let codeRequired = store.get(localStorage, KEYS.codeRequired) === "1";
   let gatewayInfo = null; // {key, data}: the configuration the gateway gave, for its address and code
+  const gatewayKey = () => `${$("ai-url").value.trim()}\n${$("ai-code").value.trim()}`;
 
   /** The access code field: shown when the gateway asks for one, or when one is kept. */
   function showCode(required = codeRequired) {
     codeRequired = !!required;
+    store.set(localStorage, KEYS.codeRequired, codeRequired ? "1" : null);
     $("ai-code-field").hidden = isLocal() || !(codeRequired || $("ai-code").value);
+  }
+
+  /**
+   * The field « Modèle » of the gateway, once it gave its configuration: the
+   * models it lists (AI_MODELS) to choose from; none, the model is fixed by
+   * the gateway (AI_MODEL) and the field disabled, a model typed there being
+   * ignored.
+   */
+  function showModels() {
+    const data = !isLocal() && gatewayInfo?.key === gatewayKey() ? gatewayInfo.data : null;
+    const models = Array.isArray(data?.models) ? data.models.filter((m) => typeof m === "string") : [];
+    const fixed = !!data && !models.length;
+    $("ai-model").disabled = fixed;
+    if (fixed) {
+      $("ai-model").value = "";
+      store.set(localStorage, `${KEYS.model}.openai`, null);
+    }
+    $("ai-models").replaceChildren(...models.map((m) => Object.assign(document.createElement("option"), { value: m })));
+    $("ai-model").placeholder = isLocal() ? OLLAMA_MODEL : !data?.model ? "modèle par défaut de la passerelle" : `${data.model} (${fixed ? "fixé par la passerelle" : "par défaut"})`;
+    $("ai-model").title = !data ? "" : fixed
+      ? "Modèle fixé par la passerelle (variable AI_MODEL dans Vercel). Pour en proposer d'autres ici, ajoutez la variable AI_MODELS."
+      : `Modèles proposés par la passerelle (variable AI_MODELS) : ${models.join(", ")}. Un autre modèle est ignoré.`;
   }
 
   function showProvider() {
@@ -539,7 +598,7 @@ export function mount({ page, reader }) {
     $("ai-url").placeholder = local ? OLLAMA_URL : `Collez l'adresse Vercel : ${GATEWAY_EXAMPLE}`;
     const savedModel = store.get(localStorage, `${KEYS.model}.${provider()}`);
     $("ai-model").value = savedModel || (local ? OLLAMA_MODEL : "");
-    $("ai-model").placeholder = local ? OLLAMA_MODEL : "modèle par défaut de la passerelle";
+    showModels();
     $("ai-think-field").hidden = !local;
     $("ai-anon-field").hidden = local;
     $("ai-fallback-field").hidden = local;
@@ -786,19 +845,19 @@ export function mount({ page, reader }) {
     }
   }
 
-  /** The configuration of the gateway (GET): provider, model, context budget, access code; asked again when its address or the code changes. */
+  /** The configuration of the gateway (GET): provider, model, models, context budget, access code; asked again when its address or the code changes. */
   async function gatewayConfig(signal) {
-    const key = `${$("ai-url").value.trim()}\n${$("ai-code").value.trim()}`;
+    const key = gatewayKey();
     if (gatewayInfo?.key === key) return gatewayInfo.data;
     const data = await gatewayFetch({ signal });
     gatewayInfo = { key, data };
     showCode(data.access_code_required);
-    if (data.model) $("ai-model").placeholder = `${data.model} (par défaut)`;
+    showModels();
     return data;
   }
 
-  /** Ask the gateway the question with its context (compacted) and the conversation, within `budget`. Resolves to its answer: {output, provider, model, quota}. */
-  async function askGateway(question, context, history, askedTask, signal, budget) {
+  /** Ask the gateway the question with its context (compacted) and the conversation, within `budget`, of the model `model` (none: its own). Resolves to its answer: {output, provider, model, quota}. */
+  async function askGateway(question, context, history, askedTask, model, signal, budget) {
     // The latest exchanges, while they take no more than half the room of the context.
     while (history.length && JSON.stringify(history).length > budget / 2) history = history.slice(2);
     const data = await gatewayFetch({
@@ -807,7 +866,7 @@ export function mount({ page, reader }) {
       body: JSON.stringify({
         gateway_schema_version: "1.0",
         task: askedTask,
-        model: $("ai-model").value.trim() || undefined,
+        model: model || undefined,
         context,
         messages: [...history, { role: "user", content: question }],
       }),
@@ -824,7 +883,8 @@ export function mount({ page, reader }) {
     const costing = askedTask === "costing";
     store.set(localStorage, KEYS.provider, provider());
     store.set(localStorage, local ? KEYS.ollama : KEYS.gateway, $("ai-url").value.trim() || null);
-    store.set(localStorage, `${KEYS.model}.${provider()}`, $("ai-model").value.trim() || null);
+    const wanted = $("ai-model").value.trim();
+    store.set(localStorage, `${KEYS.model}.${provider()}`, wanted || null);
 
     // What the question is about, read now: the conversation, the part and the quote of the tab shown when it is asked.
     showConversation();
@@ -833,7 +893,10 @@ export function mount({ page, reader }) {
     const semantic = reader.semantic ?? null;
     const snapshot = costing ? (async () => reader.costing?.())() : null;
     snapshot?.catch(() => {}); // read below
-    const history = readConversation(conv.key).messages.slice(-HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
+    const conversation = readConversation(conv.key);
+    const recent = (messages) => messages.slice(-HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
+    // The local model is given the whole conversation; the gateway, none of what the local model answered.
+    const history = recent(conversation.messages);
 
     const userBox = bubble("user", question);
     // Until the first words arrive: "Réflexion en cours…", in grey italics.
@@ -906,6 +969,8 @@ export function mount({ page, reader }) {
       let sent; // the context the model was given
       let asked; // and the questions
       let names = null; // the labels put in place of the names (gateway)
+      let quoteNames = null; // the names of the quote of the tab when the question went to the gateway
+      let notice = null; // above the answer: the local model answered in place of the gateway, or a model typed in it does not offer
       let answer = null; // of the gateway
       let localModel = null; // of Ollama
       let output;
@@ -927,18 +992,26 @@ export function mount({ page, reader }) {
           return null; // the question tells what is wrong
         });
         const budget = info?.context_chars > 0 ? info.context_chars : GATEWAY_CONTEXT_CHARS;
+        // A model the gateway does not list (AI_MODELS) is not asked for: it answers with its own, and says so.
+        const models = Array.isArray(info?.models) ? info.models : [];
+        const model = info && wanted && !models.includes(wanted) ? null : wanted;
+        if (info && wanted && !model) notice = `Modèle « ${wanted} » non proposé par la passerelle (variable AI_MODELS dans Vercel) : réponse de son modèle par défaut`;
         let whole = await contextOf(semantic, read, askedTask, false, budget);
-        let online = { question, history };
+        // The names of the quote of the tab, whatever the task: a question may name the customer.
+        const { costingNames } = await import("./chiffrage/ui.js");
+        quoteNames = costingNames({ tab: tabId });
+        let online = { question, history: recent(onlineMessages(conversation.messages)) };
         if ($("ai-anon").checked) {
-          // Before the compaction: the labels count in the budget.
-          names = anonymizer(whole, read?.snapshot?.noms ?? []);
+          // Before the compaction: the labels count in the budget. With the names this conversation
+          // replaced before: one changed since in the quote may be in its history.
+          names = anonymizer(whole, unionNames(quoteNames, conversation.names));
           whole = names.context(whole);
-          online = { question: names.text(question), history: history.map((m) => ({ ...m, content: names.text(m.content) })) };
+          online = { question: names.text(online.question), history: online.history.map((m) => ({ ...m, content: names.text(m.content) })) };
         }
         sent = compacted(whole, askedTask, budget);
         asked = questions(online.question, online.history);
         try {
-          answer = await askGateway(online.question, sent, online.history, askedTask, signal, budget);
+          answer = await askGateway(online.question, sent, online.history, askedTask, model, signal, budget);
           output = answer.output;
         } catch (err) {
           // The free quota reached: the local model, when it answers (its own address and model).
@@ -946,10 +1019,12 @@ export function mount({ page, reader }) {
           const ollama = { base: ollamaBase(store.get(localStorage, KEYS.ollama) || OLLAMA_URL), model: store.get(localStorage, `${KEYS.model}.ollama`) || OLLAMA_MODEL };
           if (await diagnoseOllama(ollama.base, ollama.model)) throw err;
           fallback = { ...ollama, notice: `Quota en ligne atteint : réponse du modèle local (${ollama.model})` };
+          notice = fallback.notice;
           line(answerBox, "ai-notice", fallback.notice, true);
           names = null; // the real names: nothing leaves the site
           output = await askLocal(ollama);
         }
+        if (notice && !fallback) line(answerBox, "ai-notice", notice, true);
       }
       foldThought();
       answerBox.classList.remove("ai-thinking");
@@ -963,9 +1038,10 @@ export function mount({ page, reader }) {
       // Every task with a part: the numbers that come from none of the data sent (informative).
       const numbers = sent.no_model_loaded ? [] : checkContextNumbers(answerText(output), sent, asked).inconnus;
       const legend = names ? names.legend(formatAnswer(output)) : [];
+      // An answer of the local model is marked: it never goes online with the conversation (onlineMessages).
       const message = {
-        role: "assistant", content: withoutThinking(output),
-        ...(check ? { costing: check } : {}), ...(numbers.length ? { numbers } : {}), ...(fallback ? { notice: fallback.notice } : {}), ...(legend.length ? { names: legend } : {}),
+        role: "assistant", content: withoutThinking(output), ...(localModel ? { local: true } : {}),
+        ...(check ? { costing: check } : {}), ...(numbers.length ? { numbers } : {}), ...(notice ? { notice } : {}), ...(legend.length ? { names: legend } : {}),
       };
       signal.throwIfAborted();
       decorate(answerBox, message);
@@ -973,7 +1049,8 @@ export function mount({ page, reader }) {
       // conversation started since about another part of the tab.
       const kept = readConversation(conv.key);
       if (!(kept.file && conv.file && kept.file !== conv.file)) {
-        writeConversation(conv.key, { file: kept.file ?? conv.file, messages: [...kept.messages, { role: "user", content: question }, message] });
+        const known = quoteNames ? unionNames(kept.names, quoteNames) : kept.names;
+        writeConversation(conv.key, { file: kept.file ?? conv.file, messages: [...kept.messages, { role: "user", content: question }, message], names: known });
       }
       const source = answer ? { provider: answer.provider, model: answer.model } : { provider: "Ollama", model: localModel };
       // Costing: the answer kept with the quote of the tab, for the record (nothing in it is applied).
@@ -1010,7 +1087,10 @@ export function mount({ page, reader }) {
   $("ai-fallback").addEventListener("change", () => store.set(localStorage, KEYS.fallback, $("ai-fallback").checked ? null : "0"));
   $("ai-code").addEventListener("input", () => store.set(localStorage, KEYS.code, $("ai-code").value.trim() || null));
   // The address and the model of each provider, kept as soon as typed: those of Ollama are also the ones of the fallback.
-  $("ai-url").addEventListener("change", () => store.set(localStorage, isLocal() ? KEYS.ollama : KEYS.gateway, $("ai-url").value.trim() || null));
+  $("ai-url").addEventListener("change", () => {
+    store.set(localStorage, isLocal() ? KEYS.ollama : KEYS.gateway, $("ai-url").value.trim() || null);
+    showModels(); // another gateway: its models are not known yet
+  });
   $("ai-model").addEventListener("change", () => store.set(localStorage, `${KEYS.model}.${provider()}`, $("ai-model").value.trim() || null));
   $("ai-amounts").addEventListener("change", () => store.set(sessionStorage, KEYS.amounts, $("ai-amounts").checked ? "1" : null));
 

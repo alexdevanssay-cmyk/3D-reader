@@ -393,7 +393,9 @@ export function adoptedEstimate(inputs, code) {
  * it: a cycle is the cycle of its island. `piece`: the inputs saved for the
  * piece (q.pieces[key]), changed in place; `inputs`: the same with their
  * defaults. The estimate used is kept apart (cycleIA), with what was there
- * before, for undoAdoption: a later estimate does not change it. Returns the
+ * before, for undoAdoption: a later estimate does not change it. A later one
+ * adopted in its place keeps what was there before the first: undone, the
+ * cycle of a person or the formula, never an earlier AI value. Returns the
  * cycle used, or null (no estimate, or one made for another island).
  */
 export function adoptEstimate(piece, inputs, route, date = new Date().toISOString()) {
@@ -401,7 +403,9 @@ export function adoptEstimate(piece, inputs, route, date = new Date().toISOStrin
   if (!e || !(e.estimation_s > 0) || route?.process !== e.ilot) return null;
   const valeur = Math.round(e.estimation_s);
   const estimation = Object.fromEntries(["date", "fournisseur", "modele", "ilot", "estimation_s", "fourchette_s", "confiance"].map((k) => [k, e[k] ?? null]));
-  piece.cycleIA = { date, valeur, avant: { procede: inputs.procede, finition: inputs.finition, cycle: inputs.cycle ?? null }, estimation };
+  const current = adoptedEstimate(inputs, e.ilot);
+  const avant = current?.avant ?? { procede: inputs.procede, finition: inputs.finition, cycle: inputs.cycle ?? null };
+  piece.cycleIA = { date, valeur, avant, estimation };
   if (inputs.procede !== e.ilot) {
     piece.procede = e.ilot;
     piece.finition = route.finition;

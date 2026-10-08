@@ -14,7 +14,7 @@ import { filledFields, heatTreatmentOf, orderValues, programmeFor, programmeOf, 
 import { DEFAULT_TOOLING, coefOf, estimateTooling, steelToolCost } from '../../web/chiffrage/tooling.js';
 import { DEFAULT_CORES, boxSize, coreBoxCost, coresPerPiece } from '../../web/chiffrage/cores.js';
 import {
-  DEFAULT_DENSITIES, GENERIC_DENSITY, adoptTendance, clearSaisies, clearSetting, clearTendances, defaultQuote, defaultSettings, exportSaisies, importTendances,
+  DEFAULT_DENSITIES, GENERIC_DENSITY, adoptTendance, clearSaisies, clearSetting, clearTendances, currentQuoteTab, defaultQuote, defaultSettings, exportSaisies, importTendances,
   loadQuote, loadSettings, loadSettingsLayers, mergeSettings, migrateSettings, saveBase, saveIndices, saveQuote, setQuoteTab, setSetting, validateTendances,
 } from '../../web/chiffrage/store.js';
 import { DEMANDE, QUOTE_KEYS, SOURCES, demandeComparee, derive, missing, pieceKeys, resolve, summarize, traced, weakest } from '../../web/chiffrage/provenance.js';
@@ -1349,6 +1349,20 @@ describe('the costing read by the AI page (read only)', () => {
     assert.match(text, /boîte à noyau « Noyau 1 »/);
     // The values themselves are those of the trace.
     assert.deepEqual(sent.costing_trace.pieces[0].valeurs['piece.prix.vente'], trace.pieces[0].valeurs['piece.prix.vente']);
+  });
+
+  test('costingNames: the names of the quote of a tab, for every task of the AI page, also without a costing workbook', () => {
+    const piece = { ...PART, noyaux: true, cores: [{ nom: 'Noyau central', masse: 0.2, qte: 1 }] };
+    computed({ quote: { client: 'ACME ESSAI', reference: 'REF-NOMS', pieces: { manuel: piece } } });
+    assert.deepEqual(ui.costingNames({ tab: 1 }), ui.costingSnapshot().noms);
+    assert.deepEqual(ui.costingNames().map((n) => [n.name, n.label]), [['ACME ESSAI', 'Client'], ['REF-NOMS', 'Référence'], ['Noyau central', 'Noyau 1']]);
+    // No costing workbook: no snapshot, the names of the quote still.
+    storage.delete('reader3d.chiffrage.base.v1');
+    assert.equal(ui.costingSnapshot(), null);
+    assert.deepEqual(ui.costingNames({ tab: 1 }).map((n) => n.name), ['ACME ESSAI', 'REF-NOMS', 'Noyau central']);
+    // Another tab without a quote: none; the quote read and saved stays the one of the tab shown.
+    assert.deepEqual(ui.costingNames({ tab: 2 }), []);
+    assert.equal(currentQuoteTab(), 1);
   });
 
   test('an answer of the AI page kept with the quote of its tab, for the record: nothing else of the quote changes', () => {

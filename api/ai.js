@@ -2,8 +2,9 @@
 // analyse" page (web/ai-workspace.js) sent to a language model of an
 // OpenAI-compatible provider (POST /chat/completions), Groq by default; the
 // key stays on the server. Configured by environment variables only (see
-// api/README.md): the key GROQ_API_KEY (any case), else AI_API_KEY with
-// AI_BASE_URL, else OPENAI_API_KEY.
+// api/README.md): AI_API_KEY with AI_BASE_URL, else the key GROQ_API_KEY (any
+// case), else OPENAI_API_KEY; and the access code READER3D_ACCESS_CODE,
+// without which it answers nothing (unless READER3D_PUBLIC=1).
 //
 //   GET  /api/ai  the public configuration: provider, model, context budget,
 //                 whether an access code is needed (never a secret)
@@ -149,24 +150,25 @@ const positive = (value, fallback) => (Number(value) > 0 ? Math.round(Number(val
 
 /** The provider of this deployment, from its environment; `error` (French) when it is not usable. */
 function providerConfig() {
-  const groqKey = env("GROQ_API_KEY");
-  const aiKey = env("AI_API_KEY");
-  const openaiKey = env("OPENAI_API_KEY");
+  const keys = { GROQ_API_KEY: env("GROQ_API_KEY"), AI_API_KEY: env("AI_API_KEY"), OPENAI_API_KEY: env("OPENAI_API_KEY") };
   const baseUrl = env("AI_BASE_URL");
-  const base = (baseUrl || (groqKey ? GROQ_BASE : aiKey ? "" : OPENAI_BASE)).replace(/\/+$/, "");
+  // AI_API_KEY with its address is another provider: the key of Groq is never sent there.
+  const keyName = keys.AI_API_KEY && baseUrl ? "AI_API_KEY" : keys.GROQ_API_KEY ? "GROQ_API_KEY" : keys.AI_API_KEY ? "AI_API_KEY" : "OPENAI_API_KEY";
+  const groqKey = keyName === "GROQ_API_KEY";
+  const base = (baseUrl || (groqKey ? GROQ_BASE : keyName === "AI_API_KEY" ? "" : OPENAI_BASE)).replace(/\/+$/, "");
   let host = "";
   try {
     if (/^https?:\/\//i.test(base)) host = new URL(base).host;
   } catch {
     // reported below
   }
-  const groq = !!groqKey || host === "api.groq.com";
+  const groq = groqKey || host === "api.groq.com";
   // The key of Groq through another address (a proxy) is still Groq's.
   const name = PROVIDER_NAMES[host] ?? (groqKey ? "Groq" : host || "le fournisseur");
-  const model = env("AI_MODEL") || (groq ? GROQ_MODEL : !aiKey && openaiKey ? env("OPENAI_MODEL") : "");
+  const model = env("AI_MODEL") || (groq ? GROQ_MODEL : keyName === "OPENAI_API_KEY" ? env("OPENAI_MODEL") : "");
   const config = {
-    key: groqKey || aiKey || openaiKey,
-    keyName: groqKey ? "GROQ_API_KEY" : aiKey ? "AI_API_KEY" : "OPENAI_API_KEY",
+    key: keys[keyName],
+    keyName,
     groq,
     base,
     name,
@@ -178,10 +180,15 @@ function providerConfig() {
   };
   if (!config.key) {
     config.error = "Aucune clé d'API sur la passerelle : créez la variable d'environnement GROQ_API_KEY dans Vercel (Settings → Environment Variables, pour Production et Preview), puis redéployez.";
-  } else if (!baseUrl && !groqKey && aiKey) {
+  } else if (!/^[\x21-\x7e]+$/.test(config.key)) {
+    // A line break pasted inside the key: fetch would refuse the header and write it, key included, in its error.
+    config.error = `Clé d'API invalide (caractère non imprimable, retour à la ligne…) dans la variable ${keyName} : recréez-la dans Vercel en collant la clé seule, puis redéployez.`;
+  } else if (keyName === "AI_API_KEY" && !baseUrl) {
     config.error = "AI_API_KEY est définie sans AI_BASE_URL : ajoutez l'adresse du fournisseur dans Vercel (par exemple https://api.x.ai/v1), puis redéployez.";
   } else if (!host) {
     config.error = `Adresse du fournisseur invalide (AI_BASE_URL = « ${baseUrl} ») : corrigez-la dans Vercel (par exemple https://api.x.ai/v1), puis redéployez.`;
+  } else if (groqKey && PROVIDER_NAMES[host] && host !== "api.groq.com") {
+    config.error = `La clé de Groq (GROQ_API_KEY) n'est pas envoyée à ${name} (AI_BASE_URL) : créez AI_API_KEY avec la clé de ${name} dans Vercel, puis redéployez.`;
   } else if (!model) {
     config.error = `Aucun modèle choisi pour ${name} : ajoutez la variable AI_MODEL dans Vercel, puis redéployez.`;
   }
@@ -282,15 +289,20 @@ function duration(value) {
   return parts.reduce((s, [, n, unit]) => s + Number(n) * { h: 3600, m: 60, s: 1, ms: 0.001 }[unit], 0);
 }
 
-/** What is left of the free quota, from the x-ratelimit-* headers of an answer; null without them. */
-function quotaOf(headers) {
+/**
+ * What is left of the free quota, from the x-ratelimit-* headers of an answer;
+ * null without them. Groq counts the requests per day; OpenAI per minute, and
+ * another provider as it says: "_day" for Groq only.
+ */
+function quotaOf(headers, config) {
   const number = (name) => {
     const v = headers.get(name);
     return v !== null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : null;
   };
+  const per = config.groq ? "_day" : "";
   const quota = {
-    requests_remaining_day: number("x-ratelimit-remaining-requests"),
-    requests_limit_day: number("x-ratelimit-limit-requests"),
+    [`requests_remaining${per}`]: number("x-ratelimit-remaining-requests"),
+    [`requests_limit${per}`]: number("x-ratelimit-limit-requests"),
     tokens_remaining_minute: number("x-ratelimit-remaining-tokens"),
     tokens_limit_minute: number("x-ratelimit-limit-tokens"),
     reset_requests: headers.get("x-ratelimit-reset-requests"),
@@ -305,11 +317,25 @@ function usageOf(data) {
   return Object.values(usage).some((v) => v !== null) ? usage : null;
 }
 
-/** A short French message for a refusal of the provider; its own text is logged, never sent back. */
-function providerError(status, data, headers, config) {
+/**
+ * The error of a refusal of the provider, whatever its form: OpenAI's {error:
+ * {message, param, code}}, Gemini's [{error}], Mistral's {message: {detail:
+ * [...]}} (a pydantic 422, the parameter refused in its "loc"), FastAPI's
+ * {detail}: {param, code, message (text)}.
+ */
+function errorOf(data) {
+  const raw = Array.isArray(data) ? data[0]?.error ?? data[0] : data?.error ?? data;
+  if (typeof raw === "string") return { param: "", code: "", message: raw };
+  const m = raw?.message ?? raw?.detail;
+  // A pydantic error repeats the value refused ("input"): left out, it may be a part of the context.
+  return { param: String(raw?.param ?? ""), code: String(raw?.code ?? ""), message: typeof m === "string" ? m : m == null ? "" : JSON.stringify(m, (k, v) => (k === "input" ? undefined : v)) };
+}
+
+/** A short French message for a refusal of the provider (to the task `task`); its own text is logged, never sent back. */
+function providerError(status, data, headers, config, task) {
   const name = config.name;
   const free = config.groq ? " (offre gratuite)" : "";
-  const detail = String(data?.error?.message ?? "").slice(0, 300);
+  const detail = errorOf(data).message.slice(0, 300);
   console.error(`AI provider ${name}: HTTP ${status}${detail ? ` ${detail}` : ""}`);
   const retry = duration(headers.get("retry-after")) ?? duration(headers.get("x-ratelimit-reset-tokens")) ?? duration(headers.get("x-ratelimit-reset-requests"));
   const later = retry !== null ? ` Réessayez dans ${wait(retry)}.` : " Réessayez plus tard.";
@@ -318,10 +344,15 @@ function providerError(status, data, headers, config) {
     return new HttpError(502, `Clé d'API refusée par ${name} (HTTP ${status}) : vérifiez la variable ${config.keyName} dans Vercel (Settings → Environment Variables), puis redéployez.`);
   }
   if (status === 413) {
-    return new HttpError(413, `La question et son contexte dépassent la limite de tokens par minute de ${name}${free} : commencez une nouvelle conversation ou choisissez une analyse plus ciblée.${retry !== null ? later : ""}`, extra);
+    // The estimate of the cycle time has no question nor conversation to shorten.
+    const limit = `la limite de tokens par minute de ${name}${free}`;
+    const what = task === "cycle_time"
+      ? `Les données de la pièce et la réponse attendue dépassent ${limit} : réduisez AI_CONTEXT_CHARS ou AI_MAX_TOKENS dans Vercel, puis redéployez.`
+      : `La question et son contexte dépassent ${limit} : commencez une nouvelle conversation ou choisissez une analyse plus ciblée.`;
+    return new HttpError(413, `${what}${retry !== null ? later : ""}`, extra);
   }
   if (status === 429) {
-    const day = headers.get("x-ratelimit-remaining-requests") === "0";
+    const day = config.groq && headers.get("x-ratelimit-remaining-requests") === "0"; // the requests of the day (Groq)
     return new HttpError(429, `Quota de ${name}${free} atteint${day ? " pour aujourd'hui" : ""}.${later}`, extra);
   }
   if (status === 404) return new HttpError(502, `Modèle « ${config.model} » introuvable chez ${name} : corrigez AI_MODEL dans Vercel.`);
@@ -329,8 +360,8 @@ function providerError(status, data, headers, config) {
   return new HttpError(502, `${name} a refusé la requête (HTTP ${status}) : vérifiez AI_MODEL et AI_BASE_URL dans Vercel ; le détail est dans les journaux de la fonction.`);
 }
 
-// Changes of a request a provider refused (HTTP 400), each tried once: structured
-// outputs it does not support, a parameter it does not know.
+// Changes of a request a provider refused (HTTP 400, or 422 for Mistral), each
+// tried once: structured outputs it does not support, a parameter it does not know.
 const FALLBACKS = [
   {
     when: (e) => e.param === "response_format" || e.code === "json_validate_failed" || /response_format|json_schema|schema/i.test(e.message),
@@ -358,8 +389,8 @@ const FALLBACKS = [
   },
 ];
 
-/** Ask the provider; resolves to {data, headers} of its answer, or throws an HttpError (French). */
-async function complete(config, body) {
+/** Ask the provider for the task `task`; resolves to {data, headers} of its answer, or throws an HttpError (French). */
+async function complete(config, body, task) {
   const deadline = Date.now() + TIMEOUT_MS;
   const tried = new Set();
   for (;;) {
@@ -375,7 +406,8 @@ async function complete(config, body) {
       if (err?.name === "TimeoutError" || err?.name === "AbortError") {
         throw new HttpError(504, `${config.name} n'a pas répondu en ${TIMEOUT_MS / 1000} s : réessayez, ou posez une question plus courte.`);
       }
-      console.error(`AI provider ${config.name}: ${err?.cause?.code || err?.message || err}`);
+      // Never its message: an error raised before the request is sent may quote its headers, the key with them.
+      console.error(`AI provider ${config.name}: ${[err?.name, err?.cause?.code].filter(Boolean).join(" ") || "fetch failed"}`);
       throw new HttpError(502, `${config.name} est injoignable depuis la passerelle : réessayez plus tard.`);
     }
     let data;
@@ -386,15 +418,15 @@ async function complete(config, body) {
       data = {};
     }
     if (response.ok) return { data, headers: response.headers };
-    if (response.status === 400) {
-      const e = { param: String(data?.error?.param ?? ""), code: String(data?.error?.code ?? ""), message: String(data?.error?.message ?? "") };
+    if (response.status === 400 || response.status === 422) {
+      const e = errorOf(data);
       const n = FALLBACKS.findIndex((f, i) => !tried.has(i) && f.when(e) && f.apply(body));
       if (n >= 0) {
         tried.add(n);
         continue;
       }
     }
-    throw providerError(response.status, data, response.headers, config);
+    throw providerError(response.status, data, response.headers, config, task);
   }
 }
 
@@ -409,22 +441,27 @@ function chatMessages(context, conversation, rules) {
   ];
 }
 
-/** The text of an answer of the provider (`json`: of a JSON task); an empty or refused one is an error. */
-function answerOf(data, json, config) {
+/**
+ * The text of an answer of the provider (`json`: of a JSON task, `task`); an
+ * empty or refused one is an error, a cut one too in JSON (`truncated`: the
+ * page may count it as an answer that cannot be used).
+ */
+function answerOf(data, json, config, task) {
   const choice = data?.choices?.[0];
   const message = choice?.message ?? {};
   let content = typeof message.content === "string" ? message.content.trim() : Array.isArray(message.content) ? message.content.map((p) => p?.text ?? "").join("").trim() : "";
   if (message.refusal) throw new HttpError(502, `${config.name} a refusé de répondre : ${String(message.refusal).slice(0, 300)}`);
   const cut = choice?.finish_reason === "length";
+  // The estimate of the cycle time has no question to narrow: a longer answer allowed is the way.
+  const longer = task === "cycle_time" ? "augmentez AI_MAX_TOKENS dans Vercel (par exemple 2 000), puis redéployez" : "posez une question plus ciblée";
   if (!content) {
-    throw new HttpError(502, cut
-      ? `Réponse vide de ${config.name} : la limite de longueur (${config.maxTokens} tokens, AI_MAX_TOKENS) a été atteinte avant la réponse. Posez une question plus ciblée.`
-      : `Réponse vide de ${config.name} : réessayez, ou reformulez la question.`);
+    if (cut) throw new HttpError(502, `Réponse vide de ${config.name} : la limite de longueur (${config.maxTokens} tokens, AI_MAX_TOKENS) a été atteinte avant la réponse : ${longer}.`, { truncated: true });
+    throw new HttpError(502, task === "cycle_time" ? `Réponse vide de ${config.name} : réessayez.` : `Réponse vide de ${config.name} : réessayez, ou reformulez la question.`);
   }
   // JSON asked without a schema (json_object) may come in a Markdown code block.
   if (json) content = content.replace(/^```(?:json)?\s*([\s\S]*?)\s*```$/, "$1");
   if (cut) {
-    if (json) throw new HttpError(502, `Réponse de ${config.name} coupée (limite de ${config.maxTokens} tokens, AI_MAX_TOKENS) : posez une question plus ciblée.`);
+    if (json) throw new HttpError(502, `Réponse de ${config.name} coupée (limite de ${config.maxTokens} tokens, AI_MAX_TOKENS) : ${longer}.`, { truncated: true });
     content += "\n\n(Réponse coupée : limite de longueur atteinte.)";
   }
   return content;
@@ -471,6 +508,11 @@ export default async function handler(req, res) {
       }
     }
     if (config.error) return reply(res, 503, { error: config.error, access_code_required: !!accessCode });
+    // No access code: anyone who knows the address could use the key (the origin is checked for
+    // pages only, a script sends none). Closed, unless the deployment opens it on purpose.
+    if (!accessCode && !/^(1|true)$/i.test(env("READER3D_PUBLIC"))) {
+      return reply(res, 503, { error: "Aucun code d'accès sur la passerelle : créez la variable READER3D_ACCESS_CODE dans Vercel (un code long et aléatoire, pour Production et Preview), puis redéployez. Sans code, n'importe qui connaissant l'adresse de la passerelle pourrait consommer le quota de la clé." });
+    }
     if (req.method === "GET") {
       return reply(res, 200, {
         provider: config.name,
@@ -500,13 +542,13 @@ export default async function handler(req, res) {
     const effort = config.reasoningEffort || (/gpt-oss/i.test(model) ? "low" : "");
     if (effort) body.reasoning_effort = effort;
     if (json) body.response_format = { type: "json_schema", json_schema: { name: json.name, strict: true, schema: json.schema } };
-    const { data, headers } = await complete(config, body);
+    const { data, headers } = await complete(config, body, task);
     const usage = usageOf(data);
     return reply(res, 200, {
-      output: answerOf(data, !!json, config),
+      output: answerOf(data, !!json, config, task),
       provider: config.name,
       model: typeof data?.model === "string" && data.model ? data.model : model,
-      quota: quotaOf(headers),
+      quota: quotaOf(headers, config),
       ...(usage ? { usage } : {}),
     });
   } catch (error) {

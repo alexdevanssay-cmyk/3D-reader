@@ -446,7 +446,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await new Promise((resolve) => ollama.close(resolve));
   });
 
-  test('IA page through the gateway (api/ai.js, a stand-in for Groq): configuration, access code, context to its budget, quota, errors', { timeout: CAD_TIMEOUT }, async (t) => {
+  test('IA page through the gateway (api/ai.js, a stand-in for Groq): closed without an access code, configuration, access code, context to its budget, models, quota, errors', { timeout: CAD_TIMEOUT }, async (t) => {
     // The gateway itself in a node:http server; its provider a stand-in for Groq's chat completions.
     const { default: gatewayHandler } = await import('../../api/ai.js');
     const completions = [];
@@ -461,7 +461,11 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
         res.end(JSON.stringify(body));
       });
     });
-    const gateway = createServer((req, res) => gatewayHandler(req, res));
+    // Each test its own client address: the limit per address of the gateway (20 requests a minute) is not shared.
+    const gateway = createServer((req, res) => {
+      req.headers['x-forwarded-for'] = '198.51.100.1';
+      return gatewayHandler(req, res);
+    });
     await Promise.all([groq, gateway].map((s) => new Promise((resolve) => s.listen(0, '127.0.0.1', resolve))));
     const saved = { ...process.env };
     // Only these settings (none of this machine's): the key named as it was created in Vercel; the page
@@ -503,13 +507,21 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.match(await page.textContent('#ai-chat .ai-error'), /^Erreur\s*Renseignez l'adresse de la passerelle : collez son adresse Vercel/);
     await page.click('#ai-clear');
 
-    // The connection test: provider, model, no access code.
+    // Only the key, as created first: the gateway closed until an access code is set, and says so.
     await page.fill('#ai-url', gatewayUrl);
+    await page.click('#ai-test');
+    await waitStatus(/^Passerelle inaccessible$/);
+    assert.match(await page.textContent('#ai-chat .ai-error'), /Aucun code d'accès sur la passerelle : créez la variable READER3D_ACCESS_CODE dans Vercel/);
+    await page.click('#ai-clear');
+
+    // Opened on purpose (READER3D_PUBLIC=1). The connection test: provider, model, no access code; the model fixed by the gateway.
+    process.env.READER3D_PUBLIC = '1';
     await page.click('#ai-test');
     await waitStatus(/^Passerelle connectée/);
     assert.equal(await status(), "Passerelle connectée : Groq · openai/gpt-oss-120b · sans code d'accès");
     assert.equal(await page.isVisible('#ai-code-field'), false);
-    assert.equal(await page.getAttribute('#ai-model', 'placeholder'), 'openai/gpt-oss-120b (par défaut)');
+    assert.equal(await page.getAttribute('#ai-model', 'placeholder'), 'openai/gpt-oss-120b (fixé par la passerelle)');
+    assert.equal(await page.isDisabled('#ai-model'), true);
 
     // An access code on the gateway: the field shown, a question without it refused, the provider not asked.
     process.env.READER3D_ACCESS_CODE = 'made-up code';
@@ -517,6 +529,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await waitStatus(/code d'accès requis$/);
     assert.equal(await page.isVisible('#ai-code-field'), true);
     assert.equal(await page.getAttribute('#ai-code', 'type'), 'password');
+    assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.ai.gatewayCodeRequired')), '1', 'its field shown at once next time');
     await ask('Quelles règles de dépouille en coquille gravité ?');
     assert.match(await page.textContent('#ai-chat .ai-error'), /Code d'accès requis : saisissez le code de la passerelle\./);
     assert.equal(completions.length, 0);
@@ -569,11 +582,29 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // The conversation of the first tab of the 3D page, about its part.
     const stored = await page.evaluate(() => JSON.parse(sessionStorage.getItem('reader3d.ai.messages')));
     assert.deepEqual([stored.file, stored.messages.length], ['box.stl', 6]);
+
+    // Models the page may choose (AI_MODELS): offered in the field; another one typed is not asked for, and the page says so.
+    process.env.AI_MODELS = 'openai/gpt-oss-20b';
+    reply = (n) => ({ status: 200, body: { model: completions.at(-1).body.model, choices: [{ message: { role: 'assistant', content: 'Une boîte.' }, finish_reason: 'stop' }] } });
+    await page.click('#ai-test');
+    await waitStatus(/code d'accès accepté$/);
+    assert.equal(await page.isDisabled('#ai-model'), false);
+    assert.equal(await page.getAttribute('#ai-model', 'placeholder'), 'openai/gpt-oss-120b (par défaut)');
+    assert.deepEqual(await page.$$eval('#ai-models option', (os) => os.map((o) => o.value)), ['openai/gpt-oss-20b']);
+    const last = () => page.locator('#ai-chat .ai-msg').last();
+    await page.fill('#ai-model', 'made-up-model');
+    await ask('Et les faces ?');
+    assert.equal(completions.at(-1).body.model, 'openai/gpt-oss-120b');
+    assert.equal(await last().locator('.ai-notice').textContent(), 'Modèle « made-up-model » non proposé par la passerelle (variable AI_MODELS dans Vercel) : réponse de son modèle par défaut');
+    await page.fill('#ai-model', 'openai/gpt-oss-20b');
+    await ask('Et les arêtes ?');
+    assert.equal(completions.at(-1).body.model, 'openai/gpt-oss-20b');
+    assert.equal(await last().locator('.ai-notice').count(), 0);
     assert.deepEqual(errors, []);
     await page.context().close();
   });
 
-  test('IA page: one conversation per tab, names anonymised online, the local model when the quota is reached, numbers checked, phone width', { timeout: CAD_TIMEOUT }, async (t) => {
+  test('IA page: one conversation per tab, names anonymised online in every task, the local model when the quota is reached and its answers kept offline, numbers checked, phone width', { timeout: CAD_TIMEOUT }, async (t) => {
     // The gateway (api/ai.js) and a stand-in for Groq, as above; a stand-in for Ollama.
     const { default: gatewayHandler } = await import('../../api/ai.js');
     const completions = [];
@@ -592,7 +623,10 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
         res.end(JSON.stringify(answer));
       });
     });
-    const gateway = createServer((req, res) => gatewayHandler(req, res));
+    const gateway = createServer((req, res) => {
+      req.headers['x-forwarded-for'] = '198.51.100.2';
+      return gatewayHandler(req, res);
+    });
     const chats = [];
     const ollama = createServer((req, res) => {
       if (req.headers.origin) res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
@@ -609,14 +643,15 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       req.on('end', () => {
         chats.push(JSON.parse(text));
         res.setHeader('Content-Type', 'application/x-ndjson');
-        res.write(`${JSON.stringify({ message: { role: 'assistant', content: 'Réponse locale : une boîte.' }, done: false })}\n`);
+        // It was given the real names and amounts: it may quote them (a made-up rate).
+        res.write(`${JSON.stringify({ message: { role: 'assistant', content: 'Réponse locale : une boîte, taux 42,5 €/h.' }, done: false })}\n`);
         res.end(`${JSON.stringify({ done: true })}\n`);
       });
     });
     await Promise.all([groq, gateway, ollama].map((x) => new Promise((resolve) => x.listen(0, '127.0.0.1', resolve))));
     const saved = { ...process.env };
     for (const k of Object.keys(process.env)) if (/^(groq_api_key|ai_|openai_|reader3d_)/i.test(k)) delete process.env[k];
-    Object.assign(process.env, { GROQ_API_KEY: 'gsk_made_up', AI_BASE_URL: `http://127.0.0.1:${groq.address().port}/openai/v1`, READER3D_ALLOWED_ORIGINS: base.replace(/\/$/, '') });
+    Object.assign(process.env, { GROQ_API_KEY: 'gsk_made_up', AI_BASE_URL: `http://127.0.0.1:${groq.address().port}/openai/v1`, READER3D_ALLOWED_ORIGINS: base.replace(/\/$/, ''), READER3D_PUBLIC: '1' });
     t.after(() => {
       for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
       Object.assign(process.env, saved);
@@ -679,17 +714,33 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.ai.anonymize')), '0');
     await page.check('#ai-anon');
 
+    // The names of the quote of the tab (no costing workbook needed), in any task: the customer named in a general question.
+    const quote = (over) => page.evaluate((q) => localStorage.setItem('reader3d.chiffrage.quote.v1', JSON.stringify(q)), { client: 'Fonderie Exemple', reference: 'REF-EX-1', ...over });
+    await quote({});
+    await page.click('.ai-task[data-task="general"]');
+    await ask('Et pour Fonderie Exemple, avec la REF-EX-1 ?');
+    assert.equal(completions.at(-1).messages.at(-1).content, 'Et pour Client, avec la Référence ?');
+    // The customer changed since in the quote: its former name, in the conversation, still replaced.
+    await quote({ client: 'Autre Client SA' });
+    await ask('Et pour Autre Client SA ?');
+    const online = JSON.stringify(completions.at(-1).messages);
+    for (const name of ['Fonderie Exemple', 'Autre Client SA', 'REF-EX-1', 'Équerre', 'named_assembly']) assert.ok(!online.includes(name), name);
+    assert.ok(online.includes('Et pour Client, avec la Référence ?'));
+    assert.equal(completions.at(-1).messages.at(-1).content, 'Et pour Client ?');
+    await page.evaluate(() => localStorage.removeItem('reader3d.chiffrage.quote.v1'));
+    await page.click('.ai-task[data-task="feature_analysis"]');
+
     // Tab 2: its own conversation, empty; its question sent without the conversation of tab 1.
     await page.click('.doc-tab-new');
     assert.equal(await page.locator('#ai-chat .ai-msg').count(), 0);
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
     await page.waitForFunction(() => document.body.dataset.status === 'done' && window.reader3d.tab.file === 'box.stl', null, { timeout: CAD_TIMEOUT });
     await ask('Résume la pièce.');
-    assert.deepEqual(completions[2].messages.map((m) => m.role), ['system', 'user', 'user']);
-    assert.equal(contextOf(completions[2]).source.file, 'Pièce.stl');
+    assert.deepEqual(completions.at(-1).messages.map((m) => m.role), ['system', 'user', 'user']);
+    assert.equal(contextOf(completions.at(-1)).source.file, 'Pièce.stl');
     // Back to tab 1: its conversation; to tab 2: its own.
     await page.click('.doc-tab:first-child');
-    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 4);
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 8);
     assert.match(await page.textContent('#ai-chat'), /Noms réels : Corps 1 = Équerre ; Corps 2 = Pin/);
     await page.click('.doc-tab:nth-child(2)');
     assert.equal(await page.locator('#ai-chat .ai-msg').count(), 2);
@@ -699,15 +750,17 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     reply = () => ({ status: 429, headers: { 'retry-after': '30' }, body: { error: { message: 'Rate limit reached', type: 'requests' } } });
     answer = await ask('Et ses arêtes ?');
     assert.equal(await answer.locator('.ai-notice').textContent(), 'Quota en ligne atteint : réponse du modèle local (qwen3:8b)');
-    assert.equal(await answer.locator('.ai-text').textContent(), 'Réponse locale : une boîte.');
+    assert.equal(await answer.locator('.ai-text').textContent(), 'Réponse locale : une boîte, taux 42,5 €/h.');
     assert.match(await page.textContent('#ai-status'), /^Réponse en \d+ s · repli local : Ollama · qwen3:8b$/);
     assert.match(chats[0].messages[0].content, /"file":"box\.stl"/);
     assert.deepEqual(chats[0].messages.slice(1).map((m) => [m.role, m.role === 'user' ? m.content : '']), [['user', 'Résume la pièce.'], ['assistant', ''], ['user', 'Et ses arêtes ?']]);
-    // Without the fallback: the message of the gateway.
+    // Without the fallback: the message of the gateway. Its request without the exchange the local model answered.
     await page.uncheck('#ai-fallback');
     answer = await ask('Et ses faces ?');
     assert.equal(await answer.locator('.ai-text').textContent(), 'Quota de Groq (offre gratuite) atteint. Réessayez dans 30 s.');
     assert.equal(chats.length, 1);
+    assert.deepEqual(completions.at(-1).messages.slice(2).map((m) => [m.role, m.role === 'user' ? m.content : '']), [['user', 'Résume la pièce.'], ['assistant', ''], ['user', 'Et ses faces ?']]);
+    assert.doesNotMatch(JSON.stringify(completions.at(-1).messages), /Réponse locale|42,5|Et ses arêtes/);
     await page.check('#ai-fallback');
     reply = (body) => ({ status: 200, body: { choices: [{ message: { role: 'assistant', content: `Volume ${volumeOf(contextOf(body))} cm³.` }, finish_reason: 'stop' }] } });
 
@@ -715,7 +768,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(await page.evaluate(() => sessionStorage.getItem('reader3d.ai.messages.2')));
     await page.click('.doc-tab:nth-child(2) .doc-tab-close');
     assert.equal(await page.evaluate(() => sessionStorage.getItem('reader3d.ai.messages.2')), null);
-    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 4);
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 8);
     // Another part opened in tab 1: a new conversation, the one of the other part is not sent with it.
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
     await page.waitForFunction(() => window.reader3d.tab.file === 'box.stl' && document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });

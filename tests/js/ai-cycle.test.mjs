@@ -374,6 +374,32 @@ describe('the estimate used in the quote, and undone', () => {
     assert.equal(adoptEstimate(other, r.inputs, { ...r.route, process: 'BPR' }), null);
   });
 
+  test('a newer estimate adopted in place of the first: undone, what was there before the first, never an AI value traced as typed', () => {
+    const auto = computed().results[0];
+    const code = auto.route.process;
+    const r = computed({ estimationCycleIA: estimate(code) }).results[0];
+    const piece = saved();
+    assert.equal(adoptEstimate(piece, r.inputs, r.route), 152);
+    const first = { ...piece.cycleIA.avant };
+    assert.deepEqual(first, { procede: 'auto', finition: 'auto', cycle: null });
+    // Estimated again, then that estimate adopted: its island is now imposed, its cycle the first estimate's.
+    piece.estimationCycleIA = estimate(code, { date: '2026-10-09T09:00:00.000Z', estimation_s: 171, fourchette_s: [150, 190] });
+    saveQuote({ ...JSON.parse(storage.get('reader3d.chiffrage.quote.v1')), pieces: { manuel: piece } });
+    ui.reload();
+    const adopted = ui.compute().results[0];
+    assert.ok(adoptedEstimate(adopted.inputs, code), 'the first adoption in effect');
+    assert.equal(adoptEstimate(piece, adopted.inputs, adopted.route), 171);
+    assert.deepEqual(piece.cycleIA.avant, first, 'what was there before the first adoption');
+    // Undone: the formula and the automatic island, as before any adoption.
+    assert.equal(undoAdoption(piece).valeur, 171);
+    assert.deepEqual([piece.procede, piece.finition, piece.cycle, 'cycleIA' in piece], ['auto', 'auto', null, false]);
+    saveQuote({ ...JSON.parse(storage.get('reader3d.chiffrage.quote.v1')), pieces: { manuel: piece } });
+    ui.reload();
+    const undone = ui.compute().results[0];
+    assert.equal(undone.trace['piece.cycle'].source.type, 'calcul');
+    assert.equal(cycleOf(undone), cycleOf(auto));
+  });
+
   test('kept with the real time measured (Retour d\'expérience): adopted or not', () => {
     const proposal = estimate('CG3');
     const r = computed({ procede: 'CG3', cycle: 152, estimationCycleIA: proposal, cycleIA: { date: '2026-10-08T10:00:00.000Z', valeur: 152, estimation: { ...proposal } } }).results[0];
@@ -437,6 +463,30 @@ describe('the request (ai-workspace.js askJSON): the AI chosen on the IA page', 
     assert.equal(plain.builds[0].budget, 9000, 'an older gateway without its budget: the one of the free plan of Groq');
     // No address: said where to give it.
     await assert.rejects(ask({ 'reader3d.ai.provider': 'openai' }, () => json({})), /Aucune passerelle IA renseignée : dans la page IA \/ analyse, collez l'adresse Vercel/);
+  });
+
+  test('the gateway asks for its access code: where to type it said, its field on the IA page shown at once; a cut answer told as such', async () => {
+    const gateway = { 'reader3d.ai.provider': 'openai', 'reader3d.ai.gateway': 'https://gw.example/api/ai' };
+    // As api/ai.js answers: the configuration to a page, the question refused without the code (or with a wrong one).
+    const locked = (url, init) => (init.method === 'POST'
+      ? json({ error: init.headers['X-Reader3D-Code'] ? "Code d'accès incorrect." : "Code d'accès requis : saisissez le code de la passerelle.", access_code_required: true }, 401)
+      : json({ provider: 'Groq', model: 'openai/gpt-oss-120b', context_chars: 9000, access_code_required: true }));
+    await assert.rejects(ask(gateway, locked), (err) => {
+      assert.equal(err.message, "Code d'accès de la passerelle requis : saisissez-le dans la page IA / analyse (champ « Code d'accès »), puis relancez.");
+      assert.deepEqual([err.status, err.codeRequired], [401, true]);
+      return true;
+    });
+    assert.equal(storage.get('reader3d.ai.gatewayCodeRequired'), '1');
+    await assert.rejects(ask({ ...gateway, 'reader3d.ai.gatewayCode': 'wrong' }, locked), /^Error: Code d'accès de la passerelle incorrect : corrigez-le dans la page IA \/ analyse \(champ « Code d'accès »\), puis relancez\.$/);
+    // A gateway without a code: the field no longer asked for.
+    await ask({ ...gateway, 'reader3d.ai.gatewayCodeRequired': '1' }, (url, init) => json(init.method === 'POST' ? { output: '{}' } : { context_chars: 9000, access_code_required: false }));
+    assert.equal(storage.get('reader3d.ai.gatewayCodeRequired'), undefined);
+    // An answer cut at the length allowed: marked, for the backtest to count it as a result that cannot be used.
+    const message = 'Réponse de Groq coupée (limite de 1200 tokens, AI_MAX_TOKENS) : augmentez AI_MAX_TOKENS dans Vercel (par exemple 2 000), puis redéployez.';
+    await assert.rejects(ask(gateway, (url, init) => json(init.method === 'POST' ? { error: message, truncated: true } : { context_chars: 9000 }, init.method === 'POST' ? 502 : 200)), (err) => {
+      assert.deepEqual([err.message, err.status, err.truncated], [message, 502, true]);
+      return true;
+    });
   });
 
   test('Ollama: its address and model, a JSON answer without thinking, the schema in the instructions; the quota of the gateway reached: Ollama', async () => {

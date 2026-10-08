@@ -33,13 +33,15 @@ const QUOTA_HEADERS = {
 };
 
 /**
- * One request to the gateway, with only the environment `env`; `provider`
- * answers the requests to the provider (body, n) with a Response, or throws.
+ * One request to the gateway, with only the environment `env` (`open`: and
+ * READER3D_PUBLIC=1, a gateway without access code opened on purpose, as most
+ * tests need); `provider` answers the requests to the provider (body, n) with
+ * a Response, or throws.
  */
-async function call({ method = "POST", origin = PAGES, headers = {}, body, env = { Groq_API_KEY: "gsk_made_up" }, provider = () => completion("Bonjour.") } = {}) {
+async function call({ method = "POST", origin = PAGES, headers = {}, body, env = { Groq_API_KEY: "gsk_made_up" }, open = true, provider = () => completion("Bonjour.") } = {}) {
   const saved = { ...process.env };
   for (const k of Object.keys(process.env)) if (VARIABLES.test(k)) delete process.env[k];
-  Object.assign(process.env, env);
+  Object.assign(process.env, open ? { READER3D_PUBLIC: "1" } : {}, env);
   const requests = [];
   const { fetch } = globalThis;
   globalThis.fetch = async (url, init) => {
@@ -213,10 +215,16 @@ test("task « cycle_time »: its own instructions and strict schema, an estimate
   assert.deepEqual(refused.requests[1].body.response_format, { type: "json_object" });
   assert.ok(refused.requests[1].body.messages[0].content.endsWith(`Le JSON suit exactement ce schéma : ${JSON.stringify(CYCLE_SCHEMA)}`));
   assert.equal(refused.json.output, JSON.stringify(estimate));
-  // A cut answer is an error (JSON).
+  // A cut answer is an error (JSON), marked so; no question to narrow: a longer answer to allow.
   const cut = await call({ body, provider: () => completion('{"estimation_s": 13', { finish: "length" }) });
   assert.equal(cut.status, 502);
-  assert.match(cut.json.error, /^Réponse de Groq coupée/);
+  assert.deepEqual(cut.json, { error: "Réponse de Groq coupée (limite de 1200 tokens, AI_MAX_TOKENS) : augmentez AI_MAX_TOKENS dans Vercel (par exemple 2 000), puis redéployez.", truncated: true });
+  const empty = await call({ body, provider: () => completion("", { finish: "length" }) });
+  assert.equal(empty.json.error, "Réponse vide de Groq : la limite de longueur (1200 tokens, AI_MAX_TOKENS) a été atteinte avant la réponse : augmentez AI_MAX_TOKENS dans Vercel (par exemple 2 000), puis redéployez.");
+  assert.equal(empty.json.truncated, true);
+  // Too large for a minute: the settings of the gateway, not a conversation.
+  const large = await call({ body, provider: () => failure(413, "Request too large") });
+  assert.equal(large.json.error, "Les données de la pièce et la réponse attendue dépassent la limite de tokens par minute de Groq (offre gratuite) : réduisez AI_CONTEXT_CHARS ou AI_MAX_TOKENS dans Vercel, puis redéployez.");
   // A costing trace in the context does not make it a costing question; an unknown task is plain text.
   const traced = await call({ body: { ...body, context: { ...context, costing_trace: null } } });
   assert.equal(traced.requests[0].body.response_format.json_schema.name, "estimation_temps_cycle");
@@ -228,8 +236,9 @@ test("task « cycle_time »: its own instructions and strict schema, an estimate
   }
 });
 
-test("a provider that refuses structured outputs or a parameter: each change tried once", async (t) => {
-  t.mock.method(console, "error", () => {});
+test("a provider that refuses structured outputs or a parameter, in its own form of error: each change tried once", async (t) => {
+  const logged = [];
+  t.mock.method(console, "error", (...args) => logged.push(args.join(" ")));
   const answer = JSON.stringify({ conclusion: "x", observations: [], inferences: [], recommendations: [], uncertainties: [], needs_human_validation: false, analyse_chiffrage: null });
   const refusals = [
     failure(400, "response_format `json_schema` is not supported with this model", { param: "response_format" }),
@@ -252,8 +261,27 @@ test("a provider that refuses structured outputs or a parameter: each change tri
   // JSON in a Markdown block: the JSON only.
   assert.equal(json.output, answer);
 
+  // Mistral: a 422 of its own form, the parameter in the "loc" of its detail (the value refused never logged).
+  const mistral = { AI_API_KEY: "made-up", AI_BASE_URL: "https://api.mistral.ai/v1", AI_MODEL: "mistral-made-up" };
+  const extra = (field) => new Response(JSON.stringify({ object: "error", message: { detail: [{ type: "extra_forbidden", loc: ["body", field], msg: "Extra inputs are not permitted", input: "secret-input" }] }, type: "invalid_request_error", param: null, code: null }), { status: 422, headers: { "Content-Type": "application/json" } });
+  let r = await call({ body: ask("?"), env: mistral, provider: (body, n) => (n === 1 ? extra("max_completion_tokens") : completion("ok", { model: "mistral-made-up" })) });
+  assert.equal(r.status, 200);
+  assert.deepEqual([r.requests.length, r.requests[1].body.max_tokens, "max_completion_tokens" in r.requests[1].body], [2, 1200, false]);
+  r = await call({ body: ask("?"), env: mistral, provider: () => extra("stop") });
+  assert.equal(r.status, 502);
+  assert.equal(r.json.error, "Mistral a refusé la requête (HTTP 422) : vérifiez AI_MODEL et AI_BASE_URL dans Vercel ; le détail est dans les journaux de la fonction.");
+  assert.match(logged.at(-1), /^AI provider Mistral: HTTP 422 \{"detail":\[\{"type":"extra_forbidden","loc":\["body","stop"\]/);
+  assert.doesNotMatch(logged.join("\n"), /secret-input/);
+  // Gemini: its errors in an array; structured outputs refused, JSON without a schema.
+  const gemini = { AI_API_KEY: "made-up", AI_BASE_URL: "https://generativelanguage.googleapis.com/v1beta/openai", AI_MODEL: "gemini-made-up" };
+  const array = new Response(JSON.stringify([{ error: { code: 400, message: "Invalid JSON payload received. Unknown name \"response_schema\"", status: "INVALID_ARGUMENT" } }]), { status: 400, headers: { "Content-Type": "application/json" } });
+  r = await call({ body: { task: "costing", context: { costing_trace: null }, messages: [{ role: "user", content: "Prix ?" }] }, env: gemini, provider: (body, n) => (n === 1 ? array : completion(answer)) });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.requests[1].body.response_format, { type: "json_object" });
+
   // The same refusal again: no loop, a short French message.
   const again = await call({ body: ask("Bonjour"), provider: () => failure(400, "reasoning_effort is not supported with this model") });
+  assert.match(logged.at(-1), /^AI provider Groq: HTTP 400 reasoning_effort is not supported/);
   assert.equal(again.requests.length, 2);
   assert.equal(again.status, 502);
   assert.match(again.json.error, /^Groq a refusé la requête \(HTTP 400\) : vérifiez AI_MODEL et AI_BASE_URL dans Vercel/);
@@ -294,6 +322,9 @@ test("errors of the provider: short French messages with the wait, never its own
   r = await call({ body: ask("?"), provider: () => failure(413, `Request too large ${secret}`) });
   assert.equal(r.status, 413);
   assert.match(r.json.error, /^La question et son contexte dépassent la limite de tokens par minute de Groq \(offre gratuite\) : commencez une nouvelle conversation/);
+  // A question cut: its advice is a narrower question.
+  r = await call({ body: { task: "costing", context: {}, messages: [{ role: "user", content: "?" }] }, provider: () => completion('{"conclusion":"', { finish: "length" }) });
+  assert.equal(r.json.error, "Réponse de Groq coupée (limite de 1200 tokens, AI_MAX_TOKENS) : posez une question plus ciblée.");
   r = await call({ body: ask("?"), provider: () => failure(503, `Service unavailable ${secret}`) });
   assert.equal(r.json.error, "Groq est indisponible pour le moment (HTTP 503). Réessayez plus tard.");
   r = await call({ body: ask("?"), provider: () => failure(404, `The model does not exist ${secret}`) });
@@ -306,6 +337,13 @@ test("errors of the provider: short French messages with the wait, never its own
   r = await call({ body: ask("?"), provider: () => { throw new TypeError("fetch failed"); } });
   assert.equal(r.status, 502);
   assert.equal(r.json.error, "Groq est injoignable depuis la passerelle : réessayez plus tard.");
+  // Another provider: its requests per minute (OpenAI) or as it counts them, never "today".
+  const openai = { OPENAI_API_KEY: "sk-made-up", AI_MODEL: "gpt-made-up" };
+  const minute = { "x-ratelimit-limit-requests": "5000", "x-ratelimit-remaining-requests": "4999", "x-ratelimit-reset-requests": "12ms", "x-ratelimit-limit-tokens": "30000", "x-ratelimit-remaining-tokens": "29000" };
+  r = await call({ body: ask("?"), env: openai, provider: () => completion("ok", { model: "gpt-made-up", headers: minute }) });
+  assert.deepEqual(r.json.quota, { requests_remaining: 4999, requests_limit: 5000, tokens_remaining_minute: 29000, tokens_limit_minute: 30000, reset_requests: "12ms", reset_tokens: null });
+  r = await call({ body: ask("?"), env: openai, provider: () => failure(429, "Rate limit", { headers: { ...minute, "x-ratelimit-remaining-requests": "0", "retry-after": "1" } }) });
+  assert.equal(r.json.error, "Quota de OpenAI atteint. Réessayez dans 1 s.");
   // Neither the provider's text, nor a stack.
   for (const status of [401, 413, 503, 404]) {
     const { text } = await call({ body: ask("?"), provider: () => failure(status, secret) });
@@ -362,6 +400,39 @@ test("configuration: Groq by default, any OpenAI-compatible provider by its vari
   assert.equal(r.json.provider, "Groq");
   r = await call({ method: "GET", env: { GROQ_API_KEY: "gsk_made_up", AI_CONTEXT_CHARS: "6000" } });
   assert.equal(r.json.context_chars, 6000);
+});
+
+test("the key of Groq never sent to another provider; a key with a line break refused, never written", async (t) => {
+  // Another provider set up beside the key of Groq: its own key goes to it.
+  for (const [base, name] of [["https://api.x.ai/v1", "xAI"], ["https://generativelanguage.googleapis.com/v1beta/openai", "Gemini"], ["https://api.mistral.ai/v1", "Mistral"]]) {
+    const env = { Groq_API_KEY: "gsk_secret_made_up", AI_API_KEY: "other-made-up", AI_BASE_URL: base, AI_MODEL: "made-up-model" };
+    let r = await call({ body: ask("?"), env, provider: () => completion("ok", { model: "made-up-model" }) });
+    assert.equal(r.requests[0].url, `${base}/chat/completions`, name);
+    assert.equal(r.requests[0].init.headers.Authorization, "Bearer other-made-up", name);
+    assert.equal(r.json.provider, name);
+    // Refused: the variable of its key named.
+    r = await call({ body: ask("?"), env, provider: () => failure(401, "invalid key") });
+    assert.match(r.json.error, new RegExp(`^Clé d'API refusée par ${name} \\(HTTP 401\\) : vérifiez la variable AI_API_KEY`));
+    // Its address without its key: the key of Groq is not sent there.
+    r = await call({ body: ask("?"), env: { Groq_API_KEY: "gsk_secret_made_up", AI_BASE_URL: base, AI_MODEL: "made-up-model" } });
+    assert.equal(r.status, 503, name);
+    assert.equal(r.json.error, `La clé de Groq (GROQ_API_KEY) n'est pas envoyée à ${name} (AI_BASE_URL) : créez AI_API_KEY avec la clé de ${name} dans Vercel, puis redéployez.`);
+    assert.equal(r.requests.length, 0);
+  }
+  // A key pasted with a line break (or a space) inside: refused before any request, the key never in the answer.
+  for (const key of ["gsk_made_up_first\nsecond", "gsk_made_up_first\r\nsecond", "gsk made_up"]) {
+    const r = await call({ body: ask("?"), env: { Groq_API_KEY: key } });
+    assert.equal(r.status, 503, JSON.stringify(key));
+    assert.equal(r.json.error, "Clé d'API invalide (caractère non imprimable, retour à la ligne…) dans la variable GROQ_API_KEY : recréez-la dans Vercel en collant la clé seule, puis redéployez.");
+    assert.equal(r.requests.length, 0);
+    assert.doesNotMatch(r.text, /made_up/);
+  }
+  // An error before the request is sent may quote its headers: never written in the logs.
+  const logged = [];
+  t.mock.method(console, "error", (...args) => logged.push(args.join(" ")));
+  const r = await call({ body: ask("?"), provider: (body, n, init) => { throw new TypeError(`Headers.append: "${init.headers.Authorization}" is an invalid header value.`); } });
+  assert.equal(r.json.error, "Groq est injoignable depuis la passerelle : réessayez plus tard.");
+  assert.deepEqual(logged, ["AI provider Groq: TypeError"]);
 });
 
 test("the model asked by the page only when the deployment lists it (AI_MODELS)", async () => {
@@ -438,9 +509,34 @@ test("access code: required to ask, by any request without an origin, refused wh
   // A wrong code is refused even where none is needed.
   r = await call({ method: "GET", env, headers: { "x-reader3d-code": "wrong" } });
   assert.equal(r.status, 401);
-  // No code configured: none needed.
+  // No code configured, the gateway opened on purpose (READER3D_PUBLIC=1): none needed.
   r = await call({ body: ask("?"), origin: null });
   assert.equal(r.status, 200);
+});
+
+test("no access code: the gateway closed, to a script without an origin as to a page, unless opened on purpose", async () => {
+  const closed = /^Aucun code d'accès sur la passerelle : créez la variable READER3D_ACCESS_CODE dans Vercel \(un code long et aléatoire, pour Production et Preview\), puis redéployez\. Sans code, n'importe qui connaissant l'adresse de la passerelle pourrait consommer le quota de la clé\.$/;
+  // Only the key of Groq, as the variable created first: a script (curl, no Origin) and a page both refused, the provider not asked.
+  for (const origin of [null, PAGES]) {
+    for (const method of ["GET", "POST"]) {
+      const r = await call({ method, origin, body: ask("Écris un poème."), open: false });
+      assert.equal(r.status, 503, `${method} ${origin}`);
+      assert.match(r.json.error, closed);
+      assert.equal(r.requests.length, 0);
+    }
+  }
+  // A missing key is told first.
+  assert.match((await call({ method: "GET", env: {}, open: false })).json.error, /^Aucune clé d'API/);
+  // Opened on purpose: READER3D_PUBLIC=1 (or true).
+  for (const value of ["1", "true"]) {
+    const r = await call({ body: ask("?"), origin: null, open: false, env: { Groq_API_KEY: "gsk_made_up", READER3D_PUBLIC: value } });
+    assert.equal(r.status, 200, value);
+  }
+  assert.equal((await call({ body: ask("?"), open: false, env: { Groq_API_KEY: "gsk_made_up", READER3D_PUBLIC: "0" } })).status, 503);
+  // With a code: the code decides.
+  const env = { Groq_API_KEY: "gsk_made_up", READER3D_ACCESS_CODE: "made-up code" };
+  assert.equal((await call({ body: ask("?"), origin: null, open: false, env })).status, 401);
+  assert.equal((await call({ body: ask("?"), origin: null, open: false, env, headers: { "x-reader3d-code": "made-up code" } })).status, 200);
 });
 
 test("requests: the body capped, a valid question, a limit per address", async () => {

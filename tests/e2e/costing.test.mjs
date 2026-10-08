@@ -614,8 +614,10 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
   });
 
   test('cycle time estimated by the AI: the data sent to the gateway, the proposal shown, used in the quote and traced, kept with the real time, undone', { timeout: 120_000 }, async (t) => {
-    // A stand-in for the AI gateway (CORS as it does it), answering the task cycle_time from the data it is given.
+    // A stand-in for the AI gateway (CORS as it does it), answering the task cycle_time from the data it is given;
+    // with `locked`, asking for an access code as api/ai.js does.
     const requests = [];
+    let locked = false;
     const cors = (req, res) => {
       if (req.headers.origin) res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
       if (req.method !== 'OPTIONS') return false;
@@ -626,9 +628,13 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const gateway = createServer(async (req, res) => {
       if (cors(req, res)) return;
       res.setHeader('Content-Type', 'application/json');
-      if (req.method === 'GET') return res.end(JSON.stringify({ provider: 'Groq', model: 'openai/gpt-oss-120b', models: [], context_chars: 9000, access_code_required: false }));
+      if (req.method === 'GET') return res.end(JSON.stringify({ provider: 'Groq', model: 'openai/gpt-oss-120b', models: [], context_chars: 9000, access_code_required: locked }));
       let text = '';
       for await (const chunk of req) text += chunk;
+      if (locked) {
+        res.statusCode = 401;
+        return res.end(JSON.stringify({ error: "Code d'accès requis : saisissez le code de la passerelle.", access_code_required: true }));
+      }
       const request = JSON.parse(text);
       requests.push(request);
       const f = request.context.formule.valeur_s;
@@ -689,9 +695,14 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // The PRI of the detail of the costing (the note of the solutions says "PRI complet" first, without an amount).
     const pri = async () => /PRI complet(?: \(outillage compris\))?(\d[\d\s]*,\d+) €/.exec(await text())[1];
     const priBefore = await pri();
-    // The button, beside the cycle of the route; the AI asked; the box of the similar parts, ticked.
-    assert.match(await text(), /IA de la page IA \/ analyse : passerelle en ligne, noms anonymisés\. Historique : 3 enregistrements, les 3 plus semblables envoyés/);
-    assert.equal(await page.isChecked('#page-chiffrage [data-pref="cycle-similar"]'), true);
+    // The button, beside the cycle of the route; the AI asked; the box of the similar parts (confidential times),
+    // unticked for the gateway unless ticked, for this browser tab only.
+    assert.match(await text(), /IA de la page IA \/ analyse : passerelle en ligne, noms anonymisés\. Historique : 3 enregistrements, non envoyé\./);
+    assert.equal(await page.isChecked('#page-chiffrage [data-pref="cycle-similar"]'), false);
+    assert.match(await text('#chistorique'), /L'historique est gardé dans ce navigateur\. Il n'est envoyé à l'IA que si la case « Envoyer les pièces similaires de l'historique » est cochée/);
+    await page.check('#page-chiffrage [data-pref="cycle-similar"]');
+    await waitText(/Historique : 3 enregistrements, les 3 plus semblables envoyés/);
+    assert.deepEqual(await page.evaluate(() => [sessionStorage.getItem('reader3d.ai.cycleSimilar'), localStorage.getItem('reader3d.ai.cycleSimilar')]), ['1', null]);
     await page.click('#page-chiffrage [data-action="estimate-cycle"]');
     await page.waitForSelector('#ccycle-ia .ccycle-value');
 
@@ -747,6 +758,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.match(row, /fourchette de \d+ à \d+ s, confiance moyenne/);
     assert.match(row, new RegExp(`îlot ${island} imposé avec l'estimation`));
     assert.match(await text('#ccycle-ia'), new RegExp(`Utilisée dans le devis : ${e} s depuis le`));
+    assert.match(await text('#cfeedback'), new RegExp(`cycle du chiffrage ${e} s × \\d+ \\(estimation IA validée\\)`));
     // Kept with the quote: after a reload, the proposal and its use.
     await page.reload();
     await page.waitForSelector('#ccycle-ia [data-action="undo-cycle"]');
@@ -774,7 +786,10 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.match(await text('#ccycle-ia'), new RegExp(`Utilisée dans le devis : ${e} s, estimation du \\d\\d/\\d\\d/\\d{4} \\d\\d:\\d\\d validée le`));
     assert.match(await page.locator('#page-chiffrage #ctrace tr', { hasText: 'piece.cycle' }).first().textContent(), /estimation IA validée/);
 
-    // "Ne plus utiliser cette valeur": the formula and the automatic island again, the price of before.
+    // The new estimate adopted in place of the first, then "Ne plus utiliser cette valeur": the formula and the
+    // automatic island again (as before the first), the price of before.
+    await page.click('#ccycle-ia [data-action="adopt-cycle"]');
+    await waitText(new RegExp(`Temps de cycle de ${e} s utilisé dans le devis : estimation IA validée \\(Groq · openai/gpt-oss-120b\\), îlot ${island}\\.`));
     await page.click('#ccycle-ia [data-action="undo-cycle"]');
     await waitText(/Estimation IA retirée du devis : temps de cycle estimé par la formule, îlot choisi automatiquement\./);
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.procede"]'), 'auto');
@@ -790,6 +805,20 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal('pieces_similaires' in requests[2].context, false);
     assert.match(await text('#ccycle-ia'), /Pièces semblables \(0 envoyée\)/);
 
+    // An access code asked by the gateway: where to type it, the Chiffrage page having no field for it;
+    // on the IA page, its field shown at once.
+    locked = true;
+    await page.click('#page-chiffrage [data-action="estimate-cycle"]');
+    await page.waitForSelector('#ccycle-ia .cmsg.error');
+    assert.equal(await page.textContent('#ccycle-ia .cmsg.error'), "Code d'accès de la passerelle requis : saisissez-le dans la page IA / analyse (champ « Code d'accès »), puis relancez.");
+    // A message of several lines keeps them (the checklist of an unreachable Ollama).
+    assert.equal(await page.$eval('#ccycle-ia .cmsg.error', (x) => getComputedStyle(x).whiteSpace), 'pre-line');
+    assert.equal(requests.length, 3);
+    await page.click('.tab[data-page="ia"]');
+    await page.waitForSelector('#ai-code-field', { state: 'visible' }); // the IA page loaded the first time it is opened
+    await page.click('.tab[data-page="chiffrage"]');
+    locked = false;
+
     // A phone: the card within 375 px (its table scrolls inside it).
     await page.setViewportSize({ width: 375, height: 800 });
     const overflow = await page.evaluate(() => [...document.querySelectorAll('#ccycle-ia')].flatMap((card) => [card, ...card.querySelectorAll('button, .cscroll, p')])
@@ -800,9 +829,11 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
   });
 
   test('backtest of the AI on the history: paced against the stand-in gateway, kept over a reload, stopped by its quota and resumed, read and exported', { timeout: 180_000 }, async (t) => {
-    // A stand-in for the AI gateway (CORS as it does it): an estimate from the weight sent; the request number `refuse` refused for quota.
+    // A stand-in for the AI gateway (CORS as it does it): an estimate from the weight sent; the request number `refuse`
+    // refused for quota, the request number `cut` answered beyond the length allowed.
     const requests = [];
     let refuse = 0;
+    let cut = 0;
     const cors = (req, res) => {
       if (req.headers.origin) res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
       if (req.method !== 'OPTIONS') return false;
@@ -820,6 +851,10 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       if (requests.length === refuse) {
         res.writeHead(429, { 'Retry-After': '1' });
         return res.end(JSON.stringify({ error: 'Quota de Groq (offre gratuite) atteint. Réessayez dans 1 s.', retry_after: 1 }));
+      }
+      if (requests.length === cut) {
+        res.statusCode = 502;
+        return res.end(JSON.stringify({ error: 'Réponse de Groq coupée (limite de 1200 tokens, AI_MAX_TOKENS) : augmentez AI_MAX_TOKENS dans Vercel (par exemple 2 000), puis redéployez.', truncated: true }));
       }
       const e = Math.round(requests.at(-1).context.piece.poids_kg * 100 + 100);
       res.end(JSON.stringify({ output: JSON.stringify({
@@ -849,7 +884,13 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    page.on('dialog', (d) => d.accept());
+    // The confirmations asked: accepted unless `refused`.
+    const dialogs = [];
+    let refused = false;
+    page.on('dialog', (d) => {
+      dialogs.push(d.message());
+      return refused ? d.dismiss() : d.accept();
+    });
     await page.goto(`${base}?lang=fr`);
     await page.evaluate((url) => {
       localStorage.setItem('reader3d.ai.provider', 'openai');
@@ -864,11 +905,26 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.match(await text(), /Pour chaque enregistrement qui a un poids et un module \(4 pièces sur 5\)/);
     assert.match(await text(), /IA de la page IA \/ analyse \(passerelle en ligne, noms anonymisés\)/);
     assert.match(await text(), /Une demande à la fois, une toutes les 20 s puis au rythme que permet le quota renvoyé par la passerelle/);
+    assert.match(await text(), /la formule de l'îlot avec les coefficients actuels de Paramètres \(source des coefficients du cycle : CG3 défaut, BPR défaut\)/);
     assert.equal(await page.isDisabled('#chistorique [data-action="export-backtest"]'), true);
+
+    // The gateway: a confirmation says what leaves the browser; refused, nothing is sent.
+    refused = true;
+    await page.click('#chistorique [data-action="backtest"]');
+    await page.waitForFunction(() => document.querySelector('#chistorique [data-action="backtest"]') && !document.getElementById('cbacktest-status'));
+    assert.equal(dialogs.length, 1);
+    assert.equal(dialogs[0], "Banc d'essai avec la passerelle en ligne : pour chacune des 4 pièces à estimer, ses données (géométrie, îlot, pièces par cycle, mise au mille, formule, sans son temps de cycle) partent au fournisseur de la passerelle, références et noms anonymisés. Continuer ?");
+    assert.equal(requests.length, 0);
+    refused = false;
+    // The similar parts and their times: sent only with the box ticked (here, under the button), said so.
+    assert.equal(await page.isChecked('#chistorique [data-pref="cycle-similar"]'), false);
+    await page.check('#chistorique [data-pref="cycle-similar"]');
+    await page.waitForFunction(() => document.querySelector('#chistorique [data-pref="cycle-similar"]').checked);
 
     // The run: one record, then the wait the quota of the gateway sets (6 s at least); a reload during it.
     await page.click('#chistorique [data-action="backtest"]');
     await page.waitForSelector('#cbacktest-status');
+    assert.equal(dialogs[1], "Banc d'essai avec la passerelle en ligne : pour chacune des 4 pièces à estimer, ses données (géométrie, îlot, pièces par cycle, mise au mille, formule, sans son temps de cycle) et jusqu'à 5 pièces semblables de l'historique avec leur temps de cycle partent au fournisseur de la passerelle, références et noms anonymisés. Sur toute la série, presque tous les temps de cycle de l'historique sont envoyés. Continuer ?");
     assert.equal(await page.isDisabled('#chistorique [data-action="backtest"]'), true);
     assert.equal((await page.textContent('#chistorique [data-action="backtest"]')).trim(), "Banc d'essai IA en cours");
     await page.waitForFunction(() => /Pièce 2 sur 4 \(BX-1\) : prochaine demande dans \d s, au rythme du quota en ligne/.test(document.getElementById('cbacktest-status')?.textContent));
@@ -935,6 +991,18 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const overflow = await page.evaluate(() => [...document.querySelectorAll('#chistorique')].flatMap((card) => [card, ...card.querySelectorAll('button, .cscroll, p')])
       .filter((x) => x.offsetParent).map((x) => [x.textContent.trim().slice(0, 30) || x.className, Math.round(x.getBoundingClientRect().right)]).filter(([, right]) => right > 375));
     assert.deepEqual(overflow, []);
+
+    // An answer cut at the length allowed: a result that cannot be used (asked again, it would be cut again), the run goes on.
+    await page.click('#chistorique [data-action="clear-backtest"]');
+    await page.waitForFunction(() => document.querySelector('#chistorique [data-action="backtest"]')?.textContent.trim() === "Banc d'essai IA");
+    cut = 9; // the last record of the run
+    await page.click('#chistorique [data-action="backtest"]');
+    await waitText(/Banc d'essai IA terminé/);
+    assert.equal(requests.length, 9);
+    assert.deepEqual(await page.$$eval('#chistorique .cbacktest .cbacktest-error', (xs) => xs.map((x) => [x.closest('tr').cells[0].textContent, x.textContent, x.title])), [
+      ['BX-3', 'réponse inutilisable', 'Réponse de Groq coupée (limite de 1200 tokens, AI_MAX_TOKENS) : augmentez AI_MAX_TOKENS dans Vercel (par exemple 2 000), puis redéployez.'],
+    ]);
+    assert.match(await text(), /Pas d'estimation utilisable pour 1 pièce \(voir le tableau\)\./);
 
     // With Ollama: no quota, slower, said so. Erased: back to the start.
     await page.evaluate(() => localStorage.setItem('reader3d.ai.provider', 'ollama'));
