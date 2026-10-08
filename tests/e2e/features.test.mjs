@@ -452,6 +452,23 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.context().close();
   });
 
+  test('a model dropped on the IA page is analysed in the 3D view', { timeout: CAD_TIMEOUT }, async () => {
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    await page.click('.tab[data-page="ia"]');
+    const stl = readFileSync(fixturePath('box.stl')).toString('base64');
+    await page.evaluate((b64) => {
+      const data = new DataTransfer();
+      data.items.add(new File([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], 'box.stl'));
+      document.getElementById('page-ia').dispatchEvent(new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true }));
+    }, stl);
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    assert.equal(await page.isVisible('#page-viewer'), true);
+    assert.equal((await page.evaluate(() => window.reader3d.result)).file, 'box.stl');
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
   test('link for AI assistants: ?url=…&report=1, JSON and window.reader3d', { timeout: CAD_TIMEOUT }, async () => {
     const { page, errors } = await newPage();
     await page.goto(`${base}?url=e2e-samples/named_assembly.step&report=1&thickness=1&lang=en`);

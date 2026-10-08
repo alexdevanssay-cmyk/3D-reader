@@ -1090,7 +1090,9 @@ window.addEventListener("drop", (e) => {
     showPage("viewer");
   } else {
     // On the costing pages, files go to the rows of their data files (chiffrage/ui.js), not to the 3D view.
-    if ($("page-viewer").hidden) return;
+    if (!$("page-chiffrage").hidden || !$("page-parametres").hidden) return;
+    // From the IA page: analysed in the 3D view, where its progress shows.
+    if (!$("page-ia").hidden) showPage("viewer");
     tab = freeTab();
   }
   const item = [...(e.dataTransfer.items ?? [])].find((i) => i.kind === "file");
