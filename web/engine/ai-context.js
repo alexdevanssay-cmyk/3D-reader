@@ -148,5 +148,134 @@ export function buildAIContext(semantic, options = {}) {
   };
 }
 
+// --------------------------------------------------------------------------- compact context
+
+const DIMENSION_KEYS = ["diameter_mm", "radius_mm", "minor_radius_mm", "cone_semi_angle_rad"];
+const round = (v, d = 3) => (finite(v) ? Math.round(v * 10 ** d) / 10 ** d : v);
+
+function roundDeep(value) {
+  if (finite(value)) return round(value);
+  if (Array.isArray(value)) return value.map(roundDeep);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, roundDeep(v)]));
+  return value;
+}
+
+/** A feature without its evidence lists: its kind, status and main dimensions. */
+function slimFeature(feature) {
+  const out = { feature_id: feature.feature_id, type: feature.type, status: feature.status, confidence: round(feature.confidence, 2) };
+  if (feature.subtype) out.subtype = feature.subtype;
+  for (const k of DIMENSION_KEYS) if (finite(feature.geometry?.[k])) out[k] = round(feature.geometry[k]);
+  return out;
+}
+
+/** Features grouped by type: counts and the distinct dimensions (largest first). */
+function featureGroups(features) {
+  const groups = new Map();
+  for (const f of features) {
+    const key = `${f.type}|${f.subtype ?? ""}`;
+    const g = groups.get(key) ?? { type: f.type, ...(f.subtype ? { subtype: f.subtype } : {}), count: 0, evidenced: 0, provisional: 0, diameters_mm: new Set() };
+    g.count++;
+    if (f.status === "provisional") g.provisional++;
+    else g.evidenced++;
+    const d = f.geometry?.diameter_mm ?? (finite(f.geometry?.radius_mm) ? 2 * f.geometry.radius_mm : null);
+    if (finite(d)) g.diameters_mm.add(round(d, 2));
+    groups.set(key, g);
+  }
+  return [...groups.values()].map((g) => {
+    const diameters = [...g.diameters_mm].sort((a, b) => b - a);
+    const { diameters_mm, ...rest } = g;
+    return { ...rest, ...(diameters.length ? { diameters_mm: diameters.slice(0, 12), ...(diameters.length > 12 ? { more_diameters: diameters.length - 12 } : {}) } : {}) };
+  });
+}
+
+function relationCounts(relations) {
+  const counts = {};
+  for (const r of relations ?? []) counts[r.type] = (counts[r.type] ?? 0) + 1;
+  return counts;
+}
+
+/**
+ * A smaller copy of an AI context (buildAIContext) for models with a small
+ * context window (a local LLM): the same facts, less detail, until its JSON
+ * fits in `maxChars`. Levels: 1 the per-surface geometry and the evidence
+ * lists left out, the foundry knowledge common to every body given once;
+ * 2 the features grouped by type; 3 only the largest bodies in detail;
+ * 4 the bodies reduced to their metrics. What was left out is listed in
+ * `compaction.omitted`, so that the model knows the context is partial.
+ */
+export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6 } = {}) {
+  const size = (o) => JSON.stringify(o).length;
+  const common = {};
+  const bodies1 = context.bodies.map((body) => {
+    const { analytic_surfaces, ...geometry } = body.geometry ?? {};
+    let foundry = body.foundry ?? null;
+    if (foundry) {
+      const { sources, simulation_boundary, confidence_policy, engineering_inputs, ...own } = foundry;
+      common.sources ??= (sources ?? []).map(({ id, title, publisher }) => ({ id, title, publisher }));
+      common.simulation_boundary ??= simulation_boundary;
+      common.confidence_policy ??= confidence_policy;
+      common.engineering_inputs ??= engineering_inputs;
+      foundry = own;
+    }
+    return {
+      id: body.id, name: body.name, role: body.role,
+      metrics: roundDeep(body.metrics),
+      geometry: { ...roundDeep(geometry), analytic_surface_count: Array.isArray(analytic_surfaces) ? analytic_surfaces.length : 0 },
+      relation_counts: relationCounts(body.relations),
+      features: (body.features ?? []).map(slimFeature),
+      ...(body.manufacturing ? { manufacturing: roundDeep(body.manufacturing) } : {}),
+      ...(body.manufacturing_plan ? { manufacturing_plan: roundDeep(body.manufacturing_plan) } : {}),
+      foundry,
+      _features: body.features ?? [],
+    };
+  });
+  const omitted = ["analytic surfaces", "feature and relation evidence lists"];
+  const strip = (bodies) => bodies.map(({ _features, ...b }) => b);
+  const build = (bodies, level) => ({
+    ...context,
+    bodies: strip(bodies),
+    foundry_common: Object.keys(common).length ? common : undefined,
+    compaction: { level, omitted: [...omitted], original_body_count: context.bodies.length },
+  });
+
+  let out = build(bodies1, 1);
+  if (size(out) <= maxChars) return out;
+
+  // 2: features grouped by type, operations summarized.
+  omitted.push("individual features (grouped by type)");
+  const bodies2 = bodies1.map((b) => ({
+    ...b,
+    features: undefined,
+    feature_groups: featureGroups(b._features),
+    ...(b.manufacturing ? { manufacturing: {
+      process_candidates: b.manufacturing.process_candidates,
+      operation_count: b.manufacturing.operations?.length ?? 0,
+      functional_thickness: b.manufacturing.functional_thickness,
+      dfm_recommendations: b.manufacturing.dfm_recommendations,
+    } } : {}),
+    ...(b.manufacturing_plan ? { manufacturing_plan: { summary: b.manufacturing_plan.summary ?? null, setup_count: b.manufacturing_plan.setups?.length ?? null } } : {}),
+  }));
+  out = build(bodies2, 2);
+  if (size(out) <= maxChars) return out;
+
+  // 3: only the largest bodies in detail.
+  const byVolume = [...bodies2].sort((a, b) => (b.metrics?.volume_mm3 ?? 0) - (a.metrics?.volume_mm3 ?? 0));
+  const detailed = new Set(byVolume.slice(0, detailedBodies).map((b) => b.id));
+  const brief = (b) => ({ id: b.id, name: b.name, role: b.role, metrics: { volume_mm3: b.metrics?.volume_mm3 ?? null, surface_area_mm2: b.metrics?.surface_area_mm2 ?? null, bbox_size_mm: b.metrics?.bbox_mm?.size ?? null }, feature_count: b._features.length });
+  if (context.bodies.length > detailedBodies) {
+    omitted.push(`details of the ${context.bodies.length - detailedBodies} smallest bodies`);
+    out = build(bodies2.map((b) => (detailed.has(b.id) ? b : brief(b))), 3);
+    if (size(out) <= maxChars) return out;
+  }
+
+  // 4: every body reduced to its metrics and feature counts; the foundry screen of the largest one.
+  omitted.push("per-body foundry and manufacturing details (kept for the largest body only)");
+  const largest = byVolume[0]?.id;
+  out = build(bodies2.map((b) => (b.id === largest ? { ...brief(b), feature_groups: b.feature_groups, foundry: b.foundry } : brief(b))), 4);
+  if (size(out) <= maxChars) return out;
+  omitted.push("warnings");
+  return { ...out, warnings: out.warnings.slice(0, 3), compaction: { ...out.compaction, omitted: [...omitted] } };
+}
+
 export const AI_CONTEXT_VERSION = "1.0";
 export const AI_CONTEXT_TASKS = [...TASKS];

@@ -71,12 +71,14 @@ function normalizeAxis(v) {
   return a;
 }
 
-function axisDistance(a, b) {
-  const aa=normalizeAxis(a), bb=normalizeAxis(b);
+/** Distance between two parallel axis lines (direction + point on it); Infinity if not parallel. */
+function axisDistance(axisA, pointA, axisB, pointB) {
+  const aa=normalizeAxis(axisA), bb=normalizeAxis(axisB);
   if (!aa || !bb) return Infinity;
+  if (!Array.isArray(pointA) || !Array.isArray(pointB) || !pointA.every(finite) || !pointB.every(finite)) return Infinity;
   const parallel = Math.abs(Math.abs(aa[0]*bb[0]+aa[1]*bb[1]+aa[2]*bb[2]) - 1);
   if (parallel > 1e-5) return Infinity;
-  const d=[(b?.[0]??0)-(a?.[0]??0),(b?.[1]??0)-(a?.[1]??0),(b?.[2]??0)-(a?.[2]??0)];
+  const d=[pointB[0]-pointA[0],pointB[1]-pointA[1],pointB[2]-pointA[2]];
   const axial=d[0]*aa[0]+d[1]*aa[1]+d[2]*aa[2];
   return Math.hypot(d[0]-axial*aa[0],d[1]-axial*aa[1],d[2]-axial*aa[2]);
 }
@@ -129,7 +131,7 @@ function cylindricalRelations(cylinders, cones, surfaces) {
   for (let i=0;i<cylinders.length;i++) {
     for (let j=i+1;j<cylinders.length;j++) {
       const a=cylinders[i], b=cylinders[j];
-      if (axisDistance(a.center_mm,b.center_mm)>Math.max(1e-4,Math.min(a.radius_mm,b.radius_mm)*1e-3)) continue;
+      if (axisDistance(a.axis,a.center_mm,b.axis,b.center_mm)>Math.max(1e-4,Math.min(a.radius_mm,b.radius_mm)*1e-3)) continue;
       const radiiEqual=Math.abs(a.radius_mm-b.radius_mm)<=Math.max(1e-5,Math.min(a.radius_mm,b.radius_mm)*1e-4);
       relations.push({
         type:radiiEqual ? "coaxial_cylinders" : "coaxial_cylinder_step",
@@ -142,7 +144,7 @@ function cylindricalRelations(cylinders, cones, surfaces) {
   }
   for (const c of cylinders) {
     for (const cone of cones) {
-      if (axisDistance(c.center_mm,cone.center_mm)>Math.max(1e-4,c.radius_mm*1e-3)) continue;
+      if (axisDistance(c.axis,c.center_mm,cone.axis,cone.center_mm)>Math.max(1e-4,c.radius_mm*1e-3)) continue;
       relations.push({
         type:"coaxial_cylinder_cone",
         surfaces:[c.index,cone.index],
