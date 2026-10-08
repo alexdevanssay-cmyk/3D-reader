@@ -408,6 +408,70 @@ test("V6 planning links operations of different precedence", () => {
   assert.ok(plan.dependencies.every(d=>d.resolvable));
 });
 
+test("V6 planning puts the operations without a tool axis in one setup", () => {
+  // Three coaxial cylinders: three drillings along Z, six counterbore
+  // candidates (relations) without an axis of their own.
+  const result = buildSemantic3D({
+    file:"shaft.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({ geometric_surfaces:[5,8,11].map((r,index)=>(
+      {index,type:"cylinder",radius_mm:r,axis:[0,0,1],center_mm:[0,0,5*index],edge_signatures:[]}
+    )) })],
+  });
+  const plan=result.bodies[0].manufacturing_plan;
+  assert.equal(plan.operation_count,9);
+  assert.equal(plan.setup_count,2);
+  assert.deepEqual(plan.setups.map(s=>s.compatibility).sort(),["axis_unknown","common_tool_axis"]);
+  assert.equal(plan.setups.find(s=>!s.tool_axis).operation_ids.length,6);
+  assert.ok(plan.planned_order.every(step=>plan.setups.some(s=>s.setup_id===step.setup_id && s.operation_ids.includes(step.operation_id))));
+});
+
+test("V6 readiness reads the closedness of the semantic body", () => {
+  const holed = (closed) => buildSemantic3D({
+    file:"hole.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({ closed, geometric_surfaces:[
+      {index:0,type:"cylinder",radius_mm:2,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[]},
+    ] })],
+  }).bodies[0].manufacturing_plan.readiness;
+  assert.ok(!holed(true).unresolved_constraints.includes("body_not_confirmed_closed"));
+  assert.ok(holed(false).unresolved_constraints.includes("body_not_confirmed_closed"));
+});
+
+test("a counterbore depends on the operations of its bore, in the plan and in the V5 sequence", () => {
+  const e=(z,r)=>[r,0,z,r,0,z];
+  const result = buildSemantic3D({
+    file:"counterbore.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({ geometric_surfaces:[
+      {index:0,type:"cylinder",radius_mm:5,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[e(0,5),e(10,5)]},
+      {index:1,type:"cylinder",radius_mm:8,axis:[0,0,1],center_mm:[0,0,10],edge_signatures:[e(10,8),e(20,8)]},
+      {index:2,type:"plane",edge_signatures:[e(0,5)]},
+      {index:3,type:"plane",edge_signatures:[e(10,5),e(10,8)]},
+      {index:4,type:"plane",edge_signatures:[e(20,8)]},
+    ] })],
+  });
+  const {manufacturing, manufacturing_plan:plan}=result.bodies[0];
+  const opById=new Map(manufacturing.operations.map(o=>[o.operation_id,o]));
+  const related=plan.dependencies.filter(d=>d.reason==="feature_relation");
+  assert.ok(related.length>0);
+  for (const d of related) {
+    const from=opById.get(d.from), to=opById.get(d.to);
+    assert.equal(to.operation,"counterboring_or_boring");
+    assert.ok(["drilling","drilling_or_boring","boss_milling_or_bore"].includes(from.operation), from.operation);
+    assert.ok(from.surfaces.some(s=>to.surfaces.includes(s)));
+  }
+  // Every counterbore candidate waits for the drilling of the bore (surface 0).
+  for (const op of manufacturing.operations.filter(o=>o.operation==="counterboring_or_boring")) {
+    assert.ok(related.some(d=>d.to===op.operation_id && opById.get(d.from).operation.startsWith("drilling") && opById.get(d.from).surfaces.includes(0)));
+  }
+  // The V5 sequence gives the same dependencies as the plan.
+  for (const step of manufacturing.sequence) {
+    const expected=[...new Set(plan.dependencies.filter(d=>d.to===step.operation_id).map(d=>d.from))].sort();
+    assert.deepEqual([...step.depends_on].sort(),expected);
+  }
+});
+
 test("keeps V6 planning deterministic across repeated semantic builds", () => {
   const input={
     file:"deterministic.step", kind:"cad", engine:"browser",

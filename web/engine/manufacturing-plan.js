@@ -34,7 +34,10 @@ function setupCompatibility(operations) {
   const groups = [];
   for (const operation of operations) {
     const axis = operationAxis(operation);
-    let group = groups.find(g => axis && g.axis && sameAxis(axis, g.axis));
+    // The operations without a tool axis share one setup, still to be determined.
+    let group = axis
+      ? groups.find(g => g.axis && sameAxis(axis, g.axis))
+      : groups.find(g => !g.axis);
     if (!group) {
       group = { axis, operations: [] };
       groups.push(group);
@@ -44,24 +47,36 @@ function setupCompatibility(operations) {
   return groups;
 }
 
-function precedence(operation) {
-  const order = {
-    pocket_milling: 20,
-    boss_milling_or_bore: 25,
-    drilling: 30,
-    drilling_blind: 30,
-    drilling_or_boring: 30,
-    counterboring_or_boring: 35,
-    boring_or_coaxial_feature_machining: 35,
-    patterned_feature_machining: 40,
-    feature_machining: 45,
-    chamfering_or_countersinking: 50,
-    fillet_or_blend_finishing: 60,
-  };
-  return order[operation] ?? 45;
+const PRECEDENCE = {
+  pocket_milling: 20,
+  boss_milling_or_bore: 25,
+  drilling: 30,
+  drilling_blind: 30,
+  drilling_or_boring: 30,
+  counterboring_or_boring: 35,
+  boring_or_coaxial_feature_machining: 35,
+  patterned_feature_machining: 40,
+  feature_machining: 45,
+  chamfering_or_countersinking: 50,
+  fillet_or_blend_finishing: 60,
+};
+
+// Operations that finish what another operation machined on the same surface:
+// a counterbore after the drilling of its bore, a chamfer after the faces it breaks.
+const FINISHING_OPERATIONS = new Set([
+  "counterboring_or_boring",
+  "boring_or_coaxial_feature_machining",
+  "feature_machining",
+  "chamfering_or_countersinking",
+]);
+
+/** Rank of an operation in the machining order (the V5 sequence uses it too). */
+export function precedence(operation) {
+  return PRECEDENCE[operation] ?? 45;
 }
 
-function operationDependencyGraph(operations) {
+/** Dependencies between candidate operations: {from, to, reason, confidence}. */
+export function operationDependencyGraph(operations) {
   const edges = [];
   const sorted = [...operations].sort((a, b) =>
     precedence(a.operation) - precedence(b.operation) ||
@@ -81,17 +96,25 @@ function operationDependencyGraph(operations) {
     }
   }
 
-  const featureToOperation = new Map();
+  // Each operation lists only its own feature: operations are related through
+  // the surfaces they share (operation.surfaces, set by semantic.js).
+  const producersBySurface = new Map();
   for (const operation of operations) {
-    for (const id of operation.feature_ids ?? []) featureToOperation.set(id, operation.operation_id);
+    if (FINISHING_OPERATIONS.has(operation.operation)) continue;
+    for (const surface of operation.surfaces ?? []) {
+      const list = producersBySurface.get(surface) ?? [];
+      list.push(operation);
+      producersBySurface.set(surface, list);
+    }
   }
 
   for (const operation of operations) {
-    for (const featureId of operation.feature_ids ?? []) {
-      const producer = featureToOperation.get(featureId);
-      if (producer && producer !== operation.operation_id) {
+    if (!FINISHING_OPERATIONS.has(operation.operation)) continue;
+    for (const surface of operation.surfaces ?? []) {
+      for (const producer of producersBySurface.get(surface) ?? []) {
+        if (precedence(producer.operation) >= precedence(operation.operation)) continue;
         edges.push({
-          from: producer,
+          from: producer.operation_id,
           to: operation.operation_id,
           reason: "feature_relation",
           confidence: 0.9,
@@ -138,7 +161,8 @@ function readiness(body, operations, setups, dependencies) {
     unresolved.push("stock_fixture_access_not_verified");
   }
   if (operations.some(o => o.status !== "candidate")) unresolved.push("non_candidate_operation_state");
-  if (body.closed !== true) unresolved.push("body_not_confirmed_closed");
+  // A semantic body (semantic.js) keeps its closedness in quality.closed.
+  if ((body.closed ?? body.quality?.closed) !== true) unresolved.push("body_not_confirmed_closed");
   if (body.quality?.evidence?.validation_error_count > 0) unresolved.push("semantic_evidence_validation_errors");
 
   const score = Math.max(0, Math.min(1,
@@ -165,25 +189,26 @@ export function buildManufacturingPlan(body) {
   const groups = setupCompatibility(operations);
   const setups = groups.map(setupCandidate);
   const dependencies = operationDependencyGraph(operations);
+  const setupOf = new Map();
+  setups.forEach((setup, index) => setup.operation_ids.forEach(id => setupOf.set(id, index)));
 
   const plannedOrder = [...operations]
     .sort((a,b) =>
-      (setups.findIndex(s => s.operation_ids.includes(a.operation_id)) -
-       setups.findIndex(s => s.operation_ids.includes(b.operation_id))) ||
+      (setupOf.get(a.operation_id) - setupOf.get(b.operation_id)) ||
       precedence(a.operation) - precedence(b.operation) ||
       a.operation_id.localeCompare(b.operation_id)
     )
     .map((operation, index) => ({
       step: index + 1,
       operation_id: operation.operation_id,
-      setup_id: setups.find(s => s.operation_ids.includes(operation.operation_id))?.setup_id ?? null,
+      setup_id: setups[setupOf.get(operation.operation_id)]?.setup_id ?? null,
       operation: operation.operation,
     }));
 
+  const ids = new Set(operations.map(o => o.operation_id));
   const dependencyMap = dependencies.map(edge => ({
     ...edge,
-    resolvable: operations.some(o => o.operation_id === edge.from) &&
-      operations.some(o => o.operation_id === edge.to),
+    resolvable: ids.has(edge.from) && ids.has(edge.to),
   }));
 
   return {
