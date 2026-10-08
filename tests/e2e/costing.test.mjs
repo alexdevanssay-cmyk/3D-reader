@@ -1,6 +1,7 @@
 // End-to-end test of the costing pages of the built site (dist/): import of
 // the costing workbook and of a prices file, the three best routes, choice of
-// an island in the drop-down lists, settings kept after a reload, Excel export.
+// an island in the drop-down lists, settings kept after a reload, trends file
+// below the values typed in, Excel export.
 // With a made-up workbook (tests/js/costing-fixture.mjs).
 //
 //   npm run build && node --test tests/e2e/costing.test.mjs
@@ -31,6 +32,8 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     writeFileSync(join(dir, 'chiffrage.xlsm'), costingWorkbook());
     writeFileSync(join(dir, 'VALEURS MB LME.xlsx'), indicesWorkbook(100));
     writeFileSync(join(dir, 'RFQ.xlsm'), seriesOrderWorkbook());
+    // A calibrated settings file (made-up values), with a misspelled key.
+    writeFileSync(join(dir, 'tendances.json'), JSON.stringify({ trs: { CG3: 0.7, SSP: 0.5 }, procceses: { CG3: { qualite: 9 } } }));
     server = createStaticServer(DIST);
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     base = `http://127.0.0.1:${server.address().port}/`;
@@ -134,6 +137,42 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.waitForSelector('#page-chiffrage .ctable');
     assert.match(await page.textContent('#page-chiffrage'), /300 s × 1 — TRS 60 %/);
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.poids"]'), '1.2', 'inputs kept too');
+
+    // Trends (calibrated settings file): their own layer, below the values typed in and the workbook.
+    await page.click('.tab[data-page="parametres"]');
+    await page.waitForSelector('#page-parametres [data-bind="s.trs.CG3"]');
+    await page.setInputFiles('#page-parametres input[data-file="tendances"]', join(dir, 'tendances.json'));
+    await page.waitForFunction(() => /Tendances « tendances\.json » importées : 2 valeurs/.test(document.getElementById('page-parametres').textContent));
+    assert.match(await page.textContent('#page-parametres .cmsg.warn'), /procceses \(vouliez-vous dire « processes » \?\)/);
+    const settingsCell = (bind) => page.locator(`#page-parametres td:has(> .cval [data-bind="${bind}"])`);
+    assert.equal(await page.inputValue('#page-parametres [data-bind="s.trs.CG3"]'), '60', 'the value typed in stays');
+    assert.match(await settingsCell('s.trs.CG3').textContent(), /^S\s*tendance 70 %, écart [-−]14,3 %\s*Adopter la tendance$/);
+    assert.equal(await page.inputValue('#page-parametres [data-bind="s.trs.SSP"]'), '50', 'nothing typed in: the trend');
+    assert.equal(await settingsCell('s.trs.SSP').locator('.csrc').textContent(), 'T');
+    assert.equal(await page.textContent('#page-parametres label:has([data-bind="s.marge"]) .csrc'), 'classeur');
+    assert.equal(await page.textContent('#page-parametres label:has([data-bind="s.densities.AS7G03"]) .csrc'), 'défaut');
+    // An emptied field is no longer a value typed in: the trend comes back (not 0).
+    await page.fill('#page-parametres [data-bind="s.trs.CG3"]', '');
+    await page.dispatchEvent('#page-parametres [data-bind="s.trs.CG3"]', 'change');
+    await page.waitForFunction(() => document.querySelector('#page-parametres [data-bind="s.trs.CG3"]')?.value === '70');
+    assert.equal(await settingsCell('s.trs.CG3').locator('.csrc').textContent(), 'T');
+    // Typed in again, then "Adopter la tendance".
+    await page.fill('#page-parametres [data-bind="s.trs.CG3"]', '65');
+    await page.dispatchEvent('#page-parametres [data-bind="s.trs.CG3"]', 'change');
+    await page.waitForSelector('#page-parametres [data-action="adopt-trend"][data-path="trs.CG3"]');
+    await page.click('#page-parametres [data-action="adopt-trend"][data-path="trs.CG3"]');
+    await page.waitForFunction(() => document.querySelector('#page-parametres [data-bind="s.trs.CG3"]')?.value === '70');
+    assert.equal(await page.locator('#page-parametres [data-action="adopt-trend"]').count(), 0);
+    // "Paramètres par défaut": erasing the trends says what is kept; the default of the code comes back.
+    const dialog = new Promise((resolve) => page.once('dialog', (d) => resolve(d.message()) || d.accept()));
+    await page.click('#page-parametres [data-action="clear-tendances"]');
+    assert.match(await dialog, /Effacer les tendances importées \(« tendances\.json », 2 valeurs\)[\s\S]*Sont conservés : vos saisies de Paramètres et le classeur/);
+    await page.waitForFunction(() => /Tendances « tendances\.json » effacées/.test(document.getElementById('page-parametres').textContent));
+    assert.equal(await page.inputValue('#page-parametres [data-bind="s.trs.CG3"]'), '75');
+    assert.equal(await settingsCell('s.trs.CG3').locator('.csrc').textContent(), 'D');
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage .ctable');
+    assert.match(await page.textContent('#page-chiffrage'), /300 s × 1 — TRS 75 %/);
 
     // The series order of the customer request: volumes per year, MOQ, target price.
     // Dropped on its row of the "Données" card (drag and drop replaces the file in use).

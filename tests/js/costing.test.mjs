@@ -13,7 +13,10 @@ import { readWorkbook } from '../../web/chiffrage/xlsxread.js';
 import { heatTreatmentOf, programmeOf, readSeriesOrder } from '../../web/chiffrage/rfq.js';
 import { DEFAULT_TOOLING, coefOf, estimateTooling, steelToolCost } from '../../web/chiffrage/tooling.js';
 import { DEFAULT_CORES, boxSize, coreBoxCost, coresPerPiece } from '../../web/chiffrage/cores.js';
-import { defaultSettings, mergeSettings } from '../../web/chiffrage/store.js';
+import {
+  DEFAULT_DENSITIES, adoptTendance, clearSaisies, clearSetting, clearTendances, defaultSettings, exportSaisies, importTendances,
+  loadSettings, loadSettingsLayers, mergeSettings, migrateSettings, setSetting, validateTendances,
+} from '../../web/chiffrage/store.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -455,3 +458,307 @@ describe('settings files', () => {
     assert.deepEqual(settings.tooling.taux, DEFAULT_TOOLING.taux, 'the current settings are not changed');
   });
 });
+
+// --------------------------------------------------------------------------- settings layers (store.js)
+
+// The settings are kept in localStorage: an in-memory one for these tests.
+const storage = new Map();
+globalThis.localStorage = {
+  getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+  setItem: (k, v) => void storage.set(k, String(v)),
+  removeItem: (k) => void storage.delete(k),
+};
+const V1 = 'reader3d.chiffrage.settings.v1';
+const V2 = 'reader3d.chiffrage.settings.v2';
+
+// The settings rules of version 1 (one saved object, merged over the
+// defaults), kept here as the reference of the non-regression tests.
+function v1Defaults(base) {
+  const d = base?.defaults ?? {};
+  return {
+    trs: { ...DEFAULT_TRS }, modes: {}, processes: structuredClone(DEFAULT_PROCESSES), operations: structuredClone(DEFAULT_OPERATIONS),
+    densities: { ...DEFAULT_DENSITIES }, tooling: structuredClone(DEFAULT_TOOLING), tth: defaultSettings(null).tth, cores: structuredClone(DEFAULT_CORES),
+    inflation: { salaires: d.evolutionSalaires ?? 0.015, conso: d.evolutionConso ?? 0.02, elec: d.evolutionElec ?? 0, gaz: d.evolutionGaz ?? 0, autresEnergies: d.evolutionAutresEnergies ?? 0.03 },
+    energy: null, marge: d.marge ?? 0.12, tauxMini: d.tauxMini ?? 0.1, coefSecurite: d.coefSecurite ?? 0.1,
+    heuresChangementCoulee: d.changeover?.[0]?.heures ?? 8, heuresChangementFinition: d.changeover?.[1]?.heures ?? 1,
+  };
+}
+function v1Load(base, saved) {
+  const defaults = v1Defaults(base);
+  if (!saved) return defaults;
+  const merged = { ...defaults, ...saved };
+  for (const key of ['trs', 'modes', 'densities', 'inflation']) merged[key] = { ...defaults[key], ...saved[key] };
+  merged.cores = { ...defaults.cores, ...saved.cores };
+  for (const k of ['etude', 'fao']) merged.cores[k] = { ...defaults.cores[k], ...saved.cores?.[k] };
+  merged.tth = { ...defaults.tth };
+  for (const [code, value] of Object.entries(saved.tth ?? {})) merged.tth[code] = { ...defaults.tth[code], ...value };
+  merged.tooling = { ...defaults.tooling, ...saved.tooling };
+  for (const [k, v] of Object.entries(defaults.tooling)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) merged.tooling[k] = { ...v, ...saved.tooling?.[k] };
+    else if (Array.isArray(v) && !Array.isArray(saved.tooling?.[k])) merged.tooling[k] = v;
+  }
+  for (const key of ['processes', 'operations']) {
+    merged[key] = { ...defaults[key] };
+    for (const [code, value] of Object.entries(saved[key] ?? {})) merged[key][code] = { ...defaults[key][code], ...value, cycle: { ...defaults[key][code]?.cycle, ...value.cycle }, rendement: { ...defaults[key][code]?.rendement, ...value.rendement } };
+  }
+  return merged;
+}
+
+/** Everything the settings change in a quote of the fixture, as ui.js:compute does it. */
+function pricesOf(s) {
+  const energy = Object.fromEntries(Object.entries(s.energy ?? {}).filter(([, v]) => Number.isFinite(v)));
+  const rates = centreRates(base, { modes: s.modes, energy });
+  const metal = { coursAchat: 2500, p1020Achat: 300, premiumAchat: 350, coursVente: 2040, p1020Vente: 320, premiumVente: 600, pafAchat: 0.06, pafVente: 0.08 };
+  const quoteBase = {
+    metal, coefDifficulte: 2, vaUsinage: 10, rebutUsinage: 0.02, coefSecurite: s.coefSecurite, tailleSerie: 1000, nombrePieces: 50000,
+    changeover: [{ code: 'CG3', heures: s.heuresChangementCoulee }, { code: 'FCE', heures: s.heuresChangementFinition }],
+    marge: s.marge, evolution: s.inflation, years: [2026, 2027], volumes: [10000, 10000], tth: 'scie', tthCoef: s.tth.T5.coef,
+  };
+  const part = { poids: 1.2, moduleMm: 3, toileMini: 5, epaisseurMax: 10, dimMax: 250, bboxSize: [250, 120, 60], volumeAnnuel: 10000, volumeTotal: 50000, tth: true, noyaux: true, sableKg: 0.3 };
+  const routes = rankRoutes(rates, base.lists, part, s, quoteBase).map((r) => [r.process, r.finition, r.feasible, r.cycle, r.miseAuMille, r.outillage, r.result.pri, r.result.years.map((y) => y.prixVente)]);
+  const box = coreBoxCost({ masse: 1, qte: 1, type: 1, complexite: 'Moyen' }, s.cores, s.tooling).total;
+  return { routes, box, density: s.densities.AS7G03 };
+}
+
+describe('settings layers: typed values, workbook, trends, defaults', () => {
+  const typedOnly = () => Object.fromEntries(Object.entries(JSON.parse(storage.get(V2)).values).map(([k, e]) => [k, e.value]));
+
+  test('nothing saved: the defaults and the workbook, the same prices as before', () => {
+    storage.clear();
+    const s = loadSettings(base);
+    assert.deepEqual(s, defaultSettings(base));
+    assert.deepEqual(pricesOf(s), pricesOf(v1Load(base, null)));
+    const layers = loadSettingsLayers(base);
+    assert.equal(layers.provenance('trs.CG3').source, 'defaut');
+    assert.equal(layers.provenance('marge').source, 'classeur');
+    assert.equal(layers.provenance('energy.elecNouveau').source, 'classeur');
+  });
+
+  test('a TRS typed in, then a trends file: the typed value stays, the trend is shown beside it', () => {
+    storage.clear();
+    assert.equal(setSetting('trs.CG3', 0.6, base), null);
+    const report = importTendances({ trs: { CG3: 0.7, SSP: 0.5 } }, 'tendances.json');
+    assert.equal(report.count, 2);
+    const layers = loadSettingsLayers(base);
+    assert.equal(layers.effective.trs.CG3, 0.6);
+    assert.deepEqual(pick(layers.provenance('trs.CG3'), ['source', 'value', 'trend']), { source: 'saisie', value: 0.6, trend: 0.7 });
+    // Where nothing is typed, the trend.
+    assert.equal(layers.effective.trs.SSP, 0.5);
+    assert.deepEqual(pick(layers.provenance('trs.SSP'), ['source', 'fileName']), { source: 'tendance', fileName: 'tendances.json' });
+  });
+
+  test('a trends file, then a TRS typed in: the typed value wins too', () => {
+    storage.clear();
+    importTendances({ trs: { CG3: 0.7 } }, 'tendances.json');
+    assert.equal(loadSettings(base).trs.CG3, 0.7);
+    setSetting('trs.CG3', 0.6, base);
+    assert.equal(loadSettings(base).trs.CG3, 0.6);
+    // A new trends file replaces the trends, never the typed value.
+    importTendances({ trs: { CG3: 0.65 } }, 'tendances 2.json');
+    assert.equal(loadSettings(base).trs.CG3, 0.6);
+    assert.equal(loadSettingsLayers(base).provenance('trs.CG3').trend, 0.65);
+    assert.deepEqual(typedOnly(), { 'trs.CG3': 0.6 }, 'only what was typed is saved');
+  });
+
+  test('the workbook above the trends, the trends above the code', () => {
+    storage.clear();
+    importTendances({ marge: 0.3, coefSecurite: 0.2, processes: { CG3: { cycle: { base: 111 } } } }, 't.json');
+    let layers = loadSettingsLayers(base);
+    assert.equal(layers.effective.marge, base.defaults.marge);
+    assert.deepEqual(pick(layers.provenance('marge'), ['source', 'trend']), { source: 'classeur', trend: 0.3 });
+    assert.equal(layers.effective.processes.CG3.cycle.base, 111);
+    assert.equal(layers.effective.processes.CG3.cycle.parKg, DEFAULT_PROCESSES.CG3.cycle.parKg);
+    // Without a workbook, the trend.
+    assert.equal(loadSettings(null).marge, 0.3);
+    // A re-imported workbook is taken into account at the next loading.
+    const other = { ...base, defaults: { ...base.defaults, marge: 0.15 } };
+    assert.equal(loadSettings(other).marge, 0.15);
+    // "Adopter la tendance" where the workbook has a value: the trend is typed in.
+    adoptTendance('marge', base);
+    layers = loadSettingsLayers(base);
+    assert.equal(layers.effective.marge, 0.3);
+    assert.equal(layers.provenance('marge').source, 'saisie');
+  });
+
+  test('"Adopter la tendance" removes the typed value', () => {
+    storage.clear();
+    importTendances({ trs: { CG3: 0.7 } }, 't.json');
+    setSetting('trs.CG3', 0.6, base);
+    adoptTendance('trs.CG3', base);
+    const layers = loadSettingsLayers(base);
+    assert.equal(layers.effective.trs.CG3, 0.7);
+    assert.equal(layers.provenance('trs.CG3').source, 'tendance');
+    assert.deepEqual(typedOnly(), {});
+  });
+
+  test('an emptied field is not set: the next layer, never 0; a 0 typed in stays 0', () => {
+    storage.clear();
+    importTendances({ trs: { CG3: 0.7 } }, 't.json');
+    setSetting('trs.CG3', 0.6, base);
+    setSetting('trs.CG3', null, base);
+    assert.equal(loadSettings(base).trs.CG3, 0.7, 'the trend');
+    clearTendances();
+    assert.equal(loadSettings(base).trs.CG3, DEFAULT_TRS.CG3, 'the default');
+    for (const path of ['marge', 'coefSecurite', 'heuresChangementCoulee', 'inflation.salaires', 'processes.CG3.rendement.base', 'processes.CG3.miseAuMille', 'operations.TRI.chargeKg', 'tooling.tiroirs']) {
+      setSetting(path, 0.5, base);
+      setSetting(path, null, base);
+      const value = path.split('.').reduce((o, k) => o[k], loadSettings(base));
+      assert.equal(value, path.split('.').reduce((o, k) => o[k], defaultSettings(base)), path);
+    }
+    setSetting('processes.CG3.famille', 'Coquille', base);
+    setSetting('processes.CG3.famille', '', base);
+    assert.equal(loadSettings(base).processes.CG3.famille, DEFAULT_PROCESSES.CG3.famille);
+    // 0 typed in: kept where it has a meaning, refused where it has none.
+    assert.equal(setSetting('marge', 0, base), null);
+    assert.equal(loadSettings(base).marge, 0);
+    assert.equal(loadSettingsLayers(base).provenance('marge').source, 'saisie');
+    for (const path of ['trs.CG3', 'densities.AS7G03', 'operations.TRI.chargeKg', 'processes.CG3.miseAuMille']) {
+      assert.ok(setSetting(path, 0, base), path);
+      assert.ok(path.split('.').reduce((o, k) => o[k], loadSettings(base)) > 0, path);
+    }
+    assert.deepEqual(typedOnly(), { marge: 0 });
+  });
+
+  test('a typed value in a table row, exported as a settings file', () => {
+    storage.clear();
+    setSetting('tooling.bandes.3.ax3', 70, base);
+    setSetting('trs.CG3', 0.6, base);
+    const s = loadSettings(base);
+    assert.equal(s.tooling.bandes[3].ax3, 70);
+    assert.deepEqual(s.tooling.bandes[2], DEFAULT_TOOLING.bandes[2]);
+    const file = exportSaisies(base);
+    assert.deepEqual(file, { tooling: { bandes: { 3: { ax3: 70 } } }, trs: { CG3: 0.6 } });
+    // The export imported as trends: the same values.
+    storage.clear();
+    importTendances(JSON.parse(JSON.stringify(file)), 'saisies.json');
+    const t = loadSettings(base);
+    assert.equal(t.tooling.bandes[3].ax3, 70);
+    assert.deepEqual(t.tooling.bandes[4], DEFAULT_TOOLING.bandes[4]);
+  });
+
+  test('migration of the saved settings of version 1: only the choices, the same prices', () => {
+    storage.clear();
+    // Version 1 saved the whole object at the first change (here: the defaults of the workbook, and a few inputs).
+    const saved = v1Load(base, null);
+    saved.trs.CG3 = 0.6;
+    saved.processes.CG3.cycle.base = 120;
+    saved.operations.FCE.parKg = 9;
+    saved.tooling.taux.ax3 = 99;
+    saved.tooling.bandes[0].ajustage = 40;
+    saved.tooling.coefPoids = [{ max: 100, coef: 1.3 }, { max: 1e9, coef: 1.25 }];
+    saved.modes = { SSP: '1*8', CG4: '2*8' };
+    saved.energy = { elecNouveau: 60 };
+    saved.densities.AS7G03 = 2.7;
+    saved.cores.marge = 0.05;
+    saved.tth.T5.coef = 0.5;
+    saved.evolution = { salaires: 0.2 }; // a key of an older version: kept
+    storage.set(V1, JSON.stringify(saved));
+    const s = loadSettings(base);
+    assert.deepEqual(pricesOf(s), pricesOf(v1Load(base, saved)));
+    assert.deepEqual(Object.keys(typedOnly()).sort(), [
+      'cores.marge', 'densities.AS7G03', 'energy.elecNouveau', 'evolution.salaires', 'modes.SSP', 'operations.FCE.parKg',
+      'processes.CG3.cycle.base', 'tooling.bandes.0.ajustage', 'tooling.coefPoids', 'tooling.taux.ax3', 'trs.CG3', 'tth.T5.coef',
+    ]);
+    const layers = loadSettingsLayers(base);
+    assert.deepEqual(pick(layers.provenance('tooling.coefPoids.1.coef'), ['source', 'migrated']), { source: 'saisie', migrated: true });
+    assert.equal(layers.provenance('tooling.coefPoids.1.max').source, 'saisie');
+    assert.ok(layers.saisies.migratedAt);
+    assert.ok(storage.has(V1), 'the settings of version 1 are kept as they were (backup)');
+    // Emptying a value of a table saved whole: the value below comes back, not NaN.
+    clearSetting('tooling.coefPoids.0.coef', base);
+    assert.equal(loadSettings(base).tooling.coefPoids[0].coef, DEFAULT_TOOLING.coefPoids[0].coef);
+    assert.equal(loadSettings(base).tooling.coefPoids[1].coef, 1.25);
+    // Migrated once; erasing the typed values does not bring them back.
+    setSetting('marge', 0.2, base);
+    assert.equal(loadSettings(base).marge, 0.2);
+    clearSaisies();
+    assert.ok(!storage.has(V1));
+    assert.deepEqual(loadSettings(base), defaultSettings(base));
+  });
+
+  test('migration: defaults and emptied fields of version 1 are not choices', () => {
+    // A workbook whose values differ from the defaults of the code (made-up values).
+    const other = { ...base, defaults: { ...base.defaults, evolutionSalaires: 0.025, marge: 0.2 } };
+    const saved = v1Load(null, null); // saved before the workbook was imported: the defaults of the code
+    saved.coefSecurite = null; // a field emptied in version 1 (it counted as 0)
+    saved.trs.CG3 = null;
+    const values = migrateSettings(saved, other);
+    assert.deepEqual(values, {});
+    storage.clear();
+    storage.set(V1, JSON.stringify(saved));
+    const s = loadSettings(other);
+    assert.equal(s.inflation.salaires, 0.025, 'the workbook, no longer the default of the code saved');
+    assert.equal(s.marge, 0.2);
+    assert.equal(s.coefSecurite, base.defaults.coefSecurite);
+    assert.equal(s.trs.CG3, DEFAULT_TRS.CG3);
+  });
+
+  test('trends file: unknown and misspelled keys reported and ignored, partial tables without NaN', () => {
+    const { values, report } = validateTendances({
+      procceses: { CG3: { qualite: 9 } },
+      processes: { CG3: { cycle: { bse: 50, parKg: 7 }, finitions: ['FCE', 'XYZ'] }, CG9: { qualite: 1 } },
+      trs: { CG3: 85, NEW: 0.9 },
+      marge: '0,15',
+      tooling: { bandes: [{ max: 150, ax3: 12 }, { max: 2000, ax3: 30, scan: 3 }], taux: { ax3: 90 } },
+      tth: { T61: { label: 'T61', coef: 1.05 }, T62: { label: 'sans coefficient' } },
+      densities: { AS21: 2.71 },
+      _commentaire: 'calé sur les devis',
+    });
+    assert.deepEqual(report.unknown, [
+      { path: 'procceses', suggestion: 'processes' },
+      { path: 'processes.CG3.cycle.bse', suggestion: 'base' },
+      { path: 'processes.CG9', suggestion: 'CG1' },
+    ]);
+    assert.deepEqual(report.invalid.map((x) => x.path), ['processes.CG3.finitions', 'trs.CG3', 'marge', 'tth.T62']);
+    assert.equal(values.procceses, undefined);
+    assert.deepEqual(values.processes.CG3, { cycle: { parKg: 7 }, finitions: ['FCE'] });
+    assert.deepEqual(values.trs, { NEW: 0.9 });
+    assert.equal(values.marge, undefined);
+    assert.deepEqual(values.tth.T61, { label: 'T61', coef: 1.05, cycle: '' });
+    assert.ok(report.completed.includes('tooling.bandes.0.ax5'));
+    assert.equal(report.count, countLeaves(values));
+    // Applied: every value of the tables is a number, the die and the core box are costed.
+    storage.clear();
+    importTendances({ tooling: { bandes: [{ max: 150, ax3: 12 }], coefPoids: [{ coef: 1.3 }] }, cores: { types: [{ prixKg: 9 }] } }, 't.json');
+    const s = loadSettings(base);
+    for (const row of [...s.tooling.bandes, ...s.tooling.coefPoids, ...s.cores.types]) for (const v of Object.values(row)) assert.ok(typeof v === 'string' || Number.isFinite(v), JSON.stringify(row));
+    assert.ok(Number.isFinite(estimateTooling({ bboxSize: [200, 120, 60], dimMax: 200 }, 2, s.tooling).total));
+    assert.ok(Number.isFinite(coreBoxCost({ masse: 1, qte: 1, type: 0, complexite: 'Moyen' }, s.cores, s.tooling).total));
+    assert.equal(loadSettingsLayers(base).provenance('tooling.bandes.0.ax3').source, 'tendance');
+    assert.equal(loadSettingsLayers(base).provenance('tooling.bandes.0.ax5').source, 'defaut', 'completed, not from the file');
+  });
+
+  test('a file without any known value is refused and the trends are kept', () => {
+    storage.clear();
+    importTendances({ trs: { CG3: 0.7 } }, 't.json');
+    assert.throws(() => importTendances({ client: 'ACME', poids: 2 }, 'devis.json'), /aucune valeur de paramètre reconnue.*client/);
+    assert.throws(() => importTendances([1, 2], 'liste.json'), /aucune valeur/);
+    assert.equal(loadSettings(base).trs.CG3, 0.7);
+  });
+
+  test('storage blocked: the typed values work for this visit', () => {
+    storage.clear();
+    const { setItem } = globalThis.localStorage;
+    globalThis.localStorage.setItem = () => {
+      throw new Error('QuotaExceededError');
+    };
+    try {
+      setSetting('trs.CG3', 0.6, base);
+      assert.equal(loadSettings(base).trs.CG3, 0.6);
+    } finally {
+      globalThis.localStorage.setItem = setItem;
+      clearSaisies();
+    }
+    assert.equal(loadSettings(base).trs.CG3, DEFAULT_TRS.CG3);
+  });
+});
+
+function pick(o, keys) {
+  return Object.fromEntries(keys.map((k) => [k, o[k]]));
+}
+
+function countLeaves(o) {
+  if (Array.isArray(o)) return o.some((x) => x && typeof x === 'object') ? o.reduce((n, x) => n + countLeaves(x), 0) : 1;
+  if (o && typeof o === 'object') return Object.values(o).reduce((n, x) => n + countLeaves(x), 0);
+  return 1;
+}

@@ -14,7 +14,9 @@ let el = null;
 let page = "chiffrage";
 let base = store.loadBase();
 let indices = store.loadIndices();
-let settings = store.loadSettings(base);
+// Settings: the effective ones (used everywhere), and their layers (store.js) for the Paramètres page.
+let layers = store.loadSettingsLayers(base);
+let settings = layers.effective;
 let q = store.loadQuote(base, indices);
 let message = null; // {kind: "ok" | "error", text}
 let thicknessBusy = false;
@@ -55,6 +57,12 @@ export function mount(targets) {
     if (!el.chiffrage.hidden) render();
   });
   return { show, setTab, forgetTab };
+}
+
+/** The settings resolved again from their layers (after an input, an import, the workbook). */
+function reloadSettings() {
+  layers = store.loadSettingsLayers(base);
+  settings = layers.effective;
 }
 
 export function show(name) {
@@ -205,8 +213,11 @@ function onChange(event) {
     }
     store.saveQuote(q);
   } else {
-    setPath(settings, path, value);
-    store.saveSettings(settings);
+    // Paramètres: only the typed values are kept (store.js); an emptied field
+    // is not set, the next layer (workbook, trend, default) applies again.
+    const refused = store.setSetting(path, value, base);
+    if (refused) message = { kind: "error", text: `Valeur refusée (${refused}) : non enregistrée.` };
+    reloadSettings();
   }
   setTimeout(render, 0);
 }
@@ -215,7 +226,7 @@ async function onClick(event) {
   const button = event.target.closest("[data-action]");
   if (!button) return;
   const action = button.dataset.action;
-  if (action === "import-workbook" || action === "import-indices" || action === "import-settings" || action === "import-rfq") button.parentElement.querySelector("input[data-file]")?.click();
+  if (action === "import-workbook" || action === "import-indices" || action === "import-tendances" || action === "import-rfq") button.parentElement.querySelector("input[data-file]")?.click();
   else if (action === "thickness") {
     thicknessBusy = true;
     render();
@@ -283,13 +294,30 @@ async function onClick(event) {
     store.resetQuote();
     q = store.defaultQuote(base, indices);
     render();
-  } else if (action === "reset-settings") {
-    if (!confirm("Revenir aux paramètres par défaut (TRS, îlots, méthodes, inflation) ?")) return;
-    store.resetSettings();
-    settings = store.loadSettings(base);
+  } else if (action === "clear-saisies") {
+    const n = Object.keys(layers.saisies.values).length;
+    const t = layers.tendances;
+    if (!confirm(`Effacer vos ${n} valeur${n > 1 ? "s" : ""} saisie${n > 1 ? "s" : ""} dans Paramètres ?\n\nSont conservés : ${t ? `les tendances importées (« ${t.fileName} »), ` : ""}le classeur de chiffrage. Chaque valeur effacée reprend celle du classeur, sinon la tendance, sinon la valeur par défaut du code.`)) return;
+    store.clearSaisies();
+    reloadSettings();
+    message = { kind: "ok", text: "Saisies de Paramètres effacées." };
     render();
-  } else if (action === "export-settings") {
-    download("parametres_chiffrage.json", new Blob([JSON.stringify(settings, null, 2)], { type: "application/json" }));
+  } else if (action === "clear-tendances") {
+    const t = layers.tendances;
+    if (!t || !confirm(`Effacer les tendances importées (« ${t.fileName} », ${store.countValues(t.values)} valeurs) ?\n\nSont conservés : vos saisies de Paramètres et le classeur de chiffrage. Les valeurs qui venaient des tendances reprennent la valeur par défaut du code.`)) return;
+    store.clearTendances();
+    reloadSettings();
+    message = { kind: "ok", text: `Tendances « ${t.fileName} » effacées.` };
+    render();
+  } else if (action === "adopt-trend") {
+    store.adoptTendance(button.dataset.path, base);
+    reloadSettings();
+    render();
+  } else if (action === "export-saisies") {
+    download("parametres_saisis.json", new Blob([JSON.stringify(store.exportSaisies(base), null, 2)], { type: "application/json" }));
+  } else if (action === "export-tendances") {
+    const t = store.exportTendances();
+    if (t) download(t.fileName || "tendances.json", new Blob([JSON.stringify(t.values, null, 2)], { type: "application/json" }));
   } else if (action === "export-xlsx") {
     exportXlsx().catch((err) => {
       message = { kind: "error", text: err.message };
@@ -314,7 +342,7 @@ async function importFile(target) {
         indices = { ...result.indices, source: "classeur", fileName: file.name, importedAt: new Date().toISOString() };
         store.saveIndices(indices);
       }
-      settings = store.loadSettings(base);
+      reloadSettings();
       // Inputs typed before the first import are kept; the rest comes from the workbook.
       if (!hadBase) {
         const keep = Object.fromEntries(Object.entries(q).filter(([k, v]) => USER_FIELDS.includes(k) && v !== null && v !== ""));
@@ -338,17 +366,26 @@ async function importFile(target) {
         kind: "ok",
         text: `${q.prototype ? "Demande de prototypes" : "Commande série"} « ${file.name} » importée : ${prog ? `${prog.annees} an${prog.annees > 1 ? "s" : ""} à partir de ${prog.premiereAnnee}, ${nf(prog.volumes.reduce((a, b) => a + b, 0), 0)} pièces` : "pas de volume série"}${order.moqs.length ? `, MOQ ${order.moqs.join(" / ")}` : ""}${order.targetPrice ? `, prix cible ${eur(order.targetPrice, 2)}` : ""}.`,
       };
-    } else if (target.dataset.file === "settings") {
-      // Merged into the current settings: a file can hold only some of them (calibrated values...).
-      const saved = JSON.parse(new TextDecoder().decode(bytes));
-      store.saveSettings(store.mergeSettings(settings, saved));
-      settings = store.loadSettings(base);
-      message = { kind: "ok", text: `Paramètres « ${file.name} » importés.` };
+    } else if (target.dataset.file === "tendances") {
+      // The calibrated settings file: its own layer, below the typed values and the workbook (store.js).
+      const report = store.importTendances(JSON.parse(new TextDecoder().decode(bytes)), file.name);
+      reloadSettings();
+      message = tendancesMessage(file.name, report);
     }
   } catch (err) {
     message = { kind: "error", text: `${file.name} : ${err.message || err}` };
   }
   render();
+}
+
+/** What an imported trends file brought, and what of it was left out (unknown keys, refused values). */
+function tendancesMessage(name, report) {
+  const list = (items, label) => `${items.slice(0, 8).map(label).join(", ")}${items.length > 8 ? ` et ${items.length - 8} autre${items.length > 9 ? "s" : ""}` : ""}`;
+  let text = `Tendances « ${name} » importées : ${report.count} valeur${report.count > 1 ? "s" : ""}, appliquées là où rien n'est saisi ni lu dans le classeur.`;
+  if (report.unknown.length) text += ` Clés inconnues, ignorées : ${list(report.unknown, (u) => `${u.path}${u.suggestion ? ` (vouliez-vous dire « ${u.suggestion} » ?)` : ""}`)}.`;
+  if (report.invalid.length) text += ` Valeurs refusées : ${list(report.invalid, (x) => `${x.path || "fichier"} (${x.reason})`)}.`;
+  if (report.completed.length) text += ` Lignes de tableau incomplètes, complétées par les valeurs par défaut : ${list(report.completed, (p) => p)}.`;
+  return { kind: report.unknown.length || report.invalid.length || report.completed.length ? "warn" : "ok", text };
 }
 
 /** The volumes of the request into the quote: series volumes, or prototype volumes for a prototype. */
@@ -842,7 +879,7 @@ function castingCard(r) {
         ${field("Temps de cycle", locked ? `<output>${e ? `${nf(e.cycle, 0)} s (estimé)` : "—"}</output>` : select("p.cycle", i.cycle ?? " ", cycleOptions, { kind: "num" }))}
         ${field("Empreintes / pièces par cycle", locked ? `<output>${e?.parCycle ?? "—"}</output>` : select("p.empreintes", i.empreintes ?? " ", empreintesOptions, { kind: "num" }))}
         ${field("Mise au mille (kg coulé / kg pièce)", locked ? `<output>${e ? nf(e.miseAuMille, 2) : "—"}</output>` : select("p.miseAuMille", i.miseAuMille ?? " ", mamOptions, { kind: "num" }))}
-        ${field("TRS de l'îlot", `<output>${routeCode ? pct(settings.trs[routeCode] ?? 0, 0) : "—"}</output>`, "modifiable dans Paramètres")}
+        ${field("TRS de l'îlot", `<output>${routeCode ? pct(r.route.operations.find((o) => o.code === routeCode)?.trs, 0) : "—"}</output>`, "modifiable dans Paramètres")}
       </div>
       ${mamDetail}
     </section>`;
@@ -1137,14 +1174,66 @@ function projectionCard(c, f) {
   </section>`;
 }
 
+// Where each setting comes from (store.js layers): its label, and its letter in the tables.
+const SOURCES = { saisie: ["saisie", "S"], classeur: ["classeur", "C"], tendance: ["tendance", "T"], defaut: ["défaut", "D"] };
+
+/**
+ * A number of the settings (input "s.<path>"), with where its value comes
+ * from and, when a current value (typed, or of the workbook) differs from the
+ * trend, the trend, the deviation and "Adopter la tendance".
+ *   opts: those of input(), and compact (table cell: the letter of the source).
+ */
+function sinput(path, value, opts = {}) {
+  const p = layers.provenance(path);
+  const [label, letter] = SOURCES[p.source];
+  const title = {
+    saisie: `Saisie du ${dateLabel(p.date)}${p.migrated ? " (reprise des paramètres enregistrés par la version précédente)" : ""}`,
+    classeur: `Valeur du classeur de chiffrage${p.fileName ? ` « ${p.fileName} »` : ""}`,
+    tendance: `Tendance du fichier « ${p.fileName} », importé le ${dateLabel(p.date)}`,
+    defaut: "Valeur par défaut du code (neutre, à ajuster)",
+  }[p.source];
+  let trend = "";
+  if (p.source !== "tendance" && typeof p.trend === "number" && typeof p.value === "number" && p.trend !== p.value) {
+    const shown = (v) => (opts.kind === "pct" ? `${(v * 100).toLocaleString("fr-FR", { maximumFractionDigits: 2 })} %` : v.toLocaleString("fr-FR", { maximumFractionDigits: 4 }));
+    const sign = p.value > p.trend ? "+" : "";
+    const gap = p.trend ? `${sign}${pct((p.value - p.trend) / Math.abs(p.trend))}` : `${sign}${shown(p.value - p.trend)}`;
+    trend = `<small class="ctrend">tendance ${shown(p.trend)}, écart ${gap} <button type="button" class="small" data-action="adopt-trend" data-path="${esc(path)}">Adopter la tendance</button></small>`;
+  }
+  return `<span class="cval">${input(`s.${path}`, value, opts)}<span class="csrc ${p.source}" title="${esc(title)}">${opts.compact ? letter : label}</span></span>${trend}`;
+}
+
+/** Paramètres: the typed values, the trends file and the workbook, and how they take precedence. */
+function settingsSourcesCard() {
+  const n = Object.keys(layers.saisies.values).length;
+  const t = layers.tendances;
+  const plural = (k, word) => `${k} ${word}${k > 1 ? "s" : ""}`;
+  const migrated = layers.saisies.migratedAt && n && !t
+    ? `<p class="cmsg warn">Les paramètres enregistrés par la version précédente ont été repris comme saisies (${plural(n, "valeur")}) : celles égales aux valeurs par défaut ou du classeur ont été retirées, et les champs qui étaient vides reprennent la source suivante. Si un fichier de paramètres calés avait été importé, ses valeurs font partie de ces saisies : réimportez-le comme tendances, puis effacez les saisies que vous ne voulez pas garder.</p>`
+    : "";
+  return `<section class="ccard">
+    <h3>Origine des paramètres</h3>
+    <div class="crow"><span>Mes saisies :</span> <strong>${n ? `${plural(n, "valeur")} saisie${n > 1 ? "s" : ""} dans cette page` : "aucune"}</strong>
+      <button type="button" class="small" data-action="export-saisies"${n ? "" : " disabled"}>Exporter mes saisies</button></div>
+    <div class="crow" data-drop="tendances" title="Glissez un fichier de paramètres calés (.json) ici pour l'importer comme tendances"><span>Tendances :</span> <strong>${t ? `${esc(t.fileName)} — importé le ${dateLabel(t.importedAt)} — ${plural(store.countValues(t.values), "valeur")}` : "aucune"}</strong>
+      <button type="button" class="small" data-action="import-tendances">Importer des tendances (fichier de paramètres calés)…</button>
+      <input type="file" data-file="tendances" accept=".json,application/json" hidden>${t ? ` <button type="button" class="small" data-action="export-tendances">Exporter les tendances</button>` : ""}</div>
+    ${base ? `<div class="crow"><span>Classeur de chiffrage :</span> <strong>${esc(base.source?.fileName)} — importé le ${dateLabel(base.source?.importedAt)}</strong></div>` : ""}
+    ${migrated}
+    <p class="small muted">Chaque valeur vient de la première source qui en a une : <span class="csrc saisie">saisie</span> dans cette page (enregistrée dans ce navigateur dès qu'elle est saisie), puis <span class="csrc classeur">classeur</span> de chiffrage, puis <span class="csrc tendance">tendance</span> du fichier de paramètres calés (une indication tirée des devis passés : elle ne remplace jamais une saisie ni une valeur du classeur), puis <span class="csrc defaut">défaut</span> du code (valeur neutre, à ajuster). Dans les tableaux : S, C, T, D. Un champ vidé n'est plus une saisie : il reprend la valeur de la source suivante (0 ne s'obtient qu'en tapant 0). Quand une valeur s'écarte de la tendance, la tendance et l'écart s'affichent sous le champ, avec « Adopter la tendance ».</p>
+    <div class="crow"><span class="small">Paramètres par défaut :</span>
+      <button type="button" class="small" data-action="clear-saisies"${n ? "" : " disabled"}>Effacer mes saisies (les tendances restent)…</button>
+      <button type="button" class="small" data-action="clear-tendances"${t ? "" : " disabled"}>Effacer les tendances (mes saisies restent)…</button></div>
+  </section>`;
+}
+
 function renderSettings() {
   const centres = base?.centres ?? [];
   const processes = Object.entries(settings.processes);
-  const pnum = (code, key, opts) => input(`s.processes.${code}.${key}`, settings.processes[code][key], opts);
+  const pnum = (code, key, opts) => sinput(`processes.${code}.${key}`, settings.processes[code][key], { ...opts, compact: true });
   const trsRows = centres
     .filter((c) => c.uo === "pph")
     .map((c) => `<tr><td><strong>${esc(c.code)}</strong> ${esc(c.name)}</td>
-      <td class="num">${input(`s.trs.${c.code}`, settings.trs[c.code] ?? 0.85, { kind: "pct", width: "80px" })}</td>
+      <td class="num">${sinput(`trs.${c.code}`, settings.trs[c.code], { kind: "pct", width: "80px", compact: true, placeholder: "85" })}</td>
       <td>${c.source === "modes" ? select(`s.modes.${c.code}`, settings.modes[c.code] ?? c.defaultMode, MODES) : `<span class="muted">${esc(c.source === "reel" ? "Réel" : "fixe")}</span>`}</td></tr>`)
     .join("");
   const processRows = processes
@@ -1154,13 +1243,13 @@ function renderSettings() {
       <td>${pnum(code, "poidsMax", { width: "60px" })}</td><td>${pnum(code, "dimMax", { width: "70px" })}</td>
       <td>${pnum(code, "volumeMin", { width: "80px" })}</td><td>${pnum(code, "empreintesMax", { width: "50px" })}</td>
       <td>${pnum(code, "grappeMax", { width: "60px" })}</td><td>${pnum(code, "miseAuMille", { width: "60px" })}</td>
-      <td>${input(`s.processes.${code}.rendement.base`, p.rendement?.base, { kind: "pct", width: "60px" })}</td>
-      <td>${input(`s.processes.${code}.rendement.parDoublement`, p.rendement?.parDoublement, { kind: "pct", width: "60px" })}</td>
-      <td>${input(`s.processes.${code}.rendement.petitePiece`, p.rendement?.petitePiece, { kind: "pct", width: "60px" })}</td>
-      <td>${input(`s.processes.${code}.cycle.base`, p.cycle.base, { width: "60px" })}</td>
-      <td>${input(`s.processes.${code}.cycle.parKg`, p.cycle.parKg, { width: "60px" })}</td>
-      <td>${input(`s.processes.${code}.cycle.exposant`, p.cycle.exposant ?? 1, { width: "60px" })}</td>
-      <td>${input(`s.processes.${code}.cycle.parModule2`, p.cycle.parModule2, { width: "60px" })}</td>
+      <td>${sinput(`processes.${code}.rendement.base`, p.rendement?.base, { kind: "pct", width: "60px", compact: true })}</td>
+      <td>${sinput(`processes.${code}.rendement.parDoublement`, p.rendement?.parDoublement, { kind: "pct", width: "60px", compact: true })}</td>
+      <td>${sinput(`processes.${code}.rendement.petitePiece`, p.rendement?.petitePiece, { kind: "pct", width: "60px", compact: true })}</td>
+      <td>${sinput(`processes.${code}.cycle.base`, p.cycle.base, { width: "60px", compact: true })}</td>
+      <td>${sinput(`processes.${code}.cycle.parKg`, p.cycle.parKg, { width: "60px", compact: true })}</td>
+      <td>${sinput(`processes.${code}.cycle.exposant`, p.cycle.exposant ?? 1, { width: "60px", compact: true })}</td>
+      <td>${sinput(`processes.${code}.cycle.parModule2`, p.cycle.parModule2, { width: "60px", compact: true })}</td>
       <td>${pnum(code, "qualite", { width: "50px" })}</td><td>${pnum(code, "outillage", { width: "80px" })}</td>
       <td>${checkbox(`s.processes.${code}.tth`, p.tth, "")}</td><td>${checkbox(`s.processes.${code}.noyaux`, p.noyaux, "")}</td></tr>`,
     )
@@ -1168,32 +1257,32 @@ function renderSettings() {
   const opRows = Object.entries(settings.operations)
     .map(
       ([code, o]) => `<tr><td><strong>${esc(code)}</strong> ${esc(o.label)}</td>
-      <td>${input(`s.operations.${code}.base`, o.base, { width: "70px" })}</td>
-      <td>${input(`s.operations.${code}.parKg`, o.parKg, { width: "70px" })}</td>
-      <td>${input(`s.operations.${code}.exposant`, o.exposant ?? 1, { width: "60px" })}</td>
-      <td>${o.chargeKg !== undefined ? input(`s.operations.${code}.chargeKg`, o.chargeKg, { width: "70px" }) : input(`s.operations.${code}.parCycle`, o.parCycle, { width: "70px" })}</td></tr>`,
+      <td>${sinput(`operations.${code}.base`, o.base, { width: "70px", compact: true })}</td>
+      <td>${sinput(`operations.${code}.parKg`, o.parKg, { width: "70px", compact: true })}</td>
+      <td>${sinput(`operations.${code}.exposant`, o.exposant ?? 1, { width: "60px", compact: true })}</td>
+      <td>${o.chargeKg !== undefined ? sinput(`operations.${code}.chargeKg`, o.chargeKg, { width: "70px", compact: true }) : sinput(`operations.${code}.parCycle`, o.parCycle, { width: "70px", compact: true })}</td></tr>`,
     )
     .join("");
   const densities = Object.entries(settings.densities)
-    .map(([a, d]) => field(a, input(`s.densities.${a}`, d, { width: "80px" })))
+    .map(([a, d]) => field(a, sinput(`densities.${a}`, d, { width: "80px" })))
     .join("");
   const energy = { ...base?.energy, ...settings.energy };
   const tthRows = Object.entries(settings.tth)
     .map(
       ([code, t]) => `<tr><td><strong>${esc(code)}</strong></td><td>${input(`s.tth.${code}.label`, t.label, { kind: "text", width: "320px" })}</td>
-      <td>${input(`s.tth.${code}.coef`, t.coef, { width: "70px" })}</td><td>${input(`s.tth.${code}.cycle`, t.cycle, { kind: "text", width: "300px" })}</td></tr>`,
+      <td>${sinput(`tth.${code}.coef`, t.coef, { width: "70px", compact: true })}</td><td>${input(`s.tth.${code}.cycle`, t.cycle, { kind: "text", width: "300px" })}</td></tr>`,
     )
     .join("");
   const tl = settings.tooling;
   const sc = settings.cores;
-  const cf = (label, path, value, hint = "", opts = {}) => field(label, input(`s.cores.${path}`, value, opts), hint);
+  const cf = (label, path, value, hint = "", opts = {}) => field(label, sinput(`cores.${path}`, value, opts), hint);
   const bandRows = tl.bandes
-    .map((b, i) => `<tr><td class="num">≤ ${nf(b.max, 0)} kg</td>${["ax3", "ax3auto", "ax5", "ax5auto", "tiroir3", "tiroir5", "scan", "ajustage"].map((k) => `<td>${input(`s.tooling.bandes.${i}.${k}`, b[k], { width: "56px" })}</td>`).join("")}</tr>`)
+    .map((b, i) => `<tr><td class="num">≤ ${nf(b.max, 0)} kg</td>${["ax3", "ax3auto", "ax5", "ax5auto", "tiroir3", "tiroir5", "scan", "ajustage"].map((k) => `<td>${sinput(`tooling.bandes.${i}.${k}`, b[k], { width: "56px", compact: true })}</td>`).join("")}</tr>`)
     .join("");
-  const tf = (label, path, value, hint = "", opts = {}) => field(label, input(`s.tooling.${path}`, value, opts), hint);
+  const tf = (label, path, value, hint = "", opts = {}) => field(label, sinput(`tooling.${path}`, value, opts), hint);
   return `<div class="cpage">${messageHtml()}
-  <p class="cmsg ok">Les paramètres sont enregistrés automatiquement dans ce navigateur dès qu'ils sont saisis, et retrouvés à la prochaine ouverture de la page.</p>
   ${base ? "" : sourcesCard()}
+  ${settingsSourcesCard()}
   <div class="cgrid">
     <section class="ccard">
       <h3>TRS et fonctionnement par centre</h3>
@@ -1203,20 +1292,20 @@ function renderSettings() {
     <section class="ccard">
       <h3>Marges, inflation, énergie</h3>
       <div class="cfields">
-        ${field("Marge sur VA par défaut", input("s.marge", settings.marge, { kind: "pct" }), "%")}
-        ${field("Taux de marge mini", input("s.tauxMini", settings.tauxMini, { kind: "pct" }), "%")}
-        ${field("Coef de sécurité mise en route", input("s.coefSecurite", settings.coefSecurite, { kind: "pct" }), "%")}
-        ${field("Changement de série : heures coulée", input("s.heuresChangementCoulee", settings.heuresChangementCoulee))}
-        ${field("Changement de série : heures finition", input("s.heuresChangementFinition", settings.heuresChangementFinition))}
-        ${field("Hausse annuelle masse salariale", input("s.inflation.salaires", settings.inflation.salaires, { kind: "pct" }), "%")}
-        ${field("Hausse annuelle conso./entretien/prestations", input("s.inflation.conso", settings.inflation.conso, { kind: "pct" }), "%")}
-        ${field("Hausse annuelle électricité", input("s.inflation.elec", settings.inflation.elec, { kind: "pct" }), "%")}
-        ${field("Hausse annuelle gaz", input("s.inflation.gaz", settings.inflation.gaz, { kind: "pct" }), "%")}
-        ${field("Hausse annuelle autres énergies", input("s.inflation.autresEnergies", settings.inflation.autresEnergies, { kind: "pct" }), "%")}
-        ${field("Électricité : ancien indice (€/MWh)", input("s.energy.elecAncien", energy.elecAncien ?? null))}
-        ${field("Électricité : nouvel indice (€/MWh)", input("s.energy.elecNouveau", energy.elecNouveau ?? null))}
-        ${field("Gaz : ancien indice (€/MWh)", input("s.energy.gazAncien", energy.gazAncien ?? null))}
-        ${field("Gaz : nouvel indice (€/MWh)", input("s.energy.gazNouveau", energy.gazNouveau ?? null))}
+        ${field("Marge sur VA par défaut", sinput("marge", settings.marge, { kind: "pct" }), "%")}
+        ${field("Taux de marge mini", sinput("tauxMini", settings.tauxMini, { kind: "pct" }), "%")}
+        ${field("Coef de sécurité mise en route", sinput("coefSecurite", settings.coefSecurite, { kind: "pct" }), "%")}
+        ${field("Changement de série : heures coulée", sinput("heuresChangementCoulee", settings.heuresChangementCoulee))}
+        ${field("Changement de série : heures finition", sinput("heuresChangementFinition", settings.heuresChangementFinition))}
+        ${field("Hausse annuelle masse salariale", sinput("inflation.salaires", settings.inflation.salaires, { kind: "pct" }), "%")}
+        ${field("Hausse annuelle conso./entretien/prestations", sinput("inflation.conso", settings.inflation.conso, { kind: "pct" }), "%")}
+        ${field("Hausse annuelle électricité", sinput("inflation.elec", settings.inflation.elec, { kind: "pct" }), "%")}
+        ${field("Hausse annuelle gaz", sinput("inflation.gaz", settings.inflation.gaz, { kind: "pct" }), "%")}
+        ${field("Hausse annuelle autres énergies", sinput("inflation.autresEnergies", settings.inflation.autresEnergies, { kind: "pct" }), "%")}
+        ${field("Électricité : ancien indice (€/MWh)", sinput("energy.elecAncien", energy.elecAncien ?? null))}
+        ${field("Électricité : nouvel indice (€/MWh)", sinput("energy.elecNouveau", energy.elecNouveau ?? null))}
+        ${field("Gaz : ancien indice (€/MWh)", sinput("energy.gazAncien", energy.gazAncien ?? null))}
+        ${field("Gaz : nouvel indice (€/MWh)", sinput("energy.gazNouveau", energy.gazNouveau ?? null))}
       </div>
     </section>
   </div>
@@ -1268,8 +1357,8 @@ function renderSettings() {
       <tbody>${bandRows}</tbody></table></div>
     <div class="cscroll"><table class="ctable compact">
       <thead><tr><th>Poids du bloc nu jusqu'à (kg)</th><th>Coefficient de poids</th></tr></thead>
-      <tbody>${tl.coefPoids.map((c, i) => `<tr><td>${input(`s.tooling.coefPoids.${i}.max`, c.max, { width: "90px" })}</td><td>${input(`s.tooling.coefPoids.${i}.coef`, c.coef, { width: "70px" })}</td></tr>`).join("")}</tbody></table></div>
-    <p class="small muted">Méthode du classeur « Outillage fonderie » : poids = L × l × h × densité × coefficient (selon le poids du bloc nu), acier = poids × prix au kg du type, usinage 3 et 5 axes (+ tiroirs), scan et ajustage selon la tranche de poids, étude et FAO selon la complexité, puis sous-traitance et marge. L × l × h = encombrement de la pièce + marges. Les boîtes à noyau utilisent les mêmes taux, tranches et coefficients. Valeurs de départ : importez le fichier de paramètres calé sur vos outillages (Importer des paramètres…).</p>
+      <tbody>${tl.coefPoids.map((c, i) => `<tr><td>${sinput(`tooling.coefPoids.${i}.max`, c.max, { width: "90px", compact: true })}</td><td>${sinput(`tooling.coefPoids.${i}.coef`, c.coef, { width: "70px", compact: true })}</td></tr>`).join("")}</tbody></table></div>
+    <p class="small muted">Méthode du classeur « Outillage fonderie » : poids = L × l × h × densité × coefficient (selon le poids du bloc nu), acier = poids × prix au kg du type, usinage 3 et 5 axes (+ tiroirs), scan et ajustage selon la tranche de poids, étude et FAO selon la complexité, puis sous-traitance et marge. L × l × h = encombrement de la pièce + marges. Les boîtes à noyau utilisent les mêmes taux, tranches et coefficients. Valeurs de départ : importez le fichier de paramètres calé sur vos outillages comme tendances (en haut de la page).</p>
   </section>
   <section class="ccard">
     <h3>Noyaux et boîtes à noyau</h3>
@@ -1288,12 +1377,6 @@ function renderSettings() {
     <h3>Densités des alliages (g/cm³)</h3>
     <div class="cfields">${densities}</div>
   </section>
-  <p class="cactions" data-drop="settings" title="Glissez un fichier de paramètres (.json) ici pour l'importer">
-    <button type="button" data-action="export-settings">Exporter les paramètres</button>
-    <button type="button" data-action="import-settings">Importer des paramètres…</button>
-    <input type="file" data-file="settings" accept=".json" hidden>
-    <button type="button" data-action="reset-settings">Paramètres par défaut</button>
-  </p>
   </div>`;
 }
 

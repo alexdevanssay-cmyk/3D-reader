@@ -150,6 +150,7 @@ Il compare ensuite le comportement du code à la hiérarchie voulue.
      - Résoudre chaque valeur dans cet ordre : `explicite (N1/N2) ?? prior (N4) ?? défaut du code`.
      - Calculer `ecart_tendance` dès qu'une valeur explicite et une valeur prior existent toutes les deux.
      - Afficher la tendance et l'écart à côté de chaque champ de Paramètres. Ajouter un bouton « Adopter la tendance » (par valeur ou par bloc) qui écrit dans Paramètres avec provenance, date et validation humaine.
+   - **Mis en œuvre (couches de paramètres).** `store.js` garde les tendances sous leur propre clé (`reader3d.chiffrage.tendances.v1` : nom du fichier, date d'import, valeurs). L'import « Importer des tendances (fichier de paramètres calés) » est validé (`validateTendances`) : clés inconnues ou mal orthographiées signalées avec une suggestion puis ignorées, valeurs hors bornes refusées, lignes de tableau incomplètes complétées et signalées, traitement thermique nouveau sans coefficient refusé. Les îlots et opérations restent une liste fermée : un code inconnu est ignoré. Ordre de résolution, valeur par valeur : `saisie ?? classeur ?? tendance ?? défaut du code`. Le classeur (N2) passe avant la tendance (N4), conformément à la hiérarchie. Paramètres affiche l'origine de chaque nombre, la tendance et l'écart relatif quand une valeur actuelle s'en écarte, et le bouton « Adopter la tendance ». Deux exports séparés : saisies et tendances. Deux effacements, chacun précisant ce qui est conservé.
 
 2. **Les défauts du code et du classeur sont figés comme s'ils étaient des saisies explicites.**
    - **Constat.**
@@ -160,6 +161,7 @@ Il compare ensuite le comportement du code à la hiérarchie voulue.
      - N'enregistrer que les clés réellement modifiées, chacune avec `{valeur, source: 'saisie', date}`.
      - Recalculer la valeur effective à chaque chargement à partir des couches : classeur courant, prior, code.
      - Dans le devis, séparer une valeur « héritée du classeur » (recalculée) d'une valeur « saisie » (figée).
+   - **Mis en œuvre pour Paramètres (couches de paramètres).** Seules les clés saisies sont enregistrées (`reader3d.chiffrage.settings.v2`, `{valeur, source: 'saisie', date}` par chemin), et la valeur effective est recalculée à chaque chargement (`loadSettingsLayers`). L'objet complet des versions précédentes est migré une fois : ses valeurs deviennent des saisies, sauf celles égales au défaut du code ou du classeur au même endroit, et les valeurs vides. Il reste stocké tel quel, comme sauvegarde, jusqu'à « Effacer mes saisies ». Le devis (`defaultQuote`, `USER_FIELDS`) n'est pas encore traité (étape 7).
 
 3. **Un champ vidé vaut 0, au lieu de laisser la main à la source suivante.**
    - **Constat.** `ui.js:readValue` renvoie null pour un champ vide ; ce null écrase le défaut dans `loadSettings`, puis les formules le traitent comme 0. Effets observés :
@@ -171,6 +173,7 @@ Il compare ensuite le comportement du code à la hiérarchie voulue.
      - PAF, prix d'achat et premium vidés : 0 ;
      - TRS vidé : retour au défaut du code, alors que l'écran affiche un autre repli.
    - **Proposition.** Un champ vide signifie « non renseigné » : la valeur passe à la couche suivante et une alerte s'affiche. Un 0 n'est accepté que s'il est saisi explicitement, et il est refusé là où il n'a pas de sens (TRS, densité, `chargeKg`, mise au mille).
+   - **Mis en œuvre pour Paramètres (couches de paramètres).** Un champ vidé retire la saisie, et la couche suivante reprend la main. Un 0 tapé est conservé. Il est refusé, avec un message, pour le TRS (borné à ]0 ; 100 %]), la densité, `chargeKg` et la mise au mille par défaut. Aucune valeur vide n'atteint plus les formules. Le TRS affiché dans le devis est celui de la gamme. Restent à traiter : les champs du devis (PAF, prix d'achat, premium) et l'alerte prévue à l'étape 8.
 
 4. **Des données de commande (N1) existent dans la RFQ mais ne sont pas lues.**
    - **Constat.** `rfq.js:readSeriesOrder` et `rfq.js:metalOf` ignorent :
