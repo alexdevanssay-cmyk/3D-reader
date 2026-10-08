@@ -118,6 +118,10 @@ function checkParity(result, exp, name) {
     approxVec(body.bbox.size, eb.bbox.size, 0, BBOX * size, `${label}: bbox.size`);
     checkMeshVolume(body, eb, label);
     approxVec(body.color, eb.color, 0, COLOR, `${label}: color`);
+    // Topology for the semantic layer (no Python counterpart): the welded mesh
+    // of a solid closes like the solid.
+    assert.equal(body.topology.watertight, body.closed, `${label}: topology.watertight`);
+    assert.equal(body.topology.triangles, body.triangles, `${label}: topology.triangles`);
   });
   checkTessellationError(result, name);
 

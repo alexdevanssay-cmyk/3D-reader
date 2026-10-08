@@ -7,7 +7,7 @@
 // Contract version: 1.0
 import { buildManufacturingPlan } from "./manufacturing-plan.js";
 import { buildFoundryAnalysis, FOUNDRY_SCHEMA_VERSION, FOUNDRY_KNOWLEDGE_VERSION } from "./foundry-knowledge.js";
-import { weldVertices } from "./meshanalysis.js";
+import { meshTopology } from "./meshanalysis.js";
 
 export const SEMANTIC_VERSION = "1.0";
 
@@ -21,47 +21,16 @@ function finite(v) { return typeof v === "number" && Number.isFinite(v); }
 function dist(a, b) { const x=a[0]-b[0], y=a[1]-b[1], z=a[2]-b[2]; return Math.hypot(x,y,z); }
 
 /**
- * Edge topology of a body's mesh, or null without one (also used by app.js,
- * whose exported bodies have no mesh). On its vertices merged by position, as
- * the Reader merges those of a mesh file: the faces of a CAD mesh and the
- * triangles of an STL file have their own.
+ * Edge topology of a body's mesh (see meshanalysis.js meshTopology), or null
+ * without one. The in-browser engine gives it with each body (body.topology),
+ * which the page keeps when it leaves the mesh out.
  */
-export function topology(body) {
-  const p = body.mesh?.positions;
-  const indices = body.mesh?.indices;
-  if (!p || !indices) return null;
-  const { verts, remap } = weldVertices(p, indices);
-  const nv = verts.length / 3;
-  const f = Uint32Array.from(indices, (i) => remap[i]);
-  const nf = Math.floor(f.length / 3);
-  const edges = new Map();
-  let degenerate = 0;
-  for (let i=0;i<nf;i++) {
-    const a=f[3*i], b=f[3*i+1], c=f[3*i+2];
-    // Corners merged (at the pole of a CAD sphere): no area, no edge of its own.
-    if (a===b || b===c || a===c) {
-      degenerate++;
-      continue;
-    }
-    for (const [u,v] of [[a,b],[b,c],[c,a]]) {
-      const lo=Math.min(u,v), hi=Math.max(u,v), k=lo*nv+hi;
-      edges.set(k,(edges.get(k)||0)+1);
-    }
-  }
-  let boundary=0, nonManifold=0;
-  for (const n of edges.values()) {
-    if (n===1) boundary++;
-    else if (n!==2) nonManifold++;
-  }
-  return {
-    vertices: nv,
-    triangles: nf,
-    unique_edges: edges.size,
-    boundary_edges: boundary,
-    non_manifold_edges: nonManifold,
-    degenerate_triangles: degenerate,
-    watertight: boundary===0 && nonManifold===0,
-  };
+function topology(body) {
+  const m = body.mesh;
+  if (!m?.positions || !m?.indices) return null;
+  // Far from the origin, float32 does not even resolve the body: its
+  // double-precision vertices when kept.
+  return meshTopology(ArrayBuffer.isView(m.positions64) ? m.positions64 : m.positions, m.indices);
 }
 
 function principalAxes(body) {
@@ -751,8 +720,8 @@ function manufacturingForBody(body, features, principal, topo) {
 }
 
 function semanticBody(body, index) {
-  // Given by the caller when its bodies have no mesh (app.js), with the index
-  // of each body in its result when given only some of them.
+  // Given with the body when it has no mesh (from the page), with the index of
+  // each body in its result when only some of them are given (app.js).
   const topo=body.topology ?? topology(body);
   const sourceIndex=body.source_index ?? index;
   const size=body.bbox?.size ?? [0,0,0];

@@ -3,7 +3,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.js";
 import { engravingMask, thicknessHistogram, thicknessStats } from "./engine/thickness.js";
 import { summarize } from "./engine/summary.js";
-import { buildSemantic3D, SEMANTIC_VERSION, topology as meshTopology } from "./engine/semantic.js";
+import { buildSemantic3D, SEMANTIC_VERSION } from "./engine/semantic.js";
 import { buildAIContext, AI_CONTEXT_VERSION } from "./engine/ai-context.js";
 
 // ---------------------------------------------------------------- units
@@ -2092,27 +2092,13 @@ function currentSemantic() {
   if (!r) return null;
   const density = $("density").value;
   if (semanticKept?.result !== r || semanticKept.density !== density) {
-    // The bodies checked, each with its index in r.bodies (what setSelection
-    // takes) and the topology of its mesh, which the exported result leaves out.
+    // The bodies checked, each with its index in r.bodies (what setSelection takes).
     const data = exportableResult(r);
     const indices = includedIndices();
-    data.bodies = data.bodies.map((b, k) => ({ ...b, source_index: indices[k], topology: bodyTopology(indices[k]) }));
+    data.bodies = data.bodies.map((b, k) => ({ ...b, source_index: indices[k] }));
     semanticKept = { result: r, density, semantic: buildSemantic3D(data) };
   }
   return semanticKept.semantic;
-}
-
-// Topology of the mesh of a body (watertight, non-manifold edges...), computed
-// once: it does not change with the bodies checked or the thickness.
-const topologies = new WeakMap(); // body of a result -> topology
-
-function bodyTopology(i) {
-  const body = state.result.bodies[i];
-  if (!topologies.has(body)) {
-    const geom = bodyGeometry(i);
-    topologies.set(body, meshTopology({ mesh: { positions: geom.attributes.position.array, indices: geom.index.array } }));
-  }
-  return topologies.get(body);
 }
 
 /** #reader3d-semantic-result: "null" at once (never that of another state), the new contract when the page is idle. */

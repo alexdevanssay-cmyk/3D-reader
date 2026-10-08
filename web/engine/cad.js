@@ -26,6 +26,8 @@
 // locations, points...): release() runs their destructor by hand. Without it,
 // every analysed model stayed in memory.
 
+import { meshTopology } from './meshanalysis.js';
+
 export const CAD_EXTENSIONS = {
   '.step': 'step',
   '.stp': 'step',
@@ -989,8 +991,8 @@ function openBody(ctx, name, shape, color) {
 
 /**
  * Body object of the result contract (same fields as Body.to_dict in model.py),
- * plus surface_types and geometric_surfaces for semantic.js, which the Python
- * engine does not give.
+ * plus surface_types, geometric_surfaces and topology for semantic.js, which the
+ * Python engine does not give.
  */
 function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], centroid, closed, color, notes, tri, surface_types, geometric_surfaces }) {
   const mesh = { positions: new Float32Array(tri.verts), indices: tri.indices };
@@ -1014,6 +1016,8 @@ function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], 
     notes,
     surface_types: surface_types ?? null,
     geometric_surfaces: geometric_surfaces ?? [],
+    // In the engine worker, not on the page: about 1.5 s for 2 million triangles.
+    topology: meshTopology(tri.verts, tri.indices),
     mesh,
   };
 }

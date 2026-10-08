@@ -73,7 +73,7 @@ reader3d analyze part.step --json</pre>
   <p>The AI-facing semantic contract is exposed as <code>window.reader3d.semantic</code> and in <code>#reader3d-semantic-result</code>, which is written once the page is idle after each result (<code>null</code> until then).
   Each body has the <code>source_index</code> of the body in the file, the index that <code>reader3d.setSelection</code> takes.
   It is versioned independently from the raw measurement result: <code>schema = 3d-semantic-json</code>,
-  <code>schema_version = 1.0</code> and feature schema <code>9.0</code>. Features expose stable IDs, evidence status and evidence counts. It contains model/body metrology, topology, principal axes and conservative geometric feature candidates.
+  <code>schema_version = 1.0</code> and feature schema <code>9.0</code>. Features expose stable IDs, evidence status and evidence counts. It contains model/body metrology, topology (of the welded mesh, given by the in-browser engine: <code>null</code> for a result of the Python engine), principal axes and conservative geometric feature candidates.
   Tessellation buffers are deliberately excluded from this payload.</p>
   <pre>{
   "schema": "3d-semantic-json",

@@ -84,6 +84,7 @@ export function analyzeMesh(name, positions, indices = null, color = null) {
   let centroid = null;
   const edges = buildEdges(work.faces, work.nv);
   const closed = isWatertight(edges, work.faces.length / 3);
+  const topology = edgeTopology(work, edges, faces.length / 3);
 
   if (closed) {
     if (!isWindingConsistent(edges, work.faces)) {
@@ -143,8 +144,24 @@ export function analyzeMesh(name, positions, indices = null, color = null) {
     color: color ? [color[0], color[1], color[2]] : null,
     triangles: faces.length / 3,
     notes,
+    topology,
     mesh,
   };
+}
+
+/**
+ * Edge topology of a triangle mesh for the semantic layer (semantic.js), on its
+ * analysis copy: vertices welded, degenerate and duplicate triangles dropped, as
+ * for `closed` above. The faces of a CAD mesh and the triangles of an STL file
+ * have their own vertices: only welded do they share their edges.
+ *
+ * @param {Float64Array|Float32Array|number[]} positions  xyz in mm
+ * @param {Uint32Array|Int32Array|number[]} indices  3 per triangle
+ */
+export function meshTopology(positions, indices) {
+  const faces = cleanFaces(positions, indices);
+  const work = buildWorkMesh(positions, faces);
+  return edgeTopology(work, buildEdges(work.faces, work.nv), faces.length / 3);
 }
 
 /** True when the float32 copy holds exactly the analysed coordinates (NaN aside). */
@@ -276,7 +293,7 @@ function buildWorkMesh(pos, faces) {
  * first occurrence (in vertex order, only referenced vertices are considered) and
  * welded vertices are numbered in order of first occurrence.
  */
-export function weldVertices(pos, faces) {
+function weldVertices(pos, faces) {
   const n = pos.length / 3;
   const referenced = new Uint8Array(n);
   for (let i = 0; i < faces.length; i++) referenced[faces[i]] = 1;
@@ -491,6 +508,26 @@ function countBoundaryEdges(edges) {
   let n = 0;
   for (let e = 0; e < edges.ne; e++) if (edges.count[e] === 1) n++;
   return n;
+}
+
+/**
+ * The topology of semantic.js from the work mesh of `triangles` triangles and its
+ * edges; degenerate_triangles counts those the work mesh dropped (no area, or a duplicate).
+ */
+function edgeTopology(work, edges, triangles) {
+  let nonManifold = 0;
+  for (let e = 0; e < edges.ne; e++) if (edges.count[e] > 2) nonManifold++;
+  const kept = work.faces.length / 3;
+  const boundary = countBoundaryEdges(edges);
+  return {
+    vertices: work.nv,
+    triangles,
+    unique_edges: edges.ne,
+    boundary_edges: boundary,
+    non_manifold_edges: nonManifold,
+    degenerate_triangles: triangles - kept,
+    watertight: kept > 0 && boundary === 0 && nonManifold === 0,
+  };
 }
 
 // --------------------------------------------------------------------------- repair
