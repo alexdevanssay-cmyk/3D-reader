@@ -595,7 +595,8 @@ test("adds V5 manufacturing semantics with process, setup, sequence and DFM meta
         {index:1,type:"plane",edge_signatures:[[0,0,0,1,0,0]]},
         {index:2,type:"plane",edge_signatures:[[0,0,0,0,1,0]]},
       ],
-      min_thickness_mm:3,
+      // As the Reader exports it (app.js thicknessExport).
+      thickness:{method:"wall",min:3,median:4,max:5},
     })],
   });
   const manufacturing=result.bodies[0].manufacturing;
@@ -607,6 +608,7 @@ test("adds V5 manufacturing semantics with process, setup, sequence and DFM meta
   assert.ok(manufacturing.operations.every(o=>o.accessibility.status==="candidate_only"));
   assert.equal(manufacturing.functional_thickness.minimum_wall_thickness_mm,3);
   assert.equal(manufacturing.functional_thickness.status,"measured");
+  assert.equal(manufacturing.functional_thickness.source,"reader_wall_thickness");
   assert.ok(Array.isArray(manufacturing.dfm_recommendations));
   assert.equal(result.manufacturing_schema_version,"1.0");
 });
@@ -633,6 +635,23 @@ test("one hole is drilled once: the features reading the same face share its ope
   assert.deepEqual(drilling.feature_ids, [cylinder.feature_id, hole.feature_id]);
   assert.equal(drilling.confidence, Math.max(cylinder.confidence, hole.confidence));
   assert.equal(manufacturing.sequence.length, 2);
+});
+
+test("functional thickness is the Reader's thinnest wall, as in the foundry evidence", () => {
+  const result = buildSemantic3D({
+    file:"thin.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({ thickness:{method:"sphere",min:1.2,median:3,max:4} })],
+  });
+  const {manufacturing, foundry}=result.bodies[0];
+  assert.equal(manufacturing.functional_thickness.status,"measured");
+  assert.equal(manufacturing.functional_thickness.minimum_wall_thickness_mm,1.2);
+  assert.equal(manufacturing.functional_thickness.minimum_wall_thickness_mm,foundry.evidence.thickness.min_mm);
+  assert.ok(manufacturing.dfm_recommendations.some(d=>d.code==="thin_wall"));
+  // Not computed: undetermined, no thin wall.
+  const none=buildSemantic3D({ file:"none.step", kind:"cad", engine:"browser", summary:{volume:1000,area:600,bodies:1,solids:1}, bodies:[body()] });
+  assert.equal(none.bodies[0].manufacturing.functional_thickness.status,"undetermined");
+  assert.ok(!none.bodies[0].manufacturing.dfm_recommendations.some(d=>d.code==="thin_wall"));
 });
 
 
@@ -677,6 +696,98 @@ test("V6 planning links operations of different precedence", () => {
   const plan=result.bodies[0].manufacturing_plan;
   assert.ok(plan.dependencies.some(d=>d.reason==="manufacturing_precedence"));
   assert.ok(plan.dependencies.every(d=>d.resolvable));
+});
+
+test("V6 planning puts the operations without a tool axis in one setup", () => {
+  // Three coaxial cylinders: three drillings along Z, three counterbore
+  // candidates without an axis of their own (a relation and the stepped
+  // feature it stands for share one operation).
+  const result = buildSemantic3D({
+    file:"shaft.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({ geometric_surfaces:[5,8,11].map((r,index)=>(
+      {index,type:"cylinder",radius_mm:r,axis:[0,0,1],center_mm:[0,0,5*index],edge_signatures:[]}
+    )) })],
+  });
+  const plan=result.bodies[0].manufacturing_plan;
+  assert.equal(plan.operation_count,6);
+  assert.equal(plan.setup_count,2);
+  assert.deepEqual(plan.setups.map(s=>s.compatibility).sort(),["axis_unknown","common_tool_axis"]);
+  assert.equal(plan.setups.find(s=>!s.tool_axis).operation_ids.length,3);
+  assert.ok(plan.planned_order.every(step=>plan.setups.some(s=>s.setup_id===step.setup_id && s.operation_ids.includes(step.operation_id))));
+});
+
+test("V6 readiness reads the closedness of the semantic body", () => {
+  const holed = (closed) => buildSemantic3D({
+    file:"hole.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({ closed, geometric_surfaces:[
+      {index:0,type:"cylinder",radius_mm:2,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[]},
+    ] })],
+  }).bodies[0].manufacturing_plan.readiness;
+  assert.ok(!holed(true).unresolved_constraints.includes("body_not_confirmed_closed"));
+  assert.ok(holed(false).unresolved_constraints.includes("body_not_confirmed_closed"));
+});
+
+/** A bore (surface 0) along Z with its counterbore (surface 1) and their planar faces. */
+function counterboredHole() {
+  const e=(z,r)=>[r,0,z,r,0,z];
+  return [
+    {index:0,type:"cylinder",radius_mm:5,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[e(0,5),e(10,5)]},
+    {index:1,type:"cylinder",radius_mm:8,axis:[0,0,1],center_mm:[0,0,10],edge_signatures:[e(10,8),e(20,8)]},
+    {index:2,type:"plane",edge_signatures:[e(0,5)]},
+    {index:3,type:"plane",edge_signatures:[e(10,5),e(10,8)]},
+    {index:4,type:"plane",edge_signatures:[e(20,8)]},
+  ];
+}
+
+test("a counterbore depends on the operations of its bore, in the plan and in the V5 sequence", () => {
+  const result = buildSemantic3D({
+    file:"counterbore.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({ geometric_surfaces:counterboredHole() })],
+  });
+  const {manufacturing, manufacturing_plan:plan}=result.bodies[0];
+  const opById=new Map(manufacturing.operations.map(o=>[o.operation_id,o]));
+  const related=plan.dependencies.filter(d=>d.reason==="feature_relation");
+  assert.ok(related.length>0);
+  for (const d of related) {
+    const from=opById.get(d.from), to=opById.get(d.to);
+    assert.equal(to.operation,"counterboring_or_boring");
+    assert.ok(["drilling","drilling_or_boring","boss_milling_or_bore"].includes(from.operation), from.operation);
+    assert.ok(from.surfaces.some(s=>to.surfaces.includes(s)));
+  }
+  // Every counterbore candidate waits for the drilling of the bore (surface 0).
+  for (const op of manufacturing.operations.filter(o=>o.operation==="counterboring_or_boring")) {
+    assert.ok(related.some(d=>d.to===op.operation_id && opById.get(d.from).operation.startsWith("drilling") && opById.get(d.from).surfaces.includes(0)));
+  }
+  // The V5 sequence gives the same dependencies as the plan.
+  for (const step of manufacturing.sequence) {
+    const expected=[...new Set(plan.dependencies.filter(d=>d.to===step.operation_id).map(d=>d.from))].sort();
+    assert.deepEqual([...step.depends_on].sort(),expected);
+  }
+});
+
+test("V6 planned order keeps every operation after those it depends on, beside a pocket", () => {
+  // The counterbored hole, and a planar pocket candidate (no tool axis) elsewhere on the part.
+  const w=(x)=>[x,50,0,x,51,0];
+  const result = buildSemantic3D({
+    file:"counterbore-pocket.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({ geometric_surfaces:[
+      ...counterboredHole(),
+      {index:5,type:"plane",edge_signatures:[w(0),w(1),w(2)]},
+      ...[0,1,2].map(x=>({index:6+x,type:"plane",edge_signatures:[w(x)]})),
+    ] })],
+  });
+  const {manufacturing, manufacturing_plan:plan}=result.bodies[0];
+  assert.ok(manufacturing.operations.some(o=>o.operation==="pocket_milling"));
+  // The setup without a tool axis comes after the drilling setup.
+  assert.deepEqual(plan.setups.map(s=>s.compatibility),["common_tool_axis","axis_unknown"]);
+  const step=new Map(plan.planned_order.map(s=>[s.operation_id,s.step]));
+  const related=plan.dependencies.filter(d=>d.reason==="feature_relation");
+  assert.ok(related.length>0);
+  for (const d of related) assert.ok(step.get(d.from)<step.get(d.to), d.from+" -> "+d.to);
 });
 
 test("keeps V6 planning deterministic across repeated semantic builds", () => {
@@ -764,6 +875,54 @@ test("feature, relation and operation ids are unique across bodies", () => {
   // The same id asked twice is no missing feature.
   const twice = buildAIContext(semantic, { task: "feature_analysis", featureIds: [id, id] });
   assert.ok(!twice.warnings.includes("some_requested_features_not_found"));
+});
+
+test("the AI context keeps the geometry of every feature type", () => {
+  const e0=[0,0,0,1,0,0], e1=[0,1,0,1,1,0], e2=[0,2,0,1,2,0];
+  const semantic = buildSemantic3D({
+    file:"features.step", kind:"cad", engine:"browser",
+    summary:{volume:100,area:600,bodies:1,solids:1},
+    bodies:[body({ volume:100, surface_types:{plane:2,cylinder:7,cone:1,sphere:0,torus:1,bspline:0}, geometric_surfaces:[
+      {index:0,type:"torus",minor_radius_mm:2,edge_signatures:[e0,e1]},
+      {index:1,type:"plane",edge_signatures:[e0]},
+      {index:2,type:"cylinder",radius_mm:8,axis:[0,0,1],center_mm:[0,0,0],wire_count:2,edge_count:2,edge_signatures:[e1]},
+      {index:3,type:"cone",semi_angle_rad:0.2,ref_radius_mm:8,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[e2,e0]},
+      {index:4,type:"plane",edge_signatures:[e2]},
+      {index:5,type:"cylinder",radius_mm:9,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[e0]},
+      {index:6,type:"cylinder",radius_mm:8,axis:[0,0,1],center_mm:[0,0,5],edge_signatures:[]},
+      ...[20,40,60].map((x,i)=>({index:7+i,type:"cylinder",radius_mm:2,axis:[0,0,1],center_mm:[x,0,0],edge_signatures:[]})),
+    ] })],
+  });
+  const features=semantic.bodies[0].features;
+  const context=buildAIContext(semantic,{task:"feature_analysis"});
+  const byId=new Map(context.bodies[0].features.map(f=>[f.feature_id,f]));
+  for (const type of ["hole_feature_candidate","boss_feature_candidate","chamfer_feature_candidate","tapered_feature_candidate",
+    "feature_relation_candidate","stepped_cylindrical_feature_candidate","coaxial_cylindrical_relation","low_fill_ratio_geometry"]) {
+    assert.ok(features.some(f=>f.type===type), type);
+  }
+  // Every numeric field of a feature (dimension, axis, centre, surface index) reaches the model.
+  const numeric=(v)=>typeof v==="number" || (Array.isArray(v) && v.length>0 && v.every(x=>x===null || numeric(x)));
+  for (const f of features) {
+    const geometry=byId.get(f.feature_id).geometry;
+    for (const [k,v] of Object.entries(f)) {
+      if (k==="confidence" || k==="evidence_count" || !numeric(v)) continue;
+      assert.deepEqual(geometry[k],v,`${f.type}.${k}`);
+    }
+  }
+  // Stepped and coaxial features carry the geometry and the id of their relation.
+  const relations=new Map(semantic.bodies[0].relations.map(r=>[r.relation_id,r]));
+  const stepped=features.filter(f=>["stepped_cylindrical_feature_candidate","coaxial_cylindrical_relation"].includes(f.type));
+  assert.ok(stepped.length>0);
+  for (const f of stepped) {
+    const c=byId.get(f.feature_id);
+    const relation=relations.get(f.evidence[0].relation_id);
+    assert.deepEqual(c.geometry.surfaces,relation.surfaces);
+    for (const k of ["radius_mm","radii_mm","diameter_mm"]) if (f[k]!=null) assert.deepEqual(c.geometry[k],f[k],k);
+    assert.deepEqual(c.evidence,[{source:"relation",relation_id:relation.relation_id}]);
+    assert.equal(c.evidence_count,1);
+  }
+  const taper=stepped.find(f=>relations.get(f.evidence[0].relation_id).type==="coaxial_cylinder_cone");
+  assert.equal(byId.get(taper.feature_id).geometry.diameter_mm,16);
 });
 
 test("the compacted AI context of a large assembly fits the budget of a local model", () => {

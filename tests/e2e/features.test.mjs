@@ -139,6 +139,15 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     approx(exported.thickness.min, 20, 0.01, 0, 'JSON thinnest wall');
     assert.equal(exported.thickness.method, 'wall');
     approx(exported.bodies[0].thickness.median, 20, 0.01, 0, 'JSON body median');
+    // Each method too, whichever the view shows: the AI context reads the
+    // hot spots on the spheres and the thinnest wall on the "wall" method.
+    assert.equal(exported.thickness.wall.min, exported.thickness.min);
+    assert.ok(Number.isFinite(exported.thickness.sphere.median) && Number.isFinite(exported.thickness.sphere.max));
+    const semantic = await page.evaluate(() => window.reader3d.semantic.bodies[0]);
+    assert.equal(semantic.foundry.evidence.thickness.hotspot_method, 'sphere');
+    assert.equal(semantic.manufacturing.functional_thickness.status, 'measured');
+    assert.equal(semantic.manufacturing.functional_thickness.minimum_wall_thickness_mm, semantic.foundry.evidence.thickness.min_mm);
+    approx(semantic.foundry.evidence.thickness.min_mm, 20, 0.01, 0, 'foundry thinnest wall');
     // The most frequent and the thickest are links: a click highlights them.
     await page.fill('#thick-value', '5');
     await page.dispatchEvent('#thick-value', 'change');

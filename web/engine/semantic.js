@@ -5,7 +5,7 @@
 // existing Reader result. CAD surface classes are supplied by cad.js when available.
 //
 // Contract version: 1.0
-import { buildManufacturingPlan } from "./manufacturing-plan.js";
+import { buildManufacturingPlan, operationDependencyGraph, precedence } from "./manufacturing-plan.js";
 import { buildFoundryAnalysis, FOUNDRY_SCHEMA_VERSION, FOUNDRY_KNOWLEDGE_VERSION } from "./foundry-knowledge.js";
 
 export const SEMANTIC_VERSION = "1.0";
@@ -863,6 +863,12 @@ function featureSurfacesKey(feature) {
   return Array.isArray(feature.surfaces) ? [...feature.surfaces].sort((a,b)=>a-b).join(",") : "";
 }
 
+/** Surfaces an operation works on: those of its feature, and the faces a chamfer or blend meets. */
+function featureSurfaces(feature) {
+  const list=[feature.surface_index, feature.floor_surface, ...(feature.surfaces ?? []), ...(feature.relation?.surfaces ?? []), ...(feature.adjacent_surfaces ?? [])];
+  return [...new Set(list.filter(i=>i!=null))];
+}
+
 function manufacturingForBody(body, features, principal) {
   // One operation per operation kind and machined faces: the features that
   // read the same faces the same way share it. The analytic cylinder of a
@@ -885,6 +891,7 @@ function manufacturingForBody(body, features, principal) {
     const entry={
       operation_id:"op-"+feature.feature_id,
       feature_ids:[feature.feature_id],
+      surfaces:featureSurfaces(feature),
       operation,
       confidence:feature.confidence,
       status:"candidate",
@@ -895,33 +902,27 @@ function manufacturingForBody(body, features, principal) {
     if (surfaces) byTarget.set(operation+"|"+surfaces, entry);
   }
 
-  const precedence={
-    "pocket_milling":20,
-    "boss_milling_or_bore":25,
-    "drilling":30,
-    "drilling_blind":30,
-    "drilling_or_boring":30,
-    "counterboring_or_boring":35,
-    "boring_or_coaxial_feature_machining":35,
-    "patterned_feature_machining":40,
-    "chamfering_or_countersinking":50,
-    "fillet_or_blend_finishing":60,
-    "feature_machining":40,
-  };
-  operations.sort((a,b)=>(precedence[a.operation]??45)-(precedence[b.operation]??45) || a.operation_id.localeCompare(b.operation_id));
+  // Same precedence and dependencies as the V6 plan (manufacturing-plan.js).
+  operations.sort((a,b)=>precedence(a.operation)-precedence(b.operation) || a.operation_id.localeCompare(b.operation_id));
+  const dependsOn=new Map();
+  for (const edge of operationDependencyGraph(operations)) {
+    const list=dependsOn.get(edge.to) ?? [];
+    if (!list.includes(edge.from)) list.push(edge.from);
+    dependsOn.set(edge.to,list);
+  }
   const sequence=operations.map((op,i)=>({
     sequence:i+1,
     operation_id:op.operation_id,
     feature_ids:op.feature_ids,
-    depends_on:i ? [operations[i-1].operation_id] : [],
+    depends_on:dependsOn.get(op.operation_id) ?? [],
   }));
 
-  const minThickness=finite(body.min_thickness_mm) ? body.min_thickness_mm
-    : finite(body.thickness_mm) ? body.thickness_mm
-    : null;
+  // The thinnest wall measured by the Reader: thickness.min is always the
+  // "wall" method, whichever method the 3D view shows (app.js thicknessExport).
+  const minThickness=finite(body.thickness?.min) ? body.thickness.min : null;
   const functionalThickness={
     minimum_wall_thickness_mm:minThickness,
-    source:minThickness!=null ? "reader_body_metric" : "not_available",
+    source:minThickness!=null ? "reader_wall_thickness" : "not_available",
     status:minThickness!=null ? "measured" : "undetermined",
     warning:minThickness!=null && minThickness < 2 ? "thin_wall_candidate" : null,
   };
@@ -984,7 +985,8 @@ function semanticBody(body, index) {
       notes:Array.isArray(body.notes)?body.notes:[],
     },
     manufacturing:manufacturingForBody(body, features, principalAxes(body)),
-    foundry: buildFoundryAnalysis(body, features, principalAxes(body), FOUNDRY_PROFILE),
+    // The Reader body has no topology of its own: the one computed here.
+    foundry: buildFoundryAnalysis({...body, topology:topo}, features, principalAxes(body), FOUNDRY_PROFILE),
   };
   semantic.manufacturing_plan = buildManufacturingPlan(semantic);
   return semantic;

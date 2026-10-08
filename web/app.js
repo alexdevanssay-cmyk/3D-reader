@@ -762,13 +762,17 @@ function exportableResult(r) {
 
 /**
  * Wall thickness of bodies of the result shown, for the exports:
- * {thickness: {method, min, median, max}} (mm), or {} when not computed.
+ * {thickness: {method, min, median, max, sphere, wall}} (mm), or {} when not
+ * computed. sphere and wall: {min, median, max} of those methods, whichever
+ * method the view shows (the foundry screen of the AI context reads them).
  */
 function thicknessExport(r, indices) {
   if (r !== state.result || !thick.results) return {};
   const stats = thickStats(indices);
   // The thinnest wall always by the "wall" method (see thickness.js).
   const wall = thickStats(indices, "wall");
+  const sphere = thickMethod() === "sphere" ? stats : thickStats(indices, "sphere");
+  const minMedianMax = (s) => ({ min: s.min, median: s.median, max: s.max });
   return {
     thickness: {
       method: thickMethod(),
@@ -777,6 +781,8 @@ function thicknessExport(r, indices) {
       max: stats.max,
       floor: thick.floor,
       details: wall.details,
+      sphere: minMedianMax(sphere),
+      wall: minMedianMax(wall),
     },
   };
 }
