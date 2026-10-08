@@ -102,8 +102,8 @@ export async function diagnoseOllama(base, model) {
 Edge : ouvrez edge://settings/content/loopbackNetwork (Chrome : chrome://settings/content/loopbackNetwork), ajoutez ${origin} dans « Autorisé », puis rechargez la page.`;
     }
     return `Ollama est inaccessible depuis cette page (${origin}). Vérifiez, dans l'ordre :
-1. Ollama est lancé (icône du lama près de l'horloge) et ${base}/api/tags s'ouvre dans un nouvel onglet ;
-2. la variable d'environnement OLLAMA_ORIGINS contient ${origin}, puis Ollama a été quitté et relancé ;
+1. Ollama est lancé (icône du lama près de l'horloge) : ${base} ouvert dans un nouvel onglet affiche « Ollama is running » ;
+2. la variable d'environnement OLLAMA_ORIGINS contient ${origin} (origines séparées par des virgules, sans espace ni « / » final — sinon Ollama ne démarre pas), puis Ollama a été quitté et relancé ;
 3. le navigateur autorise ce site à accéder aux « Applications sur l'appareil » (Edge : edge://settings/content/loopbackNetwork) — s'il le demande, cliquez sur Autoriser.
 Le détail exact est affiché dans la console du navigateur (F12).`;
   }
@@ -125,13 +125,28 @@ function defaultGateway() {
 
 /** The base address of Ollama from what was typed (an old /v1/chat/completions address is accepted). */
 function ollamaBase(value) {
+  const text = (value || OLLAMA_URL).trim();
   try {
-    const url = new URL(value || OLLAMA_URL);
-    return url.origin;
+    return new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`).origin;
   } catch {
-    return OLLAMA_URL;
+    throw new Error(`Adresse d'Ollama invalide : « ${text} » (exemple : ${OLLAMA_URL}).`);
   }
 }
+
+// The answer contract, given to Ollama as a JSON schema (structured output).
+const ANSWER_SCHEMA = {
+  type: "object",
+  properties: {
+    conclusion: { type: "string" },
+    observations: { type: "array", items: { type: "string" } },
+    inferences: { type: "array", items: { type: "string" } },
+    recommendations: { type: "array", items: { type: "string" } },
+    uncertainties: { type: "array", items: { type: "string" } },
+    needs_human_validation: { type: "boolean" },
+    quote: { type: ["object", "null"] },
+  },
+  required: ["conclusion", "observations", "inferences", "recommendations", "uncertainties", "needs_human_validation"],
+};
 
 /** Window (tokens) asked of Ollama for a prompt of this many characters: room for the answer, never below the default. */
 function contextWindow(chars) {
@@ -267,14 +282,16 @@ export function mount({ page, reader }) {
     if (problem) throw new Error(problem);
     const compact = compactAIContext(context, { maxChars: LOCAL_CONTEXT_CHARS });
     const system = `${SYSTEM_PROMPT}\n\nCONTEXTE :\n${JSON.stringify(compact)}`;
+    const numCtx = contextWindow(system.length + JSON.stringify(messages.slice(-LOCAL_HISTORY)).length + question.length);
     const history = messages.slice(-LOCAL_HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
     const body = {
       model,
       messages: [{ role: "system", content: system }, ...history, { role: "user", content: question }],
       stream: true,
-      format: "json",
+      format: ANSWER_SCHEMA,
       think: false, // Qwen3 would otherwise write a long hidden reasoning first
-      options: { num_ctx: contextWindow(system.length + JSON.stringify(history).length + question.length), temperature: 0.2 },
+      keep_alive: "15m", // the model stays loaded between questions (loading it takes long on a CPU)
+      options: { num_ctx: numCtx, temperature: 0.2 },
     };
     const post = (payload) => fetch(`${base}/api/chat`, {
       method: "POST",
@@ -282,6 +299,10 @@ export function mount({ page, reader }) {
       body: JSON.stringify(payload),
       signal,
       targetAddressSpace: "loopback",
+    }).catch((err) => {
+      if (err?.name === "AbortError") throw err;
+      // The test of /api/tags passed: not a permission problem.
+      throw new Error("La connexion à Ollama a été coupée. Ollama s'est peut-être arrêté (mémoire insuffisante pour le modèle ?) : vérifiez qu'il tourne, puis réessayez.");
     });
     let response = await post(body);
     if (response.status === 400) {
@@ -300,8 +321,16 @@ export function mount({ page, reader }) {
     const decoder = new TextDecoder();
     let pending = "";
     let answer = "";
+    let last = null;
     for (;;) {
-      const { value, done } = await reader.read();
+      let chunkRead;
+      try {
+        chunkRead = await reader.read();
+      } catch (err) {
+        if (err?.name === "AbortError") throw err;
+        throw new Error("La connexion à Ollama a été coupée pendant la réponse (Ollama arrêté ou mémoire insuffisante ?).");
+      }
+      const { value, done } = chunkRead;
       if (done) break;
       pending += decoder.decode(value, { stream: true });
       let nl;
@@ -311,12 +340,15 @@ export function mount({ page, reader }) {
         if (!line) continue;
         const chunk = JSON.parse(line);
         if (chunk.error) throw new Error(`Ollama : ${chunk.error}`);
+        if (chunk.done) last = chunk;
         if (chunk.message?.content) {
           answer += chunk.message.content;
           onText(answer);
         }
       }
     }
+    if (last?.done_reason === "length") answer += "\n\n(Réponse coupée : limite de longueur atteinte.)";
+    if (last?.prompt_eval_count >= 0.95 * numCtx) console.warn(`Ollama: prompt of ${last.prompt_eval_count} tokens for a window of ${numCtx}: the start of the context may have been dropped`);
     return answer;
   }
 
@@ -406,9 +438,13 @@ export function mount({ page, reader }) {
       return;
     }
     setStatus("Test d'Ollama…");
-    const base = ollamaBase($("ai-url").value.trim());
+    let problem;
     const model = $("ai-model").value.trim() || OLLAMA_MODEL;
-    const problem = await diagnoseOllama(base, model);
+    try {
+      problem = await diagnoseOllama(ollamaBase($("ai-url").value.trim()), model);
+    } catch (err) {
+      problem = err.message;
+    }
     if (problem) {
       bubble("error", problem);
       setStatus("Ollama inaccessible");

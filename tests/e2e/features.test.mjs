@@ -353,7 +353,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(request.model, 'qwen3:8b');
     assert.equal(request.stream, true);
     assert.equal(request.think, false);
-    assert.equal(request.format, 'json');
+    assert.deepEqual(Object.keys(request.format.properties), ['conclusion', 'observations', 'inferences', 'recommendations', 'uncertainties', 'needs_human_validation', 'quote']);
+    assert.equal(request.keep_alive, '15m');
     assert.ok(request.options.num_ctx >= 8192);
     assert.match(request.messages[0].content, /"compaction"/);
     assert.ok(request.messages[0].content.length < 20_000, `system prompt of ${request.messages[0].content.length} characters`);
