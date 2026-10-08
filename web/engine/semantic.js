@@ -707,12 +707,12 @@ function manufacturingForBody(body, features, principal) {
     depends_on:dependsOn.get(op.operation_id) ?? [],
   }));
 
-  const minThickness=finite(body.min_thickness_mm) ? body.min_thickness_mm
-    : finite(body.thickness_mm) ? body.thickness_mm
-    : null;
+  // The thinnest wall measured by the Reader: thickness.min is always the
+  // "wall" method, whichever method the 3D view shows (app.js thicknessExport).
+  const minThickness=finite(body.thickness?.min) ? body.thickness.min : null;
   const functionalThickness={
     minimum_wall_thickness_mm:minThickness,
-    source:minThickness!=null ? "reader_body_metric" : "not_available",
+    source:minThickness!=null ? "reader_wall_thickness" : "not_available",
     status:minThickness!=null ? "measured" : "undetermined",
     warning:minThickness!=null && minThickness < 2 ? "thin_wall_candidate" : null,
   };
@@ -773,7 +773,8 @@ function semanticBody(body, index) {
       notes:Array.isArray(body.notes)?body.notes:[],
     },
     manufacturing:manufacturingForBody(body, features, principalAxes(body)),
-    foundry: buildFoundryAnalysis(body, features, principalAxes(body), FOUNDRY_PROFILE),
+    // The Reader body has no topology of its own: the one computed here.
+    foundry: buildFoundryAnalysis({...body, topology:topo}, features, principalAxes(body), FOUNDRY_PROFILE),
   };
   semantic.manufacturing_plan = buildManufacturingPlan(semantic);
   return semantic;

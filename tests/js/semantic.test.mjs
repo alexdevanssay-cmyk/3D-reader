@@ -348,7 +348,8 @@ test("adds V5 manufacturing semantics with process, setup, sequence and DFM meta
         {index:1,type:"plane",edge_signatures:[[0,0,0,1,0,0]]},
         {index:2,type:"plane",edge_signatures:[[0,0,0,0,1,0]]},
       ],
-      min_thickness_mm:3,
+      // As the Reader exports it (app.js thicknessExport).
+      thickness:{method:"wall",min:3,median:4,max:5},
     })],
   });
   const manufacturing=result.bodies[0].manufacturing;
@@ -360,8 +361,26 @@ test("adds V5 manufacturing semantics with process, setup, sequence and DFM meta
   assert.ok(manufacturing.operations.every(o=>o.accessibility.status==="candidate_only"));
   assert.equal(manufacturing.functional_thickness.minimum_wall_thickness_mm,3);
   assert.equal(manufacturing.functional_thickness.status,"measured");
+  assert.equal(manufacturing.functional_thickness.source,"reader_wall_thickness");
   assert.ok(Array.isArray(manufacturing.dfm_recommendations));
   assert.equal(result.manufacturing_schema_version,"1.0");
+});
+
+test("functional thickness is the Reader's thinnest wall, as in the foundry evidence", () => {
+  const result = buildSemantic3D({
+    file:"thin.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({ thickness:{method:"sphere",min:1.2,median:3,max:4} })],
+  });
+  const {manufacturing, foundry}=result.bodies[0];
+  assert.equal(manufacturing.functional_thickness.status,"measured");
+  assert.equal(manufacturing.functional_thickness.minimum_wall_thickness_mm,1.2);
+  assert.equal(manufacturing.functional_thickness.minimum_wall_thickness_mm,foundry.evidence.thickness.min_mm);
+  assert.ok(manufacturing.dfm_recommendations.some(d=>d.code==="thin_wall"));
+  // Not computed: undetermined, no thin wall.
+  const none=buildSemantic3D({ file:"none.step", kind:"cad", engine:"browser", summary:{volume:1000,area:600,bodies:1,solids:1}, bodies:[body()] });
+  assert.equal(none.bodies[0].manufacturing.functional_thickness.status,"undetermined");
+  assert.ok(!none.bodies[0].manufacturing.dfm_recommendations.some(d=>d.code==="thin_wall"));
 });
 
 

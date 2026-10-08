@@ -73,26 +73,44 @@ export const FOUNDRY_PROFILES = {
   },
 };
 
+// Ratios of the measured thickness distribution that flag a body for review.
+// No cited source defines them: they are 3D Reader heuristics, not castability
+// limits, so the risks they raise cite their sources as background only.
+const HEURISTIC_SOURCE = "3d_reader_heuristic_unvalidated";
+const HOTSPOT_MAX_TO_MEDIAN = 1.5;
+const THIN_MIN_TO_MEDIAN = 0.6;
+
 function finite(v) { return typeof v === "number" && Number.isFinite(v); }
+
+function measured(s) { return !!s && finite(s.min) && finite(s.median) && finite(s.max); }
 
 function thicknessEvidence(body) {
   const t = body?.thickness ?? null;
-  if (!t || !finite(t.min) || !finite(t.median) || !finite(t.max)) {
+  // Per-method statistics of the Reader (app.js thicknessExport), whichever
+  // method the 3D view shows: the hot spots read on the inscribed spheres, the
+  // thin walls on the "wall" method. Else the one distribution given.
+  const sphere = measured(t?.sphere) ? t.sphere : t;
+  const wall = measured(t?.wall) ? t.wall : t;
+  if (!measured(sphere) || !measured(wall)) {
     return { status: "not_available", min_mm: null, median_mm: null, max_mm: null };
   }
+  const methodOf = (s) => (s === t ? t.method ?? null : s === t.sphere ? "sphere" : "wall");
   return {
     status: "measured",
-    method: t.method ?? null,
-    min_mm: t.min,
-    median_mm: t.median,
-    max_mm: t.max,
-    max_to_median: t.median > 0 ? t.max / t.median : null,
-    min_to_median: t.median > 0 ? t.min / t.median : null,
+    min_mm: wall.min,
+    min_method: methodOf(wall),
+    median_mm: sphere.median,
+    max_mm: sphere.max,
+    median_max_method: methodOf(sphere),
+    max_to_median: sphere.median > 0 ? sphere.max / sphere.median : null,
+    hotspot_method: methodOf(sphere),
+    min_to_median: wall.median > 0 ? wall.min / wall.median : null,
+    thin_method: methodOf(wall),
   };
 }
 
-function issue(code, severity, basis, message, source_ids = []) {
-  return { code, severity, basis, message, source_ids };
+function issue(code, severity, basis, message, source_ids = [], extra = {}) {
+  return { code, severity, basis, message, source_ids, ...extra };
 }
 
 export function buildFoundryAnalysis(body, features = [], principalAxes = null, profileId = "unspecified") {
@@ -103,12 +121,12 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
   const confirmedEvidence = [];
 
   if (body?.closed === false) {
+    // A limit of this screen, not a foundry rule: no source to cite.
     risks.push(issue(
       "open_geometry",
       "high",
       "measured_topology",
       "La géométrie ouverte ne permet pas une analyse fiable de remplissage/solidification.",
-      ["sfsa_design_steps"],
     ));
   } else if (body?.closed === true) {
     confirmedEvidence.push("closed_solid");
@@ -116,42 +134,57 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
 
   if (thickness.status === "measured") {
     confirmedEvidence.push("wall_thickness_measured");
-    if (thickness.max_to_median >= 1.5) {
+    if (thickness.max_to_median >= HOTSPOT_MAX_TO_MEDIAN) {
       risks.push(issue(
         "thick_section_hotspot_candidate",
-        "high",
+        "review",
         "measured_thickness_distribution",
-        "La concentration locale d'épaisseur est compatible avec une zone chaude candidate; une vérification de solidification/alimentation est requise.",
-        ["sfsa_design_steps","sfsa_handbook_supplement_1","afs_gating_riser"],
+        "La concentration locale d'épaisseur est compatible avec une zone chaude candidate (seuil heuristique de 3D Reader, non issu des sources); une vérification de solidification/alimentation est requise.",
+        [],
+        {
+          threshold: { metric: "max_to_median", method: thickness.hotspot_method, value: HOTSPOT_MAX_TO_MEDIAN, source: HEURISTIC_SOURCE },
+          background_source_ids: ["sfsa_design_steps","sfsa_handbook_supplement_1","afs_gating_riser"],
+        },
       ));
     }
-    if (thickness.min_to_median <= 0.6) {
+    if (thickness.min_to_median <= THIN_MIN_TO_MEDIAN) {
       risks.push(issue(
         "thin_section_candidate",
-        "medium",
+        "review",
         "measured_thickness_distribution",
-        "Une zone mince est présente; la coulabilité dépend du procédé, de l'alliage, de la distance à l'attaque et des conditions thermiques.",
-        ["sfsa_information_designers","afs_gating_riser"],
+        "Une zone mince est présente (seuil heuristique de 3D Reader, non issu des sources); la coulabilité dépend du procédé, de l'alliage, de la distance à l'attaque et des conditions thermiques.",
+        [],
+        {
+          threshold: { metric: "min_to_median", method: thickness.thin_method, value: THIN_MIN_TO_MEDIAN, source: HEURISTIC_SOURCE },
+          background_source_ids: ["sfsa_information_designers","afs_gating_riser"],
+        },
       ));
     }
   } else {
     requiredChecks.push("compute_wall_thickness_before_foundry_review");
   }
 
-  const holeCount = features.filter(f =>
-    f.type === "hole_feature_candidate" ||
-    f.subtype === "possible_through_hole" ||
-    f.subtype === "possible_through_hole_or_bore"
-  ).length;
+  // semantic.js gives one cylindrical face as a cylinder, a hole and a boss
+  // candidate: the faces are counted once. Without an inside/outside test such
+  // a face is an opening (a core) or the outside of a boss or shaft. The planar
+  // pocket signal (a face with three neighbours) fires on every face of a plain
+  // block: it is not core evidence.
+  const cylindricalFaces = new Set(features
+    .filter(f =>
+      f.type === "hole_feature_candidate" ||
+      f.type === "boss_feature_candidate" ||
+      f.subtype === "possible_through_hole"
+    )
+    .map(f => f.surface_index)
+    .filter(i => i != null));
   const pocketCount = features.filter(f => f.type === "pocket_feature_candidate").length;
-  const bossCount = features.filter(f => f.type === "boss_feature_candidate").length;
 
-  if (holeCount + pocketCount + bossCount > 0) {
+  if (cylindricalFaces.size > 0) {
     risks.push(issue(
       "core_or_undercut_review",
-      "medium",
+      "review",
       "geometric_feature_candidates",
-      "Des ouvertures, évidements ou bossages candidats peuvent imposer des noyaux, des choix de plan de joint ou des opérations de reprise; l'intention et l'accessibilité restent à confirmer.",
+      "Des faces cylindriques candidates, ouvertures ou bossages (l'intérieur et l'extérieur ne sont pas distingués), peuvent imposer des noyaux, des choix de plan de joint ou des opérations de reprise; l'intention et l'accessibilité restent à confirmer.",
       ["sfsa_design_steps","sfsa_handbook_supplement_1"],
     ));
   }
@@ -169,7 +202,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
     draft: "not_evaluated_without_parting_direction",
     fillets_and_junctions: "candidate_geometry_only",
     parting_line: "not_evaluated",
-    cores: holeCount + pocketCount > 0 ? "candidate" : "not_detected",
+    cores: cylindricalFaces.size + pocketCount > 0 ? "undetermined_without_concavity_test" : "not_detected",
     hot_spots: thickness.status === "measured" ? "screened_by_thickness_distribution" : "not_available",
     directional_solidification: "not_simulated",
     risering: "not_sized",
@@ -206,7 +239,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
       topology: body?.topology ?? null,
       thickness,
       principal_axes: principalAxes,
-      feature_counts: { hole_candidates: holeCount, pocket_candidates: pocketCount, boss_candidates: bossCount },
+      feature_counts: { cylindrical_opening_or_boss_candidates: cylindricalFaces.size, pocket_candidates: pocketCount },
       confirmed: confirmedEvidence,
     },
     rules: ruleStatus,
@@ -228,7 +261,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
       thermal_stress_distortion: "not_computed",
       message: "Cette couche prépare et explique l'analyse; elle ne remplace pas un solveur de fonderie.",
     },
-    confidence_policy: "geometry_screening_is_evidence; foundry_process_claims_require_process_alloy_and_simulation_or_foundry_validation",
+    confidence_policy: "geometry_screening_is_evidence; foundry_process_claims_require_process_alloy_and_simulation_or_foundry_validation; heuristic_thresholds_are_not_sourced_limits_and_background_source_ids_do_not_define_them",
     sources: FOUNDRY_SOURCES.map(({ id, title, publisher, url, scope }) => ({ id, title, publisher, url, scope })),
   };
 }
