@@ -1,12 +1,14 @@
 // "IA / analyse" page: questions on the part shown, answered either by a
 // language model behind the AI gateway (api/ai.js, OpenAI Responses API) or by
-// a local model run by Ollama on this computer (nothing leaves the PC).
+// a local model run by Ollama on this computer or on a device of the local
+// network, a Jetson for instance (nothing leaves the site).
 //
 // Local Ollama from a page on the web needs two permissions, both outside this
 // page: Ollama must allow the page's origin (OLLAMA_ORIGINS), and the browser
 // must allow the site to reach applications on this device ("Apps on device" /
 // loopback-network permission of Chrome and Edge, Firefox "Device apps and
-// services"). diagnoseOllama() tells which one is missing.
+// services") or devices of the local network ("Local network" /
+// local-network). diagnoseOllama() tells which one is missing.
 
 import { buildAIContext, compactAIContext, summaryAIContext } from "./engine/ai-context.js";
 
@@ -78,8 +80,24 @@ export function formatAnswer(content) {
 }
 
 /** State of the browser permission for this site to reach applications on this device (Chrome/Edge 142+, Firefox 153+), or null. */
-async function loopbackPermission() {
-  for (const name of ["loopback-network", "local-network-access"]) {
+/**
+ * The address space of Ollama's address, for the browser's Local Network
+ * Access: "loopback" for this computer, "local" for another device of the
+ * local network, none for a public address. Chrome and Edge refuse a request
+ * whose declared space is not the one its host resolves to.
+ */
+export function addressSpace(base) {
+  const { protocol, hostname } = new URL(base);
+  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host === "localhost" || host.endsWith(".localhost") || /^127\./.test(host) || host === "::1") return "loopback";
+  if (/^(10|192\.168|169\.254|172\.(1[6-9]|2\d|3[01]))\./.test(host) || /^(f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):/.test(host) || host.endsWith(".local")) return "local";
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(":")) return undefined; // a public address
+  // A name: Ollama on plain http is on the local network; https is a public service.
+  return protocol === "http:" ? "local" : undefined;
+}
+
+async function networkPermission(space) {
+  for (const name of [space === "local" ? "local-network" : "loopback-network", "local-network-access"]) {
     try {
       const status = await navigator.permissions.query({ name });
       return { name, state: status.state };
@@ -93,23 +111,34 @@ async function loopbackPermission() {
 /** Why Ollama cannot be used from this page: null when it answers and has the model. */
 export async function diagnoseOllama(base, model) {
   const origin = location.origin;
+  const space = addressSpace(base);
+  const lan = space === "local"; // Ollama on another device of the network (a Jetson, another PC)
+  const permission = lan ? "Réseau local" : "Applications sur l'appareil";
+  const settings = lan ? "localNetwork" : "loopbackNetwork";
   let response;
   try {
-    response = await fetch(`${base}/api/tags`, { cache: "no-store", signal: AbortSignal.timeout(8000), targetAddressSpace: "loopback" });
+    response = await fetch(`${base}/api/tags`, { cache: "no-store", signal: AbortSignal.timeout(8000), ...(space ? { targetAddressSpace: space } : {}) });
   } catch (err) {
-    if (err?.name === "TimeoutError") return `Ollama (${base}) ne répond pas : vérifiez qu'il est lancé (icône du lama près de l'horloge).`;
-    const permission = await loopbackPermission();
-    if (permission?.state === "denied") {
-      return `Le navigateur interdit à ce site d'accéder aux applications de ce PC (autorisation « Applications sur l'appareil » refusée).
-Edge : ouvrez edge://settings/content/loopbackNetwork (Chrome : chrome://settings/content/loopbackNetwork), ajoutez ${origin} dans « Autorisé », puis rechargez la page.`;
+    if (err?.name === "TimeoutError") {
+      return lan
+        ? `Ollama (${base}) ne répond pas : vérifiez que l'appareil est allumé et sur le réseau, et qu'Ollama y tourne (sudo systemctl status ollama).`
+        : `Ollama (${base}) ne répond pas : vérifiez qu'il est lancé (icône du lama près de l'horloge).`;
+    }
+    const state = await networkPermission(space);
+    if (state?.state === "denied") {
+      return `Le navigateur interdit à ce site d'accéder ${lan ? "aux appareils du réseau local" : "aux applications de ce PC"} (autorisation « ${permission} » refusée).
+Edge : ouvrez edge://settings/content/${settings} (Chrome : chrome://settings/content/${settings}), ajoutez ${origin} dans « Autorisé », puis rechargez la page.`;
     }
     return `Ollama est inaccessible depuis cette page (${origin}). Vérifiez, dans l'ordre :
-1. Ollama est lancé (icône du lama près de l'horloge) : ${base} ouvert dans un nouvel onglet affiche « Ollama is running » ;
-2. la variable d'environnement OLLAMA_ORIGINS contient ${origin} (origines séparées par des virgules, sans espace ni « / » final — sinon Ollama ne démarre pas), puis Ollama a été quitté et relancé ;
-3. le navigateur autorise ce site à accéder aux « Applications sur l'appareil » (Edge : edge://settings/content/loopbackNetwork) — s'il le demande, cliquez sur Autoriser.
+${lan
+    ? `1. Ollama tourne sur l'appareil et écoute le réseau (OLLAMA_HOST=0.0.0.0:11434 dans « sudo systemctl edit ollama.service ») : ${base} ouvert dans un nouvel onglet affiche « Ollama is running » ;
+2. OLLAMA_ORIGINS, dans ce même fichier, contient ${origin} (origines séparées par des virgules, sans espace ni « / » final), puis sudo systemctl daemon-reload et sudo systemctl restart ollama ;`
+    : `1. Ollama est lancé (icône du lama près de l'horloge) : ${base} ouvert dans un nouvel onglet affiche « Ollama is running » ;
+2. la variable d'environnement OLLAMA_ORIGINS contient ${origin} (origines séparées par des virgules, sans espace ni « / » final — sinon Ollama ne démarre pas), puis Ollama a été quitté et relancé ;`}
+3. le navigateur autorise ce site à accéder ${lan ? "au « Réseau local »" : "aux « Applications sur l'appareil »"} (Edge : edge://settings/content/${settings}) — s'il le demande, cliquez sur Autoriser.
 Le détail exact est affiché dans la console du navigateur (F12).`;
   }
-  if (response.status === 403) return `Ollama refuse l'origine ${origin} : ajoutez-la à OLLAMA_ORIGINS, puis quittez et relancez Ollama.`;
+  if (response.status === 403) return `Ollama refuse l'origine ${origin} : ajoutez-la à OLLAMA_ORIGINS, puis ${lan ? "redémarrez Ollama (sudo systemctl restart ollama)" : "quittez et relancez Ollama"}.`;
   if (!response.ok) return `Ollama répond par une erreur HTTP ${response.status} sur ${base}/api/tags.`;
   const data = await response.json().catch(() => ({}));
   const names = (data.models ?? []).map((m) => m.name ?? m.model).filter(Boolean);
@@ -148,8 +177,8 @@ function contextWindow(chars, reserve = 2048) {
 const seconds = (ns) => Math.round((ns ?? 0) / 1e9);
 
 /** Instructions of the local model: plain French text, laid out only when the question is about the part. */
-function systemPrompt(model) {
-  return `Tu es l'assistant d'ingénierie de 3D Reader, pour une fonderie d'aluminium. Tu es un modèle de langage (${model}) qui tourne en local sur ce PC avec Ollama : aucune donnée n'est envoyée sur Internet.
+function systemPrompt(model, where = "sur ce PC") {
+  return `Tu es l'assistant d'ingénierie de 3D Reader, pour une fonderie d'aluminium. Tu es un modèle de langage (${model}) qui tourne en local ${where} avec Ollama : aucune donnée n'est envoyée sur Internet.
 Réponds en français, en texte simple (jamais de JSON), de façon claire et concise.
 Pour une conversation ou une question générale (fonderie, procédés, chiffrage, méthode), réponds directement et brièvement.
 Pour une question sur la pièce, organise la réponse en courtes sections, celles qui sont utiles seulement : « Conclusion », « Mesuré » (valeurs du contexte, avec leurs identifiants), « Déduit », « Recommandations », « À valider ».
@@ -303,7 +332,8 @@ export function mount({ page, reader }) {
     if (problem) throw new Error(problem);
     // General questions: a summary of the part (read in seconds on a CPU); the analysis tasks: the detail.
     const compact = context.no_model_loaded ? context : task === "general" ? summaryAIContext(context) : compactAIContext(context, { maxChars: LOCAL_CONTEXT_CHARS });
-    const system = `${systemPrompt(model)}\n\nCONTEXTE :\n${JSON.stringify(compact)}`;
+    const space = addressSpace(base);
+    const system = `${systemPrompt(model, space === "loopback" ? "sur ce PC" : "sur un appareil du réseau local")}\n\nCONTEXTE :\n${JSON.stringify(compact)}`;
     const think = $("ai-think").checked;
     const reserve = think ? 4096 : 2048; // room for the answer, and for the reasoning written before it
     let history = messages.slice(-LOCAL_HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
@@ -324,7 +354,7 @@ export function mount({ page, reader }) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       signal,
-      targetAddressSpace: "loopback",
+      ...(space ? { targetAddressSpace: space } : {}),
     }).catch((err) => {
       if (err?.name === "AbortError") throw err;
       // The test of /api/tags passed: not a permission problem.
