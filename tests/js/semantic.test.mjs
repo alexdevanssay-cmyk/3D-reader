@@ -178,6 +178,22 @@ test("two boundary circles promote only a cylinder with the material outside it,
   assert.ok(candidates.every(f => f.needs_topology_confirmation === true && f.status === "provisional"));
 });
 
+test("a watertight mesh without analytic surfaces keeps the advice not to assume a process", () => {
+  // A tetrahedron from a mesh file: a closed solid, nothing known of how it is made.
+  const [a, b, c, d] = [[0,0,0], [1,0,0], [0,1,0], [0,0,1]];
+  const triangles = [[a,c,b], [a,b,d], [a,d,c], [b,c,d]];
+  const result = buildSemantic3D({
+    bodies: [body({
+      method: "mesh",
+      surface_types: null,
+      mesh: { positions: new Float32Array(triangles.flat(2)), indices: Uint32Array.from(triangles.flat(), (_, i) => i) },
+    })],
+  });
+  const [solid] = result.bodies;
+  assert.ok(solid.features.some(f => f.type === "closed_solid"));
+  assert.deepEqual(solid.manufacturing.dfm_recommendations.map(r => r.code), ["no_machining_feature_detected"]);
+});
+
 test("reports coaxial cylinders with different radii as a stepped-feature candidate", () => {
   const result = buildSemantic3D({
     file: "step.step",

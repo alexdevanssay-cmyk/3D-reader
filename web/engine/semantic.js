@@ -708,7 +708,8 @@ function manufacturingForBody(body, features, principal, topo) {
   if (minThickness!=null && minThickness < 2) dfm.push({code:"thin_wall",severity:"medium",recommendation:"verify_process_capability_and_clamping"});
   if (features.some(f=>f.status==="provisional")) dfm.push({code:"provisional_feature_intent",severity:"info",recommendation:"confirm_feature_intent_before_generating_toolpaths"});
   if (features.some(f=>f.type==="pattern_feature_candidate")) dfm.push({code:"repeated_features",severity:"info",recommendation:"consider a common setup/tool strategy for repeated features"});
-  if (!features.length) dfm.push({code:"no_machining_feature_detected",severity:"info",recommendation:"do_not_assume_a_specific_manufacturing_process_from_geometry_alone"});
+  // Machining candidates only: a closed solid or planar faces say nothing of the process.
+  if (!operations.length) dfm.push({code:"no_machining_feature_detected",severity:"info",recommendation:"do_not_assume_a_specific_manufacturing_process_from_geometry_alone"});
 
   return {
     schema_version:MANUFACTURING_SCHEMA_VERSION,
