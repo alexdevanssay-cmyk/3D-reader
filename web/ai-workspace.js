@@ -20,6 +20,7 @@ const OLLAMA_MODEL = "qwen3:8b";
 // time to read the prompt on a CPU grow with it.
 const LOCAL_CONTEXT_CHARS = 12000;
 const LOCAL_HISTORY = 6; // messages of the conversation sent again with a question
+const MAX_WINDOW = 16384; // largest window (tokens) asked of Ollama
 
 const TASKS = [
   ["general", "Analyse générale"],
@@ -141,7 +142,7 @@ function ollamaBase(value) {
  * has already read only when it does not.
  */
 function contextWindow(chars) {
-  return Math.ceil(chars / 3) + 2048 <= 8192 ? 8192 : 16384;
+  return Math.ceil(chars / 3) + 2048 <= 8192 ? 8192 : MAX_WINDOW;
 }
 
 const seconds = (ns) => Math.round((ns ?? 0) / 1e9);
@@ -295,8 +296,11 @@ export function mount({ page, reader }) {
     // General questions: a summary of the part (read in seconds on a CPU); the analysis tasks: the detail.
     const compact = context.no_model_loaded ? context : task === "general" ? summaryAIContext(context) : compactAIContext(context, { maxChars: LOCAL_CONTEXT_CHARS });
     const system = `${systemPrompt(model)}\n\nCONTEXTE :\n${JSON.stringify(compact)}`;
-    const numCtx = contextWindow(system.length + JSON.stringify(messages.slice(-LOCAL_HISTORY)).length + question.length);
-    const history = messages.slice(-LOCAL_HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
+    let history = messages.slice(-LOCAL_HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
+    const promptChars = () => system.length + JSON.stringify(history).length + question.length;
+    // The oldest exchanges are left out rather than the prompt cut by Ollama.
+    while (history.length && Math.ceil(promptChars() / 3) + 2048 > MAX_WINDOW) history = history.slice(2);
+    const numCtx = contextWindow(promptChars());
     const body = {
       model,
       messages: [{ role: "system", content: system }, ...history, { role: "user", content: question }],
@@ -368,7 +372,7 @@ export function mount({ page, reader }) {
         last.eval_count ? `rédaction de ${last.eval_count} tokens ${seconds(last.eval_duration)} s` : "",
       ].filter(Boolean).join(", ");
     }
-    if (last?.prompt_eval_count >= 0.95 * numCtx) console.warn(`Ollama: prompt of ${last.prompt_eval_count} tokens for a window of ${numCtx}: the start of the context may have been dropped`);
+    if (last?.prompt_eval_count >= 0.95 * numCtx) timing += `${timing ? ", " : ""}contexte trop long : Ollama en a peut-être ignoré le début`;
     return answer;
   }
 

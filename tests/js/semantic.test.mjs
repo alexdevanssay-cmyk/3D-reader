@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { buildSemantic3D } from "../../web/engine/semantic.js";
-import { buildAIContext } from "../../web/engine/ai-context.js";
+import { buildAIContext, compactAIContext } from "../../web/engine/ai-context.js";
 
 function body(overrides = {}) {
   return {
@@ -459,4 +459,30 @@ test("supports focused feature reasoning without losing provenance", () => {
   assert.equal(context.bodies[0].features.length, 1);
   assert.equal(context.bodies[0].features[0].feature_id, feature.feature_id);
   assert.equal(context.bodies[0].features[0].evidence_count, feature.evidence_count);
+});
+
+test("the compacted AI context of a large assembly fits the budget of a local model", () => {
+  const count = 300;
+  const bodies = Array.from({ length: count }, (_, i) => body({
+    name: `Body ${i}`,
+    volume: 1000 + i,
+    notes: ["Solid rebuilt by sewing the surfaces of the file"],
+    geometric_surfaces: [
+      { index: 0, type: "cylinder", radius_mm: 5, diameter_mm: 10, axis: [0,0,1], center_mm: [i,0,0], wire_count: 2, edge_count: 2, edge_signatures: [] },
+    ],
+  }));
+  const semantic = buildSemantic3D({
+    file: "assembly.step", kind: "cad", engine: "browser", source_unit: "mm",
+    summary: { volume: 300000, area: 180000, bodies: count, solids: count },
+    bodies,
+  });
+  const context = buildAIContext(semantic, { task: "manufacturing_analysis" });
+  const compact = compactAIContext(context, { maxChars: 12000 });
+  assert.ok(JSON.stringify(compact).length <= 12000, `${JSON.stringify(compact).length} characters`);
+  assert.equal(compact.compaction.level, 5);
+  assert.equal(compact.compaction.original_body_count, count);
+  // The largest bodies are listed, the others counted.
+  assert.equal(compact.bodies.length + compact.other_bodies.count, count);
+  assert.equal(compact.bodies[0].metrics.volume_mm3, 1000 + count - 1);
+  assert.ok(compact.warnings.length <= 5);
 });

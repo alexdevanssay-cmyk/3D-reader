@@ -271,10 +271,32 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   // 4: every body reduced to its metrics and feature counts; the foundry screen of the largest one.
   omitted.push("per-body foundry and manufacturing details (kept for the largest body only)");
   const largest = byVolume[0]?.id;
-  out = build(bodies2.map((b) => (b.id === largest ? { ...brief(b), feature_groups: b.feature_groups, foundry: b.foundry } : brief(b))), 4);
+  const level4 = (b) => (b.id === largest ? { ...brief(b), feature_groups: b.feature_groups, foundry: b.foundry } : brief(b));
+  out = build(bodies2.map(level4), 4);
   if (size(out) <= maxChars) return out;
-  omitted.push("warnings");
-  return { ...out, warnings: out.warnings.slice(0, 3), compaction: { ...out.compaction, omitted: [...omitted] } };
+
+  // 5: a large assembly. The first warnings only, then only the largest bodies
+  // listed, the others counted: the context always fits the window of a local
+  // model (a longer prompt would be cut by Ollama, the model reading part of it).
+  const warningCount = (context.warnings ?? []).length;
+  const fewWarnings = (o) => ({ ...o, warnings: (o.warnings ?? []).slice(0, 5), ...(warningCount > 5 ? { warning_count: warningCount } : {}) });
+  if (warningCount > 5) omitted.push(`${warningCount - 5} warnings`);
+  out = fewWarnings(build(bodies2.map(level4), 5));
+  if (size(out) <= maxChars) return out;
+  const omittedBefore = [...omitted];
+  for (const keep of [24, 12, 6, 3, 1]) {
+    if (keep >= byVolume.length) continue;
+    const rest = byVolume.slice(keep);
+    omitted.splice(0, omitted.length, ...omittedBefore, `the ${rest.length} smallest bodies (counted in other_bodies)`);
+    out = fewWarnings({
+      ...build(byVolume.slice(0, keep).map(level4), 5), // the largest first
+      other_bodies: { count: rest.length, volume_mm3: Math.round(rest.reduce((s, b) => s + (b.metrics?.volume_mm3 ?? 0), 0)) },
+    });
+    if (size(out) <= maxChars) return out;
+  }
+  // Last resort: the largest body without its foundry screen.
+  omitted.push("foundry screen of the largest body");
+  return { ...out, bodies: out.bodies.map(({ foundry, feature_groups, ...b }) => b), compaction: { ...out.compaction, omitted: [...omitted] } };
 }
 
 /**
