@@ -11,7 +11,7 @@ import { buildFoundryAnalysis, FOUNDRY_SCHEMA_VERSION, FOUNDRY_KNOWLEDGE_VERSION
 export const SEMANTIC_VERSION = "1.0";
 
 const EPS = 1e-9;
-const FEATURE_SCHEMA_VERSION = "9.0";
+const FEATURE_SCHEMA_VERSION = "10.0";
 const MANUFACTURING_PLANNING_SCHEMA_VERSION = "1.0";
 const MANUFACTURING_SCHEMA_VERSION = "1.0";
 const FOUNDRY_PROFILE = "unspecified";
@@ -87,16 +87,24 @@ function directionKey(axis) {
 }
 
 /**
- * Bucket key of the line through `point` along `axis`: its direction and the
+ * Bucket keys of the line through `point` along `axis`: its direction and the
  * foot of the perpendicular from the origin, rounded (the foot to 0.01 mm).
  * Coaxial faces get the same key whichever point of the axis each was given;
  * the exact coaxiality test (axisDistance) is still made on the pairs related.
+ * A foot coordinate on a rounding boundary (9.525 mm = 3/8", give or take a
+ * few bits) gives the keys of both sides, so that coaxial faces share one.
  */
-function axisLineKey(axis, point) {
+function axisLineKeys(axis, point) {
   const a=normalizeAxis(axis);
-  if (!a || !Array.isArray(point) || point.length!==3 || !point.every(finite)) return null;
+  if (!a || !Array.isArray(point) || point.length!==3 || !point.every(finite)) return [];
   const t=dot(point,a);
-  return directionKey(a)+"|"+point.map((v,i)=>Math.round((v-t*a[i])*1e2)).join(",");
+  let keys=[directionKey(a)+"|"];
+  for (let i=0;i<3;i++) {
+    const v=(point[i]-t*a[i])*1e2;
+    const rounded=Math.abs(v-Math.floor(v)-0.5)<=1e-4 ? [Math.floor(v),Math.ceil(v)] : [Math.round(v)];
+    keys=keys.flatMap(k=>rounded.map(r=>k+(i ? "," : "")+r));
+  }
+  return keys;
 }
 
 function groupBy(items, key) {
@@ -131,13 +139,26 @@ function axialPosition(face, axis) {
 function coaxialPartners(faces) {
   const order=new Map(faces.map((f,i)=>[f,i]));
   const partners=new Map();
+  // A pair may come twice: its two faces on two keys of one line, or neighbours in both chains below.
+  const linked=new Set();
   const link=(a,b)=>{
     const [first,second]=order.get(a)<order.get(b) ? [a,b] : [b,a];
+    const key=order.get(first)+":"+order.get(second);
+    if (linked.has(key)) return;
+    linked.add(key);
     const list=partners.get(first) ?? [];
     list.push(second);
     partners.set(first,list);
   };
-  for (const group of groupBy(faces, f=>axisLineKey(f.axis,f.center_mm)).values()) {
+  const lines=new Map();
+  for (const f of faces) {
+    for (const key of axisLineKeys(f.axis,f.center_mm)) {
+      const line=lines.get(key);
+      if (line) line.push(f);
+      else lines.set(key,[f]);
+    }
+  }
+  for (const group of lines.values()) {
     if (group.length<=COAXIAL_PAIRWISE_LIMIT) {
       for (let i=0;i<group.length;i++) for (let j=i+1;j<group.length;j++) link(group[i],group[j]);
       continue;
@@ -146,6 +167,10 @@ function coaxialPartners(faces) {
     const position=new Map(group.map(f=>[f,axialPosition(f,axis)]));
     const along=[...group].sort((a,b)=>position.get(a)-position.get(b) || order.get(a)-order.get(b));
     for (let i=1;i<along.length;i++) link(along[i-1],along[i]);
+    // The cylinders on their own too: a shoulder is a step between two
+    // diameters even with a chamfer (a cone) between them.
+    const cylinders=along.filter(f=>f.type==="cylinder");
+    for (let i=1;i<cylinders.length;i++) link(cylinders[i-1],cylinders[i]);
   }
   for (const list of partners.values()) list.sort((a,b)=>order.get(a)-order.get(b));
   return partners;
@@ -268,14 +293,24 @@ function parallelAxes(a,b,tol=1e-5) {
  * Repeated cylinders: groups of parallel cylinders of the same radius, each
  * member's axis more than a diameter away from another one's in its group
  * (not a split face of the same hole, nor a section of the same shaft).
- * Groups of three or more.
+ * Groups of three or more, in face order.
  */
 function repeatedCylinders(cylinders) {
-  const groups=groupBy(cylinders, c=>{
-    const direction=directionKey(c.axis);
-    return direction==null ? null : direction+"|"+Number(c.radius_mm.toPrecision(6));
-  });
-  return [...groups.values()]
+  const order=new Map(cylinders.map((c,i)=>[c,i]));
+  const groups=[];
+  for (const parallel of groupBy(cylinders, c=>directionKey(c.axis)).values()) {
+    // The same radius within the tolerance of the coaxial relations, from the
+    // smallest one of each group, rather than a rounded key: two radii a few
+    // bits apart (7/32" = 2.778125 mm) could round on either side of it.
+    let group=null;
+    for (const c of [...parallel].sort((a,b)=>a.radius_mm-b.radius_mm)) {
+      if (!group || c.radius_mm-group[0].radius_mm>Math.max(1e-5,group[0].radius_mm*1e-4)) groups.push(group=[]);
+      group.push(c);
+    }
+  }
+  return groups
+    .map(group=>group.sort((a,b)=>order.get(a)-order.get(b)))
+    .sort((a,b)=>order.get(a[0])-order.get(b[0]))
     .map(group=>group.filter(a=>group.some(b=>b!==a && axisDistance(a.axis,a.center_mm,b.axis,b.center_mm)>Math.max(a.radius_mm*2,1e-3))))
     .filter(members=>members.length>=3);
 }

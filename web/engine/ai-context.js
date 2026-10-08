@@ -170,24 +170,36 @@ function slimFeature(feature) {
   return out;
 }
 
+/** The distinct sizes of a group, largest first: the first 12 under `key`, the others counted under `more`. */
+function sizeList(sizes, key, more) {
+  const sorted = [...sizes].sort((a, b) => b - a);
+  return sorted.length ? { [key]: sorted.slice(0, 12), ...(sorted.length > 12 ? { [more]: sorted.length - 12 } : {}) } : {};
+}
+
 /** Features grouped by type: counts and the distinct dimensions (largest first). */
 function featureGroups(features) {
   const groups = new Map();
   for (const f of features) {
     const key = `${f.type}|${f.subtype ?? ""}`;
-    const g = groups.get(key) ?? { type: f.type, ...(f.subtype ? { subtype: f.subtype } : {}), count: 0, evidenced: 0, provisional: 0, diameters_mm: new Set() };
+    const g = groups.get(key) ?? { type: f.type, ...(f.subtype ? { subtype: f.subtype } : {}), count: 0, evidenced: 0, provisional: 0, diameters_mm: new Set(), radii_mm: new Set() };
     g.count++;
     if (f.status === "provisional") g.provisional++;
     else g.evidenced++;
-    const d = f.geometry?.diameter_mm ?? (finite(f.geometry?.radius_mm) ? 2 * f.geometry.radius_mm : null);
-    if (finite(d)) g.diameters_mm.add(round(d, 2));
+    if (f.type === "fillet_feature_candidate") {
+      // A fillet is sized by its radius: an R5 rounded edge is no Ø10.
+      const r = f.geometry?.radius_mm ?? f.geometry?.minor_radius_mm;
+      if (finite(r)) g.radii_mm.add(round(r, 2));
+    } else {
+      const d = f.geometry?.diameter_mm ?? (finite(f.geometry?.radius_mm) ? 2 * f.geometry.radius_mm : null);
+      if (finite(d)) g.diameters_mm.add(round(d, 2));
+    }
     groups.set(key, g);
   }
-  return [...groups.values()].map((g) => {
-    const diameters = [...g.diameters_mm].sort((a, b) => b - a);
-    const { diameters_mm, ...rest } = g;
-    return { ...rest, ...(diameters.length ? { diameters_mm: diameters.slice(0, 12), ...(diameters.length > 12 ? { more_diameters: diameters.length - 12 } : {}) } : {}) };
-  });
+  return [...groups.values()].map(({ diameters_mm, radii_mm, ...rest }) => ({
+    ...rest,
+    ...sizeList(diameters_mm, "diameters_mm", "more_diameters"),
+    ...sizeList(radii_mm, "radii_mm", "more_radii"),
+  }));
 }
 
 function relationCounts(relations) {

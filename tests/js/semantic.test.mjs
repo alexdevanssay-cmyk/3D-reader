@@ -49,7 +49,7 @@ test("builds the versioned semantic contract without changing the raw result", (
 
   assert.equal(result.schema, "3d-semantic-json");
   assert.equal(result.schema_version, "1.0");
-  assert.equal(result.feature_schema_version, "9.0");
+  assert.equal(result.feature_schema_version, "10.0");
   assert.equal(result.model.body_count, 1);
   assert.equal(result.bodies[0].metrics.volume_mm3, 1000);
   assert.deepEqual(result.bodies[0].topology, {
@@ -178,21 +178,87 @@ test("many coaxial faces are related to their neighbours along the axis, a few p
   assert.ok(result.bodies[0].manufacturing.operations.length < 3 * 43);
 });
 
-test("a plate with many parallel holes gives one pattern and no pairwise relation", () => {
-  const holes = Array.from({ length: 2500 }, (_, i) => ({
-    index: i, type: "cylinder", radius_mm: 2, axis: [0,0,1], center_mm: [(i % 50) * 6, Math.floor(i / 50) * 6, 0], edge_signatures: [],
+test("on a long shaft, a shoulder with a chamfer is still a step", () => {
+  // Five diameters, a chamfer (a cone) on each shoulder, every face split in
+  // two halves: 18 faces on one axis, more than are related pairwise.
+  const radii = [5, 7, 9, 7, 5];
+  const faces = [];
+  const add = (face, z0, z1, r0, r1) => {
+    for (const side of [1, -1]) {
+      faces.push({ ...face, index: faces.length, axis: [0,0,1], center_mm: [0,0,0], edge_signatures: [[side*r0,0,z0,side*r0,0,z0], [side*r1,0,z1,side*r1,0,z1]] });
+    }
+  };
+  radii.forEach((r, i) => {
+    add({ type: "cylinder", radius_mm: r }, 11 * i, 11 * i + 10, r, r);
+    if (i + 1 < radii.length) add({ type: "cone", ref_radius_mm: Math.min(r, radii[i + 1]), semi_angle_rad: Math.PI / 4 }, 11 * i + 10, 11 * i + 11, r, radii[i + 1]);
+  });
+  assert.equal(faces.length, 18);
+  const result = buildSemantic3D({
+    file: "shaft.step", kind: "cad", engine: "browser",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [body({ geometric_surfaces: faces })],
+  });
+  const relations = result.bodies[0].relations;
+  // One step per shoulder, across its chamfer; the two halves of each diameter coaxial.
+  assert.deepEqual(relations.filter(r => r.type === "coaxial_cylinder_step").map(r => [r.surfaces, r.radii_mm]), [
+    [[1, 4], [5, 7]],
+    [[5, 8], [7, 9]],
+    [[9, 12], [9, 7]],
+    [[13, 16], [7, 5]],
+  ]);
+  assert.equal(relations.filter(r => r.type === "coaxial_cylinders").length, 5);
+  assert.equal(result.bodies[0].features.filter(f => f.subtype === "possible_counterbore_or_coaxial_step" && f.type === "stepped_cylindrical_feature_candidate").length, 4);
+});
+
+test("inch dimensions a few bits apart still give coaxial faces and one hole pattern", () => {
+  // A counterbored hole at x = 3/8" = 9.525 mm, a rounding boundary of the
+  // axis buckets (0.01 mm), its faces' positions given a few bits apart.
+  assert.notEqual(0.375 * 25.4, 9.525);
+  const counterbore = buildSemantic3D({
+    file: "inch.step", kind: "cad", engine: "browser",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [body({ geometric_surfaces: [
+      { index: 0, type: "cylinder", radius_mm: 3, axis: [0,0,1], center_mm: [9.525, 3.175, 0], edge_signatures: [] },
+      { index: 1, type: "cylinder", radius_mm: 5, axis: [0,0,1], center_mm: [0.375 * 25.4, 3.175, 15], edge_signatures: [] },
+      { index: 2, type: "cone", ref_radius_mm: 3, semi_angle_rad: 0.78, axis: [0,0,-1], center_mm: [0.375 * 25.4, 3.175, 20], edge_signatures: [] },
+    ] })],
+  });
+  assert.deepEqual(counterbore.bodies[0].relations.map(r => [r.type, r.surfaces]), [
+    ["coaxial_cylinder_step", [0, 1]],
+    ["coaxial_cylinder_cone", [0, 2]],
+    ["coaxial_cylinder_cone", [1, 2]],
+  ]);
+
+  // Four 7/32" holes (R 2.778125 mm), two of their radii a bit smaller: one pattern.
+  const radii = [2.778125, 2.7781249999999997, 2.778125, 2.7781249999999997];
+  const plate = buildSemantic3D({
+    file: "inch-plate.step", kind: "cad", engine: "browser",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [body({ geometric_surfaces: radii.map((r, i) => ({ index: i, type: "cylinder", radius_mm: r, axis: [0,0,1], center_mm: [10 * i, 0, 0], edge_signatures: [] })) })],
+  });
+  const patterns = plate.bodies[0].features.filter(f => f.type === "pattern_feature_candidate");
+  assert.deepEqual(patterns.map(p => [p.subtype, p.surfaces]), [["possible_linear_cylindrical_pattern", [0, 1, 2, 3]]]);
+});
+
+test("a plate with 6,000 parallel holes gives one pattern and no pairwise relation, in less than 5 s", () => {
+  // Every pair tested and stored took about 15 s and 1.5 GB of heap.
+  const holes = Array.from({ length: 6000 }, (_, i) => ({
+    index: i, type: "cylinder", radius_mm: 2, axis: [0,0,1], center_mm: [(i % 100) * 6, Math.floor(i / 100) * 6, 0], edge_signatures: [],
   }));
+  const start = performance.now();
   const result = buildSemantic3D({
     file: "plate.step", kind: "cad", engine: "browser",
     summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
-    bodies: [body({ bbox: { min: [0,0,0], max: [300,300,10], size: [300,300,10] }, geometric_surfaces: holes })],
+    bodies: [body({ bbox: { min: [0,0,0], max: [600,360,10], size: [600,360,10] }, geometric_surfaces: holes })],
   });
+  const elapsed = performance.now() - start;
   const plate = result.bodies[0];
   assert.deepEqual(plate.relations, []);
   const patterns = plate.features.filter(f => f.type === "pattern_feature_candidate");
   assert.equal(patterns.length, 1);
-  assert.equal(patterns[0].surfaces.length, 2500);
+  assert.equal(patterns[0].surfaces.length, 6000);
   assert.equal(patterns[0].diameter_mm, 4);
+  assert.ok(elapsed < 5000, `${elapsed.toFixed(0)} ms`);
 });
 
 test("emits a provisional tapered-feature candidate from coaxial cylinder/cone evidence", () => {
@@ -231,7 +297,7 @@ const SEMANTIC_SOURCE = readFileSync(new URL("../../web/engine/semantic.js", imp
 
 test("feature schema advances with conservative blend/chamfer/pattern candidates", () => {
   const source = SEMANTIC_SOURCE;
-  assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "9.0"'));
+  assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "10.0"'));
   assert.ok(source.includes('type:"fillet_feature_candidate"'));
   assert.ok(source.includes('type:"chamfer_feature_candidate"'));
   assert.ok(source.includes('type:"pattern_feature_candidate"'));
@@ -436,7 +502,7 @@ test("a rounded edge is a fillet, not a hole, a bore or a boss", () => {
   // 100 x 100 x 10 block, its vertical edge at x = y = 100 rounded R5: a quarter
   // cylinder (no seam) tangent to the side planes x = 100 and y = 100.
   const lineX=[100,95,0,100,95,10], lineY=[95,100,0,95,100,10], arcBottom=[100,95,0,95,100,0], arcTop=[100,95,10,95,100,10];
-  const block = (cylinder) => buildSemantic3D({
+  const blockSemantic = (cylinder) => buildSemantic3D({
     file:"rounded.step", kind:"cad", engine:"browser",
     summary:{volume:99000,area:24000,bodies:1,solids:1},
     bodies:[body({
@@ -449,13 +515,23 @@ test("a rounded edge is a fillet, not a hole, a bore or a boss", () => {
         {index:4,type:"plane",normal:[0,0,1],center_mm:[0,0,10],edge_signatures:[arcTop]},
       ],
     })],
-  }).bodies[0];
-  const rounded = block({index:0,type:"cylinder",radius_mm:5,axis:[0,0,1],center_mm:[95,95,0],wire_count:1,edge_count:4,edge_signatures:[lineX,arcTop,lineY,arcBottom]});
+  });
+  const block = (cylinder) => blockSemantic(cylinder).bodies[0];
+  const roundedSemantic = blockSemantic({index:0,type:"cylinder",radius_mm:5,axis:[0,0,1],center_mm:[95,95,0],wire_count:1,edge_count:4,edge_signatures:[lineX,arcTop,lineY,arcBottom]});
+  const rounded = roundedSemantic.bodies[0];
   const onFace = rounded.features.filter(f=>f.surface_index===0).map(f=>`${f.type}/${f.subtype ?? ""}`);
   assert.deepEqual(onFace, ["fillet_feature_candidate/possible_cylindrical_fillet_or_blend", "cylindrical_boundary_relation/"]);
   assert.equal(rounded.features.find(f=>f.type==="fillet_feature_candidate").radius_mm, 5);
   assert.deepEqual(rounded.manufacturing.operations.map(o=>o.operation), ["fillet_or_blend_finishing"]);
   assert.equal(rounded.foundry.rules.cores, "not_detected");
+
+  // Features grouped by type (a compacted AI context): the fillet is R5, no Ø10.
+  const context = buildAIContext(roundedSemantic, { task: "feature_analysis" });
+  const compact = compactAIContext(context, { maxChars: JSON.stringify(compactAIContext(context, { maxChars: Infinity })).length - 1 });
+  assert.equal(compact.compaction.level, 2);
+  const fillets = compact.bodies[0].feature_groups.find(g => g.type === "fillet_feature_candidate");
+  assert.deepEqual(fillets.radii_mm, [5]);
+  assert.equal("diameters_mm" in fillets, false);
 
   // A full turn (its seam edge met twice) is not a blend, whatever its neighbours.
   const seam=[100,95,0,100,95,10];
