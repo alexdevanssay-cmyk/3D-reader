@@ -65,9 +65,15 @@ reader3d analyze part.step --json</pre>
   </table>
 
   <h2>3D Semantic JSON</h2>
-  <p><strong>V3 B-Rep evidence:</strong> cylindrical candidates now carry boundary evidence (<code>wire_count</code>, <code>edge_count</code>) and can be promoted to <code>possible_through_hole</code> or <code>possible_bore</code> only when the geometric and boundary signals agree. The semantic layer keeps uncertainty explicit.</p>\n\n  <p><strong>V2 feature layer:</strong> CAD bodies may now expose analytic surfaces (cylinder radius/axis/centre, cone angle, sphere radius, torus radii) and conservative feature candidates such as <code>possible_hole_or_bore</code>. A candidate always carries a confidence, a detection method, and may require topology confirmation.</p>\n\n  <p>The AI-facing semantic contract is exposed in <code>#reader3d-semantic-result</code> and as <code>window.reader3d.semantic</code>.
+  <p><strong>V3 B-Rep evidence:</strong> cylindrical candidates now carry boundary evidence (<code>wire_count</code>, <code>edge_count</code>) and can be promoted to <code>possible_through_hole</code> or <code>possible_bore</code> only when the geometric and boundary signals agree: <code>possible_through_hole</code> needs a face with the material outside it (<code>"reversed"</code>) bounded by two edges, and still needs topology confirmation, since a blind hole gives the same signals. The semantic layer keeps uncertainty explicit.</p>
+
+  <p><strong>V2 feature layer:</strong> CAD bodies may now expose analytic surfaces (cylinder radius/axis/centre, cone angle, sphere radius, torus radii) and conservative feature candidates such as <code>possible_hole_or_bore</code>. A candidate always carries a confidence, a detection method, and may require topology confirmation.
+  Each analytic surface gives the orientation of its face (<code>"forward"</code> or <code>"reversed"</code>); a plane's <code>normal</code> points out of the material, and <code>center_mm</code> is the middle of the face's UV bounds: on its surface, not always on the face (on the axis for a cylinder or a cone). A cone's <code>ref_radius_mm</code> is its radius at <code>axis_origin_mm</code>.</p>
+
+  <p>The AI-facing semantic contract is exposed as <code>window.reader3d.semantic</code> and in <code>#reader3d-semantic-result</code>, which is written once the page is idle after each result (<code>null</code> until then).
+  Each body has the <code>source_index</code> of the body in the file, the index that <code>reader3d.setSelection</code> takes.
   It is versioned independently from the raw measurement result: <code>schema = 3d-semantic-json</code>,
-  <code>schema_version = 1.0</code> and feature schema <code>10.0</code>. Features expose stable IDs (scoped by body since 10.0), evidence status and evidence counts. It contains model/body metrology, topology, principal axes and conservative geometric feature candidates.
+  <code>schema_version = 1.0</code> and feature schema <code>10.0</code>. Features expose stable IDs (scoped by body since 10.0), evidence status and evidence counts. It contains model/body metrology, topology (of the welded mesh, given by the in-browser engine: <code>null</code> for a result of the Python engine), principal axes and conservative geometric feature candidates.
   Tessellation buffers are deliberately excluded from this payload.</p>
   <pre>{
   "schema": "3d-semantic-json",
@@ -116,6 +122,18 @@ reader3d analyze part.step --json</pre>
   }]
 }</pre>
 
+  <h2>Semantic feature candidates</h2>
+  <p>Features carry evidence-quality metadata and stable feature identifiers, alongside the provisional candidates for holes, tapered transitions, fillets, chamfers, and repeated cylindrical patterns. Candidates include explicit evidence and <code>needs_topology_confirmation</code> when design intent is not proven.</p>
+
+  <h2>Relations</h2>
+  <p>Each semantic body may expose analytic surface relations separately from inferred feature candidates. Relations describe geometric evidence; feature candidates interpret that evidence and may remain uncertain.</p>
+
+  <h2>V5 manufacturing semantics</h2>
+  <p>The semantic JSON now also exposes a manufacturing layer per body. It contains candidate manufacturing operations, geometric tool-axis/setup candidates, a deterministic candidate operation sequence, functional wall-thickness metadata when the Reader already provides it, and conservative DFM recommendations. These values are explicitly candidates rather than executable toolpaths: stock, fixture, machine limits and exact accessibility are not inferred from geometry alone.</p>
+
+  <h2>V6 manufacturing planning semantics</h2>
+  <p>Feature schema <code>9.0</code> adds a deterministic planning layer on top of V5 manufacturing candidates. Each body may expose <code>manufacturing_plan</code> with compatible tool-axis setup candidates, operation dependencies, a deterministic planned order, readiness signals, and explicit unresolved constraints. V6 does not perform stock/fixture collision analysis, machine kinematics, tool selection or cutting-parameter generation; it is planning evidence, not CAM output.</p>
+
   <h2>V7 AI reasoning context</h2>
   <p>The semantic JSON can be compiled into a compact, evidence-linked context specifically intended for an LLM. This layer does not add geometry or upgrade provisional detections.</p>
   <pre>const context = reader3d.aiContext({ task: "manufacturing_analysis" });
@@ -157,13 +175,5 @@ const featureContext = reader3d.aiContext({
     </ul>
   </div>
 </main>
-<section><h2>Semantic feature candidates</h2><p>The feature schema v7.0 adds evidence-quality metadata and stable feature identifiers while retaining the provisional candidates for holes, tapered transitions, fillets, chamfers, and repeated cylindrical patterns. Candidates include explicit evidence and <code>needs_topology_confirmation</code> when design intent is not proven.</p></section><section><h2>Relations</h2><p>Each semantic body may expose analytic surface relations separately from inferred feature candidates. Relations describe geometric evidence; feature candidates interpret that evidence and may remain uncertain.</p></section></body>
+</body>
 </html>
-
-
-### V5 manufacturing semantics
-The semantic JSON now also exposes a manufacturing layer per body. It contains candidate manufacturing operations, geometric tool-axis/setup candidates, a deterministic candidate operation sequence, functional wall-thickness metadata when the Reader already provides it, and conservative DFM recommendations. These values are explicitly candidates rather than executable toolpaths: stock, fixture, machine limits and exact accessibility are not inferred from geometry alone.
-
-
-<section><h2>V6 manufacturing planning semantics</h2>
-<p>Feature schema <code>9.0</code> adds a deterministic planning layer on top of V5 manufacturing candidates. Each body may expose <code>manufacturing_plan</code> with compatible tool-axis setup candidates, operation dependencies, a deterministic planned order, readiness signals, and explicit unresolved constraints. V6 does not perform stock/fixture collision analysis, machine kinematics, tool selection or cutting-parameter generation; it is planning evidence, not CAM output.</p></section>

@@ -470,12 +470,14 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.textContent('#total-volume'), boxVolume);
     assert.equal(await page.locator('#bodies tr').count(), boxBodies);
     assert.equal(await page.inputValue('#density'), '2.68');
+    await page.waitForFunction(() => JSON.parse(document.getElementById('reader3d-semantic-result').textContent)?.source.file === 'box.stl');
     // An empty tab: the drop hint, no results.
     await page.click('.doc-tab-new');
     assert.equal(await page.locator('.doc-tab').count(), 3);
     assert.equal(await page.isVisible('#drop-hint'), true);
     assert.equal(await page.isVisible('#summary-card'), false);
     assert.equal(await page.evaluate(() => window.reader3d.result), null);
+    assert.equal(await page.textContent('#reader3d-semantic-result'), 'null');
     // Closing a tab shows its neighbour.
     await page.click('.doc-tab.active .doc-tab-close');
     assert.equal(await page.locator('.doc-tab').count(), 2);
@@ -487,6 +489,23 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'Nouvel onglet');
     assert.equal(await page.isVisible('#drop-hint'), true);
     assert.equal(await page.isVisible('#summary-card'), false);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
+  test('a model dropped on the IA page is analysed in the 3D view', { timeout: CAD_TIMEOUT }, async () => {
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    await page.click('.tab[data-page="ia"]');
+    const stl = readFileSync(fixturePath('box.stl')).toString('base64');
+    await page.evaluate((b64) => {
+      const data = new DataTransfer();
+      data.items.add(new File([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], 'box.stl'));
+      document.getElementById('page-ia').dispatchEvent(new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true }));
+    }, stl);
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    assert.equal(await page.isVisible('#page-viewer'), true);
+    assert.equal((await page.evaluate(() => window.reader3d.result)).file, 'box.stl');
     assert.deepEqual(errors, []);
     await page.context().close();
   });
@@ -504,6 +523,29 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     approx(json.summary.volume, expected['named_assembly.step'].summary.volume, 1e-9, 0, 'JSON volume');
     assert.deepEqual(json.bodies.map((b) => b.name), ['Équerre', 'Pin']);
     assert.equal(json.bodies[0].mesh, undefined, 'no display meshes in the JSON');
+    // The semantic contract, written once the page is idle: the topology of the
+    // meshes, and the bodies by their index in the file.
+    await page.waitForFunction(() => document.getElementById('reader3d-semantic-result').textContent !== 'null');
+    const semantic = JSON.parse(await page.textContent('#reader3d-semantic-result'));
+    assert.deepEqual(semantic.bodies.map((b) => [b.id, b.name, b.topology?.watertight]), [['body-0', 'Équerre', true], ['body-1', 'Pin', true]]);
+    assert.ok(semantic.bodies.every((b) => b.features.some((f) => f.type === 'closed_solid')));
+    const checked = await page.evaluate(() => (window.reader3d.setSelection([1]), window.reader3d.semantic.bodies.map((b) => [b.id, b.source_index, b.name])));
+    assert.deepEqual(checked, [['body-1', 1, 'Pin']]);
+    // A listener of "reader3d-part" gets the contract of the new selection.
+    const seen = await page.evaluate(() => new Promise((resolve) => {
+      document.addEventListener('reader3d-part', () => resolve(window.reader3d.semantic.bodies.map((b) => b.id)), { once: true });
+      window.reader3d.setSelection([0]);
+    }));
+    assert.deepEqual(seen, ['body-0']);
+    // Another thickness method: its statistics, the contract built again.
+    const rebuilt = await page.evaluate(() => {
+      const before = window.reader3d.semantic;
+      const method = document.getElementById('thick-method');
+      method.value = 'wall';
+      method.dispatchEvent(new Event('change'));
+      return window.reader3d.semantic !== before && window.reader3d.result.thickness.method === 'wall';
+    });
+    assert.equal(rebuilt, true);
 
     const viaApi = await page.evaluate(async () => (await window.reader3d.analyze('e2e-samples/box.stl')).summary.volume);
     approx(viaApi, expected['box.stl'].summary.volume, 1e-9, 0, 'reader3d.analyze');

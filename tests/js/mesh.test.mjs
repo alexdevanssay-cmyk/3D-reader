@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import { zipSync, strToU8 } from 'three/addons/libs/fflate.module.js';
 
 import { loadMeshFile, needsDomParser, MESH_EXTENSIONS } from '../../web/engine/meshload.js';
-import { analyzeMesh, analyzeMeshParts } from '../../web/engine/meshanalysis.js';
+import { analyzeMesh, analyzeMeshParts, meshTopology } from '../../web/engine/meshanalysis.js';
 import { summarize } from '../../web/engine/summary.js';
 import { UNITS, unitFromName } from '../../web/engine/units.js';
 import { approx, approxVec, fixtureBytes, loadExpected } from './helpers.mjs';
@@ -47,6 +47,9 @@ function checkBody(js, py, size, label, { color = true } = {}) {
   approxPoint(js.bbox.min, py.bbox.min, size, `${label}: bbox.min`);
   approxPoint(js.bbox.max, py.bbox.max, size, `${label}: bbox.max`);
   approxPoint(js.bbox.size, py.bbox.size, size, `${label}: bbox.size`);
+  // Topology for the semantic layer (no Python counterpart): the edges `closed` comes from.
+  assert.equal(js.topology.watertight, js.closed, `${label}: topology.watertight`);
+  assert.equal(js.topology.triangles, js.triangles, `${label}: topology.triangles`);
 
   // Display arrays of the result contract.
   assert.ok(js.mesh.positions instanceof Float32Array, `${label}: positions are a Float32Array`);
@@ -398,6 +401,21 @@ test('analysis: an unwelded triangle soup gives the same result as the indexed m
   assert.equal(b.triangles, 12);
   assert.equal(b.mesh.indices.length, 36);
   approx(b.volume, 6000, 1e-12, 0, 'volume');
+});
+
+test('analysis: the topology for the semantic layer is that of the welded mesh, closed or not', () => {
+  // The box as a soup: each triangle with its own vertices, like the faces of a CAD mesh.
+  const soup = analyzeMesh('soup', Float32Array.from(BOX_F.flatMap((f) => f.flatMap((i) => BOX_V[i]))), null);
+  const box = { vertices: 8, triangles: 12, unique_edges: 18, boundary_edges: 0, non_manifold_edges: 0, degenerate_triangles: 0, watertight: true };
+  assert.deepEqual(soup.topology, box);
+  assert.deepEqual(meshTopology(soup.mesh.positions, soup.mesh.indices), box, 'from the mesh alone (CAD bodies)');
+  // Duplicate and degenerate triangles are dropped, as for `closed`.
+  const extra = mesh([...BOX_V, [0, 0, 0]], [...BOX_F, BOX_F[0], BOX_F[1], [...BOX_F[3]].reverse(), [0, 1, 1], [0, 1, 0]]);
+  assert.deepEqual(extra.topology, { ...box, triangles: 17, degenerate_triangles: 5 });
+  // A fin: a third face on an edge, two open edges.
+  const fin = mesh([...BOX_V, [0, 0, 40]], [...BOX_F, [0, 1, 8]]);
+  assert.equal(fin.closed, false);
+  assert.deepEqual(fin.topology, { vertices: 9, triangles: 13, unique_edges: 20, boundary_edges: 2, non_manifold_edges: 1, degenerate_triangles: 0, watertight: false });
 });
 
 test('analysis: vertices are welded on a 1e-8 rounding grid like trimesh merge_vertices', () => {

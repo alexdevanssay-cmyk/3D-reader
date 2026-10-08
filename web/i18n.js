@@ -5,6 +5,7 @@ const STRINGS = {
   en: {
     "app.description": "Open STEP, IGES, STL, OBJ, GLB, 3MF… files in the browser and compute the real volume of material, the envelope and the mass.",
     "top.open": "Open file…",
+    "tab.ai": "AI / analysis",
     "tab.viewer": "3D analysis",
     "tab.costing": "Costing",
     "tab.settings": "Settings",
@@ -216,6 +217,7 @@ const STRINGS = {
   fr: {
     "app.description": "Ouvrez des fichiers STEP, IGES, STL, OBJ, GLB, 3MF… dans le navigateur et calculez le volume réel de matière, l'encombrement et la masse.",
     "top.open": "Ouvrir un fichier…",
+    "tab.ai": "IA / analyse",
     "tab.viewer": "Analyse 3D",
     "tab.costing": "Chiffrage",
     "tab.settings": "Paramètres",

@@ -7,6 +7,7 @@
 // Contract version: 1.0
 import { buildManufacturingPlan, operationDependencyGraph, precedence } from "./manufacturing-plan.js";
 import { buildFoundryAnalysis, FOUNDRY_SCHEMA_VERSION, FOUNDRY_KNOWLEDGE_VERSION } from "./foundry-knowledge.js";
+import { meshTopology } from "./meshanalysis.js";
 
 export const SEMANTIC_VERSION = "1.0";
 
@@ -25,36 +26,17 @@ const COAXIAL_PAIRWISE_LIMIT = 16;
 function finite(v) { return typeof v === "number" && Number.isFinite(v); }
 function dot(a, b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
 
+/**
+ * Edge topology of a body's mesh (see meshanalysis.js meshTopology), or null
+ * without one. The in-browser engine gives it with each body (body.topology),
+ * which the page keeps when it leaves the mesh out.
+ */
 function topology(body) {
-  const p = body.mesh?.positions;
-  const f = body.mesh?.indices;
-  if (!p || !f) return null;
-  const nv = Math.floor(p.length / 3);
-  const nf = Math.floor(f.length / 3);
-  const edges = new Map();
-  let degenerate = 0;
-  for (let i=0;i<nf;i++) {
-    const a=f[3*i], b=f[3*i+1], c=f[3*i+2];
-    if (a===b || b===c || a===c) degenerate++;
-    for (const [u,v] of [[a,b],[b,c],[c,a]]) {
-      const lo=Math.min(u,v), hi=Math.max(u,v), k=lo+","+hi;
-      edges.set(k,(edges.get(k)||0)+1);
-    }
-  }
-  let boundary=0, nonManifold=0;
-  for (const n of edges.values()) {
-    if (n===1) boundary++;
-    else if (n!==2) nonManifold++;
-  }
-  return {
-    vertices: nv,
-    triangles: nf,
-    unique_edges: edges.size,
-    boundary_edges: boundary,
-    non_manifold_edges: nonManifold,
-    degenerate_triangles: degenerate,
-    watertight: boundary===0 && nonManifold===0,
-  };
+  const m = body.mesh;
+  if (!m?.positions || !m?.indices) return null;
+  // Far from the origin, float32 does not even resolve the body: its
+  // double-precision vertices when kept.
+  return meshTopology(ArrayBuffer.isView(m.positions64) ? m.positions64 : m.positions, m.indices);
 }
 
 function principalAxes(body) {
@@ -443,7 +425,11 @@ function featureCandidates(body, topo, relations, graph) {
     if (blends.has(c.index)) continue;
     const axial = Math.max(...s);
     const likelyThrough = c.radius_mm > 0 && axial > 0 && axial / (2*c.radius_mm) > 1.5;
-    const boundaryEvidence = c.edge_count === 2 || c.wire_count === 2;
+    // Two boundary circles close a pin or a boss as well as a hole: only a face
+    // with the material outside it (reversed; any other orientation is unknown)
+    // can be a hole. They do not tell a through hole from a blind one either,
+    // hence the confirmation still needed.
+    const boundaryEvidence = c.orientation === "reversed" && (c.edge_count === 2 || c.wire_count === 2);
     out.push({
       type:"cylindrical_feature_candidate",
       subtype:boundaryEvidence && likelyThrough ? "possible_through_hole" : likelyThrough ? "possible_bore" : "cylindrical_surface",
@@ -455,7 +441,7 @@ function featureCandidates(body, topo, relations, graph) {
       axis:c.axis ?? null,
       center_mm:c.center_mm ?? null,
       boundary_evidence:{wire_count:c.wire_count ?? null,edge_count:c.edge_count ?? null},
-      needs_topology_confirmation:!(boundaryEvidence && likelyThrough)
+      needs_topology_confirmation:true
     });
   }
 
@@ -869,7 +855,7 @@ function featureSurfaces(feature) {
   return [...new Set(list.filter(i=>i!=null))];
 }
 
-function manufacturingForBody(body, features, principal) {
+function manufacturingForBody(body, features, principal, topo) {
   // One operation per operation kind and machined faces: the features that
   // read the same faces the same way share it. The analytic cylinder of a
   // hole candidate is the same hole: it takes the hole's operation.
@@ -929,11 +915,12 @@ function manufacturingForBody(body, features, principal) {
 
   const dfm=[];
   if (!body.closed) dfm.push({code:"open_body",severity:"high",recommendation:"repair_or_close_body_before_manufacturing_analysis"});
-  if (body.mesh && topology(body)?.non_manifold_edges>0) dfm.push({code:"non_manifold_geometry",severity:"high",recommendation:"repair_non_manifold_topology"});
+  if (topo?.non_manifold_edges>0) dfm.push({code:"non_manifold_geometry",severity:"high",recommendation:"repair_non_manifold_topology"});
   if (minThickness!=null && minThickness < 2) dfm.push({code:"thin_wall",severity:"medium",recommendation:"verify_process_capability_and_clamping"});
   if (features.some(f=>f.status==="provisional")) dfm.push({code:"provisional_feature_intent",severity:"info",recommendation:"confirm_feature_intent_before_generating_toolpaths"});
   if (features.some(f=>f.type==="pattern_feature_candidate")) dfm.push({code:"repeated_features",severity:"info",recommendation:"consider a common setup/tool strategy for repeated features"});
-  if (!features.length) dfm.push({code:"no_machining_feature_detected",severity:"info",recommendation:"do_not_assume_a_specific_manufacturing_process_from_geometry_alone"});
+  // Machining candidates only: a closed solid or planar faces say nothing of the process.
+  if (!operations.length) dfm.push({code:"no_machining_feature_detected",severity:"info",recommendation:"do_not_assume_a_specific_manufacturing_process_from_geometry_alone"});
 
   return {
     schema_version:MANUFACTURING_SCHEMA_VERSION,
@@ -949,17 +936,20 @@ function manufacturingForBody(body, features, principal) {
 }
 
 function semanticBody(body, index) {
-  const topo=topology(body);
+  // Given with the body when it has no mesh (from the page), with the index of
+  // each body in its result when only some of them are given (app.js).
+  const topo=body.topology ?? topology(body);
+  const sourceIndex=body.source_index ?? index;
   const size=body.bbox?.size ?? [0,0,0];
   const volume=body.volume;
   const envelopeVolume=size.reduce((a,b)=>a*b,1);
-  const id="body-"+index;
+  const id="body-"+sourceIndex;
   const graph=faceGraph(body.geometric_surfaces ?? []);
   const relations=surfaceRelations(body.geometric_surfaces ?? [], graph, id);
   const features=normalizeFeatureEvidence(featureCandidates(body,topo,relations,graph), id);
   const semantic = {
     id,
-    source_index:index,
+    source_index:sourceIndex,
     name:body.name ?? "Body",
     role:"solid_body",
     metrics:{
@@ -984,7 +974,7 @@ function semanticBody(body, index) {
       evidence:semanticEvidenceQuality(relations, features),
       notes:Array.isArray(body.notes)?body.notes:[],
     },
-    manufacturing:manufacturingForBody(body, features, principalAxes(body)),
+    manufacturing:manufacturingForBody(body, features, principalAxes(body), topo),
     // The Reader body has no topology of its own: the one computed here.
     foundry: buildFoundryAnalysis({...body, topology:topo}, features, principalAxes(body), FOUNDRY_PROFILE),
   };

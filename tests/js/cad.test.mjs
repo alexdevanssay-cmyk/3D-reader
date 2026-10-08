@@ -118,6 +118,10 @@ function checkParity(result, exp, name) {
     approxVec(body.bbox.size, eb.bbox.size, 0, BBOX * size, `${label}: bbox.size`);
     checkMeshVolume(body, eb, label);
     approxVec(body.color, eb.color, 0, COLOR, `${label}: color`);
+    // Topology for the semantic layer (no Python counterpart): the welded mesh
+    // of a solid closes like the solid.
+    assert.equal(body.topology.watertight, body.closed, `${label}: topology.watertight`);
+    assert.equal(body.topology.triangles, body.triangles, `${label}: topology.triangles`);
   });
   checkTessellationError(result, name);
 
@@ -323,6 +327,47 @@ describe('CAD specifics', () => {
     approxVec(bodies[0].bbox.size, [10, 20, 30], 0, 1e-9, 'size in mm');
   });
 
+  test('analytic surfaces for the semantic layer: orientation, outward normal, centre on the surface, bounding edges', (t) => {
+    // Block (0, 0, 0) + (100, 60, 20) with a through hole of radius 10 along z
+    // at (50, 30). Structured clone: the result comes from the engine worker.
+    const [block] = structuredClone(timedAnalyze(t, 'holed_block.step', undefined, undefined, 'holed_block.step (surfaces)')).bodies;
+    const surfaces = block.geometric_surfaces;
+    assert.ok(surfaces.every((s) => s.orientation === 'forward' || s.orientation === 'reversed'), 'orientation as a string');
+    // Each face of the block once, its normal out of the material, its centre in the
+    // middle of its UV bounds: on its plane, not always on the face (the top one: in the hole).
+    const faces = [
+      [[0, 0, -1], [50, 30, 0]], [[0, 0, 1], [50, 30, 20]],
+      [[-1, 0, 0], [0, 30, 10]], [[1, 0, 0], [100, 30, 10]],
+      [[0, -1, 0], [50, 0, 10]], [[0, 1, 0], [50, 60, 10]],
+    ];
+    const planes = surfaces.filter((s) => s.type === 'plane');
+    assert.equal(planes.length, faces.length);
+    for (const [normal, centre] of faces) {
+      const plane = planes.find((s) => s.normal.every((x, i) => Math.abs(x - normal[i]) < 1e-12));
+      assert.ok(plane, `a face with the normal ${normal}`);
+      approxVec(plane.center_mm, centre, 0, 1e-9, `centre of the face ${normal}`);
+    }
+    // The hole: the material around it (reversed), its two circles and not the
+    // seam, its centre on the axis half way through the block.
+    const [hole] = surfaces.filter((s) => s.type === 'cylinder');
+    assert.equal(hole.orientation, 'reversed');
+    assert.equal(hole.edge_count, 2);
+    approxVec(hole.axis.map(Math.abs), [0, 0, 1], 0, 1e-12, 'hole axis');
+    approxVec(hole.center_mm, [50, 30, 10], 0, 1e-9, 'hole centre');
+  });
+
+  test('a cone gives the point of its reference radius: it can be rebuilt from its centre', () => {
+    // Truncated cone along z: radius 6 at z = 0, 2 at z = 8.
+    const shape = new oc.BRepPrimAPI_MakeCone_1(6, 2, 8).Shape();
+    const [body] = analyzeCad(oc, brepBytes('cone.brep', shape), 'cone.brep').bodies;
+    const cone = body.geometric_surfaces.find((s) => s.type === 'cone');
+    approxVec(cone.axis_origin_mm, [0, 0, 0], 0, 1e-12, 'axis origin');
+    approx(cone.ref_radius_mm, 6, 1e-12, 0, 'radius at the axis origin');
+    approxVec(cone.center_mm, [0, 0, 4], 0, 1e-9, 'centre: half way up');
+    const along = cone.axis.reduce((n, x, k) => n + x * (cone.center_mm[k] - cone.axis_origin_mm[k]), 0);
+    approx(cone.ref_radius_mm + along * Math.tan(cone.semi_angle_rad), 4, 1e-9, 0, 'radius at the centre');
+  });
+
   test('quality presets change the tessellation, not the volume', (t) => {
     const name = 'sphere.stp';
     const bytes = fixtureBytes(name);
@@ -523,6 +568,11 @@ describe('CAD specifics', () => {
         approxVec(b.bbox.max, max, 0, 1e-9, `${name} ${b.name} bbox.max`);
         approxVec(b.centroid, centroid, 0, 1e-9, `${name} ${b.name} centroid`);
         assert.deepEqual(b.notes, i ? [] : [NOTE_INVERTED], `${name} ${b.name} notes`);
+        // The normals of the faces point out of the box, mirrored or not.
+        for (const s of b.geometric_surfaces) {
+          const out = s.normal.reduce((n, x, k) => n + x * (s.center_mm[k] - centroid[k]), 0);
+          assert.ok(out > 0, `${name} ${b.name} face ${s.index}: normal into the box`);
+        }
       });
       approx(totalVolume({ bodies }), 6 * 7 * 8 + 125, 1e-12, 0, `${name} volume`);
     }

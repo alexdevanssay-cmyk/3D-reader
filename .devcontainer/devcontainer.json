@@ -8,7 +8,7 @@
   "image": "mcr.microsoft.com/devcontainers/python:1-3.11-bookworm",
   "features": {
     // Node builds the browser engine assets (npm run vendor) and runs the JS tests.
-    "ghcr.io/devcontainers/features/node:1": { "version": "22" }
+    "ghcr.io/devcontainers/features/node:1": { "version": "24" }
   },
   "hostRequirements": { "memory": "4gb" },
 

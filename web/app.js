@@ -1096,7 +1096,9 @@ window.addEventListener("drop", (e) => {
     showPage("viewer");
   } else {
     // On the costing pages, files go to the rows of their data files (chiffrage/ui.js), not to the 3D view.
-    if ($("page-viewer").hidden) return;
+    if (!$("page-chiffrage").hidden || !$("page-parametres").hidden) return;
+    // From the IA page: analysed in the 3D view, where its progress shows.
+    if (!$("page-ia").hidden) showPage("viewer");
     tab = freeTab();
   }
   const item = [...(e.dataTransfer.items ?? [])].find((i) => i.kind === "file");
@@ -1773,6 +1775,7 @@ function showTab(tab) {
   if (tab.result) updatePublished(tab.result);
   else {
     $("reader3d-result").textContent = "null";
+    publishSemantic();
     document.dispatchEvent(new CustomEvent("reader3d-part"));
   }
   costingPages?.then((ui) => ui.setTab(tab.id));
@@ -2064,10 +2067,10 @@ function publishResult(r) {
 
 /** The machine-readable result in the page (and the text report), kept up to date. */
 function updatePublished(r) {
+  // First: a listener of the event that asks for the contract gets the new one.
+  publishSemantic();
   document.dispatchEvent(new CustomEvent("reader3d-part"));
   const data = exportableResult(r);
-  const semantic = buildSemantic3D(data);
-  $("reader3d-semantic-result").textContent = JSON.stringify(semantic).replace(/</g, "\\u003c");
   // "<" escaped so that a part name cannot close the script element.
   $("reader3d-result").textContent = JSON.stringify(data).replace(/</g, "\\u003c");
   if (params.get("report")) {
@@ -2080,6 +2083,51 @@ function updatePublished(r) {
     }
     pre.textContent = plainReport(data);
   }
+}
+
+// The semantic contract (engine/semantic.js) of the result shown, for the IA
+// page and for scripts. It takes seconds on a part with thousands of faces: it
+// is built when asked for, kept until the published result changes, and
+// written into #reader3d-semantic-result when the page is idle, so that it
+// never holds up or breaks the result itself.
+let semanticKept = null; // {result, density, method, semantic}
+let semanticPending = null; // idle callback writing #reader3d-semantic-result
+
+/** The semantic contract of the result shown (null without one). */
+function currentSemantic() {
+  const r = state.result;
+  if (!r) return null;
+  const density = $("density").value;
+  // The thickness method changes the statistics exported without republishing.
+  const method = thickMethod();
+  if (semanticKept?.result !== r || semanticKept.density !== density || semanticKept.method !== method) {
+    // The bodies checked, each with its index in r.bodies (what setSelection takes).
+    const data = exportableResult(r);
+    const indices = includedIndices();
+    data.bodies = data.bodies.map((b, k) => ({ ...b, source_index: indices[k] }));
+    semanticKept = { result: r, density, method, semantic: buildSemantic3D(data) };
+  }
+  return semanticKept.semantic;
+}
+
+/** #reader3d-semantic-result: "null" at once (never that of another state), the new contract when the page is idle. */
+function publishSemantic() {
+  semanticKept = null;
+  $("reader3d-semantic-result").textContent = "null";
+  if (semanticPending != null) (window.cancelIdleCallback ?? clearTimeout)(semanticPending);
+  semanticPending = null;
+  if (!state.result) return;
+  const write = () => {
+    semanticPending = null;
+    let text = "null";
+    try {
+      text = JSON.stringify(currentSemantic()).replace(/</g, "\\u003c");
+    } catch (err) {
+      console.warn("Semantic contract not built", err);
+    }
+    $("reader3d-semantic-result").textContent = text;
+  };
+  semanticPending = window.requestIdleCallback ? requestIdleCallback(write, { timeout: 2000 }) : setTimeout(write);
 }
 
 async function openUrl(url) {
@@ -2105,10 +2153,10 @@ window.reader3d = {
   aiContextVersion: AI_CONTEXT_VERSION,
   aiContext(options = {}) {
     if (!state.result) return null;
-    return buildAIContext(buildSemantic3D(exportableResult(state.result)), options);
+    return buildAIContext(currentSemantic(), options);
   },
   get semantic() {
-    return state.result ? buildSemantic3D(exportableResult(state.result)) : null;
+    return currentSemantic();
   },
   get result() {
     return state.result ? exportableResult(state.result) : null;
