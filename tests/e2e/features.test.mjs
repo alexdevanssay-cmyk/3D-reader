@@ -327,13 +327,20 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       let body = '';
       req.on('data', (c) => (body += c));
       req.on('end', () => {
-        chats.push(JSON.parse(body));
+        const request = JSON.parse(body);
+        chats.push(request);
         const answer = 'Conclusion : Deux corps fermés.\n\nMesuré :\n- volume 7,257 cm³\n\nRecommandations :\n- Calculer les épaisseurs';
         res.setHeader('Content-Type', 'application/x-ndjson');
-        // A model reads its prompt before writing: the first words come after a while.
-        setTimeout(() => {
+        const write = () => {
           for (let i = 0; i < answer.length; i += 16) res.write(`${JSON.stringify({ message: { role: 'assistant', content: answer.slice(i, i + 16) }, done: false })}\n`);
           res.end(`${JSON.stringify({ done: true, load_duration: 2e9, prompt_eval_count: 900, prompt_eval_duration: 3e9, eval_count: 40, eval_duration: 1e9 })}\n`);
+        };
+        // A model reads its prompt before writing: the first words come after a while.
+        setTimeout(() => {
+          if (!request.think) return write();
+          // Asked to reason: the reasoning first, then the answer.
+          for (const words of ['Le volume est donné ', 'par le contexte ; ', 'je vérifie les corps fermés.']) res.write(`${JSON.stringify({ message: { role: 'assistant', content: '', thinking: words }, done: false })}\n`);
+          setTimeout(write, 800);
         }, 600);
       });
     });
@@ -396,6 +403,16 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.match(chats[1].messages[0].content, /"compaction"/);
     assert.ok(chats[1].messages[0].content.length < 20_000, `system prompt of ${chats[1].messages[0].content.length} characters`);
     assert.equal(chats[1].options.num_ctx, 8192);
+    // The model's reasoning, when asked for: one grey line under the answer while it is written, then folded.
+    await page.check('#ai-think');
+    await page.fill('#ai-input', 'Combien de noyaux ?');
+    await page.press('#ai-input', 'Enter');
+    await page.waitForSelector('#ai-chat .ai-thought:not([hidden])', { timeout: 30_000 });
+    assert.match(await page.textContent('#ai-chat .ai-thought'), /je vérifie les corps fermés\.$/);
+    await page.waitForFunction(() => /Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+    assert.equal(chats[2].think, true);
+    assert.equal(await page.locator('#ai-chat .ai-thought').count(), 0);
+    assert.match(await page.textContent('#ai-chat .ai-thought-details'), /Voir la réflexion\s*Le volume est donné par le contexte ; je vérifie les corps fermés\./);
     // A new conversation forgets it.
     await page.click('#ai-clear');
     assert.equal(await page.locator('#ai-chat .ai-msg').count(), 0);

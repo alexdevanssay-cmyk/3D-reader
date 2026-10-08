@@ -31,7 +31,7 @@ const TASKS = [
   ["costing", "Chiffrage"],
 ];
 
-const KEYS = { gateway: "reader3d.ai.gateway", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider", messages: "reader3d.ai.messages" };
+const KEYS = { gateway: "reader3d.ai.gateway", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider", messages: "reader3d.ai.messages", think: "reader3d.ai.think" };
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -141,8 +141,8 @@ function ollamaBase(value) {
  * the window changes from one question to the next, and it can reuse what it
  * has already read only when it does not.
  */
-function contextWindow(chars) {
-  return Math.ceil(chars / 3) + 2048 <= 8192 ? 8192 : MAX_WINDOW;
+function contextWindow(chars, reserve = 2048) {
+  return Math.ceil(chars / 3) + reserve <= 8192 ? 8192 : MAX_WINDOW;
 }
 
 const seconds = (ns) => Math.round((ns ?? 0) / 1e9);
@@ -164,6 +164,11 @@ function withoutThinking(text) {
   return String(text ?? "").replace(/<think>[\s\S]*?(<\/think>|$)/g, "").trimStart();
 }
 
+/** That reasoning, when the model writes it in the answer. */
+function inlineThinking(text) {
+  return /<think>([\s\S]*?)(<\/think>|$)/.exec(String(text ?? ""))?.[1].trim() ?? "";
+}
+
 export function mount({ page, reader }) {
   if (!page) return { show() {} };
   page.innerHTML = `
@@ -183,6 +188,7 @@ export function mount({ page, reader }) {
           <label class="field">Modèle
             <input id="ai-model" spellcheck="false">
           </label>
+          <label class="check" id="ai-think-field" title="Le modèle raisonne avant de répondre : réponses plus sûres, mais bien plus lentes sur un PC sans carte graphique. Le raisonnement s'affiche sous la réponse."><input type="checkbox" id="ai-think"> Réflexion du modèle (plus lent)</label>
           <button id="ai-test" class="btn" type="button">Tester la connexion</button>
         </div>
         <div class="ai-row ai-tasks" role="group" aria-label="Type d'analyse">
@@ -229,12 +235,14 @@ export function mount({ page, reader }) {
     const savedModel = store.get(localStorage, `${KEYS.model}.${provider()}`);
     $("ai-model").value = savedModel || (local ? OLLAMA_MODEL : "");
     $("ai-model").placeholder = local ? OLLAMA_MODEL : "modèle par défaut du gateway";
+    $("ai-think-field").hidden = !local;
   }
   {
     const saved = store.get(localStorage, KEYS.provider);
     // Older versions stored "openai_compatible" for Ollama.
     $("ai-provider").value = saved === "openai_compatible" ? "ollama" : saved === "openai" || saved === "ollama" ? saved : "ollama";
     showProvider();
+    $("ai-think").checked = store.get(localStorage, KEYS.think) === "1";
   }
 
   function bubble(role, text = "") {
@@ -288,7 +296,7 @@ export function mount({ page, reader }) {
   let timing = ""; // time spent by Ollama on the last answer, shown with it
 
   /** Ask the local Ollama, the answer shown as it is written. Resolves to the whole answer. */
-  async function askOllama(question, context, signal, onText) {
+  async function askOllama(question, context, signal, onText, onThought) {
     const base = ollamaBase($("ai-url").value.trim());
     const model = $("ai-model").value.trim() || OLLAMA_MODEL;
     const problem = await diagnoseOllama(base, model);
@@ -296,16 +304,18 @@ export function mount({ page, reader }) {
     // General questions: a summary of the part (read in seconds on a CPU); the analysis tasks: the detail.
     const compact = context.no_model_loaded ? context : task === "general" ? summaryAIContext(context) : compactAIContext(context, { maxChars: LOCAL_CONTEXT_CHARS });
     const system = `${systemPrompt(model)}\n\nCONTEXTE :\n${JSON.stringify(compact)}`;
+    const think = $("ai-think").checked;
+    const reserve = think ? 4096 : 2048; // room for the answer, and for the reasoning written before it
     let history = messages.slice(-LOCAL_HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
     const promptChars = () => system.length + JSON.stringify(history).length + question.length;
     // The oldest exchanges are left out rather than the prompt cut by Ollama.
-    while (history.length && Math.ceil(promptChars() / 3) + 2048 > MAX_WINDOW) history = history.slice(2);
-    const numCtx = contextWindow(promptChars());
+    while (history.length && Math.ceil(promptChars() / 3) + reserve > MAX_WINDOW) history = history.slice(2);
+    const numCtx = contextWindow(promptChars(), reserve);
     const body = {
       model,
       messages: [{ role: "system", content: system }, ...history, { role: "user", content: question }],
       stream: true,
-      think: false, // Qwen3 would otherwise write a long hidden reasoning first
+      think, // Qwen3 reasons before answering only when asked: much slower on a CPU
       keep_alive: "15m", // the model stays loaded between questions (loading it takes long on a CPU)
       options: { num_ctx: numCtx, temperature: 0.2 },
     };
@@ -337,6 +347,7 @@ export function mount({ page, reader }) {
     const decoder = new TextDecoder();
     let pending = "";
     let answer = "";
+    let thought = "";
     let last = null;
     for (;;) {
       let chunkRead;
@@ -357,6 +368,10 @@ export function mount({ page, reader }) {
         const chunk = JSON.parse(line);
         if (chunk.error) throw new Error(`Ollama : ${chunk.error}`);
         if (chunk.done) last = chunk;
+        if (chunk.message?.thinking) {
+          thought += chunk.message.thinking;
+          onThought(thought);
+        }
         if (chunk.message?.content) {
           answer += chunk.message.content;
           onText(answer);
@@ -410,6 +425,34 @@ export function mount({ page, reader }) {
     // Until the first words arrive: "Réflexion en cours…", in grey italics.
     const answerBox = bubble("assistant", "Réflexion en cours…");
     answerBox.classList.add("ai-thinking");
+    // The model's reasoning while it is written: one grey line under the answer, its latest words;
+    // folded once the answer starts.
+    const thoughtLine = document.createElement("div");
+    thoughtLine.className = "ai-thought";
+    thoughtLine.hidden = true;
+    answerBox.after(thoughtLine);
+    let thought = "";
+    let folded = false;
+    const showThought = (text) => {
+      if (!text || folded) return;
+      thought = text;
+      thoughtLine.hidden = false;
+      thoughtLine.textContent = text.replace(/\s+/g, " ").slice(-300);
+    };
+    const foldThought = () => {
+      if (folded) return;
+      folded = true;
+      if (!thought) return thoughtLine.remove();
+      const details = document.createElement("details");
+      details.className = "ai-thought-details";
+      const summary = document.createElement("summary");
+      summary.textContent = "Voir la réflexion";
+      const text = document.createElement("div");
+      text.className = "ai-text";
+      text.textContent = thought;
+      details.append(summary, text);
+      thoughtLine.replaceWith(details);
+    };
     busy = new AbortController();
     $("ai-cancel").hidden = false;
     $("ai-send").disabled = true;
@@ -418,7 +461,7 @@ export function mount({ page, reader }) {
     const tick = () => {
       const s = Math.round((performance.now() - start) / 1000);
       setStatus(local
-        ? written ? `Rédaction… ${s} s` : `Lecture du contexte par le modèle… ${s} s (sur un PC sans carte graphique, cela peut prendre quelques minutes)`
+        ? written ? `Rédaction… ${s} s` : thought ? `Réflexion… ${s} s` : `Lecture du contexte par le modèle… ${s} s (sur un PC sans carte graphique, cela peut prendre quelques minutes)`
         : `Analyse… ${s} s`);
     };
     tick();
@@ -426,14 +469,17 @@ export function mount({ page, reader }) {
     try {
       const output = local
         ? await askOllama(question, context, busy.signal, (text) => {
+          showThought(inlineThinking(text));
           const visible = withoutThinking(text);
           if (!visible) return; // still thinking
           written = visible.length;
+          foldThought();
           answerBox.classList.remove("ai-thinking");
           answerBox.textContent = visible;
           $("ai-chat").scrollTop = $("ai-chat").scrollHeight;
-        })
+        }, showThought)
         : await askGateway(question, context, busy.signal);
+      foldThought();
       answerBox.classList.remove("ai-thinking");
       answerBox.textContent = formatAnswer(output) || "(réponse vide)";
       // Only answered questions are kept: a failed one is not sent again with the next.
@@ -457,6 +503,8 @@ export function mount({ page, reader }) {
       $("ai-send").disabled = false;
     }
   }
+
+  $("ai-think").addEventListener("change", () => store.set(localStorage, KEYS.think, $("ai-think").checked ? "1" : null));
 
   $("ai-provider").addEventListener("change", () => {
     store.set(localStorage, KEYS.provider, provider());

@@ -327,6 +327,10 @@ table.bodies .open { color: var(--warn); }
 .ai-error { background: var(--error-bg); color: var(--error-text); border-color: transparent; }
 .ai-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .ai-thinking { font-style: italic; color: var(--muted); }
+/* The reasoning of the model while it is written: one line, its latest words; then folded. */
+.ai-thought { display: flex; justify-content: flex-end; overflow: hidden; white-space: nowrap; margin-top: 6px; font-size: 12px; font-style: italic; color: var(--muted); }
+.ai-thought-details { margin-top: 6px; font-size: 12px; color: var(--muted); }
+.ai-thought-details summary { cursor: pointer; }
 .ai-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-top: 12px; }
 .ai-form textarea { flex: 1; min-width: 260px; font: inherit; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); resize: vertical; }
 .ai-actions { display: flex; flex-direction: column; gap: 6px; }
