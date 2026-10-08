@@ -1522,9 +1522,10 @@ function projectionCard(c, f) {
 
 // Box "Envoyer les pièces similaires de l'historique" (their cycle times are
 // confidential): for Ollama, on unless unticked, kept in this browser (nothing
-// leaves the site); for the gateway, off unless ticked, for this browser tab
-// only (sessionStorage), as the internal amounts of the IA page.
+// leaves the site); for the gateway, off until the user ticks it once (the
+// confidential history leaves the site only with their consent, remembered).
 const SIMILAR_KEY = "reader3d.ai.cycleSimilar";
+const SIMILAR_ONLINE_KEY = "reader3d.ai.cycleSimilarOnline";
 let cycleJob = null; // the estimate in progress: {key (of its piece), tab, file, controller, start}
 let cycleError = null; // {key, text}: why the last estimate of the piece `key` failed
 
@@ -1533,7 +1534,7 @@ const localAI = () => savedAI().provider === "ollama";
 function sendSimilar() {
   const local = localAI();
   try {
-    return local ? localStorage.getItem(SIMILAR_KEY) !== "0" : sessionStorage.getItem(SIMILAR_KEY) === "1";
+    return local ? localStorage.getItem(SIMILAR_KEY) !== "0" : localStorage.getItem(SIMILAR_ONLINE_KEY) === "1";
   } catch {
     return local; // storage blocked: the default
   }
@@ -1544,8 +1545,8 @@ function setSendSimilar(on) {
     if (localAI()) {
       if (on) localStorage.removeItem(SIMILAR_KEY);
       else localStorage.setItem(SIMILAR_KEY, "0");
-    } else if (on) sessionStorage.setItem(SIMILAR_KEY, "1");
-    else sessionStorage.removeItem(SIMILAR_KEY);
+    } else if (on) localStorage.setItem(SIMILAR_ONLINE_KEY, "1");
+    else localStorage.removeItem(SIMILAR_ONLINE_KEY);
   } catch {
     // storage blocked: the box is back to its default at the next rendering
   }
@@ -1555,7 +1556,7 @@ function setSendSimilar(on) {
 function similarBox() {
   const title = localAI()
     ? "Les pièces les plus semblables de l'historique, avec leur temps de cycle, sont données au modèle local (Ollama) : rien ne quitte le site."
-    : "Les pièces les plus semblables de l'historique partent à la passerelle en ligne avec leur temps de cycle, leur poids, leur module, leurs pièces par cycle et leur mise au mille (références anonymisées avec les noms). Décochée par défaut ; cochée, pour cet onglet du navigateur seulement.";
+    : "Les pièces les plus semblables de l'historique partent à la passerelle en ligne avec leur temps de cycle, leur poids, leur module, leurs pièces par cycle et leur mise au mille (références anonymisées avec les noms). Décochée par défaut ; une fois cochée, ce choix est gardé dans ce navigateur.";
   return `<label class="check small" title="${esc(title)}"><input type="checkbox" data-pref="cycle-similar"${sendSimilar() ? " checked" : ""}> Envoyer les pièces similaires de l'historique${localAI() ? "" : " à la passerelle"}</label>`;
 }
 

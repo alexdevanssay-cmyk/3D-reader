@@ -696,13 +696,13 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const pri = async () => /PRI complet(?: \(outillage compris\))?(\d[\d\s]*,\d+) €/.exec(await text())[1];
     const priBefore = await pri();
     // The button, beside the cycle of the route; the AI asked; the box of the similar parts (confidential times),
-    // unticked for the gateway unless ticked, for this browser tab only.
+    // unticked for the gateway until the user ticks it once (remembered).
     assert.match(await text(), /IA de la page IA \/ analyse : passerelle en ligne, noms anonymisés\. Historique : 3 enregistrements, non envoyé\./);
     assert.equal(await page.isChecked('#page-chiffrage [data-pref="cycle-similar"]'), false);
     assert.match(await text('#chistorique'), /L'historique est gardé dans ce navigateur\. Il n'est envoyé à l'IA que si la case « Envoyer les pièces similaires de l'historique » est cochée/);
     await page.check('#page-chiffrage [data-pref="cycle-similar"]');
     await waitText(/Historique : 3 enregistrements, les 3 plus semblables envoyés/);
-    assert.deepEqual(await page.evaluate(() => [sessionStorage.getItem('reader3d.ai.cycleSimilar'), localStorage.getItem('reader3d.ai.cycleSimilar')]), ['1', null]);
+    assert.deepEqual(await page.evaluate(() => [localStorage.getItem('reader3d.ai.cycleSimilarOnline'), localStorage.getItem('reader3d.ai.cycleSimilar')]), ['1', null]);
     await page.click('#page-chiffrage [data-action="estimate-cycle"]');
     await page.waitForSelector('#ccycle-ia .ccycle-value');
 
