@@ -490,6 +490,21 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(semantic.bodies.every((b) => b.features.some((f) => f.type === 'closed_solid')));
     const checked = await page.evaluate(() => (window.reader3d.setSelection([1]), window.reader3d.semantic.bodies.map((b) => [b.id, b.source_index, b.name])));
     assert.deepEqual(checked, [['body-1', 1, 'Pin']]);
+    // A listener of "reader3d-part" gets the contract of the new selection.
+    const seen = await page.evaluate(() => new Promise((resolve) => {
+      document.addEventListener('reader3d-part', () => resolve(window.reader3d.semantic.bodies.map((b) => b.id)), { once: true });
+      window.reader3d.setSelection([0]);
+    }));
+    assert.deepEqual(seen, ['body-0']);
+    // Another thickness method: its statistics, the contract built again.
+    const rebuilt = await page.evaluate(() => {
+      const before = window.reader3d.semantic;
+      const method = document.getElementById('thick-method');
+      method.value = 'wall';
+      method.dispatchEvent(new Event('change'));
+      return window.reader3d.semantic !== before && window.reader3d.result.thickness.method === 'wall';
+    });
+    assert.equal(rebuilt, true);
 
     const viaApi = await page.evaluate(async () => (await window.reader3d.analyze('e2e-samples/box.stl')).summary.volume);
     approx(viaApi, expected['box.stl'].summary.volume, 1e-9, 0, 'reader3d.analyze');

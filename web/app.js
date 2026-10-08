@@ -2061,6 +2061,8 @@ function publishResult(r) {
 
 /** The machine-readable result in the page (and the text report), kept up to date. */
 function updatePublished(r) {
+  // First: a listener of the event that asks for the contract gets the new one.
+  publishSemantic();
   document.dispatchEvent(new CustomEvent("reader3d-part"));
   const data = exportableResult(r);
   // "<" escaped so that a part name cannot close the script element.
@@ -2075,7 +2077,6 @@ function updatePublished(r) {
     }
     pre.textContent = plainReport(data);
   }
-  publishSemantic();
 }
 
 // The semantic contract (engine/semantic.js) of the result shown, for the IA
@@ -2083,7 +2084,7 @@ function updatePublished(r) {
 // is built when asked for, kept until the published result changes, and
 // written into #reader3d-semantic-result when the page is idle, so that it
 // never holds up or breaks the result itself.
-let semanticKept = null; // {result, density, semantic}
+let semanticKept = null; // {result, density, method, semantic}
 let semanticPending = null; // idle callback writing #reader3d-semantic-result
 
 /** The semantic contract of the result shown (null without one). */
@@ -2091,12 +2092,14 @@ function currentSemantic() {
   const r = state.result;
   if (!r) return null;
   const density = $("density").value;
-  if (semanticKept?.result !== r || semanticKept.density !== density) {
+  // The thickness method changes the statistics exported without republishing.
+  const method = thickMethod();
+  if (semanticKept?.result !== r || semanticKept.density !== density || semanticKept.method !== method) {
     // The bodies checked, each with its index in r.bodies (what setSelection takes).
     const data = exportableResult(r);
     const indices = includedIndices();
     data.bodies = data.bodies.map((b, k) => ({ ...b, source_index: indices[k] }));
-    semanticKept = { result: r, density, semantic: buildSemantic3D(data) };
+    semanticKept = { result: r, density, method, semantic: buildSemantic3D(data) };
   }
   return semanticKept.semantic;
 }
