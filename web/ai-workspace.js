@@ -394,7 +394,9 @@ export function mount({ page, reader }) {
     store.set(localStorage, `${KEYS.model}.${provider()}`, $("ai-model").value.trim() || null);
 
     bubble("user", question);
-    const answerBox = bubble("assistant", "…");
+    // Until the first words arrive: "Réflexion en cours…", in grey italics.
+    const answerBox = bubble("assistant", "Réflexion en cours…");
+    answerBox.classList.add("ai-thinking");
     busy = new AbortController();
     $("ai-cancel").hidden = false;
     $("ai-send").disabled = true;
@@ -412,10 +414,12 @@ export function mount({ page, reader }) {
       const output = local
         ? await askOllama(question, context, busy.signal, (text) => {
           written = text.length;
+          answerBox.classList.remove("ai-thinking");
           answerBox.textContent = text;
           $("ai-chat").scrollTop = $("ai-chat").scrollHeight;
         })
         : await askGateway(question, context, busy.signal);
+      answerBox.classList.remove("ai-thinking");
       answerBox.textContent = formatAnswer(output) || "(réponse vide)";
       // Only answered questions are kept: a failed one is not sent again with the next.
       messages.push({ role: "user", content: question }, { role: "assistant", content: output });

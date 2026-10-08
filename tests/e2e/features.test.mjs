@@ -330,8 +330,11 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
         chats.push(JSON.parse(body));
         const answer = JSON.stringify({ conclusion: 'Deux corps fermés.', observations: ['volume 7,257 cm³'], inferences: [], recommendations: ['Calculer les épaisseurs'], uncertainties: [], needs_human_validation: true, quote: null });
         res.setHeader('Content-Type', 'application/x-ndjson');
-        for (let i = 0; i < answer.length; i += 16) res.write(`${JSON.stringify({ message: { role: 'assistant', content: answer.slice(i, i + 16) }, done: false })}\n`);
-        res.end(`${JSON.stringify({ done: true })}\n`);
+        // A model reads its prompt before writing: the first words come after a while.
+        setTimeout(() => {
+          for (let i = 0; i < answer.length; i += 16) res.write(`${JSON.stringify({ message: { role: 'assistant', content: answer.slice(i, i + 16) }, done: false })}\n`);
+          res.end(`${JSON.stringify({ done: true })}\n`);
+        }, 600);
       });
     });
     await new Promise((resolve) => ollama.listen(0, '127.0.0.1', resolve));
@@ -343,6 +346,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.fill('#ai-url', `http://127.0.0.1:${ollama.address().port}`);
     await page.fill('#ai-input', 'Quelles règles de dépouille en coquille gravité ?');
     await page.press('#ai-input', 'Enter');
+    // While the model thinks: a grey italic placeholder in the answer bubble.
+    assert.equal(await page.textContent('#ai-chat .ai-thinking'), 'Réflexion en cours…');
     await page.waitForFunction(() => /Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
     assert.match(chats[0].messages[0].content, /"no_model_loaded":true/);
     await page.click('#ai-clear');
