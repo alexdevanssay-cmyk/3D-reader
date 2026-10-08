@@ -337,6 +337,17 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await new Promise((resolve) => ollama.listen(0, '127.0.0.1', resolve));
     const { page, errors } = await newPage('fr-FR');
     await page.goto(base);
+    // Without a 3D model: general questions are allowed.
+    await page.click('.tab[data-page="ia"]');
+    await page.selectOption('#ai-provider', 'ollama');
+    await page.fill('#ai-url', `http://127.0.0.1:${ollama.address().port}`);
+    await page.fill('#ai-input', 'Quelles règles de dépouille en coquille gravité ?');
+    await page.press('#ai-input', 'Enter');
+    await page.waitForFunction(() => /Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+    assert.match(chats[0].messages[0].content, /"no_model_loaded":true/);
+    await page.click('#ai-clear');
+    chats.length = 0;
+    await page.click('.tab[data-page="viewer"]');
     await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     await page.click('.tab[data-page="ia"]');

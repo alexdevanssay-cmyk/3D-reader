@@ -160,6 +160,7 @@ N'invente jamais de dimensions, de paramètres de procédé, de propriétés mat
 Distingue ce qui est mesuré, ce qui est déduit, ce qui est recommandé et ce qui manque.
 Pour la fonderie, cite les identifiants de sources fournis et dis clairement quand une conclusion demande une simulation de remplissage/solidification ou une validation fonderie.
 Si le contexte est partiel (champ "compaction"), dis-le quand cela limite la réponse.
+Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), réponds de façon générale (fonderie, procédés, chiffrage, méthode) sans prétendre connaître une pièce, et propose d'ouvrir le modèle si la question en dépend.
 Réponds UNIQUEMENT par un JSON valide de cette forme :
 {"conclusion":"","observations":[],"inferences":[],"recommendations":[],"uncertainties":[],"needs_human_validation":true,"quote":null}`;
 
@@ -255,10 +256,20 @@ export function mount({ page, reader }) {
     $("ai-status").textContent = text;
   }
 
+  /** The context of the question: the part shown, or none (general questions are allowed without a model). */
   function contextForCurrentTask() {
     const semantic = reader.semantic;
-    if (!semantic) throw new Error("Ouvrez d'abord un modèle 3D dans l'onglet « Analyse 3D ».");
-    const context = buildAIContext(semantic, { task: task === "costing" ? "manufacturing_analysis" : task });
+    const aiTask = task === "costing" ? "manufacturing_analysis" : task;
+    const context = semantic ? buildAIContext(semantic, { task: aiTask }) : {
+      schema: "3d-ai-reasoning-context",
+      schema_version: "1.0",
+      task: aiTask,
+      no_model_loaded: true,
+      note: "Aucun modèle 3D n'est chargé : aucune donnée de pièce n'est disponible.",
+      model: null,
+      bodies: [],
+      warnings: [],
+    };
     if (task !== "costing") return context;
     return {
       ...context,
@@ -485,20 +496,14 @@ export function mount({ page, reader }) {
     const input = $("ai-input");
     const question = input.value.trim();
     if (!question) return;
-    try {
-      contextForCurrentTask();
-    } catch (err) {
-      bubble("error", err.message);
-      return;
-    }
     input.value = "";
-    await send(question);
+    await send(question).catch((err) => bubble("error", err?.message || String(err)));
   });
 
   return {
     show() {
       $("ai-input")?.focus();
-      if (!busy) setStatus(reader.semantic ? "Modèle analysé : posez votre question" : "Ouvrez d'abord un modèle 3D");
+      if (!busy) setStatus(reader.semantic ? "Modèle analysé : posez votre question" : "Aucun modèle 3D chargé : questions générales possibles");
     },
   };
 }
