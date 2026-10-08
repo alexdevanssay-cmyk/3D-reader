@@ -30,7 +30,7 @@ import { defaultQuote } from "./store.js";
  * @property {1|2|3|4|null} niveau   level in the hierarchy
  * @property {{niveau: 'haute'|'moyenne'|'faible'|'nulle', raison: string}} confiance
  * @property {{tendance, ecart_abs, ecart_rel, seuil, alerte, chemin?}|null} ecart_tendance
- * @property {Array<{source: string, ref: string, valeur: any, ecart_rel: number|null}>} alternatives
+ * @property {Array<{source: string, autorite: string, ref: string, valeur: any, ecart_rel: number|null}>} alternatives
  *           the other sources that have a value, not retained
  * @property {string[]} hypotheses
  * @property {Array<{type: string, message: string}>} alertes   type: a key of ALERTES
@@ -61,8 +61,9 @@ export const ALERTES = {
   divergence: "sources divergentes",
   infaisable: "îlot infaisable",
   saisie_ignoree: "saisie ignorée",
+  ecart_demande: "écart à la demande client",
 };
-const TO_VALIDATE = new Set(["defaut_code", "repli_zero", "valeur_manquante", "divergence", "infaisable", "saisie_ignoree"]);
+const TO_VALIDATE = new Set(["defaut_code", "repli_zero", "valeur_manquante", "divergence", "infaisable", "saisie_ignoree", "ecart_demande"]);
 
 // Deviation from the trend above which an alert is raised (setting seuilTendance).
 export const SEUIL_TENDANCE = 0.15;
@@ -159,7 +160,7 @@ export function resolve(candidates, { seuil = SEUIL_TENDANCE, comparer = (c) => 
   for (const c of usable) {
     if (c === chosen) continue;
     const gap = relative(t.valeur, c.valeur);
-    t.alternatives.push({ source: c.source.type, ref: c.source.ref, valeur: c.valeur, ecart_rel: gap });
+    t.alternatives.push({ source: c.source.type, autorite: c.autorite, ref: c.source.ref, valeur: c.valeur, ecart_rel: gap });
     if (c.autorite === "soft_prior") t.ecart_tendance ??= ecart(t.valeur, c.valeur, seuil);
     else if (comparer(c) && differs(t.valeur, c.valeur, seuil)) {
       alert(t, "divergence", `${c.source.ref || SOURCES[c.source.type].label} = ${show(c.valeur, c.unite)}${gap !== null ? ` (écart ${signedPct(gap)})` : ""}`);
@@ -249,6 +250,53 @@ export function settingsGroup(ctx, paths, { label: what, ref }) {
   return t;
 }
 
+// --------------------------------------------------------------------------- values of the customer request
+
+// Values of the customer request (rfq.js, q.serie) that the costing compares
+// with the values it uses, without applying them: whether to apply them is a
+// decision left to the user (the weight stays the one typed in or measured,
+// the mise au mille the one typed in or estimated, the scrap rate the one of
+// the quote). grandeur: the value compared; tolerance: relative deviation
+// above which an alert is raised.
+export const DEMANDE = [
+  { field: "poidsBrut", grandeur: "poids", unite: "kg", tolerance: 0.1, label: "Poids brut vendu", ref: "demande client : Poids Brut vendu (1- Données GO NO GO)" },
+  { field: "poidsVendu", grandeur: "poids", unite: "kg", tolerance: 0.1, label: "Poids vendu par pièce", ref: "demande client : Poids vendu (5- Chiffrage Fonderie)" },
+  { field: "miseAuMille", grandeur: "miseAuMille", unite: "kg/kg", tolerance: 0.1, label: "Mise au mille", ref: "demande client : Mise au mille (5- Chiffrage Fonderie)" },
+  { field: "rebutUsinage", grandeur: "rebutUsinage", unite: "%", tolerance: 0.1, label: "Taux de rebuts usinage", ref: "demande client : Taux de rebuts usinage (5- Chiffrage Fonderie)" },
+];
+
+/**
+ * The values of the request `serie` compared with those used (`utilises`:
+ * {poids, miseAuMille, rebutUsinage}, missing or null when unknown):
+ * [{...DEMANDE entry, valeur (of the request), utilise, ecart_rel (of the
+ * value used from the request's), alerte (beyond the tolerance)}].
+ */
+export function demandeComparee(serie, utilises = {}) {
+  return DEMANDE.filter((d) => hasValue(serie?.[d.field])).map((d) => {
+    const valeur = serie[d.field];
+    const utilise = hasValue(utilises[d.grandeur]) ? utilises[d.grandeur] : null;
+    return { ...d, valeur, utilise, ecart_rel: relative(utilise, valeur), alerte: utilise !== null && differs(utilise, valeur, d.tolerance) };
+  });
+}
+
+/**
+ * The values of the request for `grandeur` added to the trace `t` as
+ * alternatives (source "rfq", hard), with an "écart à la demande client"
+ * alert when the value used differs by more than the tolerance. Not applied:
+ * t keeps its value.
+ */
+function compareDemande(t, serie, grandeur) {
+  for (const d of demandeComparee(serie, { [grandeur]: t.valeur }).filter((x) => x.grandeur === grandeur)) {
+    t.alternatives.push({ source: "rfq", autorite: SOURCES.rfq.autorite, ref: d.ref, valeur: d.valeur, ecart_rel: d.ecart_rel });
+    if (d.alerte) {
+      const gap = d.ecart_rel === null ? "" : ` (écart de ${signedPct(d.ecart_rel)})`;
+      alert(t, "ecart_demande", `${d.label} de la demande client ${show(d.valeur, d.unite)}, valeur utilisée ${show(t.valeur, d.unite)}${gap} : au-delà de la tolérance de ${signedPct(d.tolerance).replace("+", "")}, valeur de la demande non appliquée`);
+    }
+  }
+  t.validation_requise ||= needsValidation(t);
+  return t;
+}
+
 // --------------------------------------------------------------------------- registry
 
 // The traced keys, their label and the outputs every quote must trace. The
@@ -276,6 +324,8 @@ const LABELS = {
   "devis.rebutUsinage": "Rebut fonderie détecté à l'usinage",
   "parametres.tauxMini": "Paramètres : taux de marge mini",
   "parametres.prix": "Paramètres : mise en route et hausses annuelles",
+  "ensemble.poids": "Poids de l'ensemble",
+  "ensemble.miseAuMille": "Mise au mille de l'ensemble",
   "ensemble.prix.vente": "Prix de vente de l'ensemble",
   "piece.volume3d": "Volume du corps (3D)",
   "piece.poids": "Poids pièce",
@@ -414,10 +464,14 @@ export function traceQuote(ctx, c) {
   const alloy = [...rfqAlloys, firstAlloy].find((x) => x && same(x.valeur, q.alliage)) ?? traced(q.alliage, { type: "saisie", ref: "q.alliage" });
   T["devis.alliage"] = resolve([alloy, ...rfqAlloys.filter((x) => x && x !== alloy)], { seuil, comparer: () => true }) ?? missing("", "alliage inconnu");
 
-  // Density: Paramètres (layers), else the generic density of ui.js:compute.
+  // Density: Paramètres (layers), else the generic density of ui.js:compute
+  // (also the one of the 3D page: the costing gives it its density).
   T["devis.densite"] = settings.densities?.[q.alliage] !== undefined
     ? fromSetting(ctx, `densities.${q.alliage}`, { unite: "g/cm³" })
-    : traced(c.density, { type: "defaut_code", unite: "g/cm³", ref: "ui.js:compute (densité générique)", alertes: [{ type: "defaut_code", message: `densité générique : l'alliage ${q.alliage} n'a pas de densité dans Paramètres` }] });
+    : traced(c.density, {
+      type: "defaut_code", unite: "g/cm³", ref: "ui.js:compute (densité générique)", hypotheses: ["poids tiré du volume 3D et masse de la page Analyse 3D calculés avec cette densité"],
+      alertes: [{ type: "defaut_code", message: `densité générique ${fr(c.density, 2)} g/cm³ : l'alliage ${q.alliage} n'a pas de densité dans Paramètres (Densités des alliages)` }],
+    });
 
   // Volumes of the programme: the customer request, typed in, or the default of the code.
   const prog = serie ? programmeOf(serie, { proto: q.prototype }) : null;
@@ -525,7 +579,7 @@ export function traceQuote(ctx, c) {
   // Difficulty and machining scrap: copied from the workbook with the quote, or typed in (model.js:quote).
   T["devis.coefDifficulte"] = quoteField(ctx, "devis.coefDifficulte", "coefDifficulte", Number(q.coefDifficulte) || 0, { unite: "" });
   T["devis.vaUsinage"] = quoteField(ctx, "devis.vaUsinage", "vaUsinage", q.vaUsinage || 0, { unite: "€" });
-  T["devis.rebutUsinage"] = quoteField(ctx, "devis.rebutUsinage", "rebutUsinage", q.rebutUsinage || 0, { unite: "%" });
+  T["devis.rebutUsinage"] = compareDemande(quoteField(ctx, "devis.rebutUsinage", "rebutUsinage", q.rebutUsinage || 0, { unite: "%" }), serie, "rebutUsinage");
 
   // The other settings of the price: set-up of a series and yearly increases (the first year carries one).
   T["parametres.prix"] = settingsGroup(ctx, [
@@ -557,6 +611,8 @@ export function tracePiece(r, ctx, devis) {
     : null;
   T["piece.poids"] = resolve([typed("poids") ? input("poids", "kg") : null, weight3d], { seuil, comparer: () => true })
     ?? missing("kg", "poids inconnu : ni saisi ni mesuré sur un modèle 3D, la pièce n'est pas chiffrée");
+  // The weights of the customer request, compared when the quote is that piece alone (else with the set: traceEnsemble).
+  if (ctx.demandePiece) compareDemande(T["piece.poids"], q.serie, "poids");
   if (T["piece.poids"].valeur !== null && !(T["piece.poids"].valeur > 0)) alert(T["piece.poids"], "valeur_manquante", "poids nul : la pièce n'est pas chiffrée");
 
   // Geometry: typed in, else measured on the 3D model, else 0 (ui.js:computePiece).
@@ -613,6 +669,7 @@ export function tracePiece(r, ctx, devis) {
     })
     : fromSetting(ctx, `processes.${code}.miseAuMille`, { unite: "kg/kg", hypotheses: ["épaisseurs inconnues : mise au mille par défaut de l'îlot"] });
   T["piece.miseAuMille"] = resolve([mamTyped ? input("miseAuMille", "kg/kg") : null, mamEstimate], { seuil, comparer: () => false });
+  if (ctx.demandePiece) compareDemande(T["piece.miseAuMille"], q.serie, "miseAuMille");
   T["piece.kgCast"] = derive(r.final.kgCast, { unite: "kg", ref: "model.js:quote (poids × mise au mille)", entrees: { "piece.poids": T["piece.poids"], "piece.miseAuMille": T["piece.miseAuMille"] } });
   const mamKey = mamTyped ? "piece.miseAuMille.estimee" : "piece.miseAuMille";
   if (mamTyped && !(cavitiesTyped && cycleTyped)) T[mamKey] = { ...mamEstimate, hypotheses: [...mamEstimate.hypotheses, "non retenue : sert à estimer les empreintes et le cycle"] };
@@ -743,13 +800,33 @@ export function tracePiece(r, ctx, devis) {
   return T;
 }
 
-/** Trace of the price of the whole set: the pieces costed (ui.js:aggregate); those not costed are left out. */
-export function traceEnsemble(results, ensemble) {
+/**
+ * Traces of the whole set (keys "ensemble.*"): the pieces costed
+ * (ui.js:aggregate), those not costed left out. With a customer request that
+ * gives a weight or a mise au mille: the weight and the mise au mille of the
+ * set, compared with those of the request (one part: the set costed).
+ *   ctx: {q}
+ */
+export function traceEnsemble(ctx, results, ensemble) {
+  const T = {};
+  const serie = ctx.q.serie;
   const done = results.filter((r) => r.final);
   const left = results.filter((r) => !r.final).map((r) => r.piece.name);
-  return derive(ensemble.years[0]?.prixVente, {
+  const of = (key) => Object.fromEntries(done.map((r) => [`${key} [${r.piece.name}]`, r.trace?.[key]]));
+  const asked = new Set(demandeComparee(serie).map((d) => d.grandeur));
+  if (asked.has("poids") || asked.has("miseAuMille")) {
+    T["ensemble.poids"] = compareDemande(derive(ensemble.poids, { unite: "kg", ref: "ui.js:aggregate (somme des poids des pièces chiffrées)", entrees: of("piece.poids") }), serie, "poids");
+  }
+  if (asked.has("miseAuMille")) {
+    const kgCast = done.reduce((n, r) => n + (r.final.kgCast || 0), 0);
+    T["ensemble.miseAuMille"] = compareDemande(derive(ensemble.poids > 0 ? kgCast / ensemble.poids : null, {
+      unite: "kg/kg", ref: "kg coulés des pièces chiffrées / poids de l'ensemble", entrees: { ...of("piece.kgCast"), "ensemble.poids": T["ensemble.poids"] },
+    }), serie, "miseAuMille");
+  }
+  T["ensemble.prix.vente"] = derive(ensemble.years[0]?.prixVente, {
     unite: "€", ref: "ui.js:aggregate (somme des pièces chiffrées)",
-    entrees: Object.fromEntries(done.map((r) => [`piece.prix.vente [${r.piece.name}]`, r.trace?.["piece.prix.vente"]])),
+    entrees: { ...of("piece.prix.vente"), ...(T["ensemble.poids"] ? { "ensemble.poids": T["ensemble.poids"] } : {}), ...(T["ensemble.miseAuMille"] ? { "ensemble.miseAuMille": T["ensemble.miseAuMille"] } : {}) },
     alertes: left.length ? [{ type: "valeur_manquante", message: `${left.length > 1 ? `${left.length} pièces non chiffrées, exclues` : "pièce non chiffrée, exclue"} de l'ensemble : ${list(left)}` }] : [],
   });
+  return T;
 }

@@ -10,14 +10,14 @@ import { readCostingWorkbook, readIndicesWorkbook } from '../../web/chiffrage/wo
 import { centreRates, indexAverage, minimumMargin, quote, saleMetalPrice } from '../../web/chiffrage/model.js';
 import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, bestRoutes, buildRoute, estimateMiseAuMille, rankRoutes } from '../../web/chiffrage/routes.js';
 import { readWorkbook } from '../../web/chiffrage/xlsxread.js';
-import { heatTreatmentOf, programmeOf, readSeriesOrder } from '../../web/chiffrage/rfq.js';
+import { filledFields, heatTreatmentOf, orderValues, programmeFor, programmeOf, readSeriesOrder } from '../../web/chiffrage/rfq.js';
 import { DEFAULT_TOOLING, coefOf, estimateTooling, steelToolCost } from '../../web/chiffrage/tooling.js';
 import { DEFAULT_CORES, boxSize, coreBoxCost, coresPerPiece } from '../../web/chiffrage/cores.js';
 import {
-  DEFAULT_DENSITIES, adoptTendance, clearSaisies, clearSetting, clearTendances, defaultQuote, defaultSettings, exportSaisies, importTendances,
+  DEFAULT_DENSITIES, GENERIC_DENSITY, adoptTendance, clearSaisies, clearSetting, clearTendances, defaultQuote, defaultSettings, exportSaisies, importTendances,
   loadSettings, loadSettingsLayers, mergeSettings, migrateSettings, saveBase, saveIndices, saveQuote, setSetting, validateTendances,
 } from '../../web/chiffrage/store.js';
-import { QUOTE_KEYS, SOURCES, derive, missing, pieceKeys, resolve, summarize, traced, weakest } from '../../web/chiffrage/provenance.js';
+import { DEMANDE, QUOTE_KEYS, SOURCES, demandeComparee, derive, missing, pieceKeys, resolve, summarize, traced, weakest } from '../../web/chiffrage/provenance.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -312,6 +312,69 @@ describe('series order of a customer request', () => {
       alliage: 'AS9U3', typologie: 'M-1', cours: 'LME primary Alloy cash seller', month: '2026-03',
       coursAchat: 2800, coursVente: 2810, p1020Achat: 400, p1020Vente: 410, premiumAchat: 330, premiumVente: 640, pafAchat: 0.05, pafVente: 0.07,
     });
+    // Weights, mise au mille and machining scrap rate: compared with the costing, not applied.
+    assert.deepEqual([order.poidsBrut, order.poidsVendu, order.miseAuMille, order.rebutUsinage], [1.25, 1.1, 1.6, 0.03]);
+  });
+
+  test('weights, mise au mille and scrap rate: units of the request, absent values', () => {
+    // A mise au mille per tonne of pieces, a scrap rate in percent; empty or 0 weights: not given.
+    let order = readSeriesOrder(seriesOrderWorkbook({ go: { B62: 0 }, foundry: { D30: 'à définir', D31: 1450, D32: 2.5 } }));
+    assert.deepEqual([order.poidsBrut, order.poidsVendu, order.miseAuMille, order.rebutUsinage], [null, null, 1.45, 0.025]);
+    // A scrap rate of 0 is a value; labels with "d'usinage".
+    order = readSeriesOrder(seriesOrderWorkbook({ foundry: { C32: "Taux de rebut d'usinage", D32: 0 } }));
+    assert.equal(order.rebutUsinage, 0);
+    // A request without foundry quote: nothing.
+    order = readSeriesOrder(writeWorkbook({ '1- Données GO NO GO': { A20: 'Nom du client *', B20: 'X' } }));
+    assert.deepEqual([order.poidsBrut, order.poidsVendu, order.miseAuMille, order.rebutUsinage, order.matiere], [null, null, null, null, null]);
+  });
+
+  test('what a request fills in a quote, and the fields still holding its values', () => {
+    const order = readSeriesOrder(seriesOrderWorkbook(), 'rfq.xlsm');
+    const lists = { alliages: base.lists.alliages, typologies: indices.typologies.map((t) => t.name), cours: base.lists.cours };
+    const values = orderValues(order, lists);
+    assert.deepEqual(values, {
+      prototype: false, premiereAnnee: 2027, annees: 4, volumes: [1000, 1500, 1500, 800], volumeAnnuel: 1500, moqs: [2000, 500, 50], tailleSerie: 1500,
+      prixCible: 30, client: 'ACME RAIL', reference: 'AB-123', designation: 'SUPPORT PLATE', plan: 'AB-123 ind A',
+      alliage: 'AS9U3', typologie: 'M-1', cours: 'LME primary Alloy cash seller', month: '2026-03',
+      coursAchat: 2800, p1020Achat: 400, premiumAchat: 330, premiumVente: 640, pafAchat: 0.05, pafVente: 0.07,
+    });
+    // An alloy out of the list of the workbook: not written (the quote keeps its own).
+    assert.equal('alliage' in orderValues({ ...order, alliage: 'AS5Z', matiere: { ...order.matiere, alliage: 'AS5Z' } }, lists), false);
+    // Never the weight, the mise au mille or the scrap rate: compared only.
+    for (const k of ['poids', 'miseAuMille', 'rebutUsinage', 'poidsBrut', 'poidsVendu']) assert.ok(!(k in values), k);
+    const q = { ...defaultQuote(base, indices), ...structuredClone(values) };
+    assert.deepEqual(filledFields(q, values), Object.keys(values));
+    // Changed since: no longer the request's.
+    q.client = 'ACME';
+    q.volumes[1] = 1600;
+    q.alliage = 'AS7G03';
+    assert.deepEqual(filledFields(q, values), Object.keys(values).filter((k) => !['client', 'volumes', 'alliage'].includes(k)));
+  });
+
+  test('prototypes or series: only the volumes of the request change, never volumes typed in', () => {
+    const order = readSeriesOrder(seriesOrderWorkbook(), 'rfq.xlsm');
+    const series = programmeOf(order);
+    const proto = programmeOf(order, { proto: true });
+    const q = { ...defaultQuote(base, indices), ...orderValues(order) };
+    // The series volumes of the request: the prototype ones replace them, and back.
+    assert.deepEqual(programmeFor(q, order, true), { programme: proto, typed: false });
+    const asProto = { ...q, premiereAnnee: proto.premiereAnnee, annees: proto.annees, volumes: proto.volumes, volumeAnnuel: proto.pic };
+    assert.deepEqual(programmeFor(asProto, order, false), { programme: series, typed: false });
+    // Already those of the mode: nothing to do.
+    assert.deepEqual(programmeFor(q, order, false), { programme: null, typed: false });
+    // A volume typed in: kept, the request's not applied.
+    const typed = { ...q, volumes: [1000, 1600, 1500, 800] };
+    assert.deepEqual(programmeFor(typed, order, true), { programme: null, typed: true, ignored: proto });
+    // An annual volume typed in (no volumes per year), another first year: kept too.
+    assert.equal(programmeFor({ ...q, volumes: null, volumeAnnuel: 1200 }, order, true).typed, true);
+    assert.equal(programmeFor({ ...q, premiereAnnee: 2028 }, order, true).typed, true);
+    // The volumes per year saved as the annual volume every year: the request's when they are equal.
+    const flat = { ...defaultQuote(base, indices), premiereAnnee: 2026, annees: 1, volumes: null, volumeAnnuel: 20 };
+    assert.deepEqual(programmeFor(flat, order, false), { programme: series, typed: false });
+    // No request, or no volume of that kind: nothing.
+    assert.deepEqual(programmeFor(q, null, true), { programme: null, typed: false });
+    const noProto = { ...order, years: order.years.map((y) => ({ ...y, proto: 0 })) };
+    assert.deepEqual(programmeFor(q, noProto, true), { programme: null, typed: false });
   });
 
   test('another workbook is refused with the reason', () => {
@@ -859,6 +922,8 @@ describe('traced values of a quote (provenance.js)', () => {
       cycleOnly: computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', miseAuMille: 1.5, empreintes: 2 } } } }),
       cores: computed({ quote: { pieces: { manuel: { ...PART, procede: 'BPR', noyaux: true, cores: [{ nom: 'N1', masse: 0.6, qte: 2, type: 1, complexite: 'Simple' }], tth: 'T6' } } } }),
       set: computed({ p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0, 1, 2] } }),
+      request: computed({ quote: { serie: ORDER } }),
+      setRequest: computed({ quote: { serie: ORDER }, p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0, 1, 2] } }),
     };
     for (const [name, c] of Object.entries(scenarios)) {
       for (const key of QUOTE_KEYS) assert.ok(c.trace[key], `${name}: ${key}`);
@@ -878,7 +943,11 @@ describe('traced values of a quote (provenance.js)', () => {
         // A computed value names its inputs, each one traced (in its piece or in the quote).
         if (t.source.type === 'calcul') {
           assert.ok(t.source.entrees.length, what);
-          for (const e of t.source.entrees) assert.ok(T[e] ?? c.trace[e] ?? (key === 'ensemble.prix.vente' && /^piece\.prix\.vente \[/.test(e)), `${what}: input ${e}`);
+          for (const e of t.source.entrees) {
+            // A value of the set names the values of its pieces "<key> [<piece>]".
+            const ofPiece = /^(piece\.[\w.]+) \[(.+)\]$/.exec(e);
+            assert.ok(T[e] ?? c.trace[e] ?? (key.startsWith('ensemble.') && ofPiece && c.results.find((r) => r.piece.name === ofPiece[2])?.trace[ofPiece[1]]), `${what}: input ${e}`);
+          }
         }
       }
     }
@@ -924,6 +993,7 @@ describe('traced values of a quote (provenance.js)', () => {
       weightOnly: [{ quote: { pieces: { manuel: { poids: 2.5 } } } }, [[26.277257213553643, 32.38843564494282]]],
       chosen: [{ quote: { pieces: { manuel: { ...PART, procede: 'CG3', cycle: 300, empreintes: 2, miseAuMille: 1.5, mode: '1*8', outillagePrix: 15000 } } } }, [[35.28293020434457, 44.659882872969575]]],
       options: [{ quote: { tailleSerie: 0, outillageInclus: false, margeOutillage: 0.1, marge: 0.2, pieces: { manuel: { poids: 3, toileMini: 6, epaisseurMax: 20, moduleMm: 5, dimMax: 300, tth: 'T6', tthMode: 'masselotte', noyaux: true, cores: [{ nom: 'N1', masse: 0.6, qte: 2, type: 1, complexite: 'Simple' }], tribo: true, redressage: true, composants: [{ designation: 'x', qte: 2, prix: 1.5, marge: 0.1 }] } } } }, [[65.1473914433648, 82.56064146233092]]],
+      // The request has a weight, a mise au mille and a scrap rate of its own: compared, never applied (same prices).
       rfq: [{ quote: { serie: ORDER, alliage: 'AS9U3', month: ORDER.matiere.month, coursAchat: 2800, moqs: ORDER.moqs, tailleSerie: 1500, volumes: [1000, 1500, 1500, 800], annees: 4, premiereAnnee: 2027, volumeAnnuel: 1500 } }, [[28.166450045385446, 40.044076231320005]]],
       noSalePrice: [{ quote: { month: '2031-01', coursAchat: null, premiumVente: null, pafVente: null } }, [[7.003774744773435, 10.541749447754384]]],
       infeasible: [{ quote: { pieces: { manuel: { ...PART, toileMini: 2, procede: 'CG3', outillagePrix: 0 } } } }, [[52.14792795076022, 63.504747039077316]]],
@@ -1041,6 +1111,87 @@ describe('traced values of a quote (provenance.js)', () => {
     const out = computed({ quote: { pieces: { manuel: { ...PART, toileMini: 2, procede: 'CG3' } } } }).results[0].trace['piece.ilot'];
     assert.deepEqual([out.valeur, out.source.type, out.validation_requise], ['CG3', 'saisie', true]);
     assert.deepEqual(out.alertes.map((a) => a.type), ['infaisable']);
+  });
+
+  test('the weight, mise au mille and scrap rate of the customer request: alternatives, an alert beyond the tolerance, never applied', () => {
+    const without = { ...ORDER, poidsBrut: null, poidsVendu: null, miseAuMille: null, rebutUsinage: null };
+    const prices = (c) => c.results.map((r) => [r.final.pri, r.final.years[0].prixVente, r.part.poids, r.route.miseAuMille, r.final.kgCast]);
+    const rfqAlternatives = (t) => t.alternatives.filter((a) => a.source === 'rfq').map((a) => [a.autorite, a.ref, a.valeur]);
+    // Within the tolerance (10 %): alternatives (hard), no alert; the value used is the one typed in or estimated.
+    let c = computed({ quote: { serie: ORDER } });
+    assert.deepEqual(prices(c), prices(computed({ quote: { serie: without } })), 'the values of the request change no value');
+    let r = c.results[0];
+    assert.deepEqual(rfqAlternatives(r.trace['piece.poids']), [
+      ['hard', 'demande client : Poids Brut vendu (1- Données GO NO GO)', 1.25],
+      ['hard', 'demande client : Poids vendu (5- Chiffrage Fonderie)', 1.1],
+    ]);
+    assert.deepEqual([r.trace['piece.poids'].valeur, r.trace['piece.poids'].source.type, r.trace['piece.poids'].alertes], [1.2, 'saisie', []]);
+    close(r.trace['piece.poids'].alternatives[1].ecart_rel, 1.2 / 1.1 - 1, 1e-12, 'deviation from the weight sold');
+    assert.deepEqual(rfqAlternatives(r.trace['piece.miseAuMille']), [['hard', 'demande client : Mise au mille (5- Chiffrage Fonderie)', 1.6]]);
+    assert.equal(r.trace['piece.miseAuMille'].valeur, r.route.miseAuMille);
+    assert.ok(Math.abs(r.route.miseAuMille / 1.6 - 1) <= 0.1 && !r.trace['piece.miseAuMille'].alertes.some((a) => a.type === 'ecart_demande'));
+    // The scrap rate of the quote (workbook: 2 %) against the request's (3 %): beyond the tolerance.
+    const scrap = c.trace['devis.rebutUsinage'];
+    assert.deepEqual([scrap.valeur, scrap.source.type, rfqAlternatives(scrap)], [0.02, 'classeur', [['hard', 'demande client : Taux de rebuts usinage (5- Chiffrage Fonderie)', 0.03]]]);
+    assert.deepEqual(scrap.alertes.map((a) => a.type), ['ecart_demande']);
+    assert.match(scrap.alertes[0].message, /Taux de rebuts usinage de la demande client 3 %, valeur utilisée 2 % \(écart de [-−]33,3\s%\) : au-delà de la tolérance de 10\s%, valeur de la demande non appliquée/);
+    assert.equal(r.trace['piece.prix.pri'].validation_requise, true, 'down to the price');
+    // The scrap rate of the request typed in: no deviation.
+    const same = computed({ quote: { serie: ORDER, rebutUsinage: 0.03 } }).trace['devis.rebutUsinage'];
+    assert.deepEqual([same.source.type, same.alertes, same.alternatives.filter((a) => a.source === 'rfq').map((a) => a.ecart_rel)], ['saisie', [], [0]]);
+
+    // Weight beyond the tolerance: an alert for each weight of the request, to validate down to the price; the weight stays the one typed in.
+    c = computed({ quote: { serie: ORDER, pieces: { manuel: { ...PART, poids: 1.5 } } } });
+    r = c.results[0];
+    assert.equal(r.part.poids, 1.5);
+    assert.deepEqual(r.trace['piece.poids'].alertes.map((a) => a.type), ['ecart_demande', 'ecart_demande']);
+    assert.match(r.trace['piece.poids'].alertes[0].message, /Poids brut vendu de la demande client 1,25 kg, valeur utilisée 1,5 kg \(écart de \+20\s%\)/);
+    assert.deepEqual([r.trace['piece.poids'].validation_requise, r.trace['piece.kgCast'].validation_requise, r.trace['piece.prix.vente'].validation_requise], [true, true, true]);
+
+    // Mise au mille typed in (island chosen): 1.5 within 10 % of 1.6, 1.2 beyond; the one typed in is used.
+    const mam = (miseAuMille) => computed({ quote: { serie: ORDER, pieces: { manuel: { ...PART, procede: 'CG3', miseAuMille } } } }).results[0];
+    r = mam(1.5);
+    assert.deepEqual([r.route.miseAuMille, r.trace['piece.miseAuMille'].alertes], [1.5, []]);
+    r = mam(1.2);
+    assert.deepEqual([r.route.miseAuMille, r.trace['piece.miseAuMille'].alertes.map((a) => a.type)], [1.2, ['ecart_demande']]);
+    assert.equal(r.trace['piece.miseAuMille'].source.type, 'saisie');
+
+    // A set of pieces: the request (one part) compared with the set, not with each piece.
+    const p3d = { file: 'asm.step', parts: PARTS_3D.slice(0, 2), selected: [0, 1] };
+    c = computed({ quote: { serie: ORDER, pieces: {} }, p3d });
+    for (const x of c.results) assert.deepEqual([rfqAlternatives(x.trace['piece.poids']), rfqAlternatives(x.trace['piece.miseAuMille'])], [[], []], x.piece.name);
+    const weight = c.trace['ensemble.poids'];
+    assert.deepEqual([weight.valeur, weight.source.entrees], [c.ensemble.poids, ['piece.poids [A]', 'piece.poids [B]']]);
+    assert.deepEqual(rfqAlternatives(weight).map((a) => a[2]), [1.25, 1.1]);
+    assert.deepEqual(weight.alertes.map((a) => a.type), ['ecart_demande', 'ecart_demande'], `${c.ensemble.poids} kg`);
+    const setMam = c.trace['ensemble.miseAuMille'];
+    close(setMam.valeur, c.results.reduce((n, x) => n + x.final.kgCast, 0) / c.ensemble.poids, 1e-12, 'mise au mille of the set');
+    assert.deepEqual(rfqAlternatives(setMam).map((a) => a[2]), [1.6]);
+    assert.deepEqual(c.trace['ensemble.prix.vente'].source.entrees.slice(-2), ['ensemble.poids', 'ensemble.miseAuMille']);
+    assert.equal(c.trace['ensemble.prix.vente'].validation_requise, true);
+    assert.deepEqual(prices(c), prices(computed({ quote: { serie: without, pieces: {} }, p3d })));
+    // Without those values in the request: no trace of the set's weight.
+    assert.equal(computed({ quote: { serie: without, pieces: {} }, p3d }).trace['ensemble.poids'], undefined);
+    // The comparison shown in the "Commande série" card.
+    assert.deepEqual(demandeComparee(ORDER, { poids: 1.5, rebutUsinage: 0.03 }).map((d) => [d.field, d.utilise, d.alerte]), [
+      ['poidsBrut', 1.5, true], ['poidsVendu', 1.5, true], ['miseAuMille', null, false], ['rebutUsinage', 0.03, false],
+    ]);
+    assert.deepEqual(DEMANDE.map((d) => d.tolerance), [0.1, 0.1, 0.1, 0.1]);
+  });
+
+  test('an alloy without density: the generic density, said in the trace; one typed in Paramètres is used', () => {
+    const workbook = structuredClone(base);
+    workbook.lists.alliages.push('AS5Z');
+    const p3d = { file: 'support.step', parts: [PARTS_3D[0]], selected: [0] };
+    let c = computed({ workbook, p3d, quote: { alliage: 'AS5Z', pieces: {} } });
+    assert.equal(c.density, GENERIC_DENSITY);
+    close(c.results[0].part.poids, (PARTS_3D[0].volume / 1e6) * GENERIC_DENSITY, 1e-12, 'weight from the 3D model');
+    const t = c.trace['devis.densite'];
+    assert.deepEqual([t.valeur, t.autorite, t.validation_requise, t.alertes.map((a) => a.type)], [GENERIC_DENSITY, 'default_code', true, ['defaut_code']]);
+    assert.match(t.alertes[0].message, /densité générique 2,7 g\/cm³ : l'alliage AS5Z n'a pas de densité dans Paramètres/);
+    assert.equal(c.results[0].trace['piece.poids'].validation_requise, true);
+    c = computed({ workbook, p3d, quote: { alliage: 'AS5Z', pieces: {} }, setup: () => setSetting('densities.AS5Z', 2.9, workbook) });
+    assert.deepEqual([c.density, c.trace['devis.densite'].source.type, c.trace['devis.densite'].alertes], [2.9, 'parametres', []]);
   });
 
   test('a 3D model: geometry as evidence, the weight typed in above the one measured, divergent sources', () => {

@@ -11,6 +11,7 @@ const FOUNDRY = "5- Chiffrage Fonderie";
 
 const str = (v) => (v === undefined || v === null || typeof v === "object" ? "" : String(v).trim());
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+const positive = (v) => (num(v) > 0 ? v : null);
 const norm = (s) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").toLowerCase();
 
 /** Cells of the row whose label (column `labelCol`) matches `re`: {row, at(col)}. */
@@ -26,7 +27,8 @@ function rowOf(cells, re, labelCol = "A") {
 /**
  * Read the series order of an RFQ workbook. Returns
  * {fileName, importedAt, client, demande, reference, plan, offre, alliage, fonderie, usinage,
- *  references, years:[{year, volume}], moqs:[n], targetPrice, elec, gaz}.
+ *  references, years:[{year, volume}], moqs:[n], targetPrice, elec, gaz, matiere,
+ *  poidsBrut, poidsVendu, miseAuMille, rebutUsinage}.
  */
 export function readSeriesOrder(bytes, fileName = "") {
   const wb = readWorkbook(bytes);
@@ -83,6 +85,29 @@ export function readSeriesOrder(bytes, fileName = "") {
     elec: num(dataValue(/^electricite/)),
     gaz: num(dataValue(/^gaz/)),
     matiere: metalOf(wb.sheet(FOUNDRY)),
+    // Values of the part that the costing compares with its own (provenance.js:
+    // alternatives, alert beyond a tolerance) but does not apply: whether to
+    // apply them is a decision left to the user. null when absent.
+    poidsBrut: positive(value(/^poids brut vendu/)),
+    ...foundryOf(wb.sheet(FOUNDRY)),
+  };
+}
+
+/**
+ * Weight, mise au mille and machining scrap rate of the foundry quote of the
+ * request ("5- Chiffrage Fonderie", labels in column C, values in D):
+ * {poidsVendu (kg / piece), miseAuMille (kg cast / kg piece), rebutUsinage
+ * (fraction)}, null when absent. A mise au mille of 100 or more is read per
+ * 1000 kg (kg cast for a tonne of pieces), a scrap rate above 1 in percent.
+ */
+function foundryOf(cells) {
+  const at = (re) => (cells ? rowOf(cells, re, "C")?.at("D") : undefined);
+  const mam = positive(at(/^mise au mille/));
+  const scrap = num(at(/^taux de rebuts? (d')?usinage/));
+  return {
+    poidsVendu: positive(at(/^poids vendu/)),
+    miseAuMille: mam === null ? null : mam >= 100 ? mam / 1000 : mam,
+    rebutUsinage: scrap === null || scrap < 0 ? null : scrap > 1 ? scrap / 100 : scrap,
   };
 }
 
@@ -127,6 +152,70 @@ export function programmeOf(order, { proto = false } = {}) {
   const volumes = order.years.filter((y) => y.year >= first && y.year <= last).map(volumeOf);
   return { premiereAnnee: first, annees: volumes.length, volumes, pic: Math.max(...volumes) };
 }
+
+const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+const pick = (value, options) => options?.find((o) => String(o).toLowerCase() === String(value ?? "").toLowerCase());
+
+/** The volumes of quote `q` ({premiereAnnee, annees, volumes, volumeAnnuel}) are those of `prog` (programmeOf). */
+export function sameProgramme(q, prog) {
+  if (!prog || q.premiereAnnee !== prog.premiereAnnee || q.annees !== prog.annees) return false;
+  const volumes = Array.isArray(q.volumes) && q.volumes.length === q.annees ? q.volumes : Array.from({ length: q.annees }, () => q.volumeAnnuel || 0);
+  return volumes.every((v, i) => v === prog.volumes[i]);
+}
+
+/**
+ * Prototypes (`proto`) or series: the programme of the request for that mode
+ * goes into quote `q` only in place of volumes that came from the request
+ * (its series or prototype volumes); volumes typed in are kept.
+ * {programme: to apply, or null; typed: volumes typed in kept, the request's not applied}.
+ */
+export function programmeFor(q, order, proto) {
+  const prog = order ? programmeOf(order, { proto }) : null;
+  if (!prog || sameProgramme(q, prog)) return { programme: null, typed: false };
+  const fromRequest = [false, true].some((p) => sameProgramme(q, programmeOf(order, { proto: p })));
+  return fromRequest ? { programme: prog, typed: false } : { programme: null, typed: true, ignored: prog };
+}
+
+/**
+ * What a customer request writes into a quote ({field: value}): the
+ * identification of the part, the volumes of its programme (the prototype
+ * ones for `proto`), its order quantities and the series size, the target
+ * price, and the alloy and the metal of its foundry quote when the lists
+ * have them. lists: {alliages, typologies, cours} (costing workbook, indices).
+ */
+export function orderValues(order, lists = {}, { proto = !!order.prototype } = {}) {
+  const out = { prototype: !!order.prototype };
+  const prog = programmeOf(order, { proto });
+  if (prog) Object.assign(out, { premiereAnnee: prog.premiereAnnee, annees: prog.annees, volumes: prog.volumes, volumeAnnuel: prog.pic });
+  if (order.moqs.length) {
+    out.moqs = order.moqs;
+    // The changeover is spread over the largest order quantity, at most a year of production.
+    out.tailleSerie = prog ? Math.min(order.moqs[0], prog.pic) : order.moqs[0];
+  }
+  if (order.targetPrice) out.prixCible = order.targetPrice;
+  if (order.client) out.client = order.client;
+  // "MZ-0681155 - K.451.256G LABLE PLATE RIGHT": reference, then designation.
+  const m = /^(\S+)\s+-\s+(.+)$/.exec(order.reference);
+  if (m) [out.reference, out.designation] = [m[1], m[2]];
+  else if (order.reference) out.reference = order.reference;
+  if (order.plan) out.plan = order.plan;
+  // The metal of the foundry quote of the request, as the default of the "Matière" card.
+  const metal = order.matiere;
+  const alliage = pick(metal?.alliage, lists.alliages) ?? pick(order.alliage, lists.alliages);
+  if (alliage) out.alliage = alliage;
+  if (metal) {
+    const typologie = pick(metal.typologie, lists.typologies);
+    const cours = pick(metal.cours, lists.cours);
+    if (typologie) out.typologie = typologie;
+    if (cours) out.cours = cours;
+    if (metal.month) out.month = metal.month;
+    for (const k of ["coursAchat", "p1020Achat", "premiumAchat", "premiumVente", "pafAchat", "pafVente"]) if (metal[k] !== null) out[k] = metal[k];
+  }
+  return out;
+}
+
+/** The fields of quote `q` that still hold the value a request gave them (`values`: orderValues). */
+export const filledFields = (q, values) => Object.keys(values).filter((k) => same(q[k], values[k]));
 
 /**
  * Heat treatment asked in the "Autres (TTH, FSW...)" field: the code of the

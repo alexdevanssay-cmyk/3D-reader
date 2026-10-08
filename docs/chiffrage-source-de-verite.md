@@ -189,6 +189,7 @@ Il compare ensuite le comportement du code à la hiérarchie voulue.
      - Stocker ces valeurs dans `q.serie` comme données N1.
      - Les appliquer en priorité (poids, mise au mille, taux de rebut) ou, au minimum, calculer l'écart avec l'estimation (poids 3D / poids brut vendu, bbox / L×l×h).
      - Faire de « Fonderie » un îlot imposé par défaut, avec dérogation tracée.
+   - **Mis en œuvre (données RFQ), en partie.** `rfq.js:readSeriesOrder` lit aussi « Poids Brut vendu (en kg) » (1- Données GO NO GO, libellé en A, valeur en B), « Poids vendu (kg / pc) », « Mise au mille » et « Taux de rebuts usinage » (5- Chiffrage Fonderie, libellé en C, valeur en D) et les range dans `q.serie` (`poidsBrut`, `poidsVendu`, `miseAuMille`, `rebutUsinage` ; une mise au mille ≥ 100 est lue pour 1 000 kg, un taux > 1 en pourcentage). Ces valeurs ne sont **pas appliquées** : les appliquer automatiquement est une décision laissée à l'utilisateur. Elles sont ajoutées aux traces comme autres sources (`rfq`, hard) : `piece.poids` et `piece.miseAuMille` quand une seule pièce est chiffrée, `ensemble.poids` et `ensemble.miseAuMille` (kg coulés / poids de l'ensemble) pour un ensemble, `devis.rebutUsinage`. Un écart au-delà de la tolérance (10 % pour chacune, `provenance.js:DEMANDE`) donne l'alerte « écart à la demande client », à valider, propagée jusqu'au prix. La carte « Commande série » les compare au chiffrage (demande, chiffrage, écart) et l'export les reprend dans l'onglet « Commande série ». Restent non lus : dimensions L×l×h, onglets 4, 6, 7, 8 et Pré-étude Moule SP, empreintes, conditionnement, productivité.
 
 5. **Saisie et RFQ se partagent les mêmes champs : la dernière écriture gagne.**
    - **Constat.**
@@ -198,6 +199,7 @@ Il compare ensuite le comportement du code à la hiérarchie voulue.
      - Pour le TTH, c'est l'inverse : la saisie prime sur la RFQ.
      - L'aide « selon la demande client » s'affiche dès que TTH = Aucun, ce qui peut induire en erreur.
    - **Proposition.** Conserver séparément la valeur RFQ (`q.serie`) et la surcharge saisie. Valeur effective = `surcharge ?? RFQ ?? N2`. Afficher la provenance et l'écart. Appliquer la même règle à tous les champs.
+   - **Mis en œuvre, en partie.** Ce que la RFQ écrit dans le devis est décrit par une seule fonction (`rfq.js:orderValues`). À l'import, les valeurs remplacées sont gardées (`q.serieAvant`, celles d'avant la première RFQ). « Retirer » liste les champs qui gardent encore une valeur écrite par la RFQ (et qui n'avaient pas déjà cette valeur) ; la carte « Commande série » propose « Remettre les valeurs d'avant l'import » ou « Garder ces valeurs » (`q.serieRetiree`). La bascule « Prototype » ne remplace que des volumes venus de la RFQ (volumes série ou proto de la demande, `rfq.js:programmeFor`) ; des volumes saisis sont conservés, avec un message. L'aide « selon la demande client » du TTH ne s'affiche que si le TTH de la pièce n'est pas choisi. Restent : la séparation surcharge / RFQ pour chaque champ (`q.overrides`, étape 7).
 
 6. **Cours de vente : l'indice passe avant la RFQ.**
    - **Constat.** Dans `ui.js:compute`, la valeur RFQ ne sert qu'en repli (`sale.source = 'demande'`).
@@ -243,6 +245,7 @@ Il compare ensuite le comportement du code à la hiérarchie voulue.
 11. **La densité de la page 3D diverge de celle du chiffrage.**
     - **Constat.** `semantic.js:buildSemantic3D` (`mass_g`) et la masse affichée utilisent la densité de la page 3D, qui n'est synchronisée qu'à l'import RFQ (`setMaterial`). La densité générique s'applique sans alerte. Un alliage du classeur sans entrée n'a pas de champ dans Paramètres.
     - **Proposition.** Une seule source, `settings.densities[q.alliage]`, poussée vers la page 3D à chaque changement d'alliage. Une carte Densités qui liste tous les alliages du classeur. Une alerte quand la densité générique s'applique.
+   - **Mis en œuvre.** La densité du chiffrage (`settings.densities[q.alliage]`, sinon la densité générique `store.js:GENERIC_DENSITY`) est poussée vers la page 3D (`window.reader3d.setMaterial`) à chaque changement d'alliage (saisi, RFQ, valeurs remises après « Retirer ») et quand la densité de l'alliage change dans Paramètres (saisie, tendances). La carte « Densités des alliages » liste aussi les alliages du classeur sans densité (champ vide : densité générique). La trace `devis.densite` porte une alerte quand la densité générique s'applique.
 
 12. **Des règles métier sont codées en dur, hors de Paramètres.**
     - **Constat.** Liste :
@@ -409,6 +412,7 @@ Créer `web/chiffrage/provenance.js`. Pour chaque sortie, il décrit les sources
 ### Étape 7 : RFQ et saisies séparées (écarts n° 4, 5 et 10)
 - Lire les champs RFQ manquants dans `q.serie`.
 - Ranger les saisies dans `q.overrides`.
+- **Mis en œuvre, en partie (données RFQ).** Poids brut vendu, poids vendu, mise au mille et taux de rebuts usinage lus dans `q.serie`, comparés et non appliqués (écart n° 4) ; « Retirer » et bascule « Prototype » sans écrasement silencieux (écart n° 5). Restent `q.overrides`, la règle `surcharge ?? RFQ ?? N2` et le rattachement géométrique des saisies.
 - Valeur effective = surcharge ?? RFQ ?? N2.
 - Rattacher les saisies de pièce à une empreinte géométrique stable.
 

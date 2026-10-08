@@ -215,6 +215,22 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       assert.equal(await page.inputValue(`#page-chiffrage [data-bind="q.${bind}"]`), value, bind);
     }
     assert.match(await page.textContent('#page-chiffrage'), /2[\s\u202f]810,00\s*valeur de la demande client/);
+    // The weights, the mise au mille and the scrap rate of the request: compared with the costing, not applied.
+    const compared = await page.textContent('#page-chiffrage .cdemande');
+    for (const text of ['Poids brut vendu', 'Poids vendu par pièce', 'Mise au mille', 'Taux de rebuts usinage']) assert.ok(compared.includes(text), text);
+    const scrapRow = page.locator('#page-chiffrage .cdemande tr', { hasText: 'Taux de rebuts usinage' });
+    assert.match(await scrapRow.textContent(), /Taux de rebuts usinage\s*3,00 %\s*2,00 %\s*[-−]33,3 % \(tolérance 10 %\)/);
+    assert.equal(await scrapRow.getAttribute('class'), 'calert');
+    assert.match(await page.textContent('#page-chiffrage'), /ne sont pas appliquées automatiquement \(les appliquer est une décision à prendre\)/);
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.poids"]'), '1.2');
+    assert.match(await page.textContent('#page-chiffrage #ctrace'), /écart à la demande client : Taux de rebuts usinage de la demande client 3 %/);
+    // The alloy of the request and its density, on the 3D page too; and at each change of the alloy.
+    const material = () => page.$eval('#material', (s) => s.selectedOptions[0].textContent);
+    assert.equal(await material(), 'AS9U3 (2,76)');
+    await page.selectOption('#page-chiffrage [data-bind="q.alliage"]', 'AS7G03');
+    await page.waitForFunction(() => document.querySelector('#material').selectedOptions[0].textContent === 'AS7G03 (2,68)');
+    await page.selectOption('#page-chiffrage [data-bind="q.alliage"]', 'AS9U3');
+    await page.waitForFunction(() => document.querySelector('#material').selectedOptions[0].textContent === 'AS9U3 (2,76)');
     // Prototype: the prototype volumes of the request, without target price.
     assert.equal(await page.isChecked('#page-chiffrage [data-bind="q.prototype"]'), false);
     await page.check('#page-chiffrage [data-bind="q.prototype"]');
@@ -222,6 +238,18 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.volumes.0"]'), '20');
     assert.match(await page.textContent('#page-chiffrage'), /non utilisé pour des prototypes/);
     await page.uncheck('#page-chiffrage [data-bind="q.prototype"]');
+    await page.waitForFunction(() => document.querySelector('#page-chiffrage [data-bind="q.volumes.1"]')?.value === '1500');
+    // A volume typed in: the prototype box keeps it (only the volumes of the request change).
+    const series = () => page.waitForFunction(() => ![...document.querySelectorAll('#page-chiffrage h3')].some((h) => h.textContent.startsWith('Prototypes')));
+    await typeIn('q.volumes.1', 1600);
+    await page.waitForFunction(() => document.querySelector('#page-chiffrage [data-bind="q.volumes.1"]')?.value === '1600');
+    await page.check('#page-chiffrage [data-bind="q.prototype"]');
+    await page.waitForFunction(() => /Volumes saisis conservés : les volumes proto de la demande client/.test(document.getElementById('page-chiffrage').textContent));
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.volumes.1"]'), '1600');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.volumes.0"]'), '1000');
+    await page.uncheck('#page-chiffrage [data-bind="q.prototype"]');
+    await series();
+    await typeIn('q.volumes.1', 1500);
     await page.waitForFunction(() => document.querySelector('#page-chiffrage [data-bind="q.volumes.1"]')?.value === '1500');
     const moqRows = await page.$$eval('#page-chiffrage .ctable tbody tr', (trs) => trs.map((tr) => tr.textContent).filter((t) => /MOQ \d/.test(t)));
     assert.equal(moqRows.length, 3, moqRows.join('\n'));
@@ -261,6 +289,19 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.click('.doc-tab:nth-child(2) .doc-tab-close');
     assert.equal(await page.locator('.doc-tab').count(), 1);
     assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.client"]'), 'ACME RAIL');
+
+    // "Retirer" the request: the fields it filled are said, kept until the values of before the import are put back.
+    await page.click('#page-chiffrage [data-action="remove-rfq"]');
+    await page.waitForFunction(() => /Commande série :\s*aucune/.test(document.getElementById('page-chiffrage').textContent));
+    assert.match(await page.textContent('#page-chiffrage'), /Demande client « RFQ\.xlsm » retirée\. Ces champs gardent les valeurs qu'elle avait remplies : client, référence, désignation, n° de plan, [^.]*alliage/);
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.client"]'), 'ACME RAIL');
+    await page.click('#page-chiffrage [data-action="restore-before-rfq"]');
+    await page.waitForFunction(() => document.querySelector('#page-chiffrage [data-bind="q.client"]')?.value === '');
+    assert.match(await page.textContent('#page-chiffrage'), /Valeurs d'avant l'import de « RFQ\.xlsm » remises/);
+    assert.doesNotMatch(await page.textContent('#page-chiffrage'), /gardent les valeurs/);
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.alliage"]'), 'AS7G03');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.coursAchat"]'), '2500');
+    assert.equal(await material(), 'AS7G03 (2,68)');
 
     assert.deepEqual(errors, []);
     await context.close();

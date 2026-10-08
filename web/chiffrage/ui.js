@@ -7,8 +7,8 @@ import { centreRates, indexAverage, quote, saleMetalPrice, solveMargin as minimu
 import { bestRoutes, buildRoute, rankRoutes } from "./routes.js";
 import { estimateTooling } from "./tooling.js";
 import { coreBoxCost, coresPerPiece, newCore } from "./cores.js";
-import { programmeOf, readSeriesOrder } from "./rfq.js";
-import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, label as traceLabel, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
+import { filledFields, orderValues, programmeFor, programmeOf, readSeriesOrder } from "./rfq.js";
+import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, demandeComparee, label as traceLabel, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
 import * as store from "./store.js";
 
 let el = null;
@@ -63,8 +63,22 @@ export function mount(targets) {
 
 /** The settings resolved again from their layers (after an input, an import, the workbook). */
 function reloadSettings() {
+  const before = densityOf(q?.alliage);
   layers = store.loadSettingsLayers(base);
   settings = layers.effective;
+  if (q && densityOf(q.alliage) !== before) pushMaterial();
+}
+
+/** Density of an alloy: the one of Paramètres, else the generic density (alert in the trace). */
+const densityOf = (alloy) => settings.densities[alloy] ?? store.GENERIC_DENSITY;
+
+/**
+ * The alloy of the quote and its density to the 3D page (mass of the part):
+ * one density, the one the costing uses. At each change of the alloy (typed
+ * in, customer request) or of its density.
+ */
+function pushMaterial() {
+  if (q.alliage) window.reader3d?.setMaterial?.(q.alliage, densityOf(q.alliage));
 }
 
 /** The data files, the settings and the quote read again from this browser's storage (tests). */
@@ -103,7 +117,7 @@ const monthLabel = (m) => {
 };
 const dateLabel = (iso) => (iso ? new Date(iso).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" }) : "—");
 // Inputs of the user (the others are defaults from the workbook).
-const USER_FIELDS = ["client", "reference", "designation", "plan", "volumeAnnuel", "annees", "premiereAnnee", "volumes", "pieces", "pieceFile", "serie", "moqs", "prixCible", "serieEnergie", "outillageInclus", "margeOutillage", "prototype"];
+const USER_FIELDS = ["client", "reference", "designation", "plan", "volumeAnnuel", "annees", "premiereAnnee", "volumes", "pieces", "pieceFile", "serie", "serieAvant", "serieRetiree", "moqs", "prixCible", "serieEnergie", "outillageInclus", "margeOutillage", "prototype"];
 // Inputs of each piece (q.pieces[key]); null: from the 3D model or estimated.
 const PIECE_DEFAULTS = {
   poids: null, toileMini: null, epaisseurMax: null, moduleMm: null, dimMax: null,
@@ -206,7 +220,8 @@ function onChange(event) {
     // A new annual volume or programme length resets the per-year volumes.
     if (path === "volumeAnnuel" || path === "annees") q.volumes = null;
     // Prototype or series: the volumes of the request change (strategy of the request workbook).
-    if (path === "prototype") applyProgramme();
+    if (path === "prototype") switchProgramme();
+    if (path === "alliage") pushMaterial();
     store.saveQuote(q);
   } else if (scope === "p") {
     // Inputs of the piece shown.
@@ -297,7 +312,11 @@ async function onClick(event) {
     store.saveQuote(q);
     render();
   } else if (action === "remove-rfq") {
-    q.serie = null;
+    removeSeriesOrder();
+    render();
+  } else if (action === "restore-before-rfq" || action === "keep-rfq-values") {
+    if (action === "restore-before-rfq") restoreBeforeSeriesOrder();
+    q.serieRetiree = null;
     store.saveQuote(q);
     render();
   } else if (action === "reset-quote") {
@@ -406,48 +425,98 @@ function tendancesMessage(name, report) {
   return { kind: report.unknown.length || report.invalid.length || report.completed.length ? "warn" : "ok", text };
 }
 
-/** The volumes of the request into the quote: series volumes, or prototype volumes for a prototype. */
-function applyProgramme() {
-  const prog = q.serie ? programmeOf(q.serie, { proto: q.prototype }) : null;
-  if (prog) {
-    q.premiereAnnee = prog.premiereAnnee;
-    q.annees = prog.annees;
-    q.volumes = prog.volumes;
-    q.volumeAnnuel = prog.pic;
+/**
+ * Prototype or series (the box just ticked or unticked): the volumes of the
+ * request for that mode, only in place of volumes that came from the request;
+ * volumes typed in are kept, and the message says so.
+ */
+function switchProgramme() {
+  const { programme, typed, ignored } = programmeFor(q, q.serie, q.prototype);
+  if (programme) {
+    q.premiereAnnee = programme.premiereAnnee;
+    q.annees = programme.annees;
+    q.volumes = programme.volumes;
+    q.volumeAnnuel = programme.pic;
+  } else if (typed) {
+    message = {
+      kind: "warn",
+      text: `Volumes saisis conservés : les volumes ${q.prototype ? "proto" : "série"} de la demande client (${plural(ignored.annees, "an")} à partir de ${ignored.premiereAnnee}, ${nf(ignored.volumes.reduce((a, b) => a + b, 0), 0)} pièces) ne les remplacent pas. Réimportez la demande pour les reprendre.`,
+    };
   }
-  return prog;
 }
 
-/** Take the series order of a customer request into the quote. */
+/** The lists the values of a request are picked in: alloys, typologies, price indices. */
+const orderLists = () => ({
+  alliages: base?.lists.alliages,
+  typologies: indices?.typologies?.length ? indices.typologies.map((t) => t.name) : base?.lists.typologies,
+  cours: base?.lists.cours,
+});
+
+/**
+ * Take the series order of a customer request into the quote (rfq.js:orderValues).
+ * The values it replaces are kept as they were before the first request
+ * (q.serieAvant), to put them back when the request is removed.
+ */
 function applySeriesOrder(order) {
+  const values = orderValues(order, orderLists());
+  const avant = { ...q.serieAvant };
+  for (const k of Object.keys(values)) if (!(k in avant)) avant[k] = q[k] ?? null;
   q.serie = order;
-  q.prototype = !!order.prototype;
-  const prog = applyProgramme();
-  if (order.moqs.length) {
-    q.moqs = order.moqs;
-    // The changeover is spread over the largest order quantity, at most a year of production.
-    q.tailleSerie = prog ? Math.min(order.moqs[0], prog.pic) : order.moqs[0];
-  }
-  if (order.targetPrice) q.prixCible = order.targetPrice;
-  if (order.client) q.client = order.client;
-  // "MZ-0681155 - K.451.256G LABLE PLATE RIGHT": reference, then designation.
-  const m = /^(\S+)\s+-\s+(.+)$/.exec(order.reference);
-  if (m) [q.reference, q.designation] = [m[1], m[2]];
-  else if (order.reference) q.reference = order.reference;
-  if (order.plan) q.plan = order.plan;
-  // The metal of the foundry quote of the request, as the default of the "Matière" card.
-  const metal = order.matiere;
-  const pick = (value, options) => options?.find((o) => String(o).toLowerCase() === String(value ?? "").toLowerCase());
-  q.alliage = pick(metal?.alliage, base?.lists.alliages) ?? pick(order.alliage, base?.lists.alliages) ?? q.alliage;
+  q.serieAvant = avant;
+  q.serieRetiree = null;
+  Object.assign(q, JSON.parse(JSON.stringify(values)));
   // The same alloy as the material of the 3D analysis (its mass).
-  if (q.alliage && settings.densities[q.alliage]) window.reader3d?.setMaterial?.(q.alliage, settings.densities[q.alliage]);
-  if (metal) {
-    const typologies = indices?.typologies?.length ? indices.typologies.map((t) => t.name) : base?.lists.typologies;
-    q.typologie = pick(metal.typologie, typologies) ?? q.typologie;
-    q.cours = pick(metal.cours, base?.lists.cours) ?? q.cours;
-    if (metal.month) q.month = metal.month;
-    for (const k of ["coursAchat", "p1020Achat", "premiumAchat", "premiumVente", "pafAchat", "pafVente"]) if (metal[k] !== null) q[k] = metal[k];
-  }
+  pushMaterial();
+}
+
+// Fields of the quote a customer request fills (rfq.js:orderValues), as named in the page.
+const ORDER_FIELDS = {
+  client: "client", reference: "référence", designation: "désignation", plan: "n° de plan", prototype: "prototype",
+  premiereAnnee: "première année", annees: "durée du programme", volumes: "volumes par année", volumeAnnuel: "volume annuel",
+  moqs: "MOQ", tailleSerie: "taille de série", prixCible: "prix cible", alliage: "alliage", typologie: "typologie de la moyenne",
+  cours: "cours utilisé", month: "date d'application des cours", coursAchat: "cours achat", p1020Achat: "P1020 achat",
+  premiumAchat: "premium achat", premiumVente: "premium vente", pafAchat: "perte au feu achat", pafVente: "PAF vendue",
+};
+const fieldNames = (fields) => fields.map((k) => ORDER_FIELDS[k] ?? k).join(", ");
+const ORDER_RANK = Object.keys(ORDER_FIELDS);
+const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+/**
+ * "Retirer": the request is removed. The fields it filled keep their values
+ * until the user puts back those of before the import or keeps them
+ * (q.serieRetiree, card "Commande série"): never left without a word.
+ */
+function removeSeriesOrder() {
+  const order = q.serie;
+  const values = orderValues(order, orderLists(), { proto: q.prototype });
+  const avant = q.serieAvant ?? {};
+  // Still the request's value, and not the one the field already had before the import.
+  const filled = filledFields(q, values)
+    .filter((k) => !(k in avant) || !sameJson(avant[k], values[k]))
+    .sort((a, b) => ORDER_RANK.indexOf(a) - ORDER_RANK.indexOf(b));
+  q.serie = null;
+  q.serieAvant = null;
+  q.serieRetiree = filled.length
+    ? { fileName: order.fileName, fields: Object.fromEntries(filled.map((k) => [k, values[k]])), avant: Object.fromEntries(filled.filter((k) => k in avant).map((k) => [k, avant[k]])) }
+    : null;
+  store.saveQuote(q);
+  // Its heat treatment was the one of the pieces without a choice of their own (pieceInputs): no longer.
+  const tth = order.tth ? ` Son traitement thermique (${order.tth}) ne s'applique plus aux pièces sans traitement choisi : choisissez-le pour chaque pièce s'il le faut.` : "";
+  message = filled.length
+    ? { kind: "warn", text: `Demande client « ${order.fileName} » retirée. Ces champs gardent les valeurs qu'elle avait remplies : ${fieldNames(filled)}. Vérifiez-les, ou remettez les valeurs d'avant l'import (carte « Commande série »).${tth}` }
+    : { kind: tth ? "warn" : "ok", text: `Demande client « ${order.fileName} » retirée.${tth}` };
+}
+
+/** The fields still holding the values of the request removed (q.serieRetiree). */
+const stillFilled = (r) => (r ? filledFields(q, r.fields) : []);
+
+/** The fields the request removed had filled, still with its values: back to those of before the import (else of a new quote). */
+function restoreBeforeSeriesOrder() {
+  const r = q.serieRetiree;
+  const fresh = store.defaultQuote(base, indices);
+  for (const k of stillFilled(r)) q[k] = k in (r.avant ?? {}) ? r.avant[k] : fresh[k];
+  pushMaterial();
+  message = { kind: "ok", text: `Valeurs d'avant l'import de « ${r.fileName} » remises.` };
 }
 
 function download(name, blob) {
@@ -497,7 +566,7 @@ export function compute() {
   const selected = pieces.length > 1 ? "ensemble" : pieces[0].key;
   currentKey = selected === "ensemble" ? currentKey : selected;
 
-  const density = settings.densities[q.alliage] ?? 2.7;
+  const density = densityOf(q.alliage);
   const years = Array.from({ length: Math.max(1, q.annees || 1) }, (_, i) => (q.premiereAnnee || new Date().getFullYear()) + i);
   const volumes = Array.isArray(q.volumes) && q.volumes.length === years.length ? q.volumes : years.map(() => q.volumeAnnuel || 0);
   const volumeTotal = volumes.reduce((a, b) => a + (b || 0), 0);
@@ -524,13 +593,14 @@ export function compute() {
   const rates = centreRates(base, { modes: settings.modes, energy });
   const common = { density, years, volumes, volumeTotal, sale, metal, energy, rates };
   // Where each value comes from: traced after the computation, it changes none of them.
-  const ctx = traceContext(p3d);
+  // The weight and the mise au mille of the customer request: compared with the piece costed alone, else with the set.
+  const ctx = { ...traceContext(p3d), demandePiece: pieces.length === 1 };
   common.trace = traceQuote(ctx, common);
   const results = pieces.map((piece) => computePiece(piece, common, ctx));
   const out = { p3d, allPieces, pieces, selected, results, ...common };
   if (selected === "ensemble") {
     out.ensemble = aggregate(results.filter((r) => r.final), years);
-    out.trace["ensemble.prix.vente"] = traceEnsemble(results, out.ensemble);
+    Object.assign(out.trace, traceEnsemble(ctx, results, out.ensemble));
   }
   return out;
 }
@@ -852,13 +922,23 @@ function pieceFields(r) {
       ${field("Épaisseur maxi / point chaud (mm)", input("p.epaisseurMax", i.epaisseurMax, { placeholder: a.epaisseurMax ? nf(a.epaisseurMax, 2) : "" }))}
       ${field("Module V/S (mm)", input("p.moduleMm", i.moduleMm, { placeholder: a.moduleMm ? nf(a.moduleMm, 2) : "" }), "fixe le temps de solidification")}
       ${field("Plus grande dimension (mm)", input("p.dimMax", i.dimMax, { placeholder: a.dimMax ? nf(a.dimMax, 0) : "" }))}
-      ${field("Traitement thermique", select("p.tth", i.tth, [["none", "Aucun"], ...Object.entries(settings.tth).map(([code, t]) => [code, t.label])]), i.tth !== "none" ? esc(settings.tth[i.tth]?.cycle ?? "") : q.serie ? "selon la demande client" : "")}
+      ${field("Traitement thermique", select("p.tth", i.tth, [["none", "Aucun"], ...Object.entries(settings.tth).map(([code, t]) => [code, t.label])]), tthHint(r))}
       ${i.tth !== "none" ? field("Poids traité", select("p.tthMode", i.tthMode, [["scie", "Pièce seule (masselottes sciées avant)"], ["masselotte", "Pièce avec masselottes (grappe)"]])) : ""}
       ${field("Noyaux sable", checkbox("p.noyaux", i.noyaux, "oui"))}
       ${field("Tribofinition", checkbox("p.tribo", i.tribo, "oui"))}
       ${field("Redressage", checkbox("p.redressage", i.redressage, "oui"))}
     </div>
     ${i.noyaux ? `<p class="small">Noyaux : voir la carte « Noyaux et boîtes à noyau » ci-dessous.</p>` : ""}`;
+}
+
+/** Under the heat treatment: its cycle; and "selon la demande client" only when it comes from the request (nothing chosen for the piece). */
+function tthHint(r) {
+  const i = r.inputs;
+  const fromRequest = q.serie && (q.pieces?.[r.piece.key]?.tth ?? null) === null;
+  return [
+    i.tth !== "none" ? esc(settings.tth[i.tth]?.cycle ?? "") : "",
+    fromRequest ? (q.serie.tth ? "selon la demande client" : "aucun dans la demande client") : "",
+  ].filter(Boolean).join(" — ");
 }
 
 /** The sand cores of a piece and their core boxes. */
@@ -1162,9 +1242,36 @@ function moqPrices(c) {
   return { base: at(q.tailleSerie), moqs: (q.moqs ?? []).map(at), shown };
 }
 
+/**
+ * The weight, the mise au mille and the scrap rate of the customer request
+ * against those the costing uses (provenance.js:demandeComparee): for the
+ * piece shown, or the set. Read from the traces, which carry the same
+ * comparison (alternatives, alert beyond the tolerance).
+ */
+function demandeRows(c) {
+  const T = c.selected === "ensemble" ? c.trace : c.results.find((r) => r.piece.key === c.selected)?.trace ?? {};
+  const used = (k) => T[`${c.selected === "ensemble" ? "ensemble" : "piece"}.${k}`]?.valeur;
+  return demandeComparee(q.serie, { poids: used("poids"), miseAuMille: used("miseAuMille"), rebutUsinage: c.trace["devis.rebutUsinage"]?.valeur });
+}
+
+/** A value of the request or of the costing, by its unit. */
+const demandeValue = (v, unite) => (v === null || v === undefined ? "—" : unite === "%" ? pct(v, 2) : unite === "kg" ? `${nf(v, 3)} kg` : nf(v, 2));
+
+/** The fields a request removed had filled and that still hold its values: a notice, and the choice. */
+function removedOrderNotice() {
+  const r = q.serieRetiree;
+  const fields = stillFilled(r);
+  if (q.serie || !fields.length) return "";
+  const back = fields.every((k) => k in (r.avant ?? {}));
+  return `<p class="cmsg warn">Demande client « ${esc(r.fileName)} » retirée : ces champs gardent les valeurs qu'elle avait remplies : ${esc(fieldNames(fields))}.
+    <button type="button" class="small" data-action="restore-before-rfq">${back ? "Remettre les valeurs d'avant l'import" : "Remettre les valeurs d'avant l'import (sinon celles d'un nouveau chiffrage)"}</button>
+    <button type="button" class="small" data-action="keep-rfq-values">Garder ces valeurs</button></p>`;
+}
+
 function seriesCard(c) {
   const s = q.serie;
   const prices = moqPrices(c);
+  const compared = s ? demandeRows(c) : [];
   // Prototypes: no target price (strategy of the request workbook).
   const target = q.prototype ? null : q.prixCible;
   const gap = (p) => (target > 0 ? `${p > target ? "+" : ""}${eur(p - target, 2)} (${pct(p / target - 1)})` : "—");
@@ -1177,7 +1284,7 @@ function seriesCard(c) {
   const mismatch = s?.fonderie && prices ? prices.shown.filter((r) => r.route && !r.route.process.toUpperCase().startsWith(s.fonderie.toUpperCase())) : [];
   return `<section class="ccard">
     <h3>${q.prototype ? "Prototypes" : "Commande série"}${c.selected === "ensemble" ? " — ensemble" : ""}</h3>
-    ${s ? `<p class="small">${[s.client, s.demande, s.offre && `offre ${s.offre}`, s.fonderie && `fonderie ${s.fonderie}`, s.usinage, s.tth && `TTH ${s.tth}`, s.references > 1 && `${s.references} références dans la demande`].filter(Boolean).map(esc).join(" — ")}</p>` : `<p class="small muted">Importez la demande client (onglet « 1- Données GO NO GO ») pour reprendre les volumes par année, les MOQ et le prix cible, ou saisissez-les ici.</p>`}
+    ${s ? `<p class="small">${[s.client, s.demande, s.offre && `offre ${s.offre}`, s.fonderie && `fonderie ${s.fonderie}`, s.usinage, s.tth && `TTH ${s.tth}`, s.references > 1 && `${s.references} références dans la demande`].filter(Boolean).map(esc).join(" — ")}</p>` : `<p class="small muted">Importez la demande client (onglet « 1- Données GO NO GO ») pour reprendre les volumes par année, les MOQ et le prix cible, ou saisissez-les ici ; son poids, sa mise au mille et son taux de rebut d'usinage sont comparés au chiffrage.</p>`}
     <div class="cfields">
       ${field("Quantités commandées (MOQ)", input("q.moqs", q.moqs ?? [], { kind: "list", placeholder: "1000 ; 500 ; 50" }), "séparées par « ; »")}
       ${field("Prix cible client (€/pièce)", input("q.prixCible", q.prixCible, { min: 0 }), q.prototype ? "non utilisé pour des prototypes" : "")}
@@ -1185,6 +1292,13 @@ function seriesCard(c) {
       ${s && (s.elec > 0 || s.gaz > 0) ? checkbox("q.serieEnergie", q.serieEnergie !== false, `Prix de l'énergie de la demande (élec ${nf(s.elec ?? 0, 0)} €/MWh, gaz ${nf(s.gaz ?? 0, 0)} €/MWh)`) : ""}
     </div>
     ${mismatch.length ? `<p class="cmsg warn">La demande indique la fonderie « ${esc(s.fonderie)} » : îlot retenu différent pour ${mismatch.map((r) => `${esc(r.piece.name)} (${esc(r.route.process)})`).join(", ")}.</p>` : ""}
+    ${removedOrderNotice()}
+    ${compared.length ? `<h4>Données de la demande comparées au chiffrage${c.selected === "ensemble" ? " (ensemble)" : ""}</h4>
+      <div class="cscroll"><table class="ctable compact cdemande">
+        <thead><tr><th>Donnée de la demande client</th><th class="num">Demande</th><th class="num">Chiffrage</th><th class="num">Écart</th></tr></thead>
+        <tbody>${compared.map((d) => `<tr${d.alerte ? ' class="calert"' : ""}><td>${esc(d.label)}</td><td class="num">${demandeValue(d.valeur, d.unite)}</td><td class="num">${demandeValue(d.utilise, d.unite)}</td><td class="num${d.alerte ? " bad" : ""}">${Number.isFinite(d.ecart_rel) ? signedPct(d.ecart_rel) : "—"}${d.alerte ? ` (tolérance ${pct(d.tolerance, 0)})` : ""}</td></tr>`).join("")}</tbody>
+      </table></div>
+      <p class="small muted">Valeurs lues dans la demande client et comparées au chiffrage : elles ne sont pas appliquées automatiquement (les appliquer est une décision à prendre). Le chiffrage garde le poids saisi ou tiré du modèle 3D, la mise au mille saisie ou estimée et le taux de rebut du devis ; un écart au-delà de la tolérance est signalé dans la carte Traçabilité. Pour retenir une valeur de la demande, saisissez-la : poids de la pièce, mise au mille (îlot imposé), taux de rebut détecté à l'usinage.</p>` : ""}
     ${prices ? `<div class="cscroll"><table class="ctable">
       <thead><tr><th>Quantité</th><th class="num">Mise en route / pièce</th><th class="num">Prix de vente ${c.years[0]}</th><th class="num">Marge sur VA</th><th class="num">Écart au prix cible</th></tr></thead>
       <tbody>${rows}</tbody></table></div>
@@ -1246,12 +1360,15 @@ function traceBanner(sum) {
     <button type="button" class="small" data-action="show-trace">Voir le détail</button></p>`;
 }
 
+/** The name of another source: the field of the customer request (its reference), else the type of source. */
+const altName = (a) => (a.source === "rfq" && a.ref ? a.ref : TRACE_SOURCES[a.source]?.label ?? a.source);
+
 function traceRow(cle, t) {
   const s = t.source;
   const name = TRACE_SOURCES[s.type]?.label ?? s.type;
   const details = [s.ref && `Référence : ${s.ref}`, s.entrees?.length && `Entrées : ${s.entrees.join(", ")}`].filter(Boolean).join("\n");
   const notes = [
-    ...t.alternatives.map((a) => `autre source : ${TRACE_SOURCES[a.source]?.label ?? a.source} ${traceValue(a.valeur, t.unite)}${Number.isFinite(a.ecart_rel) ? ` (écart ${signedPct(a.ecart_rel)})` : ""}`),
+    ...t.alternatives.map((a) => `autre source : ${esc(altName(a))} ${traceValue(a.valeur, t.unite)}${Number.isFinite(a.ecart_rel) ? ` (écart ${signedPct(a.ecart_rel)})` : ""}`),
     ...t.hypotheses.map(esc),
   ];
   const e = t.ecart_tendance;
@@ -1379,8 +1496,9 @@ function renderSettings() {
       <td>${o.chargeKg !== undefined ? sinput(`operations.${code}.chargeKg`, o.chargeKg, { width: "70px", compact: true }) : sinput(`operations.${code}.parCycle`, o.parCycle, { width: "70px", compact: true })}</td></tr>`,
     )
     .join("");
-  const densities = Object.entries(settings.densities)
-    .map(([a, d]) => field(a, sinput(`densities.${a}`, d, { width: "80px" })))
+  // Every alloy of the settings and of the workbook: one without density gets the generic one (alert in the trace).
+  const densities = [...new Set([...Object.keys(settings.densities), ...(base?.lists.alliages ?? [])])]
+    .map((a) => field(a, sinput(`densities.${a}`, settings.densities[a], { width: "80px", placeholder: nf(store.GENERIC_DENSITY, 2) }), settings.densities[a] === undefined ? `aucune densité : densité générique ${nf(store.GENERIC_DENSITY, 2)} utilisée` : ""))
     .join("");
   const energy = { ...base?.energy, ...settings.energy };
   const tthRows = Object.entries(settings.tth)
@@ -1585,6 +1703,14 @@ async function exportXlsx() {
   if (prices) {
     for (const x of [prices.base, ...prices.moqs]) serie.push([x.tailleSerie, x.miseEnRoute, x.prixVente, P(x.margeVaPct), q.prixCible > 0 ? x.prixVente - q.prixCible : null]);
   }
+  const compared = q.serie ? demandeRows(c) : [];
+  if (compared.length) {
+    serie.push([], ["Donnée de la demande client (non appliquée)", "Demande", "Chiffrage", "Écart", "Au-delà de la tolérance"].map(H));
+    for (const d of compared) {
+      const v = (x) => (d.unite === "%" ? P(x) : x);
+      serie.push([d.label, v(d.valeur), v(d.utilise), P(d.ecart_rel), d.alerte ? `oui (tolérance ${pct(d.tolerance, 0)})` : "non"]);
+    }
+  }
 
   // Traceability: one row per traced value; the data files and their dates in the header.
   const t = layers.tendances;
@@ -1613,7 +1739,7 @@ async function exportXlsx() {
         piece ?? "Devis", cle, traceLabel(cle), typeof x.valeur === "number" && percent ? P(x.valeur) : x.valeur, x.unite,
         TRACE_SOURCES[x.source.type]?.label ?? x.source.type, x.source.ref, x.source.fichier ?? null, x.source.date ? dateLabel(x.source.date) : null, x.source.entrees?.join(", ") || null,
         x.autorite, x.niveau, x.confiance.niveau, x.confiance.raison, e ? (percent ? P(e.tendance) : e.tendance) : null, e ? P(e.ecart_rel) : null,
-        x.alternatives.map((a) => `${TRACE_SOURCES[a.source]?.label ?? a.source} : ${traceText(a.valeur, x.unite)}`).join(" ; ") || null,
+        x.alternatives.map((a) => `${altName(a)} : ${traceText(a.valeur, x.unite)}`).join(" ; ") || null,
         x.hypotheses.join(" ; ") || null, x.alertes.map((a) => `${ALERTES[a.type] ?? a.type} : ${a.message}`).join(" ; ") || null, x.validation_requise ? "oui" : "non",
       ]);
     }

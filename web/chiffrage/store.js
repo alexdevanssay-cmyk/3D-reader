@@ -39,6 +39,8 @@ export const DEFAULT_DENSITIES = {
   AS7G03: 2.68, AS7G06: 2.68, AS7U3: 2.75, AS8U3: 2.75, AS9G: 2.65, AS9GU: 2.7, AS9U3: 2.76,
   AS10G: 2.65, AS12: 2.65, AS12U: 2.7, AS12UNG: 2.68, AS13: 2.65, AZ10: 2.85, AZ5: 2.8,
 };
+// Density of an alloy that has none in the settings (an alert in the trace of the quote).
+export const GENERIC_DENSITY = 2.7;
 
 const clone = (x) => JSON.parse(JSON.stringify(x));
 
@@ -533,6 +535,8 @@ export function defaultQuote(base, indices) {
     marge: null, // null: the setting
     composants: [],
     serie: null, // series order of the customer request (rfq.js)
+    serieAvant: null, // {field: value} the fields of the quote before a request filled them (back with "Retirer")
+    serieRetiree: null, // {fileName, fields: {field: value}, avant}: request removed, fields still holding its values
     moqs: [], // order quantities, largest first
     prixCible: null,
     serieEnergie: true, // energy prices of the request in place of the settings
