@@ -328,12 +328,12 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       req.on('data', (c) => (body += c));
       req.on('end', () => {
         chats.push(JSON.parse(body));
-        const answer = JSON.stringify({ conclusion: 'Deux corps fermés.', observations: ['volume 7,257 cm³'], inferences: [], recommendations: ['Calculer les épaisseurs'], uncertainties: [], needs_human_validation: true, quote: null });
+        const answer = 'Conclusion : Deux corps fermés.\n\nMesuré :\n- volume 7,257 cm³\n\nRecommandations :\n- Calculer les épaisseurs';
         res.setHeader('Content-Type', 'application/x-ndjson');
         // A model reads its prompt before writing: the first words come after a while.
         setTimeout(() => {
           for (let i = 0; i < answer.length; i += 16) res.write(`${JSON.stringify({ message: { role: 'assistant', content: answer.slice(i, i + 16) }, done: false })}\n`);
-          res.end(`${JSON.stringify({ done: true })}\n`);
+          res.end(`${JSON.stringify({ done: true, load_duration: 2e9, prompt_eval_count: 900, prompt_eval_duration: 3e9, eval_count: 40, eval_duration: 1e9 })}\n`);
         }, 600);
       });
     });
@@ -369,14 +369,20 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(request.model, 'qwen3:8b');
     assert.equal(request.stream, true);
     assert.equal(request.think, false);
-    assert.deepEqual(Object.keys(request.format.properties), ['conclusion', 'observations', 'inferences', 'recommendations', 'uncertainties', 'needs_human_validation', 'quote']);
+    // Plain French text (a forced JSON form made the small model copy an empty template).
+    assert.equal(request.format, undefined);
+    assert.match(request.messages[0].content, /en texte simple \(jamais de JSON\)/);
+    assert.match(request.messages[0].content, /qwen3:8b\) qui tourne en local sur ce PC/);
     assert.equal(request.keep_alive, '15m');
-    assert.ok(request.options.num_ctx >= 8192);
-    assert.match(request.messages[0].content, /"compaction"/);
-    assert.ok(request.messages[0].content.length < 20_000, `system prompt of ${request.messages[0].content.length} characters`);
+    assert.equal(request.options.num_ctx, 8192);
+    // A general question: a summary of the part only, read in seconds by a local model.
+    assert.match(request.messages[0].content, /"summary_only":true/);
+    assert.ok(request.messages[0].content.length < 6000, `system prompt of ${request.messages[0].content.length} characters`);
+    assert.match(await page.textContent('#ai-status'), /chargement du modèle 2 s, lecture de 900 tokens 3 s, rédaction de 40 tokens 1 s/);
     assert.deepEqual(request.messages.slice(1).map((m) => m.role), ['user']);
     // An origin refused by Ollama: the question fails with the page's own origin in the explanation, and is not kept.
     allowed = false;
+    await page.click('.ai-task[data-task="manufacturing_analysis"]');
     await page.fill('#ai-input', 'Et les noyaux ?');
     await page.press('#ai-input', 'Enter');
     await page.waitForFunction(() => document.getElementById('ai-status').textContent === 'Erreur', null, { timeout: 30_000 });
@@ -386,6 +392,10 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.press('#ai-input', 'Enter');
     await page.waitForFunction(() => /Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
     assert.deepEqual(chats[1].messages.slice(1).map((m) => [m.role, m.role === 'user' ? m.content : '']), [['user', 'Résume la pièce.'], ['assistant', ''], ['user', 'Et les noyaux ?']]);
+    // An analysis task: the detailed context, compacted to fit, with the same window.
+    assert.match(chats[1].messages[0].content, /"compaction"/);
+    assert.ok(chats[1].messages[0].content.length < 20_000, `system prompt of ${chats[1].messages[0].content.length} characters`);
+    assert.equal(chats[1].options.num_ctx, 8192);
     // A new conversation forgets it.
     await page.click('#ai-clear');
     assert.equal(await page.locator('#ai-chat .ai-msg').count(), 0);

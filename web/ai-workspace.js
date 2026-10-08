@@ -8,7 +8,7 @@
 // loopback-network permission of Chrome and Edge, Firefox "Device apps and
 // services"). diagnoseOllama() tells which one is missing.
 
-import { buildAIContext, compactAIContext } from "./engine/ai-context.js";
+import { buildAIContext, compactAIContext, summaryAIContext } from "./engine/ai-context.js";
 
 const PROVIDERS = [
   ["openai", "OpenAI / Responses API (gateway)"],
@@ -18,7 +18,7 @@ const OLLAMA_URL = "http://localhost:11434";
 const OLLAMA_MODEL = "qwen3:8b";
 // The context of a local model is kept small: its window (num_ctx) and the
 // time to read the prompt on a CPU grow with it.
-const LOCAL_CONTEXT_CHARS = 16000;
+const LOCAL_CONTEXT_CHARS = 12000;
 const LOCAL_HISTORY = 6; // messages of the conversation sent again with a question
 
 const TASKS = [
@@ -56,13 +56,14 @@ const store = {
 
 /** The text of an answer: the JSON of the structured contract laid out, or the raw text. */
 export function formatAnswer(content) {
+  const text = withoutThinking(content);
   let parsed = null;
   try {
-    parsed = JSON.parse(String(content).replace(/^\s*<think>[\s\S]*?<\/think>\s*/, ""));
+    parsed = JSON.parse(text);
   } catch {
-    return String(content ?? "");
+    return text;
   }
-  if (!parsed || typeof parsed !== "object") return String(content ?? "");
+  if (!parsed || typeof parsed !== "object") return text;
   const list = (title, items) => (Array.isArray(items) && items.length ? `${title} :\n- ${items.map((i) => (typeof i === "string" ? i : JSON.stringify(i))).join("\n- ")}` : "");
   return [
     parsed.conclusion ?? "",
@@ -133,36 +134,34 @@ function ollamaBase(value) {
   }
 }
 
-// The answer contract, given to Ollama as a JSON schema (structured output).
-const ANSWER_SCHEMA = {
-  type: "object",
-  properties: {
-    conclusion: { type: "string" },
-    observations: { type: "array", items: { type: "string" } },
-    inferences: { type: "array", items: { type: "string" } },
-    recommendations: { type: "array", items: { type: "string" } },
-    uncertainties: { type: "array", items: { type: "string" } },
-    needs_human_validation: { type: "boolean" },
-    quote: { type: ["object", "null"] },
-  },
-  required: ["conclusion", "observations", "inferences", "recommendations", "uncertainties", "needs_human_validation"],
-};
-
-/** Window (tokens) asked of Ollama for a prompt of this many characters: room for the answer, never below the default. */
+/**
+ * Window (tokens) asked of Ollama for a prompt of this many characters, with
+ * room for the answer. Only two sizes: Ollama reloads the whole model when
+ * the window changes from one question to the next, and it can reuse what it
+ * has already read only when it does not.
+ */
 function contextWindow(chars) {
-  const tokens = Math.ceil(chars / 3) + 2048;
-  return Math.min(32768, Math.max(8192, Math.ceil(tokens / 2048) * 2048));
+  return Math.ceil(chars / 3) + 2048 <= 8192 ? 8192 : 16384;
 }
 
-const SYSTEM_PROMPT = `Tu es l'assistant d'ingénierie de 3D Reader, pour une fonderie. Réponds en français.
-N'utilise que le contexte fourni (analyse géométrique et sémantique de la pièce, connaissances fonderie).
-N'invente jamais de dimensions, de paramètres de procédé, de propriétés matière, de probabilités de défaut, d'attaques, de masselottes ni de résultats de simulation.
-Distingue ce qui est mesuré, ce qui est déduit, ce qui est recommandé et ce qui manque.
+const seconds = (ns) => Math.round((ns ?? 0) / 1e9);
+
+/** Instructions of the local model: plain French text, laid out only when the question is about the part. */
+function systemPrompt(model) {
+  return `Tu es l'assistant d'ingénierie de 3D Reader, pour une fonderie d'aluminium. Tu es un modèle de langage (${model}) qui tourne en local sur ce PC avec Ollama : aucune donnée n'est envoyée sur Internet.
+Réponds en français, en texte simple (jamais de JSON), de façon claire et concise.
+Pour une conversation ou une question générale (fonderie, procédés, chiffrage, méthode), réponds directement et brièvement.
+Pour une question sur la pièce, organise la réponse en courtes sections, celles qui sont utiles seulement : « Conclusion », « Mesuré » (valeurs du contexte, avec leurs identifiants), « Déduit », « Recommandations », « À valider ».
+N'utilise que le contexte fourni (analyse géométrique et sémantique de la pièce, connaissances fonderie). N'invente jamais de dimensions, de paramètres de procédé, de propriétés matière, de prix, de taux, de temps de cycle, de nombre de noyaux, de probabilités de défaut, d'attaques, de masselottes ni de résultats de simulation.
 Pour la fonderie, cite les identifiants de sources fournis et dis clairement quand une conclusion demande une simulation de remplissage/solidification ou une validation fonderie.
 Si le contexte est partiel (champ "compaction"), dis-le quand cela limite la réponse.
-Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), réponds de façon générale (fonderie, procédés, chiffrage, méthode) sans prétendre connaître une pièce, et propose d'ouvrir le modèle si la question en dépend.
-Réponds UNIQUEMENT par un JSON valide de cette forme :
-{"conclusion":"","observations":[],"inferences":[],"recommendations":[],"uncertainties":[],"needs_human_validation":true,"quote":null}`;
+Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.`;
+}
+
+/** The answer without a model's hidden reasoning (<think>…</think>, written by older Ollama versions). */
+function withoutThinking(text) {
+  return String(text ?? "").replace(/<think>[\s\S]*?(<\/think>|$)/g, "").trimStart();
+}
 
 export function mount({ page, reader }) {
   if (!page) return { show() {} };
@@ -285,21 +284,23 @@ export function mount({ page, reader }) {
     };
   }
 
+  let timing = ""; // time spent by Ollama on the last answer, shown with it
+
   /** Ask the local Ollama, the answer shown as it is written. Resolves to the whole answer. */
   async function askOllama(question, context, signal, onText) {
     const base = ollamaBase($("ai-url").value.trim());
     const model = $("ai-model").value.trim() || OLLAMA_MODEL;
     const problem = await diagnoseOllama(base, model);
     if (problem) throw new Error(problem);
-    const compact = compactAIContext(context, { maxChars: LOCAL_CONTEXT_CHARS });
-    const system = `${SYSTEM_PROMPT}\n\nCONTEXTE :\n${JSON.stringify(compact)}`;
+    // General questions: a summary of the part (read in seconds on a CPU); the analysis tasks: the detail.
+    const compact = context.no_model_loaded ? context : task === "general" ? summaryAIContext(context) : compactAIContext(context, { maxChars: LOCAL_CONTEXT_CHARS });
+    const system = `${systemPrompt(model)}\n\nCONTEXTE :\n${JSON.stringify(compact)}`;
     const numCtx = contextWindow(system.length + JSON.stringify(messages.slice(-LOCAL_HISTORY)).length + question.length);
     const history = messages.slice(-LOCAL_HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
     const body = {
       model,
       messages: [{ role: "system", content: system }, ...history, { role: "user", content: question }],
       stream: true,
-      format: ANSWER_SCHEMA,
       think: false, // Qwen3 would otherwise write a long hidden reasoning first
       keep_alive: "15m", // the model stays loaded between questions (loading it takes long on a CPU)
       options: { num_ctx: numCtx, temperature: 0.2 },
@@ -359,6 +360,14 @@ export function mount({ page, reader }) {
       }
     }
     if (last?.done_reason === "length") answer += "\n\n(Réponse coupée : limite de longueur atteinte.)";
+    if (last) {
+      // Where the time went: loading the model, reading the prompt, writing the answer.
+      timing = [
+        seconds(last.load_duration) >= 1 ? `chargement du modèle ${seconds(last.load_duration)} s` : "",
+        last.prompt_eval_count ? `lecture de ${last.prompt_eval_count} tokens ${seconds(last.prompt_eval_duration)} s` : "",
+        last.eval_count ? `rédaction de ${last.eval_count} tokens ${seconds(last.eval_duration)} s` : "",
+      ].filter(Boolean).join(", ");
+    }
     if (last?.prompt_eval_count >= 0.95 * numCtx) console.warn(`Ollama: prompt of ${last.prompt_eval_count} tokens for a window of ${numCtx}: the start of the context may have been dropped`);
     return answer;
   }
@@ -413,18 +422,21 @@ export function mount({ page, reader }) {
     try {
       const output = local
         ? await askOllama(question, context, busy.signal, (text) => {
-          written = text.length;
+          const visible = withoutThinking(text);
+          if (!visible) return; // still thinking
+          written = visible.length;
           answerBox.classList.remove("ai-thinking");
-          answerBox.textContent = text;
+          answerBox.textContent = visible;
           $("ai-chat").scrollTop = $("ai-chat").scrollHeight;
         })
         : await askGateway(question, context, busy.signal);
       answerBox.classList.remove("ai-thinking");
       answerBox.textContent = formatAnswer(output) || "(réponse vide)";
       // Only answered questions are kept: a failed one is not sent again with the next.
-      messages.push({ role: "user", content: question }, { role: "assistant", content: output });
+      messages.push({ role: "user", content: question }, { role: "assistant", content: withoutThinking(output) });
       saveMessages();
-      setStatus(`Réponse en ${Math.round((performance.now() - start) / 1000)} s`);
+      setStatus(`Réponse en ${Math.round((performance.now() - start) / 1000)} s${local && timing ? ` (${timing})` : ""}`);
+      timing = "";
     } catch (err) {
       answerBox.parentElement.remove();
       if (err?.name === "AbortError") {

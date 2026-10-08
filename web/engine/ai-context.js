@@ -277,5 +277,36 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   return { ...out, warnings: out.warnings.slice(0, 3), compaction: { ...out.compaction, omitted: [...omitted] } };
 }
 
+/**
+ * A short summary of an AI context, for conversation and general questions:
+ * the model's size and the bodies' metrics only (a local model on a CPU reads
+ * it in seconds). The detailed context is for the analysis tasks.
+ */
+export function summaryAIContext(context) {
+  const r = (v) => (finite(v) ? Math.round(v * 100) / 100 : v ?? null);
+  const bodies = (context.bodies ?? []).map((b) => ({
+    id: b.id,
+    name: b.name,
+    closed: b.quality?.closed ?? null,
+    volume_mm3: r(b.metrics?.volume_mm3),
+    surface_area_mm2: r(b.metrics?.surface_area_mm2),
+    bbox_size_mm: (b.metrics?.bbox_mm?.size ?? []).map(r),
+    feature_count: (b.features ?? []).length,
+  }));
+  const largest = [...bodies].sort((a, b) => (b.volume_mm3 ?? 0) - (a.volume_mm3 ?? 0)).slice(0, 12);
+  return {
+    schema: context.schema,
+    schema_version: context.schema_version,
+    task: context.task,
+    summary_only: true,
+    note: "Résumé de la pièce : pour le détail (features, fabrication, fonderie), choisir une analyse dédiée.",
+    source: context.source,
+    model: roundDeep(context.model),
+    body_count: bodies.length,
+    bodies: largest,
+    ...(bodies.length > largest.length ? { other_bodies: bodies.length - largest.length } : {}),
+  };
+}
+
 export const AI_CONTEXT_VERSION = "1.0";
 export const AI_CONTEXT_TASKS = [...TASKS];
