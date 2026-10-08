@@ -544,6 +544,50 @@ test("supports focused feature reasoning without losing provenance", () => {
   assert.equal(context.bodies[0].features[0].evidence_count, feature.evidence_count);
 });
 
+test("the AI context keeps the geometry of every feature type", () => {
+  const e0=[0,0,0,1,0,0], e1=[0,1,0,1,1,0], e2=[0,2,0,1,2,0];
+  const semantic = buildSemantic3D({
+    file:"features.step", kind:"cad", engine:"browser",
+    summary:{volume:100,area:600,bodies:1,solids:1},
+    bodies:[body({ volume:100, surface_types:{plane:2,cylinder:7,cone:1,sphere:0,torus:1,bspline:0}, geometric_surfaces:[
+      {index:0,type:"torus",minor_radius_mm:2,edge_signatures:[e0,e1]},
+      {index:1,type:"plane",edge_signatures:[e0]},
+      {index:2,type:"cylinder",radius_mm:8,axis:[0,0,1],center_mm:[0,0,0],wire_count:2,edge_count:2,edge_signatures:[e1]},
+      {index:3,type:"cone",semi_angle_rad:0.2,ref_radius_mm:8,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[e2,e0]},
+      {index:4,type:"plane",edge_signatures:[e2]},
+      {index:5,type:"cylinder",radius_mm:9,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[e0]},
+      {index:6,type:"cylinder",radius_mm:8,axis:[0,0,1],center_mm:[0,0,5],edge_signatures:[]},
+      ...[20,40,60].map((x,i)=>({index:7+i,type:"cylinder",radius_mm:2,axis:[0,0,1],center_mm:[x,0,0],edge_signatures:[]})),
+    ] })],
+  });
+  const features=semantic.bodies[0].features;
+  const context=buildAIContext(semantic,{task:"feature_analysis"});
+  const byId=new Map(context.bodies[0].features.map(f=>[f.feature_id,f]));
+  for (const type of ["hole_feature_candidate","boss_feature_candidate","chamfer_feature_candidate","tapered_feature_candidate",
+    "feature_relation_candidate","stepped_cylindrical_feature_candidate","coaxial_cylindrical_relation","low_fill_ratio_geometry"]) {
+    assert.ok(features.some(f=>f.type===type), type);
+  }
+  // Every numeric field of a feature (dimension, axis, centre, surface index) reaches the model.
+  const numeric=(v)=>typeof v==="number" || (Array.isArray(v) && v.length>0 && v.every(x=>x===null || numeric(x)));
+  for (const f of features) {
+    const geometry=byId.get(f.feature_id).geometry;
+    for (const [k,v] of Object.entries(f)) {
+      if (k==="confidence" || k==="evidence_count" || !numeric(v)) continue;
+      assert.deepEqual(geometry[k],v,`${f.type}.${k}`);
+    }
+  }
+  // Stepped and coaxial features carry the geometry and the id of their relation.
+  for (const f of features.filter(f=>f.relation)) {
+    const c=byId.get(f.feature_id);
+    assert.deepEqual(c.geometry.surfaces,f.relation.surfaces);
+    for (const k of ["radius_mm","radii_mm","diameter_mm"]) if (f.relation[k]!=null) assert.deepEqual(c.geometry[k],f.relation[k],k);
+    assert.deepEqual(c.evidence,[{source:"relation",relation_id:f.relation.relation_id}]);
+    assert.equal(c.evidence_count,1);
+  }
+  const taper=features.find(f=>f.relation?.type==="coaxial_cylinder_cone");
+  assert.equal(byId.get(taper.feature_id).geometry.diameter_mm,16);
+});
+
 test("the compacted AI context of a large assembly fits the budget of a local model", () => {
   const count = 300;
   const bodies = Array.from({ length: count }, (_, i) => body({

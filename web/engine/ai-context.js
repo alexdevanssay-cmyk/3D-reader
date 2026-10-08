@@ -7,8 +7,26 @@ const TASKS = new Set(["general", "feature_analysis", "manufacturing_analysis", 
 function finite(v) { return typeof v === "number" && Number.isFinite(v); }
 function clamp(v) { return finite(v) ? Math.max(0, Math.min(1, v)) : 0; }
 
+// Keys of a semantic feature that are not its geometry: they have their own
+// fields in the context, or describe the detection rather than the part. Every
+// other key is geometry, so that a new geometric field is not silently dropped.
+const NON_GEOMETRY_KEYS = new Set([
+  "feature_id", "type", "subtype", "status", "confidence", "method", "evidence", "evidence_count",
+  "evidence_quality", "needs_topology_confirmation", "interpretation", "relation",
+]);
+// Geometry of the analytic relation that a stepped or coaxial feature stands for.
+const RELATION_GEOMETRY_KEYS = ["surfaces", "radius_mm", "radii_mm", "diameter_mm", "cone_ref_radius_mm"];
+
 function evidenceFor(feature) {
   return (feature?.evidence ?? []).map(e => ({ ...e }));
+}
+
+function featureGeometry(feature) {
+  const geometry = Object.fromEntries(Object.entries(feature).filter(([k]) => !NON_GEOMETRY_KEYS.has(k)));
+  for (const k of RELATION_GEOMETRY_KEYS) {
+    if (feature.relation?.[k] != null && !(k in geometry)) geometry[k] = feature.relation[k];
+  }
+  return geometry;
 }
 
 function featureContext(feature) {
@@ -21,9 +39,7 @@ function featureContext(feature) {
     method: feature.method ?? null,
     evidence: evidenceFor(feature),
     evidence_count: feature.evidence_count ?? evidenceFor(feature).length,
-    geometry: Object.fromEntries(Object.entries(feature).filter(([k]) =>
-      ["diameter_mm","radius_mm","minor_radius_mm","cone_semi_angle_rad","surface_index","floor_surface","boundary_planes","wall_surfaces","surfaces","centers_mm","axes","adjacent_surfaces","support_or_termination_planes"].includes(k)
-    )),
+    geometry: featureGeometry(feature),
     needs_topology_confirmation: feature.needs_topology_confirmation === true,
   };
 }
@@ -150,7 +166,7 @@ export function buildAIContext(semantic, options = {}) {
 
 // --------------------------------------------------------------------------- compact context
 
-const DIMENSION_KEYS = ["diameter_mm", "radius_mm", "minor_radius_mm", "cone_semi_angle_rad"];
+const DIMENSION_KEYS = ["diameter_mm", "radius_mm", "minor_radius_mm", "cone_semi_angle_rad", "semi_angle_rad", "cylinder_diameter_mm"];
 const round = (v, d = 3) => (finite(v) ? Math.round(v * 10 ** d) / 10 ** d : v);
 
 function roundDeep(value) {

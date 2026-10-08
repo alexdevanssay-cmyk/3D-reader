@@ -148,7 +148,7 @@ function cylindricalRelations(cylinders, cones, surfaces) {
       relations.push({
         type:"coaxial_cylinder_cone",
         surfaces:[c.index,cone.index],
-        diameter_mm:c.diameter_mm,
+        diameter_mm:2*c.radius_mm,
         cone_ref_radius_mm:cone.ref_radius_mm ?? null,
         confidence:0.9,
       });
@@ -528,6 +528,7 @@ function featureCandidates(body, topo, stableRelations) {
         relation:r,
         confidence:0.78,
         method:"coaxial_analytic_surfaces",
+        evidence:[{source:"relation", relation_id:r.relation_id}],
         needs_topology_confirmation:true
       });
     } else if (r.type==="coaxial_cylinder_step") {
@@ -537,6 +538,7 @@ function featureCandidates(body, topo, stableRelations) {
         relation:r,
         confidence:0.79,
         method:"coaxial_analytic_surfaces_with_different_radii",
+        evidence:[{source:"relation", relation_id:r.relation_id}],
         needs_topology_confirmation:true
       });
     } else if (r.type==="coaxial_cylinders") {
@@ -546,6 +548,7 @@ function featureCandidates(body, topo, stableRelations) {
         relation:r,
         confidence:0.94,
         method:"coaxial_analytic_surfaces",
+        evidence:[{source:"relation", relation_id:r.relation_id}],
         needs_topology_confirmation:true
       });
     }
