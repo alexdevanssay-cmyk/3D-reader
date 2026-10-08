@@ -812,6 +812,10 @@ function solidBody(ctx, name, solid, color, notes) {
 /** Compact analytic descriptors used by the semantic layer. */
 function describeGeometricSurface(oc, face, out, index) {
   const surface = new oc.BRepAdaptor_Surface_2(face, true);
+  // Plane(), Axis(), Direction(), Location()... return new copies whose
+  // destructor does nothing (see release()): released in the finally block.
+  const temps = [];
+  const tmp = (obj) => (temps.push(obj), obj);
   try {
     const T = oc.GeomAbs_SurfaceType;
     const type = surface.GetType();
@@ -819,33 +823,37 @@ function describeGeometricSurface(oc, face, out, index) {
     if (!name) return;
     const item = { index, type: name, orientation: face.Orientation_1(), wire_count: countSubShapes(oc, face, oc.TopAbs_ShapeEnum.TopAbs_WIRE), edge_count: countSubShapes(oc, face, oc.TopAbs_ShapeEnum.TopAbs_EDGE), edge_signatures: edgeSignatures(oc, face) };
     if (name === "plane") {
-      const p = surface.Plane();
-      const a = p.Axis();
-      const d = a.Direction();
+      const p = tmp(surface.Plane());
+      const a = tmp(p.Axis());
+      const d = tmp(a.Direction());
+      const o = tmp(a.Location());
       item.normal = [d.X(), d.Y(), d.Z()];
-      item.center_mm = [a.Location().X(), a.Location().Y(), a.Location().Z()];
+      item.center_mm = [o.X(), o.Y(), o.Z()];
     }
     if (name === "cylinder") {
-      const c = surface.Cylinder();
-      const a = c.Axis();
-      const d = a.Direction();
+      const c = tmp(surface.Cylinder());
+      const a = tmp(c.Axis());
+      const d = tmp(a.Direction());
+      const o = tmp(a.Location());
       item.radius_mm = c.Radius();
       item.axis = [d.X(), d.Y(), d.Z()];
-      item.center_mm = [a.Location().X(), a.Location().Y(), a.Location().Z()];
+      item.center_mm = [o.X(), o.Y(), o.Z()];
     }
     if (name === "cone") {
-      const c = surface.Cone();
-      const ax = c.Axis();
-      const d = ax.Direction();
+      const c = tmp(surface.Cone());
+      const ax = tmp(c.Axis());
+      const d = tmp(ax.Direction());
+      const o = tmp(ax.Location());
       item.semi_angle_rad = c.SemiAngle();
       item.ref_radius_mm = c.RefRadius();
       item.axis = [d.X(), d.Y(), d.Z()];
-      item.center_mm = [ax.Location().X(), ax.Location().Y(), ax.Location().Z()];
+      item.center_mm = [o.X(), o.Y(), o.Z()];
     }
-    if (name === "sphere") item.radius_mm = surface.Sphere().Radius();
-    if (name === "torus") { const t = surface.Torus(); item.major_radius_mm = t.MajorRadius(); item.minor_radius_mm = t.MinorRadius(); }
+    if (name === "sphere") item.radius_mm = tmp(surface.Sphere()).Radius();
+    if (name === "torus") { const t = tmp(surface.Torus()); item.major_radius_mm = t.MajorRadius(); item.minor_radius_mm = t.MinorRadius(); }
     out.push(item);
   } finally {
+    for (const obj of temps) release(oc, obj);
     surface.delete();
   }
 }
@@ -875,7 +883,16 @@ function edgeSignatures(oc, face) {
 function forEachChildShape(oc, shape, kind, upperKind, fn) {
   const exp = new oc.TopExp_Explorer_2(shape, kind, upperKind);
   try {
-    for (; exp.More(); exp.Next()) fn(exp.Current());
+    for (; exp.More(); exp.Next()) {
+      // Current() returns a TopoDS_Shape copy holding a reference on the
+      // sub-shape: released like in forEachChild(), or it keeps the model alive.
+      const child = exp.Current();
+      try {
+        fn(child);
+      } finally {
+        release(oc, child);
+      }
+    }
   } finally {
     exp.delete();
   }
@@ -1395,7 +1412,7 @@ function soften(ratio) {
 }
 
 // Classes without resources of their own: releasing the block is their whole destructor.
-const PLAIN_DATA = new Set(['gp_Pnt', 'gp_Trsf', 'Poly_Triangle', 'TDF_Label', 'Standard_GUID', 'BRep_Builder']);
+const PLAIN_DATA = new Set(['gp_Pnt', 'gp_Dir', 'gp_Ax1', 'gp_Pln', 'gp_Cylinder', 'gp_Cone', 'gp_Sphere', 'gp_Torus', 'gp_Trsf', 'Poly_Triangle', 'TDF_Label', 'Standard_GUID', 'BRep_Builder']);
 
 /**
  * Delete an embind object, running its destructor by hand when delete() would not.

@@ -7,6 +7,7 @@
 
 import assert from 'node:assert/strict';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 
@@ -302,6 +303,79 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.notEqual(maxPin, maxBracket);
     assert.deepEqual(errors, []);
     await page.context().close();
+  });
+
+  test('IA page: a question answered by a local Ollama, streamed; refused origins explained', { timeout: CAD_TIMEOUT }, async () => {
+    // A stand-in for Ollama: /api/tags and a streamed /api/chat, CORS as Ollama does it (OLLAMA_ORIGINS).
+    let allowed = true;
+    const chats = [];
+    const ollama = createServer((req, res) => {
+      const origin = req.headers.origin;
+      if (origin && !allowed) {
+        res.writeHead(403);
+        return res.end();
+      }
+      if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET,POST', 'Access-Control-Allow-Headers': 'Content-Type' });
+        return res.end();
+      }
+      if (req.url === '/api/tags') {
+        res.setHeader('Content-Type', 'application/json');
+        return res.end(JSON.stringify({ models: [{ name: 'qwen3:8b' }] }));
+      }
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        chats.push(JSON.parse(body));
+        const answer = JSON.stringify({ conclusion: 'Deux corps fermés.', observations: ['volume 7,257 cm³'], inferences: [], recommendations: ['Calculer les épaisseurs'], uncertainties: [], needs_human_validation: true, quote: null });
+        res.setHeader('Content-Type', 'application/x-ndjson');
+        for (let i = 0; i < answer.length; i += 16) res.write(`${JSON.stringify({ message: { role: 'assistant', content: answer.slice(i, i + 16) }, done: false })}\n`);
+        res.end(`${JSON.stringify({ done: true })}\n`);
+      });
+    });
+    await new Promise((resolve) => ollama.listen(0, '127.0.0.1', resolve));
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.click('.tab[data-page="ia"]');
+    await page.selectOption('#ai-provider', 'ollama');
+    await page.fill('#ai-url', `http://127.0.0.1:${ollama.address().port}`);
+    await page.fill('#ai-input', 'Résume la pièce.');
+    await page.press('#ai-input', 'Enter');
+    await page.waitForFunction(() => /Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+    const chat = await page.textContent('#ai-chat');
+    assert.match(chat, /Deux corps fermés\./);
+    assert.match(chat, /Recommandations :\s*- Calculer les épaisseurs/);
+    // Native chat API, streamed, JSON, no hidden reasoning, a compact context sized for the window.
+    const [request] = chats;
+    assert.equal(request.model, 'qwen3:8b');
+    assert.equal(request.stream, true);
+    assert.equal(request.think, false);
+    assert.deepEqual(Object.keys(request.format.properties), ['conclusion', 'observations', 'inferences', 'recommendations', 'uncertainties', 'needs_human_validation', 'quote']);
+    assert.equal(request.keep_alive, '15m');
+    assert.ok(request.options.num_ctx >= 8192);
+    assert.match(request.messages[0].content, /"compaction"/);
+    assert.ok(request.messages[0].content.length < 20_000, `system prompt of ${request.messages[0].content.length} characters`);
+    assert.deepEqual(request.messages.slice(1).map((m) => m.role), ['user']);
+    // An origin refused by Ollama: the question fails with the page's own origin in the explanation, and is not kept.
+    allowed = false;
+    await page.fill('#ai-input', 'Et les noyaux ?');
+    await page.press('#ai-input', 'Enter');
+    await page.waitForFunction(() => document.getElementById('ai-status').textContent === 'Erreur', null, { timeout: 30_000 });
+    assert.match(await page.textContent('#ai-chat .ai-error'), new RegExp(`OLLAMA_ORIGINS contient ${base.replace(/\/$/, '').replace(/[.]/g, '\\.')}`));
+    allowed = true;
+    await page.fill('#ai-input', 'Et les noyaux ?');
+    await page.press('#ai-input', 'Enter');
+    await page.waitForFunction(() => /Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+    assert.deepEqual(chats[1].messages.slice(1).map((m) => [m.role, m.role === 'user' ? m.content : '']), [['user', 'Résume la pièce.'], ['assistant', ''], ['user', 'Et les noyaux ?']]);
+    // A new conversation forgets it.
+    await page.click('#ai-clear');
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 0);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+    await new Promise((resolve) => ollama.close(resolve));
   });
 
   test('tabs: several parts open side by side, each with its own analysis', { timeout: CAD_TIMEOUT }, async () => {

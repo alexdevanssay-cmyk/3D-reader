@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { buildSemantic3D } from "../../web/engine/semantic.js";
 import { buildAIContext } from "../../web/engine/ai-context.js";
 
@@ -167,8 +168,10 @@ test("keeps feature intent provisional even when analytic evidence is strong", (
   assert.equal(candidate.needs_topology_confirmation, true);
 });
 
+const SEMANTIC_SOURCE = readFileSync(new URL("../../web/engine/semantic.js", import.meta.url), "utf8");
+
 test("feature schema advances with conservative blend/chamfer/pattern candidates", () => {
-  const source = "web/engine/semantic.js";
+  const source = SEMANTIC_SOURCE;
   assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "9.0"'));
   assert.ok(source.includes('type:"fillet_feature_candidate"'));
   assert.ok(source.includes('type:"chamfer_feature_candidate"'));
@@ -177,9 +180,18 @@ test("feature schema advances with conservative blend/chamfer/pattern candidates
 });
 
 test("semantic bodies expose analytic relations separately from inferred features", () => {
-  const source = "web/engine/semantic.js";
-  assert.ok(source.includes("relations:surfaceRelations("));
-  assert.ok(source.includes("features:featureCandidates(body,topo,"));
+  const result = buildSemantic3D({
+    file: "relations.step", kind: "cad", engine: "browser",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [body({ geometric_surfaces: [
+      { index: 0, type: "cylinder", radius_mm: 5, diameter_mm: 10, axis: [0,0,1], center_mm: [0,0,0], edge_signatures: [] },
+      { index: 1, type: "cylinder", radius_mm: 8, diameter_mm: 16, axis: [0,0,1], center_mm: [0,0,5], edge_signatures: [] },
+    ] })],
+  });
+  const semanticBody = result.bodies[0];
+  assert.ok(semanticBody.relations.length > 0);
+  assert.ok(semanticBody.relations.every(r => /^relation-\d+$/.test(r.relation_id) && !("feature_id" in r)));
+  assert.ok(semanticBody.features.every(f => /^feature-[0-9a-f]{8}$/.test(f.feature_id) && !("relation_id" in f)));
 });
 
 
@@ -373,11 +385,27 @@ test("adds V6 deterministic manufacturing planning with setup grouping and const
   assert.ok(plan.setups.every(s=>s.status==="candidate_with_constraints"));
   assert.ok(plan.setups.every(s=>s.unresolved_constraints.includes("stock_fixture_access_not_verified")));
   assert.equal(plan.planned_order.length,plan.operation_count);
-  assert.ok(plan.dependencies.length >= 1);
+  // Two drillings of the same precedence on independent axes: no dependency is invented.
+  assert.deepEqual(plan.dependencies, []);
+  assert.equal(plan.readiness.dependency_count, 0);
   assert.equal(plan.constraints.collision_check,"not_performed");
   assert.equal(plan.constraints.machine_kinematics,"not_analyzed");
   assert.equal(plan.readiness.status,"needs_review");
   assert.ok(plan.readiness.unresolved_constraints.includes("stock_fixture_access_not_verified"));
+});
+
+test("V6 planning links operations of different precedence", () => {
+  const result = buildSemantic3D({
+    file:"countersink.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({ geometric_surfaces:[
+      {index:0,type:"cylinder",radius_mm:5,diameter_mm:10,axis:[0,0,1],center_mm:[0,0,0],edge_signatures:[]},
+      {index:1,type:"cone",ref_radius_mm:5,semi_angle_rad:0.25,axis:[0,0,1],center_mm:[0,0,2],edge_signatures:[]},
+    ] })],
+  });
+  const plan=result.bodies[0].manufacturing_plan;
+  assert.ok(plan.dependencies.some(d=>d.reason==="manufacturing_precedence"));
+  assert.ok(plan.dependencies.every(d=>d.resolvable));
 });
 
 test("keeps V6 planning deterministic across repeated semantic builds", () => {
