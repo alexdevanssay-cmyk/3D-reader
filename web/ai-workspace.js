@@ -20,9 +20,20 @@
 // explains, it never sets a value: no answer is applied to the quote or the
 // settings. Every number of its answer must be in the trace, or the answer is
 // marked "non vérifiée". The AI gateway gets the internal amounts masked,
-// unless the user ticks the box that sends them.
+// unless the user ticks the box that sends them. Each answer of this task is
+// kept with the quote (chiffrage/ui.js addAIAnalysis), for the record.
+//
+// Every task with a part: the numbers of an answer that come from none of the
+// data sent are counted under it (engine/ai-context.js checkContextNumbers).
+//
+// One conversation per tab of the 3D page (see conversationKey). The gateway
+// gets neutral labels in place of the names of the part, of its bodies and of
+// the quote ("Pièce", "Corps 1"...: engine/ai-context.js anonymizer), unless
+// the box is unticked; Ollama always gets the real names (nothing leaves the
+// site). When the free quota of the gateway is reached, the local model
+// answers if it can (box "Repli automatique sur le modèle local").
 
-import { buildAIContext, compactAIContext, summaryAIContext } from "./engine/ai-context.js";
+import { anonymizer, buildAIContext, checkContextNumbers, compactAIContext, summaryAIContext } from "./engine/ai-context.js";
 
 const PROVIDERS = [
   ["openai", "En ligne via la passerelle (Groq…)"], // value of earlier versions, kept in this browser's storage
@@ -49,8 +60,13 @@ const TASKS = [
   ["costing", "Chiffrage"],
 ];
 
-const KEYS = { gateway: "reader3d.ai.gateway", code: "reader3d.ai.gatewayCode", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider", messages: "reader3d.ai.messages", think: "reader3d.ai.think", amounts: "reader3d.ai.costingAmounts" };
+const KEYS = {
+  gateway: "reader3d.ai.gateway", code: "reader3d.ai.gatewayCode", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider",
+  messages: "reader3d.ai.messages", think: "reader3d.ai.think", amounts: "reader3d.ai.costingAmounts", anonymize: "reader3d.ai.anonymize", fallback: "reader3d.ai.fallback",
+};
 const COSTING_LABEL = "Raisonnement IA — aucune valeur n'est appliquée";
+// HTTP statuses of the gateway when the free quota of its provider is reached (api/ai.js): the local model may answer instead.
+const QUOTA_STATUSES = [413, 429];
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -73,6 +89,39 @@ const store = {
     }
   },
 };
+
+// One conversation per tab of the 3D page (reader.tab), in this browser
+// tab's sessionStorage: the first tab's under the key of earlier versions,
+// kept after a reload as its quote (chiffrage/store.js); the others' as long
+// as the page (app.js forgets them when their tab is closed and when the
+// page loads again). A conversation belongs to the part it is about ({file,
+// messages}): another file opened in its tab starts a new one, so that a
+// part's conversation is never sent with another part's context.
+const conversationKey = (id) => (id == null || id === 1 ? KEYS.messages : `${KEYS.messages}.${id}`);
+const unsaved = new Map(); // conversations that could not be saved (storage blocked or full): kept for this visit
+
+/** The conversation saved under `key`: {file (null: no part yet), messages}. */
+function readConversation(key) {
+  let data = null;
+  try {
+    data = JSON.parse(unsaved.get(key) ?? store.get(sessionStorage, key) ?? "null");
+  } catch {
+    data = null;
+  }
+  if (Array.isArray(data)) data = { messages: data }; // earlier versions: the messages alone
+  return { file: typeof data?.file === "string" ? data.file : null, messages: Array.isArray(data?.messages) ? data.messages : [] };
+}
+
+function writeConversation(key, conversation) {
+  const text = conversation.messages.length ? JSON.stringify(conversation) : null;
+  unsaved.delete(key);
+  try {
+    if (text === null) sessionStorage.removeItem(key);
+    else sessionStorage.setItem(key, text);
+  } catch {
+    if (text !== null) unsaved.set(key, text);
+  }
+}
 
 /** The text of an answer: the JSON of the structured contract laid out, or the raw text. */
 export function formatAnswer(content) {
@@ -106,26 +155,44 @@ export function formatAnswer(content) {
   ].filter(Boolean).join("\n\n");
 }
 
+/** The strings of the part `pick` of a JSON answer, one per line; null when the answer is not JSON. */
+function jsonText(content, pick) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(withoutThinking(content));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const strings = [];
+  (function walk(v) {
+    if (typeof v === "string") strings.push(v);
+    else if (v && typeof v === "object") Object.values(v).forEach(walk);
+  })(pick(parsed));
+  return strings.join("\n");
+}
+
 /**
  * The part of an answer that is about the costing, whose numbers are checked
  * against the trace: analyse_chiffrage of an answer of the gateway (JSON),
  * else the whole text (the plain text of Ollama).
  */
 export function costingText(content) {
-  const text = withoutThinking(content);
-  let parsed = null;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return text;
-  }
-  if (!parsed || typeof parsed !== "object") return text;
-  const strings = [];
-  (function walk(v) {
-    if (typeof v === "string") strings.push(v);
-    else if (v && typeof v === "object") Object.values(v).forEach(walk);
-  })(parsed.analyse_chiffrage);
-  return strings.join("\n");
+  return jsonText(content, (parsed) => parsed.analyse_chiffrage) ?? withoutThinking(content);
+}
+
+/** The text of an answer whose numbers are checked against the data sent: every string of its JSON, or its plain text. */
+export function answerText(content) {
+  return jsonText(content, (parsed) => parsed) ?? withoutThinking(content);
+}
+
+/** Under an answer of the gateway: the real names of the labels it writes ([[label, name]], engine/ai-context.js anonymizer). */
+const namesLine = (names) => `Noms réels : ${names.map(([label, name]) => `${label} = ${name}`).join(" ; ")}`;
+
+/** Under an answer: how many of its numbers come from none of the data sent (informative). */
+export function numbersLabel(unknown) {
+  const n = unknown.length;
+  return `${n} nombre${n > 1 ? "s ne viennent" : " ne vient"} pas des données envoyées`;
 }
 
 /** State of the browser permission for this site to reach applications on this device (Chrome/Edge 142+, Firefox 153+), or null. */
@@ -275,7 +342,7 @@ export function mount({ page, reader }) {
           <label class="field">Fournisseur
             <select id="ai-provider">${PROVIDERS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
           </label>
-          <label class="field"><span id="ai-url-label">Adresse</span>
+          <label class="field ai-url-field"><span id="ai-url-label">Adresse</span>
             <input id="ai-url" type="url" spellcheck="false">
           </label>
           <label class="field">Modèle
@@ -285,6 +352,8 @@ export function mount({ page, reader }) {
             <input id="ai-code" type="password" autocomplete="off" spellcheck="false">
           </label>
           <label class="check" id="ai-think-field" title="Le modèle raisonne avant de répondre : réponses plus sûres, mais bien plus lentes sur un PC sans carte graphique. Le raisonnement s'affiche sous la réponse."><input type="checkbox" id="ai-think"> Réflexion du modèle (plus lent)</label>
+          <label class="check" id="ai-anon-field" title="Avant l'envoi à la passerelle, le nom du fichier, les noms des corps, la référence et la désignation de la pièce, les noms du client et des fichiers du chiffrage sont remplacés par « Pièce », « Corps 1 »… Le modèle local (Ollama) reçoit toujours les vrais noms : rien ne quitte le site."><input type="checkbox" id="ai-anon"> Anonymiser les noms envoyés en ligne</label>
+          <label class="check" id="ai-fallback-field" title="Quand le quota gratuit de la passerelle est atteint, la question est posée au modèle local (Ollama, avec l'adresse et le modèle choisis pour lui), s'il répond."><input type="checkbox" id="ai-fallback"> Repli automatique sur le modèle local</label>
           <label class="check" id="ai-amounts-field" hidden title="Sans cette case, la passerelle reçoit la trace du chiffrage sans les montants internes (taux, coûts, prix, marges, pertes au feu, TRS) : leurs sources et leurs écarts relatifs seulement. Le modèle local (Ollama) reçoit toujours la trace complète, rien ne quitte le site."><input type="checkbox" id="ai-amounts"> Envoyer les montants internes du chiffrage à la passerelle</label>
           <button id="ai-test" class="btn" type="button">Tester la connexion</button>
         </div>
@@ -309,14 +378,8 @@ export function mount({ page, reader }) {
   const $ = (id) => page.querySelector("#" + id);
   let task = "general";
   let busy = null; // AbortController of the question in progress
-  let messages = [];
-  try {
-    messages = JSON.parse(store.get(sessionStorage, KEYS.messages) || "[]");
-    if (!Array.isArray(messages)) messages = [];
-  } catch {
-    messages = [];
-  }
-  const saveMessages = () => store.set(sessionStorage, KEYS.messages, JSON.stringify(messages));
+  let shown = null; // {key, file}: the conversation on screen, the one of the tab shown and of its part
+  let pending = null; // the question in progress: {key, nodes (its two messages, shown again with their conversation), dropped}
 
   const provider = () => $("ai-provider").value;
   const isLocal = () => provider() === "ollama";
@@ -341,6 +404,8 @@ export function mount({ page, reader }) {
     $("ai-model").value = savedModel || (local ? OLLAMA_MODEL : "");
     $("ai-model").placeholder = local ? OLLAMA_MODEL : "modèle par défaut de la passerelle";
     $("ai-think-field").hidden = !local;
+    $("ai-anon-field").hidden = local;
+    $("ai-fallback-field").hidden = local;
     $("ai-amounts-field").hidden = local || task !== "costing";
     showCode();
   }
@@ -351,6 +416,9 @@ export function mount({ page, reader }) {
     $("ai-provider").value = saved === "openai_compatible" ? "ollama" : saved === "openai" || saved === "ollama" ? saved : "ollama";
     showProvider();
     $("ai-think").checked = store.get(localStorage, KEYS.think) === "1";
+    // Anonymised names and the fallback on the local model: on unless unticked.
+    $("ai-anon").checked = store.get(localStorage, KEYS.anonymize) !== "0";
+    $("ai-fallback").checked = store.get(localStorage, KEYS.fallback) !== "0";
     // Consent to send the internal amounts: kept for this browser tab only (sessionStorage), never for good.
     $("ai-amounts").checked = store.get(sessionStorage, KEYS.amounts) === "1";
   }
@@ -377,37 +445,82 @@ export function mount({ page, reader }) {
     return body;
   }
 
-  /** Under the label of a costing answer: whether every number it cites is in the trace sent (chiffrage/ai-trace.js checkNumbers). */
-  function showCheck(body, check) {
-    const line = document.createElement("div");
-    line.className = `ai-check ${check.verifiee ? "ok" : "bad"}`;
-    const n = check.inconnus.length;
-    line.textContent = check.verifiee
-      ? check.nombres ? "Vérifiée : chaque nombre cité figure dans la trace du chiffrage." : "Aucun nombre cité."
-      : `Réponse non vérifiée : ${n > 1 ? `${n} nombres absents` : "un nombre absent"} de la trace du chiffrage (${check.inconnus.join(" ; ")}).`;
-    body.before(line);
+  /** A line of an answer besides its text: before it (`before`), else at the end of its message. */
+  function line(body, className, text, before = false) {
+    const el = document.createElement("div");
+    el.className = className;
+    el.textContent = text;
+    if (before) body.before(el);
+    else body.parentElement.append(el);
+    return el;
   }
 
-  for (const m of messages) {
-    const body = bubble(m.role, m.role === "assistant" ? formatAnswer(m.content) : m.content, !!m.costing);
-    if (m.costing) showCheck(body, m.costing);
+  /** Under the label of a costing answer: whether every number it cites is in the trace sent (chiffrage/ai-trace.js checkNumbers). */
+  function showCheck(body, check) {
+    const n = check.inconnus.length;
+    line(body, `ai-check ${check.verifiee ? "ok" : "bad"}`, check.verifiee
+      ? check.nombres ? "Vérifiée : chaque nombre cité figure dans la trace du chiffrage." : "Aucun nombre cité."
+      : `Réponse non vérifiée : ${n > 1 ? `${n} nombres absents` : "un nombre absent"} de la trace du chiffrage (${check.inconnus.join(" ; ")}).`, true);
   }
+
+  /**
+   * The lines kept with an answer: its costing check, the numbers that come
+   * from none of the data sent, the real names of the labels it writes.
+   */
+  function decorate(body, m) {
+    if (m.costing) showCheck(body, m.costing);
+    if (m.numbers?.length) line(body, "ai-numbers", numbersLabel(m.numbers)).title = m.numbers.join(" ; ");
+    if (m.names?.length) line(body, "ai-names", namesLine(m.names));
+  }
+
+  /** A message kept in a conversation, on screen. */
+  function showMessage(m) {
+    if (m.role !== "assistant") return bubble("user", m.content);
+    const body = bubble("assistant", formatAnswer(m.content), !!m.costing);
+    if (m.notice) line(body, "ai-notice", m.notice, true);
+    decorate(body, m);
+  }
+
+  /** The conversation of the tab shown, on screen; a new one when another part was opened in that tab. */
+  function showConversation() {
+    const tab = reader.tab ?? { id: 1, file: null };
+    const key = conversationKey(tab.id);
+    if (shown?.key === key && shown.file === tab.file) return;
+    const conversation = readConversation(key);
+    if (tab.file && conversation.file && conversation.file !== tab.file) {
+      // Its question in progress is about the part that was there: dropped.
+      if (pending?.key === key) {
+        pending.dropped = true;
+        busy?.abort();
+      }
+      writeConversation(key, { file: tab.file, messages: [] });
+      conversation.messages = [];
+    }
+    shown = { key, file: tab.file };
+    $("ai-chat").replaceChildren();
+    for (const m of conversation.messages) showMessage(m);
+    if (pending?.key === key) $("ai-chat").append(...pending.nodes);
+    $("ai-chat").scrollTop = $("ai-chat").scrollHeight;
+  }
+  showConversation();
+  // Another tab shown, or another part in the tab shown.
+  document.addEventListener("reader3d-part", showConversation);
 
   function setStatus(text) {
     $("ai-status").textContent = text;
   }
 
   /**
-   * The context of the question: the part shown, or none (general questions
-   * are allowed without a model); for the task "Chiffrage", the traced values
-   * of the quote (costing_trace, read only): smaller for the local model; for
-   * the gateway, its internal amounts masked unless the box is ticked, within
+   * The whole context of a question, before its compaction: the part
+   * (`semantic`), or none (general questions are allowed without a model);
+   * for the task "Chiffrage", the traced values of the quote (`costing`:
+   * {snapshot, problem}, read only): smaller for the local model; for the
+   * gateway, its internal amounts masked unless the box is ticked, within
    * two thirds of the gateway's budget (`budget`, characters) as for the
    * local model.
    */
-  async function contextForCurrentTask(local, budget = GATEWAY_CONTEXT_CHARS) {
-    const semantic = reader.semantic;
-    const aiTask = task === "costing" ? "manufacturing_analysis" : task;
+  async function contextOf(semantic, costing, askedTask, local, budget = GATEWAY_CONTEXT_CHARS) {
+    const aiTask = askedTask === "costing" ? "manufacturing_analysis" : askedTask;
     const context = semantic ? buildAIContext(semantic, { task: aiTask }) : {
       schema: "3d-ai-reasoning-context",
       schema_version: "1.0",
@@ -418,35 +531,30 @@ export function mount({ page, reader }) {
       bodies: [],
       warnings: [],
     };
-    if (task !== "costing") return context;
-    let snapshot = null;
-    let problem = null;
-    try {
-      snapshot = (await reader.costing?.()) ?? null;
-    } catch (err) {
-      problem = `trace du chiffrage indisponible : ${err?.message || err}`;
-    }
+    if (!costing) return context;
     const { traceForAI } = await import("./chiffrage/ai-trace.js");
-    const costingTrace = traceForAI(snapshot, local ? { maxChars: LOCAL_TRACE_CHARS } : { mask: !$("ai-amounts").checked, maxChars: Math.round((budget * 2) / 3) });
-    return { ...context, costing_trace: costingTrace, ...(problem ? { costing_note: problem } : {}) };
+    const costingTrace = traceForAI(costing.snapshot, local ? { maxChars: LOCAL_TRACE_CHARS } : { mask: !$("ai-amounts").checked, maxChars: Math.round((budget * 2) / 3) });
+    return { ...context, costing_trace: costingTrace, ...(costing.problem ? { costing_note: costing.problem } : {}) };
   }
+
+  /**
+   * The context sent: for general questions, a summary of the part (read in
+   * seconds by a local model on a CPU); for the analysis tasks, the detail,
+   * as much as `maxChars` allows (the costing trace is kept whole by the
+   * compaction, the geometry has the room it leaves).
+   */
+  const compacted = (context, askedTask, maxChars) =>
+    context.no_model_loaded ? context : askedTask === "general" ? summaryAIContext(context) : compactAIContext(context, { maxChars });
 
   let timing = ""; // time spent by Ollama on the last answer, shown with it
 
-  /** Ask the local Ollama, the answer shown as it is written. Resolves to the whole answer. */
-  async function askOllama(question, context, signal, onText, onThought) {
-    const base = ollamaBase($("ai-url").value.trim());
-    const model = $("ai-model").value.trim() || OLLAMA_MODEL;
-    const problem = await diagnoseOllama(base, model);
-    if (problem) throw new Error(problem);
-    // General questions: a summary of the part (read in seconds on a CPU); the analysis tasks: the detail.
-    // The costing trace is kept whole by the compaction (the geometry has the room it leaves).
-    const compact = context.no_model_loaded ? context : task === "general" ? summaryAIContext(context) : compactAIContext(context, { maxChars: LOCAL_CONTEXT_CHARS });
+  /** Ask Ollama (`ollama`: {base, model}), the answer shown as it is written. Resolves to the whole answer. */
+  async function askOllama(question, context, history, askedTask, ollama, signal, onText, onThought) {
+    const { base, model } = ollama;
     const space = addressSpace(base);
-    const system = `${systemPrompt(model, space === "loopback" ? "sur ce PC" : "sur un appareil du réseau local", task === "costing")}\n\nCONTEXTE :\n${JSON.stringify(compact)}`;
+    const system = `${systemPrompt(model, space === "loopback" ? "sur ce PC" : "sur un appareil du réseau local", askedTask === "costing")}\n\nCONTEXTE :\n${JSON.stringify(context)}`;
     const think = $("ai-think").checked;
     const reserve = think ? 4096 : 2048; // room for the answer, and for the reasoning written before it
-    let history = messages.slice(-HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
     const promptChars = () => system.length + JSON.stringify(history).length + question.length;
     // The oldest exchanges are left out rather than the prompt cut by Ollama.
     while (history.length && Math.ceil(promptChars() / 3) + reserve > MAX_WINDOW) history = history.slice(2);
@@ -485,7 +593,7 @@ export function mount({ page, reader }) {
     // Streamed answer: one JSON object per line.
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    let pending = "";
+    let buffer = "";
     let answer = "";
     let thought = "";
     let last = null;
@@ -499,11 +607,11 @@ export function mount({ page, reader }) {
       }
       const { value, done } = chunkRead;
       if (done) break;
-      pending += decoder.decode(value, { stream: true });
+      buffer += decoder.decode(value, { stream: true });
       let nl;
-      while ((nl = pending.indexOf("\n")) >= 0) {
-        const line = pending.slice(0, nl).trim();
-        pending = pending.slice(nl + 1);
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
         if (!line) continue;
         const chunk = JSON.parse(line);
         if (chunk.error) throw new Error(`Ollama : ${chunk.error}`);
@@ -531,7 +639,7 @@ export function mount({ page, reader }) {
     return answer;
   }
 
-  /** A request to the gateway: its JSON answer, or an Error with its message (in French). */
+  /** A request to the gateway: its JSON answer, or an Error with its message (in French) and the HTTP status. */
   async function gatewayFetch(init = {}) {
     const url = $("ai-url").value.trim();
     if (!url) throw new Error(`Renseignez l'adresse de la passerelle : collez son adresse Vercel (${GATEWAY_EXAMPLE}, voir api/README.md), ou choisissez « Ollama local ».`);
@@ -548,6 +656,7 @@ export function mount({ page, reader }) {
       if (data.access_code_required) showCode(true);
       const error = new Error((typeof data.error === "string" ? data.error : data.error?.message) || `La passerelle répond par une erreur HTTP ${response.status}.`);
       error.codeRequired = !!data.access_code_required;
+      error.status = response.status;
       throw error;
     }
     return data;
@@ -564,21 +673,18 @@ export function mount({ page, reader }) {
     return data;
   }
 
-  /** Ask the gateway, the context compacted to its budget. Resolves to its answer: {output, provider, model, quota}. */
-  async function askGateway(question, context, signal, budget) {
-    // General questions: a summary of the part; the analysis tasks: the detail, as much as the budget allows.
-    const compact = context.no_model_loaded ? context : task === "general" ? summaryAIContext(context) : compactAIContext(context, { maxChars: budget });
+  /** Ask the gateway the question with its context (compacted) and the conversation, within `budget`. Resolves to its answer: {output, provider, model, quota}. */
+  async function askGateway(question, context, history, askedTask, signal, budget) {
     // The latest exchanges, while they take no more than half the room of the context.
-    let history = messages.slice(-HISTORY).map(({ role, content }) => ({ role, content }));
     while (history.length && JSON.stringify(history).length > budget / 2) history = history.slice(2);
     const data = await gatewayFetch({
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         gateway_schema_version: "1.0",
-        task,
+        task: askedTask,
         model: $("ai-model").value.trim() || undefined,
-        context: compact,
+        context,
         messages: [...history, { role: "user", content: question }],
       }),
       signal,
@@ -590,15 +696,26 @@ export function mount({ page, reader }) {
 
   async function send(question) {
     const local = isLocal();
-    const costing = task === "costing";
+    const askedTask = task;
+    const costing = askedTask === "costing";
     store.set(localStorage, KEYS.provider, provider());
     store.set(localStorage, local ? KEYS.ollama : KEYS.gateway, $("ai-url").value.trim() || null);
     store.set(localStorage, `${KEYS.model}.${provider()}`, $("ai-model").value.trim() || null);
 
-    bubble("user", question);
+    // What the question is about, read now: the conversation, the part and the quote of the tab shown when it is asked.
+    showConversation();
+    const conv = shown;
+    const tabId = reader.tab?.id;
+    const semantic = reader.semantic ?? null;
+    const snapshot = costing ? (async () => reader.costing?.())() : null;
+    snapshot?.catch(() => {}); // read below
+    const history = readConversation(conv.key).messages.slice(-HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
+
+    const userBox = bubble("user", question);
     // Until the first words arrive: "Réflexion en cours…", in grey italics.
     const answerBox = bubble("assistant", "Réflexion en cours…", costing);
     answerBox.classList.add("ai-thinking");
+    const mine = (pending = { key: conv.key, nodes: [userBox.parentElement, answerBox.parentElement], dropped: false });
     // The model's reasoning while it is written: one grey line under the answer, its latest words;
     // folded once the answer starts.
     const thoughtLine = document.createElement("div");
@@ -627,40 +744,89 @@ export function mount({ page, reader }) {
       details.append(summary, text);
       thoughtLine.replaceWith(details);
     };
+    const onText = (text) => {
+      showThought(inlineThinking(text));
+      const visible = withoutThinking(text);
+      if (!visible) return; // still thinking
+      written = visible.length;
+      foldThought();
+      answerBox.classList.remove("ai-thinking");
+      answerBox.textContent = visible;
+      $("ai-chat").scrollTop = $("ai-chat").scrollHeight;
+    };
     busy = new AbortController();
+    const { signal } = busy;
     $("ai-cancel").hidden = false;
     $("ai-send").disabled = true;
     const start = performance.now();
     let written = 0;
+    let fallback = null; // the local model, answering in place of the gateway
     const tick = () => {
       const s = Math.round((performance.now() - start) / 1000);
-      setStatus(local
+      setStatus(local || fallback
         ? written ? `Rédaction… ${s} s` : thought ? `Réflexion… ${s} s` : `Lecture du contexte par le modèle… ${s} s (sur un PC sans carte graphique, cela peut prendre quelques minutes)`
         : `Analyse… ${s} s`);
     };
     tick();
     const timer = setInterval(tick, 1000);
     try {
-      // The gateway's budget; an older gateway, without its configuration: the default one.
-      const info = local ? null : await gatewayConfig(busy.signal).catch((err) => {
-        if (err?.name === "AbortError") throw err;
-        return null; // the question tells what is wrong
-      });
-      const budget = info?.context_chars > 0 ? info.context_chars : GATEWAY_CONTEXT_CHARS;
-      const context = await contextForCurrentTask(local, budget);
+      let read = null; // the costing of the tab, read only: {snapshot, problem}
+      if (snapshot) {
+        try {
+          read = { snapshot: (await snapshot) ?? null };
+        } catch (err) {
+          read = { snapshot: null, problem: `trace du chiffrage indisponible : ${err?.message || err}` };
+        }
+      }
+      const questions = (q, h) => [q, ...h.filter((m) => m.role === "user").map((m) => m.content)];
+      let sent; // the context the model was given
+      let asked; // and the questions
+      let names = null; // the labels put in place of the names (gateway)
       let answer = null; // of the gateway
-      const output = local
-        ? await askOllama(question, context, busy.signal, (text) => {
-          showThought(inlineThinking(text));
-          const visible = withoutThinking(text);
-          if (!visible) return; // still thinking
-          written = visible.length;
-          foldThought();
-          answerBox.classList.remove("ai-thinking");
-          answerBox.textContent = visible;
-          $("ai-chat").scrollTop = $("ai-chat").scrollHeight;
-        }, showThought)
-        : (answer = await askGateway(question, context, busy.signal, budget)).output;
+      let localModel = null; // of Ollama
+      let output;
+      const askLocal = async (ollama) => {
+        sent = compacted(await contextOf(semantic, read, askedTask, true), askedTask, LOCAL_CONTEXT_CHARS);
+        asked = questions(question, history);
+        localModel = ollama.model;
+        return askOllama(question, sent, history, askedTask, ollama, signal, onText, showThought);
+      };
+      if (local) {
+        const ollama = { base: ollamaBase($("ai-url").value.trim()), model: $("ai-model").value.trim() || OLLAMA_MODEL };
+        const problem = await diagnoseOllama(ollama.base, ollama.model);
+        if (problem) throw new Error(problem);
+        output = await askLocal(ollama);
+      } else {
+        // The gateway's budget; an older gateway, without its configuration: the default one.
+        const info = await gatewayConfig(signal).catch((err) => {
+          if (err?.name === "AbortError") throw err;
+          return null; // the question tells what is wrong
+        });
+        const budget = info?.context_chars > 0 ? info.context_chars : GATEWAY_CONTEXT_CHARS;
+        let whole = await contextOf(semantic, read, askedTask, false, budget);
+        let online = { question, history };
+        if ($("ai-anon").checked) {
+          // Before the compaction: the labels count in the budget.
+          names = anonymizer(whole, read?.snapshot?.noms ?? []);
+          whole = names.context(whole);
+          online = { question: names.text(question), history: history.map((m) => ({ ...m, content: names.text(m.content) })) };
+        }
+        sent = compacted(whole, askedTask, budget);
+        asked = questions(online.question, online.history);
+        try {
+          answer = await askGateway(online.question, sent, online.history, askedTask, signal, budget);
+          output = answer.output;
+        } catch (err) {
+          // The free quota reached: the local model, when it answers (its own address and model).
+          if (err?.name === "AbortError" || !QUOTA_STATUSES.includes(err?.status) || !$("ai-fallback").checked) throw err;
+          const ollama = { base: ollamaBase(store.get(localStorage, KEYS.ollama) || OLLAMA_URL), model: store.get(localStorage, `${KEYS.model}.ollama`) || OLLAMA_MODEL };
+          if (await diagnoseOllama(ollama.base, ollama.model)) throw err;
+          fallback = { ...ollama, notice: `Quota en ligne atteint : réponse du modèle local (${ollama.model})` };
+          line(answerBox, "ai-notice", fallback.notice, true);
+          names = null; // the real names: nothing leaves the site
+          output = await askLocal(ollama);
+        }
+      }
       foldThought();
       answerBox.classList.remove("ai-thinking");
       answerBox.textContent = formatAnswer(output) || "(réponse vide)";
@@ -668,34 +834,60 @@ export function mount({ page, reader }) {
       let check = null;
       if (costing) {
         const { checkNumbers } = await import("./chiffrage/ai-trace.js");
-        check = checkNumbers(costingText(output), context.costing_trace);
-        showCheck(answerBox, check);
+        check = checkNumbers(costingText(output), sent.costing_trace);
       }
-      // Only answered questions are kept: a failed one is not sent again with the next.
-      messages.push({ role: "user", content: question }, { role: "assistant", content: withoutThinking(output), ...(check ? { costing: check } : {}) });
-      saveMessages();
-      const source = answer ? gatewayLabel(answer) : "";
-      setStatus(`Réponse en ${Math.round((performance.now() - start) / 1000)} s${local && timing ? ` (${timing})` : ""}${source ? ` · ${source}` : ""}`);
+      // Every task with a part: the numbers that come from none of the data sent (informative).
+      const numbers = sent.no_model_loaded ? [] : checkContextNumbers(answerText(output), sent, asked).inconnus;
+      const legend = names ? names.legend(formatAnswer(output)) : [];
+      const message = {
+        role: "assistant", content: withoutThinking(output),
+        ...(check ? { costing: check } : {}), ...(numbers.length ? { numbers } : {}), ...(fallback ? { notice: fallback.notice } : {}), ...(legend.length ? { names: legend } : {}),
+      };
+      signal.throwIfAborted();
+      decorate(answerBox, message);
+      // Only answered questions are kept: a failed one is not sent again with the next. Not in a
+      // conversation started since about another part of the tab.
+      const kept = readConversation(conv.key);
+      if (!(kept.file && conv.file && kept.file !== conv.file)) {
+        writeConversation(conv.key, { file: kept.file ?? conv.file, messages: [...kept.messages, { role: "user", content: question }, message] });
+      }
+      const source = answer ? { provider: answer.provider, model: answer.model } : { provider: "Ollama", model: localModel };
+      // Costing: the answer kept with the quote of the tab, for the record (nothing in it is applied).
+      if (costing && sent.costing_trace) {
+        const { addAIAnalysis } = await import("./chiffrage/ui.js");
+        const text = [formatAnswer(output), legend.length ? namesLine(legend) : ""].filter(Boolean).join("\n\n");
+        addAIAnalysis({ date: new Date().toISOString(), provider: source.provider ?? null, model: source.model ?? null, question, answer: text, verified: check.verifiee }, { tab: tabId });
+      }
+      const label = answer ? gatewayLabel(answer) : fallback ? `repli local : Ollama · ${fallback.model}` : "";
+      setStatus(`Réponse en ${Math.round((performance.now() - start) / 1000)} s${(local || fallback) && timing ? ` (${timing})` : ""}${label ? ` · ${label}` : ""}`);
       timing = "";
     } catch (err) {
       answerBox.parentElement.remove();
+      // A question dropped (its tab closed, another part opened in it, a new conversation): nothing to say there.
+      const there = shown?.key === conv.key && !mine.dropped;
       if (err?.name === "AbortError") {
-        bubble("error", "Question annulée.");
+        if (there) bubble("error", "Question annulée.");
         setStatus("Annulé");
       } else {
-        bubble("error", err?.message || String(err));
+        if (there) bubble("error", err?.message || String(err));
         setStatus("Erreur");
       }
     } finally {
       clearInterval(timer);
       busy = null;
+      pending = null;
       $("ai-cancel").hidden = true;
       $("ai-send").disabled = false;
     }
   }
 
   $("ai-think").addEventListener("change", () => store.set(localStorage, KEYS.think, $("ai-think").checked ? "1" : null));
+  $("ai-anon").addEventListener("change", () => store.set(localStorage, KEYS.anonymize, $("ai-anon").checked ? null : "0"));
+  $("ai-fallback").addEventListener("change", () => store.set(localStorage, KEYS.fallback, $("ai-fallback").checked ? null : "0"));
   $("ai-code").addEventListener("input", () => store.set(localStorage, KEYS.code, $("ai-code").value.trim() || null));
+  // The address and the model of each provider, kept as soon as typed: those of Ollama are also the ones of the fallback.
+  $("ai-url").addEventListener("change", () => store.set(localStorage, isLocal() ? KEYS.ollama : KEYS.gateway, $("ai-url").value.trim() || null));
+  $("ai-model").addEventListener("change", () => store.set(localStorage, `${KEYS.model}.${provider()}`, $("ai-model").value.trim() || null));
   $("ai-amounts").addEventListener("change", () => store.set(sessionStorage, KEYS.amounts, $("ai-amounts").checked ? "1" : null));
 
   $("ai-provider").addEventListener("change", () => {
@@ -752,9 +944,12 @@ export function mount({ page, reader }) {
   $("ai-cancel").addEventListener("click", () => busy?.abort());
 
   $("ai-clear").addEventListener("click", () => {
-    busy?.abort();
-    messages = [];
-    saveMessages();
+    showConversation();
+    if (pending?.key === shown.key) {
+      pending.dropped = true;
+      busy?.abort();
+    }
+    writeConversation(shown.key, { file: null, messages: [] });
     $("ai-chat").replaceChildren();
     setStatus("Nouvelle conversation");
   });
@@ -778,8 +973,22 @@ export function mount({ page, reader }) {
 
   return {
     show() {
+      showConversation();
       $("ai-input")?.focus();
       if (!busy) setStatus(reader.semantic ? "Modèle analysé : posez votre question" : "Aucun modèle 3D chargé : questions générales possibles");
+    },
+    /** The tab `id` of the 3D page was closed (app.js): its conversation is forgotten, its question dropped. */
+    forgetTab(id) {
+      const key = conversationKey(id);
+      if (pending?.key === key) {
+        pending.dropped = true;
+        busy?.abort();
+      }
+      writeConversation(key, { file: null, messages: [] });
+      if (shown?.key === key) {
+        shown = null;
+        showConversation();
+      }
     },
   };
 }

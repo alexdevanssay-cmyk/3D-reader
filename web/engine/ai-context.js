@@ -355,5 +355,193 @@ export function summaryAIContext(context) {
   };
 }
 
+// --------------------------------------------------------------------------- numbers of an answer
+
+// A number written in a text: "1 234,5", "-12 %", "0.75". Not the digits of
+// an identifier (CG3, AS7G03, T6, P1020, M-1, J73, 3D), of an ordinal (2e),
+// of a date, a time or the number of an item of a list.
+const NUMBER = /(?<![\p{L}\p{N}_.,/:\-−])(?:[-−](?=\d))?\d+(?:[ \u00a0\u202f]\d{3})*(?:[.,]\d+)?(?![\d\p{Lu}_]|[.,:]\d|(?:er|re|e|ème|eme|nde?)(?!\p{L}))/gu;
+const DATES = /\b\d{4}-\d{2}-\d{2}(?:T[\d:.]+Z?)?\b|\b\d{1,2}[/.]\d{1,2}[/.]\d{2,4}\b/g;
+const LIST_ITEM = /^([ \t]*(?:[-*•][ \t]+)?)\d+[.)](?=\s)/gm;
+const blank = (m) => " ".repeat(m.length);
+
+/** The numbers of a text: [{texte, valeur, tolerance, index}] (tolerance: half a unit of the last digit written, see below). */
+export function numbersOf(text) {
+  const s = String(text ?? "").replace(DATES, blank).replace(LIST_ITEM, blank);
+  return [...s.matchAll(NUMBER)].map((m) => {
+    const raw = m[0];
+    const valeur = Number(raw.replace(/[ \u00a0\u202f]/g, "").replace(",", ".").replace("−", "-"));
+    return { texte: raw, valeur, tolerance: tolerance(raw, valeur), index: m.index };
+  });
+}
+
+/**
+ * How far from a value a number written may be and still be that value
+ * rounded: half a unit of its last decimal; for a whole number ending in
+ * zeros, rounded to two significant digits at least ("15 000" for 15 012,
+ * "300" for 302, never "10" for 14).
+ */
+function tolerance(raw, valeur) {
+  const decimals = /[.,](\d+)$/.exec(raw)?.[1].length ?? 0;
+  if (decimals) return 0.5 * 10 ** -decimals;
+  const digits = String(Math.trunc(Math.abs(valeur)));
+  const significant = Math.max(digits.replace(/0+$/, "").length, 2);
+  return digits.length > significant ? 0.5 * 10 ** (digits.length - significant) : 0.5;
+}
+
+/** The numbers of a text that are none of `known` (absolute values) to their rounding: {nombres (count), inconnus (as written)}. */
+export function unknownNumbers(text, known) {
+  const numbers = numbersOf(text);
+  const inconnus = numbers.filter((n) => !known.some((k) => Math.abs(Math.abs(n.valeur) - k) <= n.tolerance + 1e-9 * Math.max(1, k))).map((n) => n.texte);
+  return { nombres: numbers.length, inconnus: [...new Set(inconnus)] };
+}
+
+// Fields of a context that describe it, not the part or the quote: their numbers are not data.
+const ABOUT = /^(schema|.*version|note|masque|compaction|reasoning_contract)$/;
+
+/**
+ * The unit of the numbers under a key of a context, read from its name
+ * (volume_mm3, bbox_mm, mass_g, cone_semi_angle_rad, fill_ratio, ecart_pct);
+ * undefined: the unit of the field that holds it.
+ */
+function unitOfKey(key) {
+  if (/_mm3$|^volume$/.test(key)) return "mm3";
+  if (/_mm2$|^area$/.test(key)) return "mm2";
+  if (/_mm$/.test(key)) return "mm";
+  if (/_g$/.test(key)) return "g";
+  if (/_rad$/.test(key)) return "rad";
+  if (/ratio$|^confidence$/.test(key)) return "fraction";
+  if (/_pct$/.test(key)) return "%";
+  return undefined;
+}
+
+// The other ways a value may be written in an answer: its unit converted.
+const CONVERSIONS = {
+  mm: [0.1, 0.001], // cm, m
+  mm2: [0.01, 1e-6], // cm², m²
+  mm3: [0.001, 1e-6], // cm³, dm³ (litres)
+  g: [0.001], // kg
+  rad: [180 / Math.PI], // degrees
+  fraction: [100], // percent
+  "%": [0.01], // a fraction
+};
+
+/**
+ * Every number a context gives (its values, and the numbers of its texts) as
+ * absolute values, with the other forms an answer may write them in: another
+ * unit (cm, cm³, kg, degrees, a fraction in percent and back), a radius as a
+ * diameter and a diameter as a radius.
+ */
+function contextNumbers(context) {
+  const known = [];
+  (function walk(v, unit, key) {
+    if (typeof v === "number" && Number.isFinite(v)) {
+      const a = Math.abs(v);
+      const sizes = /radius|radii/.test(key) ? [a, 2 * a] : /diameter/.test(key) ? [a, a / 2] : [a];
+      for (const s of sizes) known.push(s, ...(CONVERSIONS[unit] ?? []).map((f) => s * f));
+    } else if (typeof v === "string") known.push(...numbersOf(v).map((n) => Math.abs(n.valeur)));
+    else if (Array.isArray(v)) v.forEach((x) => walk(x, unit, key));
+    else if (v && typeof v === "object") {
+      // A traced value of the costing: in percent when its unit is "%".
+      const own = v.unite === "%" ? "%" : unit;
+      for (const [k, x] of Object.entries(v)) if (!ABOUT.test(k)) walk(x, unitOfKey(k) ?? own, k);
+    }
+  })(context, undefined, "");
+  return known;
+}
+
+/**
+ * The numbers of an answer that come from none of the data sent: the context
+ * (`context`, the one the model was given) and the questions (`asked`,
+ * texts), to their rounding and their unit (see contextNumbers). Informative:
+ * a number may be a sum or a fact of general knowledge. {nombres (count),
+ * inconnus (as written)}.
+ */
+export function checkContextNumbers(text, context, asked = []) {
+  return unknownNumbers(text, [...contextNumbers(context), ...asked.flatMap((q) => numbersOf(q).map((n) => Math.abs(n.valeur)))]);
+}
+
+// --------------------------------------------------------------------------- anonymised context
+
+// Labels of the data files of the costing trace (costing_trace.fichiers).
+const FILE_LABELS = { classeur: "classeur de chiffrage", indices: "fichier des indices", tendances: "fichier de tendances", rfq: "demande client" };
+// A code (an enumeration, an identifier) of a context, never a name written by a person: left as it is.
+const CODE = /^[a-z0-9_.:/-]+$/;
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// A name replaced wherever it is written in a text: long enough not to be part of a word or a number.
+const distinctive = (name) => (name.length >= 3 && /\p{L}/u.test(name)) || name.length >= 5;
+const bodyLabel = (body, i) => `Corps ${Number(/^body-(\d+)$/.exec(body?.id ?? "")?.[1] ?? i) + 1}`;
+
+/**
+ * What an AI context sends online without the names that tell the part or
+ * the customer (case "Anonymiser les noms envoyés en ligne" of the IA page):
+ * the file name ("Pièce.step"), the names of the bodies ("Corps 1"..., by the
+ * number of their id), the files the costing trace read ("classeur de
+ * chiffrage"...) and the names of the quote, `names` ([{name, label}]:
+ * client, reference, designation... of ui.js costingSnapshot noms), all
+ * replaced by neutral labels: as whole values, and wherever they are written
+ * in a text (the reasons, hypotheses and alerts of the trace, the question).
+ * Built from the whole context (every body), applied to the context sent
+ * (compacted). Returns {context(c): the copy of `c` sent, text(s): a text
+ * (the question, the conversation), legend(answer): [[label, name]] of the
+ * labels an answer writes}.
+ */
+export function anonymizer(context, names = []) {
+  const byName = new Map(); // name -> label
+  const byLabel = new Map(); // label -> name, for the legend
+  const add = (name, label) => {
+    const n = typeof name === "string" ? name.trim() : "";
+    if (!n || n === label) return;
+    if (!byName.has(n)) byName.set(n, label);
+    if (!byLabel.has(label)) byLabel.set(label, n);
+  };
+  (context?.bodies ?? []).forEach((b, i) => add(b?.name, bodyLabel(b, i)));
+  const file = context?.source?.file;
+  const ext = /\.[^./\\]+$/.exec(file ?? "")?.[0] ?? "";
+  add(file, `Pièce${ext}`);
+  add(file?.slice(0, file.length - ext.length), "Pièce");
+  if (byName.has(file?.trim())) byLabel.set("Pièce", file.trim()); // the legend gives the whole file name
+  for (const [k, f] of Object.entries(context?.costing_trace?.fichiers ?? {})) add(f?.nom, FILE_LABELS[k] ?? "fichier");
+  for (const { name, label } of names) add(name, label);
+
+  const words = [...byName.keys()].filter(distinctive).sort((a, b) => b.length - a.length);
+  const re = words.length ? new RegExp(`(?<![\\p{L}\\p{N}_])(?:${words.map(escapeRe).join("|")})(?![\\p{L}\\p{N}_])`, "gu") : null;
+  const text = (s) => (re && typeof s === "string" ? s.replace(re, (m) => byName.get(m)) : s);
+  const whole = (s) => (typeof s === "string" ? byName.get(s.trim()) ?? text(s) : s);
+  const deep = (v) => {
+    if (typeof v === "string") return CODE.test(v) ? v : text(v);
+    if (Array.isArray(v)) return v.map(deep);
+    if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, deep(x)]));
+    return v;
+  };
+
+  return {
+    context(c) {
+      if (!c || typeof c !== "object") return c;
+      const out = deep(c);
+      if (out.source?.file) out.source.file = whole(c.source.file);
+      // Each body by its own label (two bodies of the same name, two labels).
+      if (Array.isArray(c.bodies)) out.bodies = c.bodies.map((b, i) => (b && typeof b === "object" && "name" in b ? { ...out.bodies[i], name: bodyLabel(b, i) } : out.bodies[i]));
+      const trace = out.costing_trace;
+      if (trace) {
+        trace.pieces = (trace.pieces ?? []).map((p) => ({ ...p, nom: whole(p.nom) }));
+        trace.alertes = (trace.alertes ?? []).map((a) => (a.piece ? { ...a, piece: whole(a.piece) } : a));
+        for (const [k, f] of Object.entries(trace.fichiers ?? {})) if (f?.nom) trace.fichiers[k] = { ...f, nom: whole(f.nom) };
+      }
+      return out;
+    },
+    text,
+    legend(answer) {
+      const s = String(answer ?? "");
+      const seen = new Set();
+      return [...byLabel].filter(([label, name]) => {
+        if (seen.has(name) || !new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRe(label)}(?![\\p{L}\\p{N}_])`, "u").test(s)) return false;
+        seen.add(name);
+        return true;
+      });
+    },
+  };
+}
+
 export const AI_CONTEXT_VERSION = "1.0";
 export const AI_CONTEXT_TASKS = [...TASKS];

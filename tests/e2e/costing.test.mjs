@@ -2,7 +2,8 @@
 // the costing workbook and of a prices file, the three best routes, choice of
 // an island in the drop-down lists, settings kept after a reload, trends file
 // below the values typed in, traced values, Excel export; the traced values
-// read by the AI page (task "Chiffrage"), read only.
+// read by the AI page (task "Chiffrage"), read only, and its answers kept
+// with the quote (sheet "Analyses IA" of the export).
 // With a made-up workbook (tests/js/costing-fixture.mjs).
 //
 //   npm run build && node --test tests/e2e/costing.test.mjs
@@ -309,7 +310,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await context.close();
   });
 
-  test('IA page, task « Chiffrage »: the traced values sent read only, the numbers of the answer checked, the amounts masked for the gateway', { timeout: 120_000 }, async (t) => {
+  test('IA page, task « Chiffrage »: the traced values sent read only, the numbers of the answer checked, the amounts masked for the gateway, the answers kept with the quote', { timeout: 120_000 }, async (t) => {
     // Stand-ins for Ollama (/api/tags, a streamed /api/chat) and for the AI gateway, CORS as they do it.
     const chats = [];
     const gatewayRequests = [];
@@ -357,7 +358,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       s.closeAllConnections();
       s.close(resolve);
     }))));
-    const context = await browser.newContext({ locale: 'fr-FR' });
+    const context = await browser.newContext({ locale: 'fr-FR', acceptDownloads: true });
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
@@ -375,7 +376,13 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
 
     // The AI page alone, in a new visit: the costing page is not opened, the quote is read from this browser's storage.
     await page.goto(`${base}?lang=fr&page=ia`);
-    const costingStorage = () => page.evaluate(() => JSON.stringify(Object.entries(localStorage).filter(([k]) => k.startsWith('reader3d.chiffrage')).sort()));
+    // What the costing keeps in this browser, but the answers of the AI kept with the quote (a record, see below).
+    const costingStorage = () => page.evaluate(() => JSON.stringify(Object.entries(localStorage).filter(([k]) => k.startsWith('reader3d.chiffrage')).sort().map(([k, v]) => {
+      if (k !== 'reader3d.chiffrage.quote.v1') return [k, v];
+      const { analysesIA, ...quote } = JSON.parse(v);
+      return [k, JSON.stringify(quote)];
+    })));
+    const analyses = () => page.evaluate(() => JSON.parse(localStorage.getItem('reader3d.chiffrage.quote.v1')).analysesIA);
     const stored = await costingStorage();
     await page.selectOption('#ai-provider', 'ollama');
     await page.fill('#ai-url', `http://127.0.0.1:${ollama.address().port}`);
@@ -412,8 +419,12 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     answer = () => 'Avec un taux de 85 €/h sur piece.va, le prix baisserait.';
     reply = await ask('Et avec un autre taux ?');
     assert.match(await reply.locator('.ai-check.bad').textContent(), /Réponse non vérifiée : un nombre absent de la trace du chiffrage \(85\)/);
-    // The AI wrote nothing: the costing data of this browser are unchanged.
+    // The AI wrote nothing: the costing data of this browser are unchanged. Its answers are kept with the quote, for the record.
     assert.equal(await costingStorage(), stored);
+    const kept = await analyses();
+    assert.deepEqual(kept.map((a) => [a.provider, a.model, a.question, a.verified]), [['Ollama', 'qwen3:8b', 'Pourquoi ce prix ?', true], ['Ollama', 'qwen3:8b', 'Et avec un autre taux ?', false]]);
+    assert.match(kept[1].answer, /Avec un taux de 85 €\/h/);
+    assert.ok(kept.every((a) => !Number.isNaN(Date.parse(a.date))));
 
     // The AI gateway: the internal amounts masked, unless the box is ticked.
     await page.selectOption('#ai-provider', 'openai');
@@ -448,6 +459,18 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.waitForSelector('#ai-chat .ai-label');
     assert.equal(await page.locator('#ai-chat .ai-label').count(), 4);
     assert.equal(await page.locator('#ai-chat .ai-check.bad').count(), 1);
+
+    // The Excel export of the quote: the answers of the AI in their own sheet, none of their values applied.
+    assert.deepEqual((await analyses()).map((a) => a.provider), ['Ollama', 'Ollama', 'Groq', 'Groq']);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage [data-action="export-xlsx"]:not([disabled])');
+    const [download] = await Promise.all([page.waitForEvent('download'), page.click('#page-chiffrage [data-action="export-xlsx"]')]);
+    const files = unzipSync(new Uint8Array(readFileSync(await download.path())));
+    assert.match(strFromU8(files['xl/workbook.xml']), /name="Analyses IA"/);
+    const sheet = strFromU8(files['xl/worksheets/sheet8.xml']);
+    for (const text of ["aucune valeur n'a été appliquée au devis ni aux paramètres", 'Fournisseur', 'Pourquoi ce prix ?', 'Et avec un autre taux ?', 'Et le détail ?', 'qwen3:8b', 'openai/gpt-oss-120b', 'non : nombres absents de la trace']) {
+      assert.ok(sheet.includes(text), text);
+    }
     assert.deepEqual(errors, []);
     await context.close();
   });

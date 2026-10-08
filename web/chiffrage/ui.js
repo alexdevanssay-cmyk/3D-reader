@@ -105,6 +105,20 @@ export function setTab(id) {
 /** The tab `id` was closed: its quote is forgotten. */
 export const forgetTab = (id) => store.forgetQuote(id);
 
+/**
+ * An answer of the AI page on the costing (task "Chiffrage") kept with the
+ * quote of the tab `tab` of the 3D page: {date, provider, model, question,
+ * answer, verified}. A record only: nothing in it is applied to the quote or
+ * the settings. The Excel export lists them (sheet "Analyses IA").
+ */
+export function addAIAnalysis(entry, { tab = store.currentQuoteTab() } = {}) {
+  // The quote shown in the Chiffrage page is the one in memory, saved at each change.
+  if (el && tab === store.currentQuoteTab()) {
+    q.analysesIA = [...(q.analysesIA ?? []), entry];
+    store.saveQuote(q);
+  } else store.appendToQuote(tab, "analysesIA", entry);
+}
+
 // --------------------------------------------------------------------------- formatting
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -785,7 +799,11 @@ function deepFreeze(o) {
  * of the tab `tab` of the 3D page are then read from this browser's storage.
  * null without a costing workbook.
  *   {devis: {ensemble, trace}, pieces: [{nom, chiffree, trace, routes}],
- *    alertes, resume: {valeurs, a_valider, alertes}, fichiers: {classeur, indices, tendances, rfq}}
+ *    alertes, resume: {valeurs, a_valider, alertes}, fichiers: {classeur, indices, tendances, rfq},
+ *    noms: [{name, label}]}
+ * noms: the names of the quote that tell the customer or the part (client,
+ * reference, designation, plan, request, cores, components), never sent:
+ * the AI page puts their labels in their place in what it sends online.
  */
 export function costingSnapshot({ tab } = {}) {
   if (!el) {
@@ -836,7 +854,20 @@ export function costingSnapshot({ tab } = {}) {
       tendances: t ? file(t.fileName, t.importedAt) : null,
       rfq: q.serie ? file(q.serie.fileName, q.serie.importedAt) : null,
     },
+    noms: namesOf(q),
   }));
+}
+
+/** The names of quote `q` that tell the customer or the part, each with its neutral label (costingSnapshot noms). */
+function namesOf(q) {
+  const s = q.serie ?? {};
+  const pieces = Object.values(q.pieces ?? {});
+  return [
+    ...[[q.client, "Client"], [s.client, "Client"], [q.reference, "Référence"], [q.designation, "Désignation"], [s.reference, "Référence"],
+      [q.plan, "Plan"], [s.plan, "Plan"], [s.demande, "Demande"], [s.offre, "Offre"], [s.gsab, "Numéro de dossier"]],
+    ...[...new Set(pieces.flatMap((p) => p.cores ?? []).map((c) => c?.nom))].map((n, i) => [n, `Noyau ${i + 1}`]),
+    ...[...new Set([...(q.composants ?? []), ...pieces.flatMap((p) => p.composants ?? [])].map((c) => c?.designation))].map((n, i) => [n, `Composant ${i + 1}`]),
+  ].filter(([name]) => typeof name === "string" && name.trim()).map(([name, label]) => ({ name: name.trim(), label }));
 }
 
 /** Thinnest wall text, with the lettering below the floor in brackets. */
@@ -1822,6 +1853,16 @@ async function exportXlsx() {
     }
   }
 
+  // The answers of the AI page on this quote, kept for the record: none of their values was applied.
+  const analyses = q.analysesIA ?? [];
+  const analysesIA = [
+    [H("Analyses IA"), null],
+    ["Statut", "raisonnements de l'IA gardés pour mémoire : aucune valeur n'a été appliquée au devis ni aux paramètres"],
+    [],
+    ["Date", "Fournisseur", "Modèle", "Question", "Réponse", "Nombres vérifiés"].map(H),
+    ...analyses.map((a) => [dateLabel(a.date), a.provider, a.model, a.question, String(a.answer ?? "").slice(0, 32000), a.verified ? "oui" : "non : nombres absents de la trace"]),
+  ];
+
   const bytes = buildXlsx([
     { name: "Synthèse", rows: synthese, widths: [32, 14, 14, 20, 16, 34, 22, 14, 10, 12, 8, 12, 22, 14, 16, 12, 14, 14, 14, 12] },
     { name: "Gammes", rows: gammes, header: true, widths: [28, 10, 34, 14, 12, 14, 10, 18, 14, 14] },
@@ -1830,6 +1871,7 @@ async function exportXlsx() {
     { name: "Commande série", rows: serie, widths: [26, 24, 22, 14, 22, 12, 12, 12, 12, 12, 12, 12] },
     { name: "Solutions", rows: solutions, header: true, widths: [28, 8, 40, 10, 12, 14, 12, 12, 18, 12, 14] },
     { name: "Traçabilité", rows: tracabilite, widths: [24, 26, 34, 14, 10, 18, 40, 22, 16, 40, 12, 8, 10, 40, 12, 12, 30, 50, 60, 10] },
+    ...(analyses.length ? [{ name: "Analyses IA", rows: analysesIA, widths: [16, 12, 22, 50, 100, 20] }] : []),
   ]);
   const name = (q.reference || c.p3d?.file?.replace(/\.[^.]+$/, "") || "piece").replace(/[^\w.-]+/g, "_");
   download(`chiffrage_${name}.xlsx`, new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));

@@ -543,6 +543,7 @@ export function defaultQuote(base, indices) {
     prototype: false, // prototypes: prototype volumes of the request, no target price
     outillageInclus: true, // tooling amortised in the piece price; false: sold apart
     margeOutillage: 0, // margin on the tooling sold apart
+    analysesIA: [], // answers of the AI page on this quote, a record: {date, provider, model, question, answer, verified}; none applied
   };
 }
 
@@ -554,6 +555,22 @@ let quoteTab = 1;
 /** The quote read and saved from now on: the one of the tab `id` of the 3D page. */
 export function setQuoteTab(id) {
   quoteTab = id;
+}
+
+/** The tab of the 3D page whose quote is read and saved. */
+export const currentQuoteTab = () => quoteTab;
+
+/** `entry` added to the list `field` of the quote of the tab `id` as it is saved (not the one in a page). */
+export function appendToQuote(id, field, entry) {
+  const shown = quoteTab;
+  quoteTab = id;
+  try {
+    const saved = readQuote() ?? {};
+    saved[field] = [...(Array.isArray(saved[field]) ? saved[field] : []), entry];
+    return saveQuote(saved);
+  } finally {
+    quoteTab = shown;
+  }
 }
 
 function readQuote() {

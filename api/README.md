@@ -34,6 +34,7 @@ Créez `AI_API_KEY`, `AI_BASE_URL` et `AI_MODEL` à la place de `GROQ_API_KEY` :
 
 - Groq n'entraîne pas ses modèles sur les données reçues. Activez en plus **Zero Data Retention** dans les réglages de l'organisation de la console Groq : les requêtes ne sont alors pas conservées.
 - Partent vers le fournisseur : la conversation et un contexte réduit de la pièce (mesures, features, analyse de fabrication et de fonderie). Le fichier 3D lui-même n'est jamais envoyé.
+- Noms anonymisés : la case « Anonymiser les noms envoyés en ligne » (cochée par défaut) remplace, avant l'envoi, le nom du fichier, les noms des corps, la référence, la désignation, le client, le plan, les noms des noyaux et des composants, et les noms des fichiers du chiffrage par « Pièce », « Corps 1 », « Client »… Dans la question et la conversation aussi. Sous la réponse, la page rappelle les vrais noms des étiquettes citées. Le modèle local (Ollama) reçoit toujours les vrais noms : rien ne quitte le site.
 - Tâche « Chiffrage » : les valeurs tracées du devis partent aussi. Les montants internes (taux, coûts, prix, marges, pertes au feu, TRS) sont masqués, sauf si la case « Envoyer les montants internes du chiffrage à la passerelle » est cochée (pour l'onglet du navigateur seulement).
 - Le contexte est transmis au modèle comme des **données**, entre délimiteurs. Les textes venant du fichier CAO ou du devis ne sont jamais suivis comme des instructions.
 - L'IA explique, elle ne fixe aucune valeur : rien de ce qu'elle répond n'est appliqué au devis ni aux paramètres. Chaque nombre d'une réponse « Chiffrage » est comparé à la trace envoyée, sinon la réponse est marquée « non vérifiée ».
@@ -45,6 +46,7 @@ Par modèle et par organisation : 30 requêtes par minute, 1 000 par jour, 8 000
 - Une question d'analyse consomme jusqu'à 4 000 à 5 000 tokens : les règles, le contexte (9 000 caractères au plus), la conversation récente et la réponse (1 200 tokens au plus). Comptez **une à deux questions d'analyse par minute**, davantage pour des questions générales (contexte résumé).
 - Après chaque réponse, la page affiche le fournisseur, le modèle et le nombre de questions restantes aujourd'hui.
 - Quota atteint : la page affiche « Quota de Groq (offre gratuite) atteint. Réessayez dans … ». Une question trop longue pour une minute est refusée : commencez une nouvelle conversation ou choisissez une analyse plus ciblée.
+- Repli automatique : avec la case « Repli automatique sur le modèle local » (cochée par défaut), une question refusée pour quota (HTTP 413 ou 429) est posée au modèle local Ollama, s'il répond, avec l'adresse et le modèle choisis pour lui. La réponse porte la mention « Quota en ligne atteint : réponse du modèle local (…) ».
 - La passerelle limite aussi chaque adresse IP à 20 requêtes par minute. Ce compteur est tenu par chaque instance de la fonction, et Vercel peut en lancer plusieurs : c'est un frein, pas une limite exacte.
 - Une requête fait au plus 200 Ko. Le fournisseur a 50 secondes pour répondre : la fonction est limitée à 60 secondes (`vercel.json`, offre Hobby).
 

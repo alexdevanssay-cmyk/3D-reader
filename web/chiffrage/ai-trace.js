@@ -8,6 +8,10 @@
 // settings. Pure functions, no DOM.
 
 import { ALERTES, SOURCES, label, pieceKeys } from "./provenance.js";
+import { numbersOf, unknownNumbers } from "../engine/ai-context.js";
+
+// How numbers are read in a text, shared with the check of the other tasks of the AI page.
+export { numbersOf };
 
 export const MASQUE = "masqué";
 
@@ -30,38 +34,6 @@ const PIECE_KEYS = {
  */
 export const isInternal = (cle, unite = "") =>
   unite.includes("€") || /^(devis\.marge|parametres\.tauxMini|devis\.metal\.paf(Achat|Vente)|centre\.[^.]+\.(trs|taux))$/.test(cle);
-
-// A number written in a text: "1 234,5", "-12 %", "0.75". Not the digits of
-// an identifier (CG3, AS7G03, T6, P1020, M-1, J73, 3D), of an ordinal (2e),
-// of a date, a time or the number of an item of a list.
-const NUMBER = /(?<![\p{L}\p{N}_.,/:\-−])(?:[-−](?=\d))?\d+(?:[ \u00a0\u202f]\d{3})*(?:[.,]\d+)?(?![\d\p{Lu}_]|[.,:]\d|(?:er|re|e|ème|eme|nde?)(?!\p{L}))/gu;
-const DATES = /\b\d{4}-\d{2}-\d{2}(?:T[\d:.]+Z?)?\b|\b\d{1,2}[/.]\d{1,2}[/.]\d{2,4}\b/g;
-const LIST_ITEM = /^([ \t]*(?:[-*•][ \t]+)?)\d+[.)](?=\s)/gm;
-const blank = (m) => " ".repeat(m.length);
-
-/** The numbers of a text: [{texte, valeur, tolerance, index}] (tolerance: half a unit of the last digit written, see below). */
-export function numbersOf(text) {
-  const s = String(text ?? "").replace(DATES, blank).replace(LIST_ITEM, blank);
-  return [...s.matchAll(NUMBER)].map((m) => {
-    const raw = m[0];
-    const valeur = Number(raw.replace(/[ \u00a0\u202f]/g, "").replace(",", ".").replace("−", "-"));
-    return { texte: raw, valeur, tolerance: tolerance(raw, valeur), index: m.index };
-  });
-}
-
-/**
- * How far from a value a number written may be and still be that value
- * rounded: half a unit of its last decimal; for a whole number ending in
- * zeros, rounded to two significant digits at least ("15 000" for 15 012,
- * "300" for 302, never "10" for 14).
- */
-function tolerance(raw, valeur) {
-  const decimals = /[.,](\d+)$/.exec(raw)?.[1].length ?? 0;
-  if (decimals) return 0.5 * 10 ** -decimals;
-  const digits = String(Math.trunc(Math.abs(valeur)));
-  const significant = Math.max(digits.replace(/0+$/, "").length, 2);
-  return digits.length > significant ? 0.5 * 10 ** (digits.length - significant) : 0.5;
-}
 
 /** The numbers of a text replaced by "…" (the dates kept). */
 export function maskNumbers(text) {
@@ -212,8 +184,6 @@ function knownNumbers(trace) {
  * written)}. One is enough for the answer to be "non vérifiée".
  */
 export function checkNumbers(text, trace) {
-  const known = knownNumbers(trace);
-  const numbers = numbersOf(text);
-  const inconnus = numbers.filter((n) => !known.some((k) => Math.abs(Math.abs(n.valeur) - k) <= n.tolerance + 1e-9 * Math.max(1, k))).map((n) => n.texte);
-  return { verifiee: !inconnus.length, nombres: numbers.length, inconnus: [...new Set(inconnus)] };
+  const { nombres, inconnus } = unknownNumbers(text, knownNumbers(trace));
+  return { verifiee: !inconnus.length, nombres, inconnus };
 }

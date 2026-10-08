@@ -1803,6 +1803,7 @@ function closeTab(tab) {
   tab.view = tab.result = tab.file = null;
   tabs.splice(i, 1);
   forgetQuote(tab.id);
+  forgetConversation(tab.id);
   if (!tabs.length) nextTabId = 1;
   if (tab === activeTab) {
     activeTab = null;
@@ -1819,6 +1820,20 @@ function forgetQuote(id) {
       // no storage
     }
   }
+}
+
+// The conversation of the IA page of a tab (ai-workspace.js: one per tab, in
+// sessionStorage, the first tab's under the key of earlier versions).
+const conversationKey = (id) => (id === 1 ? "reader3d.ai.messages" : `reader3d.ai.messages.${id}`);
+
+/** Forget the conversation of the IA page of the tab `id` (closed). */
+function forgetConversation(id) {
+  try {
+    sessionStorage.removeItem(conversationKey(id));
+  } catch {
+    // no storage
+  }
+  aiWorkspace?.then((ui) => ui.forgetTab?.(id)).catch(() => {});
 }
 
 /** "3D Reader": start again with one empty tab (the settings, the costing workbook and the metal prices are kept). */
@@ -2189,8 +2204,13 @@ window.reader3d = {
    * costing workbook. Also when the costing page was never opened.
    */
   async costing() {
+    const tab = activeTab?.id; // the tab shown when asked
     const ui = await import("./chiffrage/ui.js");
-    return ui.costingSnapshot({ tab: activeTab?.id });
+    return ui.costingSnapshot({ tab });
+  },
+  /** The tab shown: its id and the name of the file of its part (null: none). The IA page keeps a conversation per tab. */
+  get tab() {
+    return activeTab ? { id: activeTab.id, file: activeTab.file?.name ?? null } : null;
   },
   /** Material of the part (alloy name and density g/cm³), e.g. from a customer request. */
   setMaterial(label, density) {
@@ -2261,6 +2281,13 @@ for (const [param, id] of [["unit", "unit"], ["quality", "quality"]]) {
   if (value && [...$(id).options].some((o) => o.value === value)) $(id).value = value;
 }
 defaultMaterial = { value: $("material").value, alloy: null, density: $("density").value };
+// The tabs start again: the conversations of the IA page of the tabs of the
+// page before a reload are forgotten, but the first tab's (as its quote).
+try {
+  for (const key of Object.keys(sessionStorage)) if (key.startsWith(`${conversationKey(1)}.`)) sessionStorage.removeItem(key);
+} catch {
+  // no storage
+}
 showTab(createTab());
 applyLanguage();
 setStatus("idle");

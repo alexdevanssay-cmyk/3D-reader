@@ -260,6 +260,8 @@ table.bodies .open { color: var(--warn); }
 .tabs { display: flex; gap: 2px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
 .tab { border: none; background: transparent; padding: 4px 12px; border-radius: 6px; }
 .tab.active { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+/* A phone: the four pages within its width. */
+@media (max-width: 420px) { .tab { padding: 4px 7px; } }
 .page { height: calc(100% - 53px); overflow-y: auto; padding: 16px; }
 @media (max-width: 900px) { .page { height: auto; } }
 
@@ -326,11 +328,14 @@ table.bodies .open { color: var(--warn); }
 .close-row .close-body { font-size: 12px; color: var(--accent); }
 
 /* "IA / analyse" page (ai-workspace.js). */
-.ai-page { max-width: 1100px; margin: 0 auto; padding: 24px 16px; display: grid; gap: 16px; }
+.ai-page { max-width: 1100px; margin: 0 auto; padding: 24px 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .ai-page h2 { margin: 0; font-size: 18px; }
+.ai-page .card-head { flex-wrap: wrap; gap: 4px 12px; }
 .ai-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-top: 12px; }
-.ai-row .field { flex-direction: column; align-items: stretch; gap: 4px; }
-.ai-row #ai-url { min-width: 320px; }
+/* Fields as wide as the room they have, never wider than the page (a phone: one per row). */
+.ai-row .field { flex-direction: column; align-items: stretch; gap: 4px; min-width: 0; max-width: 100%; }
+.ai-row .field > input, .ai-row .field > select { min-width: 0; max-width: 100%; }
+.ai-row .ai-url-field { flex: 1 1 320px; }
 .ai-tasks { gap: 8px; }
 .ai-task[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 .ai-chat { display: grid; gap: 10px; max-height: 55vh; overflow: auto; }
@@ -346,10 +351,15 @@ table.bodies .open { color: var(--warn); }
 .ai-check { margin-bottom: 6px; font-size: 12px; }
 .ai-check.ok { color: var(--ok); }
 .ai-check.bad { color: var(--warn); font-weight: 600; }
+/* The local model answering in place of the gateway; the numbers of an answer that come from none of
+   the data sent; the real names of the labels the gateway was sent. */
+.ai-notice { margin-bottom: 6px; font-size: 12px; font-weight: 600; color: var(--warn); }
+.ai-numbers, .ai-names { margin-top: 6px; font-size: 12px; color: var(--muted); }
 /* The reasoning of the model while it is written: one line, its latest words; then folded. */
 .ai-thought { display: flex; justify-content: flex-end; overflow: hidden; white-space: nowrap; margin-top: 6px; font-size: 12px; font-style: italic; color: var(--muted); }
 .ai-thought-details { margin-top: 6px; font-size: 12px; color: var(--muted); }
 .ai-thought-details summary { cursor: pointer; }
 .ai-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-top: 12px; }
-.ai-form textarea { flex: 1; min-width: 260px; font: inherit; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); resize: vertical; }
+.ai-form textarea { flex: 1 1 260px; min-width: 0; font: inherit; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); resize: vertical; }
 .ai-actions { display: flex; flex-direction: column; gap: 6px; }
+@media (max-width: 600px) { .ai-page { padding: 8px 0; } }

@@ -15,10 +15,11 @@ import { DEFAULT_TOOLING, coefOf, estimateTooling, steelToolCost } from '../../w
 import { DEFAULT_CORES, boxSize, coreBoxCost, coresPerPiece } from '../../web/chiffrage/cores.js';
 import {
   DEFAULT_DENSITIES, GENERIC_DENSITY, adoptTendance, clearSaisies, clearSetting, clearTendances, defaultQuote, defaultSettings, exportSaisies, importTendances,
-  loadSettings, loadSettingsLayers, mergeSettings, migrateSettings, saveBase, saveIndices, saveQuote, setQuoteTab, setSetting, validateTendances,
+  loadQuote, loadSettings, loadSettingsLayers, mergeSettings, migrateSettings, saveBase, saveIndices, saveQuote, setQuoteTab, setSetting, validateTendances,
 } from '../../web/chiffrage/store.js';
 import { DEMANDE, QUOTE_KEYS, SOURCES, demandeComparee, derive, missing, pieceKeys, resolve, summarize, traced, weakest } from '../../web/chiffrage/provenance.js';
 import { MASQUE, checkNumbers, isInternal, maskNumbers, numbersOf, traceForAI } from '../../web/chiffrage/ai-trace.js';
+import { anonymizer } from '../../web/engine/ai-context.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -1241,7 +1242,8 @@ describe('the costing read by the AI page (read only)', () => {
 
   test('costingSnapshot: the traces of the quote and of its pieces, the best routes, the alerts and the data files', () => {
     const [s, c] = snapshotOf();
-    assert.deepEqual(Object.keys(s), ['devis', 'pieces', 'alertes', 'resume', 'fichiers']);
+    assert.deepEqual(Object.keys(s), ['devis', 'pieces', 'alertes', 'resume', 'fichiers', 'noms']);
+    assert.deepEqual(s.noms, [], 'no customer, reference nor designation typed in');
     assert.equal(s.devis.ensemble, false);
     for (const key of QUOTE_KEYS) assert.deepEqual(s.devis.trace[key], c.trace[key], key);
     assert.equal(s.pieces.length, 1);
@@ -1323,6 +1325,53 @@ describe('the costing read by the AI page (read only)', () => {
     storage.clear();
     assert.equal(ui.costingSnapshot(), null);
     assert.equal(traceForAI(null), null);
+  });
+
+  test('costingSnapshot noms: the names of the quote that tell the customer or the part, replaced by their labels in what is sent online', () => {
+    const piece = { ...PART, noyaux: true, cores: [{ nom: 'Noyau central', masse: 0.2, qte: 1 }], composants: [{ designation: 'Insert fileté', qte: 2, prix: 0.1, marge: 0.1 }] };
+    const [s] = snapshotOf({ quote: { serie: ORDER, ...orderValues(ORDER), pieces: { manuel: piece } } });
+    const labels = Object.fromEntries(s.noms.map((n) => [n.name, n.label]));
+    assert.deepEqual(labels, {
+      'ACME RAIL': 'Client', 'AB-123': 'Référence', 'SUPPORT PLATE': 'Désignation', 'AB-123 - SUPPORT PLATE': 'Référence', 'AB-123 ind A': 'Plan',
+      'Castings 2027': 'Demande', 'GTEST-CG-2026-00': 'Offre', 'Noyau central': 'Noyau 1', 'Insert fileté': 'Composant 1',
+    });
+    // The piece typed in is named after the designation; the core box after its core: both in the trace.
+    const trace = traceForAI(s);
+    assert.equal(trace.pieces[0].nom, 'SUPPORT PLATE');
+    assert.match(JSON.stringify(trace), /Noyau central/);
+    // Online: none of these names, nor the files read (the request's name may tell the customer).
+    const context = { source: { file: 'AB-123.step' }, bodies: [], costing_trace: trace };
+    const sent = anonymizer(context, s.noms).context(context);
+    const text = JSON.stringify(sent);
+    for (const name of [...s.noms.map((n) => n.name), 'RFQ.xlsm', 'test.xlsm']) assert.ok(!text.includes(name), name);
+    assert.equal(sent.costing_trace.pieces[0].nom, 'Désignation');
+    assert.deepEqual([sent.costing_trace.fichiers.classeur.nom, sent.costing_trace.fichiers.rfq.nom], ['classeur de chiffrage', 'demande client']);
+    assert.match(text, /boîte à noyau « Noyau 1 »/);
+    // The values themselves are those of the trace.
+    assert.deepEqual(sent.costing_trace.pieces[0].valeurs['piece.prix.vente'], trace.pieces[0].valeurs['piece.prix.vente']);
+  });
+
+  test('an answer of the AI page kept with the quote of its tab, for the record: nothing else of the quote changes', () => {
+    const c = computed();
+    const saved = () => JSON.parse(storage.get('reader3d.chiffrage.quote.v1'));
+    const before = saved();
+    const entry = { date: '2026-10-08T10:00:00.000Z', provider: 'Groq', model: 'openai/gpt-oss-120b', question: 'Pourquoi ce prix ?', answer: 'Le prix vient du cycle.', verified: true };
+    ui.addAIAnalysis(entry, { tab: 1 });
+    assert.deepEqual(saved().analysesIA, [entry]);
+    assert.deepEqual({ ...saved(), analysesIA: before.analysesIA }, before);
+    ui.reload();
+    assert.deepEqual(ui.compute().results[0].final.years[0].prixVente, c.results[0].final.years[0].prixVente);
+    // The quote of another tab: its own list; the first tab's unchanged.
+    try {
+      ui.addAIAnalysis({ ...entry, question: 'Et le moule ?', verified: false }, { tab: 2 });
+      setQuoteTab(2);
+      assert.deepEqual(loadQuote(base, indices).analysesIA.map((a) => [a.question, a.verified]), [['Et le moule ?', false]]);
+    } finally {
+      setQuoteTab(1);
+    }
+    assert.deepEqual(loadQuote(base, indices).analysesIA.map((a) => a.question), ['Pourquoi ce prix ?']);
+    // A new quote has none.
+    assert.deepEqual(defaultQuote(base, indices).analysesIA, []);
   });
 
   test('the trace sent to a model: every value with its source and authority, percentages in percent, nothing more than the snapshot', () => {

@@ -1,7 +1,8 @@
 // End-to-end tests of the user-facing features of the built site (dist/):
 // French interface, analysis progress, memory gauge, Excel export, wall
-// thickness, the IA page (a local Ollama, the AI gateway), and the
-// link-driven mode for AI assistants (?url=…&report=1, window.reader3d).
+// thickness, the IA page (a local Ollama, the AI gateway, a conversation per
+// tab, anonymised names, the fallback on the local model, a phone's width),
+// and the link-driven mode for AI assistants (?url=…&report=1, window.reader3d).
 //
 //   npm run build && node --test tests/e2e/features.test.mjs
 
@@ -565,8 +566,163 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await status(), 'Erreur');
     assert.equal(await page.textContent('#ai-chat .ai-msg:last-child .ai-text'), 'Quota de Groq (offre gratuite) atteint. Réessayez dans 12 s.');
     assert.equal(await page.locator('#ai-chat .ai-msg').count(), kept + 2, 'the question and the error');
-    const stored = await page.evaluate(() => JSON.parse(sessionStorage.getItem('reader3d.ai.messages')).length);
-    assert.equal(stored, 6);
+    // The conversation of the first tab of the 3D page, about its part.
+    const stored = await page.evaluate(() => JSON.parse(sessionStorage.getItem('reader3d.ai.messages')));
+    assert.deepEqual([stored.file, stored.messages.length], ['box.stl', 6]);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
+  test('IA page: one conversation per tab, names anonymised online, the local model when the quota is reached, numbers checked, phone width', { timeout: CAD_TIMEOUT }, async (t) => {
+    // The gateway (api/ai.js) and a stand-in for Groq, as above; a stand-in for Ollama.
+    const { default: gatewayHandler } = await import('../../api/ai.js');
+    const completions = [];
+    const contextOf = (body) => JSON.parse(body.messages[1].content.replace(/^[\s\S]*?<<<DONNEES_3D_READER\n/, '').replace(/\nDONNEES_3D_READER>>>$/, ''));
+    // The answer cites the volume of the part sent (in cm³) and a made-up thickness.
+    const volumeOf = (context) => (context.model.metrics.volume_mm3 / 1000).toLocaleString('fr-FR', { maximumFractionDigits: 3 });
+    let reply = (body) => ({ status: 200, body: { model: 'openai/gpt-oss-120b', choices: [{ message: { role: 'assistant', content: `Corps 1 : ${volumeOf(contextOf(body))} cm³, paroi de 99,9 mm ; Corps 2 à part.` }, finish_reason: 'stop' }] } });
+    const groq = createServer((req, res) => {
+      let text = '';
+      req.on('data', (c) => (text += c));
+      req.on('end', () => {
+        const body = JSON.parse(text);
+        completions.push(body);
+        const { status, body: answer, headers = {} } = reply(body);
+        res.writeHead(status, { 'Content-Type': 'application/json', 'x-ratelimit-remaining-requests': String(1000 - completions.length), ...headers });
+        res.end(JSON.stringify(answer));
+      });
+    });
+    const gateway = createServer((req, res) => gatewayHandler(req, res));
+    const chats = [];
+    const ollama = createServer((req, res) => {
+      if (req.headers.origin) res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET,POST', 'Access-Control-Allow-Headers': 'Content-Type' });
+        return res.end();
+      }
+      if (req.url === '/api/tags') {
+        res.setHeader('Content-Type', 'application/json');
+        return res.end(JSON.stringify({ models: [{ name: 'qwen3:8b' }] }));
+      }
+      let text = '';
+      req.on('data', (c) => (text += c));
+      req.on('end', () => {
+        chats.push(JSON.parse(text));
+        res.setHeader('Content-Type', 'application/x-ndjson');
+        res.write(`${JSON.stringify({ message: { role: 'assistant', content: 'Réponse locale : une boîte.' }, done: false })}\n`);
+        res.end(`${JSON.stringify({ done: true })}\n`);
+      });
+    });
+    await Promise.all([groq, gateway, ollama].map((x) => new Promise((resolve) => x.listen(0, '127.0.0.1', resolve))));
+    const saved = { ...process.env };
+    for (const k of Object.keys(process.env)) if (/^(groq_api_key|ai_|openai_|reader3d_)/i.test(k)) delete process.env[k];
+    Object.assign(process.env, { GROQ_API_KEY: 'gsk_made_up', AI_BASE_URL: `http://127.0.0.1:${groq.address().port}/openai/v1`, READER3D_ALLOWED_ORIGINS: base.replace(/\/$/, '') });
+    t.after(() => {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+      return Promise.all([groq, gateway, ollama].map((x) => new Promise((resolve) => {
+        x.closeAllConnections();
+        x.close(resolve);
+      })));
+    });
+    t.mock.method(console, 'error', () => {}); // the gateway logs the refusals of the provider
+
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    // A phone: every field and button of the IA page within 375 px, no horizontal scroll, for both providers.
+    await page.setViewportSize({ width: 375, height: 800 });
+    await page.click('.tab[data-page="ia"]');
+    for (const provider of ['openai', 'ollama']) {
+      await page.selectOption('#ai-provider', provider);
+      const overflow = await page.evaluate(() => ({
+        page: document.documentElement.scrollWidth,
+        controls: [...document.querySelectorAll('#page-ia input, #page-ia select, #page-ia button, #page-ia textarea, #page-ia label')]
+          .filter((el) => el.offsetParent).map((el) => [el.id || el.textContent.trim().slice(0, 30), Math.round(el.getBoundingClientRect().right)]).filter(([, right]) => right > 375),
+      }));
+      assert.deepEqual(overflow, { page: 375, controls: [] }, provider);
+    }
+    await page.setViewportSize({ width: 1280, height: 800 });
+    // The local model of this browser: the one of the fallback.
+    await page.fill('#ai-url', `http://127.0.0.1:${ollama.address().port}`);
+    await page.dispatchEvent('#ai-url', 'change');
+    await page.selectOption('#ai-provider', 'openai');
+    await page.fill('#ai-url', `http://127.0.0.1:${gateway.address().port}/api/ai`);
+    assert.equal(await page.isChecked('#ai-anon'), true);
+    assert.equal(await page.isChecked('#ai-fallback'), true);
+    const ask = async (question) => {
+      await page.fill('#ai-input', question);
+      await page.press('#ai-input', 'Enter');
+      await page.waitForFunction(() => !document.getElementById('ai-send').disabled && !/Analyse|Lecture|Rédaction/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+      return page.locator('#ai-chat .ai-msg').last();
+    };
+
+    // Tab 1: a part of two named bodies. Online, the labels in place of its names, in the context and the question.
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.click('.tab[data-page="ia"]');
+    await page.click('.ai-task[data-task="feature_analysis"]');
+    let answer = await ask("Quel est le volume de l'Équerre ?");
+    let sent = contextOf(completions[0]);
+    assert.equal(sent.source.file, 'Pièce.step');
+    assert.deepEqual(sent.bodies.map((b) => b.name), ['Corps 1', 'Corps 2']);
+    for (const name of ['Équerre', 'named_assembly']) assert.ok(!JSON.stringify(completions[0].messages).includes(name), name);
+    assert.equal(completions[0].messages.at(-1).content, "Quel est le volume de l'Corps 1 ?");
+    // Under the answer: the real names of its labels; its made-up number counted, the volume of the part is not.
+    assert.equal(await answer.locator('.ai-names').textContent(), 'Noms réels : Corps 1 = Équerre ; Corps 2 = Pin');
+    assert.equal(await answer.locator('.ai-numbers').textContent(), '1 nombre ne vient pas des données envoyées');
+    assert.equal(await answer.locator('.ai-numbers').getAttribute('title'), '99,9');
+    // Unticked: the real names.
+    await page.uncheck('#ai-anon');
+    await ask('Et la Pin ?');
+    assert.match(JSON.stringify(contextOf(completions[1])), /Équerre/);
+    assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.ai.anonymize')), '0');
+    await page.check('#ai-anon');
+
+    // Tab 2: its own conversation, empty; its question sent without the conversation of tab 1.
+    await page.click('.doc-tab-new');
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 0);
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done' && window.reader3d.tab.file === 'box.stl', null, { timeout: CAD_TIMEOUT });
+    await ask('Résume la pièce.');
+    assert.deepEqual(completions[2].messages.map((m) => m.role), ['system', 'user', 'user']);
+    assert.equal(contextOf(completions[2]).source.file, 'Pièce.stl');
+    // Back to tab 1: its conversation; to tab 2: its own.
+    await page.click('.doc-tab:first-child');
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 4);
+    assert.match(await page.textContent('#ai-chat'), /Noms réels : Corps 1 = Équerre ; Corps 2 = Pin/);
+    await page.click('.doc-tab:nth-child(2)');
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 2);
+    assert.match(await page.textContent('#ai-chat'), /Résume la pièce\./);
+
+    // The free quota reached: the local model answers, with the real names, and says so.
+    reply = () => ({ status: 429, headers: { 'retry-after': '30' }, body: { error: { message: 'Rate limit reached', type: 'requests' } } });
+    answer = await ask('Et ses arêtes ?');
+    assert.equal(await answer.locator('.ai-notice').textContent(), 'Quota en ligne atteint : réponse du modèle local (qwen3:8b)');
+    assert.equal(await answer.locator('.ai-text').textContent(), 'Réponse locale : une boîte.');
+    assert.match(await page.textContent('#ai-status'), /^Réponse en \d+ s · repli local : Ollama · qwen3:8b$/);
+    assert.match(chats[0].messages[0].content, /"file":"box\.stl"/);
+    assert.deepEqual(chats[0].messages.slice(1).map((m) => [m.role, m.role === 'user' ? m.content : '']), [['user', 'Résume la pièce.'], ['assistant', ''], ['user', 'Et ses arêtes ?']]);
+    // Without the fallback: the message of the gateway.
+    await page.uncheck('#ai-fallback');
+    answer = await ask('Et ses faces ?');
+    assert.equal(await answer.locator('.ai-text').textContent(), 'Quota de Groq (offre gratuite) atteint. Réessayez dans 30 s.');
+    assert.equal(chats.length, 1);
+    await page.check('#ai-fallback');
+    reply = (body) => ({ status: 200, body: { choices: [{ message: { role: 'assistant', content: `Volume ${volumeOf(contextOf(body))} cm³.` }, finish_reason: 'stop' }] } });
+
+    // Closing tab 2 forgets its conversation; tab 1's is shown.
+    assert.ok(await page.evaluate(() => sessionStorage.getItem('reader3d.ai.messages.2')));
+    await page.click('.doc-tab:nth-child(2) .doc-tab-close');
+    assert.equal(await page.evaluate(() => sessionStorage.getItem('reader3d.ai.messages.2')), null);
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 4);
+    // Another part opened in tab 1: a new conversation, the one of the other part is not sent with it.
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => window.reader3d.tab.file === 'box.stl' && document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 0);
+    await ask('Quel volume ?');
+    assert.deepEqual(completions.at(-1).messages.map((m) => m.role), ['system', 'user', 'user']);
+    assert.equal(await page.locator('#ai-chat .ai-numbers').count(), 0, 'every number of the answer comes from the context');
     assert.deepEqual(errors, []);
     await page.context().close();
   });
