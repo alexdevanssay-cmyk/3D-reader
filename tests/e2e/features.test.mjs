@@ -429,12 +429,14 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.textContent('#total-volume'), boxVolume);
     assert.equal(await page.locator('#bodies tr').count(), boxBodies);
     assert.equal(await page.inputValue('#density'), '2.68');
+    await page.waitForFunction(() => JSON.parse(document.getElementById('reader3d-semantic-result').textContent)?.source.file === 'box.stl');
     // An empty tab: the drop hint, no results.
     await page.click('.doc-tab-new');
     assert.equal(await page.locator('.doc-tab').count(), 3);
     assert.equal(await page.isVisible('#drop-hint'), true);
     assert.equal(await page.isVisible('#summary-card'), false);
     assert.equal(await page.evaluate(() => window.reader3d.result), null);
+    assert.equal(await page.textContent('#reader3d-semantic-result'), 'null');
     // Closing a tab shows its neighbour.
     await page.click('.doc-tab.active .doc-tab-close');
     assert.equal(await page.locator('.doc-tab').count(), 2);
@@ -463,6 +465,14 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     approx(json.summary.volume, expected['named_assembly.step'].summary.volume, 1e-9, 0, 'JSON volume');
     assert.deepEqual(json.bodies.map((b) => b.name), ['Équerre', 'Pin']);
     assert.equal(json.bodies[0].mesh, undefined, 'no display meshes in the JSON');
+    // The semantic contract, written once the page is idle: the topology of the
+    // meshes, and the bodies by their index in the file.
+    await page.waitForFunction(() => document.getElementById('reader3d-semantic-result').textContent !== 'null');
+    const semantic = JSON.parse(await page.textContent('#reader3d-semantic-result'));
+    assert.deepEqual(semantic.bodies.map((b) => [b.id, b.name, b.topology?.watertight]), [['body-0', 'Équerre', true], ['body-1', 'Pin', true]]);
+    assert.ok(semantic.bodies.every((b) => b.features.some((f) => f.type === 'closed_solid')));
+    const checked = await page.evaluate(() => (window.reader3d.setSelection([1]), window.reader3d.semantic.bodies.map((b) => [b.id, b.source_index, b.name])));
+    assert.deepEqual(checked, [['body-1', 1, 'Pin']]);
 
     const viaApi = await page.evaluate(async () => (await window.reader3d.analyze('e2e-samples/box.stl')).summary.volume);
     approx(viaApi, expected['box.stl'].summary.volume, 1e-9, 0, 'reader3d.analyze');

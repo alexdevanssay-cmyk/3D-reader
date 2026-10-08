@@ -7,6 +7,7 @@
 // Contract version: 1.0
 import { buildManufacturingPlan } from "./manufacturing-plan.js";
 import { buildFoundryAnalysis, FOUNDRY_SCHEMA_VERSION, FOUNDRY_KNOWLEDGE_VERSION } from "./foundry-knowledge.js";
+import { weldVertices } from "./meshanalysis.js";
 
 export const SEMANTIC_VERSION = "1.0";
 
@@ -19,19 +20,31 @@ const FOUNDRY_PROFILE = "unspecified";
 function finite(v) { return typeof v === "number" && Number.isFinite(v); }
 function dist(a, b) { const x=a[0]-b[0], y=a[1]-b[1], z=a[2]-b[2]; return Math.hypot(x,y,z); }
 
-function topology(body) {
+/**
+ * Edge topology of a body's mesh, or null without one (also used by app.js,
+ * whose exported bodies have no mesh). On its vertices merged by position, as
+ * the Reader merges those of a mesh file: the faces of a CAD mesh and the
+ * triangles of an STL file have their own.
+ */
+export function topology(body) {
   const p = body.mesh?.positions;
-  const f = body.mesh?.indices;
-  if (!p || !f) return null;
-  const nv = Math.floor(p.length / 3);
+  const indices = body.mesh?.indices;
+  if (!p || !indices) return null;
+  const { verts, remap } = weldVertices(p, indices);
+  const nv = verts.length / 3;
+  const f = Uint32Array.from(indices, (i) => remap[i]);
   const nf = Math.floor(f.length / 3);
   const edges = new Map();
   let degenerate = 0;
   for (let i=0;i<nf;i++) {
     const a=f[3*i], b=f[3*i+1], c=f[3*i+2];
-    if (a===b || b===c || a===c) degenerate++;
+    // Corners merged (at the pole of a CAD sphere): no area, no edge of its own.
+    if (a===b || b===c || a===c) {
+      degenerate++;
+      continue;
+    }
     for (const [u,v] of [[a,b],[b,c],[c,a]]) {
-      const lo=Math.min(u,v), hi=Math.max(u,v), k=lo+","+hi;
+      const lo=Math.min(u,v), hi=Math.max(u,v), k=lo*nv+hi;
       edges.set(k,(edges.get(k)||0)+1);
     }
   }
@@ -669,7 +682,7 @@ function manufacturingAccessibility(feature) {
   };
 }
 
-function manufacturingForBody(body, features, principal) {
+function manufacturingForBody(body, features, principal, topo) {
   const operations=[];
   for (const feature of features) {
     const operation=manufacturingOperation(feature);
@@ -718,7 +731,7 @@ function manufacturingForBody(body, features, principal) {
 
   const dfm=[];
   if (!body.closed) dfm.push({code:"open_body",severity:"high",recommendation:"repair_or_close_body_before_manufacturing_analysis"});
-  if (body.mesh && topology(body)?.non_manifold_edges>0) dfm.push({code:"non_manifold_geometry",severity:"high",recommendation:"repair_non_manifold_topology"});
+  if (topo?.non_manifold_edges>0) dfm.push({code:"non_manifold_geometry",severity:"high",recommendation:"repair_non_manifold_topology"});
   if (minThickness!=null && minThickness < 2) dfm.push({code:"thin_wall",severity:"medium",recommendation:"verify_process_capability_and_clamping"});
   if (features.some(f=>f.status==="provisional")) dfm.push({code:"provisional_feature_intent",severity:"info",recommendation:"confirm_feature_intent_before_generating_toolpaths"});
   if (features.some(f=>f.type==="pattern_feature_candidate")) dfm.push({code:"repeated_features",severity:"info",recommendation:"consider a common setup/tool strategy for repeated features"});
@@ -738,15 +751,18 @@ function manufacturingForBody(body, features, principal) {
 }
 
 function semanticBody(body, index) {
-  const topo=topology(body);
+  // Given by the caller when its bodies have no mesh (app.js), with the index
+  // of each body in its result when given only some of them.
+  const topo=body.topology ?? topology(body);
+  const sourceIndex=body.source_index ?? index;
   const size=body.bbox?.size ?? [0,0,0];
   const volume=body.volume;
   const envelopeVolume=size.reduce((a,b)=>a*b,1);
   const relations=surfaceRelations(body.geometric_surfaces ?? []);
   const features=normalizeFeatureEvidence(featureCandidates(body,topo,relations));
   const semantic = {
-    id: "body-"+index,
-    source_index:index,
+    id: "body-"+sourceIndex,
+    source_index:sourceIndex,
     name:body.name ?? "Body",
     role:"solid_body",
     metrics:{
@@ -771,7 +787,7 @@ function semanticBody(body, index) {
       evidence:semanticEvidenceQuality(relations, features),
       notes:Array.isArray(body.notes)?body.notes:[],
     },
-    manufacturing:manufacturingForBody(body, features, principalAxes(body)),
+    manufacturing:manufacturingForBody(body, features, principalAxes(body), topo),
     foundry: buildFoundryAnalysis(body, features, principalAxes(body), FOUNDRY_PROFILE),
   };
   semantic.manufacturing_plan = buildManufacturingPlan(semantic);

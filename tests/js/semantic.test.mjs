@@ -65,6 +65,51 @@ test("builds the versioned semantic contract without changing the raw result", (
   assert.equal("indices" in result.bodies[0], false);
 });
 
+test("the topology of a mesh whose faces have their own vertices (CAD, STL) is that of its surface", () => {
+  // A tetrahedron, each face with its own 3 vertices, plus a triangle with two
+  // corners at the same point (as at the pole of a CAD sphere).
+  const [a, b, c, d] = [[0,0,0], [1,0,0], [0,1,0], [0,0,1]];
+  const triangles = [[a,c,b], [a,b,d], [a,d,c], [b,c,d], [a,a,b]];
+  const result = buildSemantic3D({
+    bodies: [body({ mesh: { positions: new Float32Array(triangles.flat(2)), indices: Uint32Array.from(triangles.flat(), (_, i) => i) } })],
+  });
+  assert.deepEqual(result.bodies[0].topology, {
+    vertices: 4,
+    triangles: 5,
+    unique_edges: 6,
+    boundary_edges: 0,
+    non_manifold_edges: 0,
+    degenerate_triangles: 1,
+    watertight: true,
+  });
+  assert.ok(result.bodies[0].features.some(f => f.type === "closed_solid"));
+});
+
+test("bodies as the page gives them: topology without a mesh, index in the Reader result", () => {
+  // app.js gives the bodies checked (here the second and the fourth of the
+  // file) without their meshes, with the topology of each.
+  const watertight = { vertices: 8, triangles: 12, unique_edges: 18, boundary_edges: 0, non_manifold_edges: 0, degenerate_triangles: 0, watertight: true };
+  const nonManifold = { ...watertight, unique_edges: 19, non_manifold_edges: 1, watertight: false };
+  const { mesh, ...meshless } = body();
+  const result = buildSemantic3D({
+    file: "assembly.step",
+    kind: "cad",
+    summary: { volume: 2000, bodies: 2 },
+    bodies: [
+      { ...meshless, source_index: 1, topology: watertight },
+      { ...meshless, name: "Bracket", source_index: 3, topology: nonManifold },
+    ],
+  });
+  const [housing, bracket] = result.bodies;
+  assert.deepEqual([housing.id, housing.source_index, bracket.id, bracket.source_index], ["body-1", 1, "body-3", 3]);
+  assert.deepEqual(housing.topology, watertight);
+  assert.ok(housing.features.some(f => f.type === "closed_solid"));
+  assert.ok(!housing.manufacturing.dfm_recommendations.some(d => d.code === "non_manifold_geometry"));
+  assert.ok(bracket.manufacturing.dfm_recommendations.some(d => d.code === "non_manifold_geometry"));
+  // Without an index: the position in the list (a result with all its bodies).
+  assert.equal(buildSemantic3D({ bodies: [meshless] }).bodies[0].source_index, 0);
+});
+
 test("detects cylindrical passage evidence from shared B-Rep edge signatures", () => {
   const sharedA = [0,0,0, 1,0,0];
   const sharedB = [0,0,0, 0,1,0];

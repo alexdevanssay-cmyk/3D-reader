@@ -276,7 +276,7 @@ function buildWorkMesh(pos, faces) {
  * first occurrence (in vertex order, only referenced vertices are considered) and
  * welded vertices are numbered in order of first occurrence.
  */
-function weldVertices(pos, faces) {
+export function weldVertices(pos, faces) {
   const n = pos.length / 3;
   const referenced = new Uint8Array(n);
   for (let i = 0; i < faces.length; i++) referenced[faces[i]] = 1;
