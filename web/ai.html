@@ -65,7 +65,7 @@ reader3d analyze part.step --json</pre>
   </table>
 
   <h2>3D Semantic JSON</h2>
-  <p><strong>V3 B-Rep evidence:</strong> cylindrical candidates now carry boundary evidence (<code>wire_count</code>, <code>edge_count</code>) and can be promoted to <code>possible_through_hole</code> or <code>possible_bore</code> only when the geometric and boundary signals agree. The semantic layer keeps uncertainty explicit.</p>
+  <p><strong>V3 B-Rep evidence:</strong> cylindrical candidates now carry boundary evidence (<code>wire_count</code>, <code>edge_count</code>) and can be promoted to <code>possible_through_hole</code> or <code>possible_bore</code> only when the geometric and boundary signals agree: <code>possible_through_hole</code> needs a face with the material outside it (<code>"reversed"</code>) bounded by two edges, and still needs topology confirmation, since a blind hole gives the same signals. The semantic layer keeps uncertainty explicit.</p>
 
   <p><strong>V2 feature layer:</strong> CAD bodies may now expose analytic surfaces (cylinder radius/axis/centre, cone angle, sphere radius, torus radii) and conservative feature candidates such as <code>possible_hole_or_bore</code>. A candidate always carries a confidence, a detection method, and may require topology confirmation.
   Each analytic surface gives the orientation of its face (<code>"forward"</code> or <code>"reversed"</code>); a plane's <code>normal</code> points out of the material, and <code>center_mm</code> is the middle of the face (on the axis for a cylinder or a cone).</p>

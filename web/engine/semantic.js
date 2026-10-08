@@ -260,7 +260,11 @@ function featureCandidates(body, topo, stableRelations) {
   for (const c of cylinders) {
     const axial = Math.max(...s);
     const likelyThrough = c.radius_mm > 0 && axial > 0 && axial / (2*c.radius_mm) > 1.5;
-    const boundaryEvidence = c.edge_count === 2 || c.wire_count === 2;
+    // Two boundary circles close a pin or a boss as well as a hole: only a face
+    // with the material outside it (reversed; any other orientation is unknown)
+    // can be a hole. They do not tell a through hole from a blind one either,
+    // hence the confirmation still needed.
+    const boundaryEvidence = c.orientation === "reversed" && (c.edge_count === 2 || c.wire_count === 2);
     out.push({
       type:"cylindrical_feature_candidate",
       subtype:boundaryEvidence && likelyThrough ? "possible_through_hole" : likelyThrough ? "possible_bore" : "cylindrical_surface",
@@ -272,7 +276,7 @@ function featureCandidates(body, topo, stableRelations) {
       axis:c.axis ?? null,
       center_mm:c.center_mm ?? null,
       boundary_evidence:{wire_count:c.wire_count ?? null,edge_count:c.edge_count ?? null},
-      needs_topology_confirmation:!(boundaryEvidence && likelyThrough)
+      needs_topology_confirmation:true
     });
   }
 

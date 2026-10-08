@@ -159,6 +159,25 @@ test("detects cylindrical passage evidence from shared B-Rep edge signatures", (
   assert.equal(relation.needs_topology_confirmation, false);
 });
 
+test("two boundary circles promote only a cylinder with the material outside it, and never confirm a through hole", () => {
+  // Each cylinder bounded by two circles (no seam), long for its diameter: a
+  // hole (reversed), a pin or a boss (forward), and orientations not known (an
+  // older result: the embind enum as {} or a number).
+  const cylinder = (index, orientation) => ({ index, type: "cylinder", radius_mm: 2, axis: [0,0,1], center_mm: [2+2*index,5,5], orientation, wire_count: 1, edge_count: 2, edge_signatures: [] });
+  const result = buildSemantic3D({
+    bodies: [body({ geometric_surfaces: [cylinder(0, "reversed"), cylinder(1, "forward"), cylinder(2, {}), cylinder(3, 1)] })],
+  });
+  const candidates = result.bodies[0].features.filter(f => f.type === "cylindrical_feature_candidate");
+  assert.deepEqual(candidates.map(f => [f.surface_index, f.subtype, f.confidence]), [
+    [0, "possible_through_hole", 0.86],
+    [1, "possible_bore", 0.72],
+    [2, "possible_bore", 0.72],
+    [3, "possible_bore", 0.72],
+  ]);
+  // Two circles also bound a blind hole: still to be confirmed.
+  assert.ok(candidates.every(f => f.needs_topology_confirmation === true && f.status === "provisional"));
+});
+
 test("reports coaxial cylinders with different radii as a stepped-feature candidate", () => {
   const result = buildSemantic3D({
     file: "step.step",
