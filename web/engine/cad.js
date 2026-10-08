@@ -790,6 +790,8 @@ function solidBody(ctx, name, solid, color, notes) {
   if (volume < 0) {
     notes.push(NOTE_INVERTED);
     volume = -volume;
+    // The normals of its faces point into the material (a mirrored instance).
+    for (const s of geometricSurfaces) if (s.normal) s.normal = s.normal.map((x) => -x);
   }
 
   const tri = triangulate(ctx, solid);
@@ -821,14 +823,31 @@ function describeGeometricSurface(oc, face, out, index) {
     const type = surface.GetType();
     const name = type === T.GeomAbs_Plane ? "plane" : type === T.GeomAbs_Cylinder ? "cylinder" : type === T.GeomAbs_Cone ? "cone" : type === T.GeomAbs_Sphere ? "sphere" : type === T.GeomAbs_Torus ? "torus" : type === T.GeomAbs_BSplineSurface ? "bspline" : type === T.GeomAbs_BezierSurface ? "bezier" : null;
     if (!name) return;
-    const item = { index, type: name, orientation: face.Orientation_1(), wire_count: countSubShapes(oc, face, oc.TopAbs_ShapeEnum.TopAbs_WIRE), edge_count: countSubShapes(oc, face, oc.TopAbs_ShapeEnum.TopAbs_EDGE), edge_signatures: edgeSignatures(oc, face) };
+    // A string: the embind enum value has no property of its own, it arrives
+    // as {} from the worker (structured clone) and in the JSON.
+    const { TopAbs_FORWARD, TopAbs_REVERSED } = oc.TopAbs_Orientation;
+    const orientation = face.Orientation_1();
+    const reversed = orientation === TopAbs_REVERSED;
+    const item = { index, type: name, orientation: orientation === TopAbs_FORWARD ? "forward" : reversed ? "reversed" : null, wire_count: countSubShapes(oc, face, oc.TopAbs_ShapeEnum.TopAbs_WIRE), edge_count: boundaryEdgeCount(oc, face), edge_signatures: edgeSignatures(oc, face) };
+    // The middle of the face (of its UV bounds), on its surface. The origin of
+    // the surface's placement can be anywhere: off the face, outside the part.
+    const middle = () => tmp(surface.Value((surface.FirstUParameter() + surface.LastUParameter()) / 2, (surface.FirstVParameter() + surface.LastVParameter()) / 2));
+    // That point projected on the axis of a cylinder or a cone (o: gp_Pnt, d: gp_Dir).
+    const onAxis = (o, d) => {
+      const m = middle();
+      const t = (m.X() - o.X()) * d.X() + (m.Y() - o.Y()) * d.Y() + (m.Z() - o.Z()) * d.Z();
+      return [o.X() + t * d.X(), o.Y() + t * d.Y(), o.Z() + t * d.Z()];
+    };
     if (name === "plane") {
       const p = tmp(surface.Plane());
       const a = tmp(p.Axis());
       const d = tmp(a.Direction());
-      const o = tmp(a.Location());
-      item.normal = [d.X(), d.Y(), d.Z()];
-      item.center_mm = [o.X(), o.Y(), o.Z()];
+      // The normal of the face (outward on a solid): that of the surface (its
+      // axis, or the opposite on a left-handed placement), opposite on a reversed face.
+      const s = (p.Direct() ? 1 : -1) * (reversed ? -1 : 1);
+      item.normal = [s * d.X(), s * d.Y(), s * d.Z()];
+      const m = middle();
+      item.center_mm = [m.X(), m.Y(), m.Z()];
     }
     if (name === "cylinder") {
       const c = tmp(surface.Cylinder());
@@ -837,7 +856,7 @@ function describeGeometricSurface(oc, face, out, index) {
       const o = tmp(a.Location());
       item.radius_mm = c.Radius();
       item.axis = [d.X(), d.Y(), d.Z()];
-      item.center_mm = [o.X(), o.Y(), o.Z()];
+      item.center_mm = onAxis(o, d);
     }
     if (name === "cone") {
       const c = tmp(surface.Cone());
@@ -847,7 +866,7 @@ function describeGeometricSurface(oc, face, out, index) {
       item.semi_angle_rad = c.SemiAngle();
       item.ref_radius_mm = c.RefRadius();
       item.axis = [d.X(), d.Y(), d.Z()];
-      item.center_mm = [o.X(), o.Y(), o.Z()];
+      item.center_mm = onAxis(o, d);
     }
     if (name === "sphere") item.radius_mm = tmp(surface.Sphere()).Radius();
     if (name === "torus") { const t = tmp(surface.Torus()); item.major_radius_mm = t.MajorRadius(); item.minor_radius_mm = t.MinorRadius(); }
@@ -905,6 +924,22 @@ function countSubShapes(oc, shape, kind) {
   return n;
 }
 
+/**
+ * Edges that bound a face, each once. The seam of a closed surface (where a
+ * cylinder closes on itself) is met twice and bounds nothing; a degenerated
+ * edge (the pole of a sphere, the apex of a cone) is a point.
+ */
+function boundaryEdgeCount(oc, face) {
+  const { TopAbs_EDGE, TopAbs_SHAPE } = oc.TopAbs_ShapeEnum;
+  let n = 0;
+  forEachChildShape(oc, face, TopAbs_EDGE, TopAbs_SHAPE, (shape) => {
+    const edge = oc.TopoDS.Edge_1(shape);
+    if (!oc.BRep_Tool.Degenerated(edge) && !oc.BRep_Tool.IsClosed_2(edge, face)) n++;
+    release(oc, edge);
+  });
+  return n;
+}
+
 /** Count OpenCascade surface classes for the semantic layer. */
 function countSurfaceType(oc, face, counts) {
   const surface = new oc.BRepAdaptor_Surface_2(face, true);
@@ -952,7 +987,11 @@ function openBody(ctx, name, shape, color) {
   });
 }
 
-/** Body object of the result contract (same fields as Body.to_dict in model.py). */
+/**
+ * Body object of the result contract (same fields as Body.to_dict in model.py),
+ * plus surface_types and geometric_surfaces for semantic.js, which the Python
+ * engine does not give.
+ */
 function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], centroid, closed, color, notes, tri, surface_types, geometric_surfaces }) {
   const mesh = { positions: new Float32Array(tri.verts), indices: tri.indices };
   // The display copy is float32. When that rounded the vertices, the double-precision

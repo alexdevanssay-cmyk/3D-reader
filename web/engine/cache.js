@@ -5,7 +5,8 @@
 // oldest results are dropped above a total size.
 
 // Bump when the engine gives different results for the same file.
-const VERSION = 1;
+// 2: analytic surfaces of the CAD bodies (surface_types, geometric_surfaces).
+const VERSION = 2;
 const DB_NAME = 'reader3d-cache';
 const MAX_BYTES = 768 * 2 ** 20;
 const MAX_ENTRIES = 60;
