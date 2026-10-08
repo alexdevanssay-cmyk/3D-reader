@@ -22,7 +22,7 @@ function featureContext(feature) {
     evidence: evidenceFor(feature),
     evidence_count: feature.evidence_count ?? evidenceFor(feature).length,
     geometry: Object.fromEntries(Object.entries(feature).filter(([k]) =>
-      ["diameter_mm","radius_mm","minor_radius_mm","cone_semi_angle_rad","surface_index","floor_surface","boundary_planes","wall_surfaces","surfaces","centers_mm","axes","adjacent_surfaces","support_or_termination_planes"].includes(k)
+      ["diameter_mm","radius_mm","radii_mm","minor_radius_mm","cone_semi_angle_rad","surface_index","floor_surface","boundary_planes","wall_surfaces","surfaces","centers_mm","axes","adjacent_surfaces","support_or_termination_planes"].includes(k)
     )),
     needs_topology_confirmation: feature.needs_topology_confirmation === true,
   };
@@ -94,13 +94,15 @@ export function buildAIContext(semantic, options = {}) {
   const requestedTask = options.task ?? "general";
   const task = TASKS.has(requestedTask) ? requestedTask : "general";
   const selected = selectFeatures(semantic, options.featureIds);
+  // Feature ids are scoped by body (body-0/feature-…): one id names one feature.
+  const found = new Set(selected?.map(s => s.feature_id));
   const source = semantic.source ?? {};
   const warnings = [];
   if (semantic.analysis_hints?.length) warnings.push(...semantic.analysis_hints);
-  if (selected && selected.length < options.featureIds.length) warnings.push("some_requested_features_not_found");
+  if (selected && options.featureIds.some(id => !found.has(id))) warnings.push("some_requested_features_not_found");
   const bodies = (semantic.bodies ?? []).map(body => bodyContext(body, task));
   if (task === "feature_analysis" && selected) {
-    for (const body of bodies) body.features = body.features.filter(f => selected.some(s => s.feature_id === f.feature_id));
+    for (const body of bodies) body.features = body.features.filter(f => found.has(f.feature_id));
   }
   const provisional = bodies.flatMap(b => b.features).filter(f => f.status === "provisional");
   const evidenceErrors = bodies.flatMap(b => b.quality?.evidence?.validation_errors ?? []);

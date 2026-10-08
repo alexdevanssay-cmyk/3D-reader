@@ -121,9 +121,9 @@ reader3d analyze part.step --json</pre>
   <pre>const context = reader3d.aiContext({ task: "manufacturing_analysis" });
 const featureContext = reader3d.aiContext({
   task: "feature_analysis",
-  featureIds: ["feature-..."]
+  featureIds: ["body-0/feature-..."]
 });</pre>
-  <p>Supported tasks are <code>general</code>, <code>feature_analysis</code>, <code>manufacturing_analysis</code>, <code>dfm</code> and <code>planning</code>. The context preserves feature/relation IDs, evidence, confidence, provisional status and unresolved manufacturing constraints. The LLM must treat provisional features as hypotheses, cite the supplied evidence for conclusions, preserve units and never invent dimensions. V7 remains a reasoning context layer, not an LLM itself and not a CAM generator.</p>
+  <p>Supported tasks are <code>general</code>, <code>feature_analysis</code>, <code>manufacturing_analysis</code>, <code>dfm</code> and <code>planning</code>. The context preserves feature/relation IDs (scoped by body, e.g. <code>body-0/feature-1a2b3c4d</code>, <code>body-0/relation-3</code>), evidence, confidence, provisional status and unresolved manufacturing constraints. The LLM must treat provisional features as hypotheses, cite the supplied evidence for conclusions, preserve units and never invent dimensions. V7 remains a reasoning context layer, not an LLM itself and not a CAM generator.</p>
 
   <h2>JSON results</h2>
   <pre>{
