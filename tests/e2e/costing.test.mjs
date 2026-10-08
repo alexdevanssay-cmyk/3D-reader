@@ -3,7 +3,8 @@
 // an island in the drop-down lists, settings kept after a reload, trends file
 // below the values typed in, traced values, Excel export; the traced values
 // read by the AI page (task "Chiffrage"), read only, and its answers kept
-// with the quote (sheet "Analyses IA" of the export).
+// with the quote (sheet "Analyses IA" of the export); the cycle time estimated
+// by the AI, used in the quote once adopted, and undone.
 // With a made-up workbook (tests/js/costing-fixture.mjs).
 //
 //   npm run build && node --test tests/e2e/costing.test.mjs
@@ -369,7 +370,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.match(await text('#cfeedback'), /saisissez la référence \(carte Pièce\)/);
     await typeIn('q.reference', 'REF-RETOUR');
     await page.waitForFunction(() => /saisissez le temps mesuré/.test(document.getElementById('cfeedback').textContent));
-    const pri = async () => /PRI complet[^\d]*([\d\s,]+)/.exec(await text())[1];
+    const pri = async () => /PRI complet(?: \(outillage compris\))?(\d[\d\s]*,\d+) €/.exec(await text())[1];
     const priBefore = await pri();
     await typeIn('p.cycleReel', 250);
     await page.waitForSelector('#cfeedback [data-action="save-feedback"]:not([disabled])');
@@ -607,6 +608,192 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     for (const text of ["aucune valeur n'a été appliquée au devis ni aux paramètres", 'Fournisseur', 'Pourquoi ce prix ?', 'Et avec un autre taux ?', 'Et le détail ?', 'qwen3:8b', 'openai/gpt-oss-120b', 'non : nombres absents de la trace']) {
       assert.ok(sheet.includes(text), text);
     }
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('cycle time estimated by the AI: the data sent to the gateway, the proposal shown, used in the quote and traced, kept with the real time, undone', { timeout: 120_000 }, async (t) => {
+    // A stand-in for the AI gateway (CORS as it does it), answering the task cycle_time from the data it is given.
+    const requests = [];
+    const cors = (req, res) => {
+      if (req.headers.origin) res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
+      if (req.method !== 'OPTIONS') return false;
+      res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET,POST', 'Access-Control-Allow-Headers': 'Content-Type, Accept' });
+      res.end();
+      return true;
+    };
+    const gateway = createServer(async (req, res) => {
+      if (cors(req, res)) return;
+      res.setHeader('Content-Type', 'application/json');
+      if (req.method === 'GET') return res.end(JSON.stringify({ provider: 'Groq', model: 'openai/gpt-oss-120b', models: [], context_chars: 9000, access_code_required: false }));
+      let text = '';
+      for await (const chunk of req) text += chunk;
+      const request = JSON.parse(text);
+      requests.push(request);
+      const f = request.context.formule.valeur_s;
+      const e = Math.round(f * 1.1);
+      const similar = request.context.pieces_similaires ?? [];
+      res.end(JSON.stringify({ output: JSON.stringify({
+        estimation_s: e, fourchette_s: [e - 20, e + 20], confiance: 'moyenne',
+        decomposition: [
+          { etape: 'Poteyage et fermeture', secondes: 15, justification: 'coquille poteyée à chaque cycle' },
+          { etape: 'Coulée', secondes: 10, justification: 'débit supposé de 0,7 kg/s' },
+          { etape: 'Solidification', secondes: e - 50, justification: 'module de 0,3 cm, règle de Chvorinov' },
+          { etape: 'Ouverture et éjection', secondes: 25, justification: 'extraction de la grappe' },
+        ],
+        comparaison: { formule_commentaire: `formule à ${Math.round(f)} s : estimation 10 % au-dessus`, tendance_commentaire: '', pieces_similaires_commentaire: similar.length ? `proche de ${similar[0].ref}` : '' },
+        pieces_similaires_utilisees: similar.slice(0, 1).map((x) => x.ref),
+        hypotheses: ['coquille à température de régime'],
+        a_verifier: ['temps de solidification au point chaud'],
+      }), provider: 'Groq', model: 'openai/gpt-oss-120b', quota: { requests_remaining_day: 990 } }));
+    });
+    await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => {
+      gateway.closeAllConnections();
+      gateway.close(resolve);
+    }));
+    // A history of cycle times (made-up values).
+    const record = (over) => ({
+      ref: 'HX-1', fichier_3d: 'hx1_confidentiel.stp', source: 'devis', ilot: 'CG3', temps_cycle_s: 210, pieces_par_cycle: 1, trs: 0.8, poids_kg: 1.4, module_mm: 3.2,
+      volume_cm3: 520, surface_cm2: 1500, encombrement_mm: [150, 90, 40], noyaux: false, sable_kg: null, serie: 800, mise_au_mille: 1.7, ...over,
+    });
+    writeFileSync(join(dir, 'historique-ia.json'), JSON.stringify({ schema: 'reader3d-historique-cycles', version: 1, pieces: [
+      record(), record({ ref: 'HX-2', source: 'production', temps_cycle_s: 190, poids_kg: 1.1 }), record({ ref: 'HX-3', ilot: 'BPR', temps_cycle_s: 150 }),
+    ] }));
+
+    const context = await browser.newContext({ locale: 'fr-FR', acceptDownloads: true });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    // The AI chosen on the IA page: the gateway (names anonymised, by default).
+    await page.evaluate((url) => {
+      localStorage.setItem('reader3d.ai.provider', 'openai');
+      localStorage.setItem('reader3d.ai.gateway', url);
+    }, `http://127.0.0.1:${gateway.address().port}/api/ai`);
+    await page.click('.tab[data-page="chiffrage"]');
+    const text = (selector = '#page-chiffrage') => page.textContent(selector).then((x) => x.replace(/[\u202f\u00a0]/g, ' '));
+    const waitText = (re) => page.waitForFunction((source) => new RegExp(source).test(document.getElementById('page-chiffrage').textContent.replace(/[\u202f\u00a0]/g, ' ')), re.source);
+    await page.setInputFiles('#page-chiffrage input[data-file="historique"]', join(dir, 'historique-ia.json'));
+    await waitText(/Historique « historique-ia\.json » importé/);
+    await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
+    await page.waitForSelector('#page-chiffrage .cmsg.ok');
+    const typeIn = async (bind, value) => {
+      await page.fill(`#page-chiffrage [data-bind="${bind}"]`, String(value));
+      await page.dispatchEvent(`#page-chiffrage [data-bind="${bind}"]`, 'change');
+    };
+    for (const [bind, value] of [['q.client', 'ACME ESSAI'], ['q.reference', 'REF-CYCLE-IA'], ['p.poids', 1.2], ['p.toileMini', 5], ['p.epaisseurMax', 10], ['p.moduleMm', 3], ['p.dimMax', 250]]) await typeIn(bind, value);
+    await page.waitForSelector('#page-chiffrage .ctable tr.retained');
+    const estimated = Number(/Temps de cycle\s*(\d+) s \(estimé\)/.exec(await text())[1]);
+    // The PRI of the detail of the costing (the note of the solutions says "PRI complet" first, without an amount).
+    const pri = async () => /PRI complet(?: \(outillage compris\))?(\d[\d\s]*,\d+) €/.exec(await text())[1];
+    const priBefore = await pri();
+    // The button, beside the cycle of the route; the AI asked; the box of the similar parts, ticked.
+    assert.match(await text(), /IA de la page IA \/ analyse : passerelle en ligne, noms anonymisés\. Historique : 3 enregistrements, les 3 plus semblables envoyés/);
+    assert.equal(await page.isChecked('#page-chiffrage [data-pref="cycle-similar"]'), true);
+    await page.click('#page-chiffrage [data-action="estimate-cycle"]');
+    await page.waitForSelector('#ccycle-ia .ccycle-value');
+
+    // What the gateway was sent: the task, the data of the piece and of its casting, the formula, the similar parts; no name.
+    const [request] = requests;
+    assert.equal(request.task, 'cycle_time');
+    assert.deepEqual(request.messages.map((m) => m.role), ['user']);
+    const data = request.context;
+    const island = data.coulee.ilot;
+    assert.deepEqual([data.piece.nom, data.piece.poids_kg, data.piece.module_mm, data.piece.toile_mini_mm, data.piece.epaisseur_max_mm], ['Pièce', 1.2, 3, 5, 10]);
+    assert.ok(Math.abs(data.formule.valeur_s - estimated) <= 0.5, `${data.formule.valeur_s} vs ${estimated}`);
+    assert.ok(data.formule.termes_s.base > 0 && data.cycle_devis.source === "formule de l'îlot");
+    assert.deepEqual(data.pieces_similaires.map((x) => x.ref), ['Historique 1', 'Historique 2', 'Historique 3']);
+    assert.ok(data.pieces_similaires.every((x) => x.temps_cycle_s > 0 && ['devis', 'production'].includes(x.source)));
+    const sent = JSON.stringify(request);
+    for (const name of ['HX-1', 'HX-2', 'HX-3', 'hx1_confidentiel', 'ACME ESSAI', 'REF-CYCLE-IA']) assert.ok(!sent.includes(name), name);
+    assert.ok(JSON.stringify(data).length <= 9000);
+
+    // The proposal: value, range, confidence, breakdown, comparison, hypotheses, points to verify, model, date; the numbers flagged.
+    const e = Math.round(data.formule.valeur_s * 1.1);
+    const card = await text('#ccycle-ia');
+    assert.match(card, /Proposition IA — rien n'est appliqué sans votre validation/);
+    assert.match(card, new RegExp(`${e} s par cycle — fourchette de ${e - 20} s à ${e + 20} s, confiance moyenne — îlot ${island}`));
+    assert.match(card, /Groq · openai\/gpt-oss-120b · \d\d\/\d\d\/\d{4}/);
+    assert.equal(await page.locator('#ccycle-ia .ccycle-steps tbody tr').count(), 4);
+    assert.match(card, new RegExp(`Total de la décomposition${e} s`));
+    assert.match(card, new RegExp(`Formule \\([\\d,]+ s\\) : formule à ${Math.round(data.formule.valeur_s)} s`));
+    // The references of the history: their labels sent, the real ones shown.
+    const first = /^Noms réels : Historique 1 = (HX-\d)$/.exec(await page.textContent('#ccycle-ia .ai-names'))?.[1];
+    assert.ok(first);
+    assert.match(card, new RegExp(`Pièces semblables \\(3 envoyées\\) : proche de Historique 1 — utilisées : ${first}`));
+    assert.match(card, /Hypothèses\s*coquille à température de régime/);
+    assert.match(card, /À vérifier\s*temps de solidification au point chaud/);
+    assert.equal(await page.textContent('#ccycle-ia .ai-numbers'), "1 nombre ne vient pas des données envoyées ni de l'estimation");
+    assert.equal(await page.getAttribute('#ccycle-ia .ai-numbers', 'title'), '0,7');
+    // Nothing applied yet: the same price; the estimate is another source of the cycle in the trace.
+    assert.equal(await pri(), priBefore);
+    await page.click('#page-chiffrage [data-action="show-trace"]');
+    await page.waitForSelector('#page-chiffrage #ctrace details[open] table');
+    let row = await page.locator('#page-chiffrage #ctrace tr', { hasText: 'piece.cycle' }).first().textContent();
+    assert.match(row, /calcul/);
+    assert.match(row, new RegExp(`autre source : estimation IA non validée \\(Groq · openai/gpt-oss-120b · \\d\\d/\\d\\d/\\d{4}, fourchette de ${e - 20} à ${e + 20} s\\) ${e} s`));
+
+    // "Utiliser cette valeur": the cycle of the quote, its island imposed; traced « estimation IA validée ».
+    await page.click('#ccycle-ia [data-action="adopt-cycle"]');
+    await waitText(new RegExp(`Temps de cycle de ${e} s utilisé dans le devis : estimation IA validée \\(Groq · openai/gpt-oss-120b\\), îlot ${island} désormais imposé`));
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.procede"]'), island);
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.cycle"]'), String(e));
+    assert.notEqual(await pri(), priBefore, 'the price of the cycle adopted');
+    row = await page.locator('#page-chiffrage #ctrace tr', { hasText: 'piece.cycle' }).first().textContent();
+    assert.match(row, new RegExp(`${e} s\\s*estimation IA validée, \\d\\d/\\d\\d/\\d{4}`));
+    assert.match(row, /hard \(N1\)\s*moyenne/);
+    assert.match(row, /fourchette de \d+ à \d+ s, confiance moyenne/);
+    assert.match(row, new RegExp(`îlot ${island} imposé avec l'estimation`));
+    assert.match(await text('#ccycle-ia'), new RegExp(`Utilisée dans le devis : ${e} s depuis le`));
+    // Kept with the quote: after a reload, the proposal and its use.
+    await page.reload();
+    await page.waitForSelector('#ccycle-ia [data-action="undo-cycle"]');
+    // The Excel export: the value with its source in Traçabilité, the estimate in "Analyses IA".
+    const [download] = await Promise.all([page.waitForEvent('download'), page.click('#page-chiffrage [data-action="export-xlsx"]')]);
+    const files = unzipSync(new Uint8Array(readFileSync(await download.path())));
+    const sheets = Object.entries(files).filter(([k]) => k.startsWith('xl/worksheets/')).map(([, v]) => strFromU8(v));
+    assert.ok(sheets.some((x) => x.includes('piece.cycle') && x.includes('estimation IA validée')));
+    assert.ok(sheets.some((x) => x.includes(`Estimation du temps de cycle de coulée (îlot ${island}) : ${e} s`) && x.includes('non : nombres absents des données envoyées')));
+
+    // The real time measured: kept with the estimate, compared with it.
+    await typeIn('p.cycleReel', e + 10);
+    await page.waitForSelector('#cfeedback [data-action="save-feedback"]:not([disabled])');
+    await page.click('#cfeedback [data-action="save-feedback"]');
+    await waitText(/Temps de cycle réel enregistré dans le retour d'expérience : « REF-CYCLE-IA »/);
+    const kept = await page.evaluate(() => JSON.parse(localStorage.getItem('reader3d.chiffrage.historique.v1')).pieces.find((x) => x.source === 'production' && x.ref === 'REF-CYCLE-IA'));
+    assert.deepEqual({ ...kept.estimation_ia, date: null }, { temps_cycle_s: e, fournisseur: 'Groq', modele: 'openai/gpt-oss-120b', date: null, adoptee: true });
+    assert.deepEqual(await page.$$eval('#chistorique .chisto thead th', (ths) => ths.map((th) => th.textContent)), ['Référence', 'Îlot', 'Réel', 'Formule', 'Écart', 'Estimation IA', 'Écart']);
+
+    // A new estimate: a proposal again, the value of the quote still the one adopted, with its source.
+    await page.click('#page-chiffrage [data-action="estimate-cycle"]');
+    await page.waitForSelector('#ccycle-ia [data-action="adopt-cycle"]:not([disabled])');
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].context.cycle_devis.source, 'estimation IA validée');
+    assert.match(await text('#ccycle-ia'), new RegExp(`Utilisée dans le devis : ${e} s, estimation du \\d\\d/\\d\\d/\\d{4} \\d\\d:\\d\\d validée le`));
+    assert.match(await page.locator('#page-chiffrage #ctrace tr', { hasText: 'piece.cycle' }).first().textContent(), /estimation IA validée/);
+
+    // "Ne plus utiliser cette valeur": the formula and the automatic island again, the price of before.
+    await page.click('#ccycle-ia [data-action="undo-cycle"]');
+    await waitText(/Estimation IA retirée du devis : temps de cycle estimé par la formule, îlot choisi automatiquement\./);
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.procede"]'), 'auto');
+    assert.equal(await pri(), priBefore);
+    assert.equal(await page.isDisabled('#ccycle-ia [data-action="adopt-cycle"]'), false);
+
+    // The box unticked: no similar part sent.
+    await page.uncheck('#page-chiffrage [data-pref="cycle-similar"]');
+    await waitText(/Historique : 4 enregistrements, non envoyé\./); // with the real time kept above
+    await page.click('#page-chiffrage [data-action="estimate-cycle"]');
+    await page.waitForFunction(() => !document.querySelector('#ccycle-status'));
+    assert.equal(requests.length, 3);
+    assert.equal('pieces_similaires' in requests[2].context, false);
+    assert.match(await text('#ccycle-ia'), /Pièces semblables \(0 envoyée\)/);
+
+    // A phone: the card within 375 px (its table scrolls inside it).
+    await page.setViewportSize({ width: 375, height: 800 });
+    const overflow = await page.evaluate(() => [...document.querySelectorAll('#ccycle-ia')].flatMap((card) => [card, ...card.querySelectorAll('button, .cscroll, p')])
+      .filter((x) => x.offsetParent).map((x) => [x.textContent.trim().slice(0, 30) || x.className, Math.round(x.getBoundingClientRect().right)]).filter(([, right]) => right > 375));
+    assert.deepEqual(overflow, []);
     assert.deepEqual(errors, []);
     await context.close();
   });

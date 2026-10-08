@@ -6,7 +6,8 @@
 // record: {ref, fichier_3d, source, ilot, temps_cycle_s, pieces_par_cycle,
 //          trs, poids_kg, module_mm, volume_cm3, surface_cm2, encombrement_mm,
 //          noyaux, sable_kg, serie, mise_au_mille, date?, note?,
-//          toile_mini_mm?, epaisseur_max_mm?, estimation_ia?}
+//          toile_mini_mm?, epaisseur_max_mm?, estimation_ia?: {temps_cycle_s,
+//          fournisseur?, modele?, date?, adoptee?}}
 // A reference to compare the estimates with: nothing of it is applied to a
 // quote or to the settings, and nothing is sent anywhere.
 
@@ -44,7 +45,8 @@ const OPTIONAL = {
   epaisseur_max_mm: POSITIVE,
   date: [(v) => isText(v) && !Number.isNaN(Date.parse(v)), "date attendue (AAAA-MM-JJ)"],
   note: TEXT,
-  // The estimate of the AI for this record, once a person validated it (step of the AI page).
+  // The estimate of the AI for this piece and island (ai-cycle.js), kept with the time measured;
+  // adoptee: used in the quote ("Utiliser cette valeur"), else a proposal only.
   estimation_ia: [(v) => isPlain(v) && isPositive(v.temps_cycle_s), "{temps_cycle_s > 0} attendu"],
 };
 const KNOWN = new Set([...ORDER, ...Object.keys(OPTIONAL)]);
@@ -84,7 +86,11 @@ export function checkRecord(raw) {
   }
   if (record.estimation_ia) {
     const e = record.estimation_ia;
-    record.estimation_ia = { temps_cycle_s: e.temps_cycle_s, ...Object.fromEntries(["fournisseur", "modele", "date"].filter((k) => isText(e[k])).map((k) => [k, e[k]])) };
+    record.estimation_ia = {
+      temps_cycle_s: e.temps_cycle_s,
+      ...Object.fromEntries(["fournisseur", "modele", "date"].filter((k) => isText(e[k])).map((k) => [k, e[k]])),
+      ...(typeof e.adoptee === "boolean" ? { adoptee: e.adoptee } : {}),
+    };
   }
   return { record, errors, ignored, unknown };
 }
@@ -276,9 +282,11 @@ export function similarParts(history, part, { k = 5 } = {}) {
  * The record "production" of a piece of the quote (ui.js:computePiece result
  * `r`, with its retained route) and its real cycle time `tempsCycle` (s):
  * the geometry of the 3D model or typed in, and the island, pieces per cycle,
- * TRS and mise au mille of the quote. ref: the reference of the quote.
+ * TRS and mise au mille of the quote. ref: the reference of the quote;
+ * estimation: the estimate of the AI for the piece on that island
+ * ({temps_cycle_s, fournisseur, modele, date, adoptee}), if any.
  */
-export function productionRecord(r, { ref, tempsCycle, fichier = null, serie = null, date = new Date().toISOString() }) {
+export function productionRecord(r, { ref, tempsCycle, fichier = null, serie = null, date = new Date().toISOString(), estimation = null }) {
   const casting = r.route.operations.find((o) => o.code === r.route.process);
   const { record } = checkRecord({
     ref,
@@ -300,6 +308,7 @@ export function productionRecord(r, { ref, tempsCycle, fichier = null, serie = n
     toile_mini_mm: r.part.toileMini || null,
     epaisseur_max_mm: r.part.epaisseurMax || null,
     date,
+    estimation_ia: estimation,
   });
   return record;
 }

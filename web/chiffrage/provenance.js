@@ -10,7 +10,10 @@
 //   2. hard            current rules: Paramètres, costing workbook, metal indices
 //   3. evidence        3D geometry (measured)
 //   4. soft_prior      trends (the calibrated settings file): never above 1 or 2
-//   5. reasoning_only  the LLM: it explains, it never sets a value
+//   5. reasoning_only  the LLM: it explains, it never sets a value; an
+//                      estimate of it (the cycle time, ai-cycle.js) enters a
+//                      quote only once a person adopts it: then a value typed
+//                      in (1), "estimation IA validée"
 // Out of the hierarchy: default_code (a neutral value of the code: a
 // hypothesis to validate) and calcul (a value derived from others, as
 // confident as its weakest input).
@@ -19,6 +22,7 @@ import { DEFAULT_TRS } from "./routes.js";
 import { bandOf } from "./tooling.js";
 import { programmeOf } from "./rfq.js";
 import { defaultQuote } from "./store.js";
+import { adoptedEstimate } from "./ai-cycle.js";
 
 /**
  * @typedef {Object} ValeurTracee
@@ -41,6 +45,7 @@ import { defaultQuote } from "./store.js";
 export const SOURCES = {
   saisie: { autorite: "hard", niveau: 1, confiance: "haute", label: "saisie du devis", raison: "saisie dans le devis" },
   rfq: { autorite: "hard", niveau: 1, confiance: "haute", label: "demande client", raison: "commande du client (demande importée)" },
+  ia_validee: { autorite: "hard", niveau: 1, confiance: "moyenne", label: "estimation IA validée", raison: "estimation d'un modèle de langage validée par une personne : à confirmer par une mesure en production" },
   parametres: { autorite: "hard", niveau: 2, confiance: "haute", label: "saisie Paramètres", raison: "saisie dans Paramètres" },
   classeur: { autorite: "hard", niveau: 2, confiance: "haute", label: "classeur", raison: "classeur de chiffrage" },
   indices: { autorite: "hard", niveau: 2, confiance: "haute", label: "indices", raison: "fichier des indices matière" },
@@ -693,7 +698,29 @@ export function tracePiece(r, ctx, devis) {
     plafond: ["moyenne", "estimation à confirmer par les méthodes"],
     hypotheses: mamTyped || cavitiesTyped ? ["cycle estimé avec les empreintes et la mise au mille estimées, pas celles saisies"] : [],
   });
-  T["piece.cycle"] = resolve([cycleTyped ? input("cycle", "s") : null, cycleEstimate], { seuil, comparer: () => false });
+  // The estimate of the AI adopted by a person ("Utiliser cette valeur"): a value typed in, from its own source.
+  const ai = cycleTyped ? adoptedEstimate(i, code) : null;
+  const e0 = ai?.estimation;
+  const range = (x) => (Array.isArray(x.fourchette_s) ? `, fourchette de ${fr(x.fourchette_s[0], 1)} à ${fr(x.fourchette_s[1], 1)} s` : "");
+  const typedCycle = ai
+    ? traced(i.cycle, {
+      type: "ia_validee", unite: "s", ref: `q.pieces["${key}"].cycle (estimation IA)`, date: ai.date,
+      raison: `estimation de ${e0.fournisseur ?? "l'IA"}${e0.modele ? ` · ${e0.modele}` : ""} validée par une personne le ${day(ai.date)} : à confirmer par une mesure en production`,
+      hypotheses: [
+        `estimation IA du ${day(e0.date)} (${[e0.fournisseur, e0.modele].filter(Boolean).join(" · ")}) : ${fr(e0.estimation_s, 1)} s${range(e0)}, confiance ${e0.confiance}`,
+        ...(ai.avant?.procede !== code ? [`îlot ${code} imposé avec l'estimation`] : []),
+      ],
+    })
+    : cycleTyped ? input("cycle", "s") : null;
+  T["piece.cycle"] = resolve([typedCycle, cycleEstimate], { seuil, comparer: () => false });
+  // The last estimate of the AI for this island, not adopted: another source, never the value.
+  const proposed = i.estimationCycleIA;
+  if (proposed?.ilot === code && proposed.estimation_s > 0 && proposed.date !== e0?.date) {
+    T["piece.cycle"].alternatives.push({
+      source: "ia", autorite: SOURCES.ia.autorite, valeur: proposed.estimation_s, ecart_rel: relative(T["piece.cycle"].valeur, proposed.estimation_s),
+      ref: `estimation IA non validée (${[proposed.fournisseur, proposed.modele, day(proposed.date)].filter(Boolean).join(" · ")}${range(proposed)})`,
+    });
+  }
 
   // The casting centre: working mode, TRS, rate.
   const rate = r.finalRates.get(code);

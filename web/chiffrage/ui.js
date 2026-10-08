@@ -10,6 +10,10 @@ import { coreBoxCost, coresPerPiece, newCore } from "./cores.js";
 import { filledFields, orderValues, programmeFor, programmeOf, readSeriesOrder } from "./rfq.js";
 import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, demandeComparee, label as traceLabel, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
 import { compareCycles, countHistory, exportHistory, importHistory, mergeHistory, productionRecord } from "./history.js";
+import {
+  SIMILAR, adoptEstimate, adoptedEstimate, anonymiseCycleData, cycleData, cycleNumbers, cycleQuestion, cycleText, fitCycleData, forgetAdoption, localCycleRules, readCycleAnswer, undoAdoption,
+} from "./ai-cycle.js";
+import { askJSON, numbersLabel, savedAI } from "../ai-workspace.js";
 import * as store from "./store.js";
 
 let el = null;
@@ -145,6 +149,8 @@ const PIECE_DEFAULTS = {
   cores: [], // sand cores (cores.js): {nom, masse kg, qte per piece, L, l, h box mm, type, tiroirs, complexite}
   composants: [],
   cycleReel: null, // real cycle time measured in production (s), to keep in the history (Retour d'expérience); not used by the costing
+  estimationCycleIA: null, // the last estimate of the cycle time by the AI for this piece (ai-cycle.js): a proposal
+  cycleIA: null, // the estimate used as the cycle typed in ("Utiliser cette valeur"): {date, valeur, avant, estimation}
 };
 function pieceInputs(key) {
   const i = { ...PIECE_DEFAULTS, ...q.pieces?.[key] };
@@ -212,6 +218,11 @@ function onChange(event) {
   const bind = target.dataset.bind;
   if (!bind) {
     if (target.dataset.file) importFile(target);
+    // Box "Envoyer les pièces similaires de l'historique": a choice of this browser, not of the quote.
+    if (target.dataset.pref === "cycle-similar") {
+      setSendSimilar(target.checked);
+      setTimeout(render, 0);
+    }
     return;
   }
   const value = readValue(target);
@@ -252,6 +263,7 @@ function onChange(event) {
       const poids = compute()?.results.find((r) => r.piece.key === currentKey)?.part.poids ?? 0;
       piece.cores = [{ ...newCore(0, poids), ...(piece.sableKg > 0 ? { masse: piece.sableKg } : {}) }];
     }
+    forgetAdoption(piece);
     store.saveQuote(q);
   } else {
     // Paramètres: only the typed values are kept (store.js); an emptied field
@@ -282,6 +294,7 @@ async function onClick(event) {
     piece.procede = action === "auto" ? "auto" : button.dataset.process;
     piece.finition = action === "auto" ? "auto" : button.dataset.finition;
     piece.cycle = piece.empreintes = piece.miseAuMille = piece.mode = null;
+    forgetAdoption(piece);
     store.saveQuote(q);
     render();
   } else if (action === "piece") {
@@ -373,6 +386,16 @@ async function onClick(event) {
     traceOpen = !button.parentElement.open;
   } else if (action === "save-feedback") {
     saveFeedback();
+    render();
+  } else if (action === "estimate-cycle") {
+    estimateCycle();
+  } else if (action === "cancel-cycle") {
+    cycleJob?.controller.abort();
+  } else if (action === "adopt-cycle") {
+    adoptCycle();
+    render();
+  } else if (action === "undo-cycle") {
+    undoCycle();
     render();
   } else if (action === "export-historique") {
     download("historique_cycles.json", new Blob([JSON.stringify(exportHistory(store.loadHistorique()), null, 2)], { type: "application/json" }));
@@ -1039,6 +1062,7 @@ function renderQuote() {
     ${ensemble ? "" : toolingCard(r)}
   </div>
 
+  ${ensemble ? "" : cycleCard(r)}
   ${!ensemble && r?.inputs.noyaux ? coresFields(r) : ""}
   ${ensemble ? ensembleCard(c) : solutionsCard(r)}
   ${ensemble ? ensembleDetailCard(c) : detailCard(r)}
@@ -1143,6 +1167,7 @@ function castingCard(r) {
         ${field("Mise au mille (kg coulé / kg pièce)", locked ? `<output>${e ? nf(e.miseAuMille, 2) : "—"}</output>` : select("p.miseAuMille", i.miseAuMille ?? " ", mamOptions, { kind: "num" }))}
         ${field("TRS de l'îlot", `<output>${routeCode ? pct(r.route.operations.find((o) => o.code === routeCode)?.trs, 0) : "—"}</output>`, "modifiable dans Paramètres")}
       </div>
+      ${routeCode ? cycleButton(r) : ""}
       ${mamDetail}
     </section>`;
 }
@@ -1470,6 +1495,232 @@ function projectionCard(c, f) {
   </section>`;
 }
 
+// --------------------------------------------------------------------------- estimate of the cycle time by the AI
+
+// Box "Envoyer les pièces similaires de l'historique": on unless unticked, kept in this browser.
+const SIMILAR_KEY = "reader3d.ai.cycleSimilar";
+let cycleJob = null; // the estimate in progress: {key (of its piece), tab, file, controller, start}
+let cycleError = null; // {key, text}: why the last estimate of the piece `key` failed
+
+function sendSimilar() {
+  try {
+    return localStorage.getItem(SIMILAR_KEY) !== "0";
+  } catch {
+    return true; // storage blocked: the default
+  }
+}
+
+function setSendSimilar(on) {
+  try {
+    if (on) localStorage.removeItem(SIMILAR_KEY);
+    else localStorage.setItem(SIMILAR_KEY, "0");
+  } catch {
+    // storage blocked: the box is ticked again at the next rendering
+  }
+}
+
+/** The AI the estimate is asked of: the one chosen on the IA page. */
+function aiChoice() {
+  const ai = savedAI();
+  return ai.provider === "ollama"
+    ? `Ollama local (${esc(ai.ollama.model)})`
+    : `passerelle en ligne${ai.gateway.url ? "" : " (adresse à renseigner dans la page IA / analyse)"}${ai.anonymize ? ", noms anonymisés" : ""}`;
+}
+
+/** Under the casting parameters: "Estimer le temps de cycle avec l'IA", the box of the similar parts, the AI asked. */
+function cycleButton(r) {
+  const busy = cycleJob?.key === r.piece.key;
+  const n = store.loadHistorique().length;
+  const sent = Math.min(n, SIMILAR);
+  return `<div class="crow ccycle-ask">
+      <button type="button" class="small" data-action="estimate-cycle"${cycleJob ? " disabled" : ""}>Estimer le temps de cycle avec l'IA</button>
+      ${busy ? `<span id="ccycle-status" class="small muted" role="status">Estimation en cours…</span> <button type="button" class="small" data-action="cancel-cycle">Annuler</button>` : ""}
+      <label class="check small"><input type="checkbox" data-pref="cycle-similar"${sendSimilar() ? " checked" : ""}> Envoyer les pièces similaires de l'historique</label>
+    </div>
+    <p class="small muted">IA de la page IA / analyse : ${aiChoice()}. Historique : ${n ? `${plural(n, "enregistrement")}, ${!sendSimilar() ? "non envoyé" : sent > 1 ? `les ${sent} plus semblables envoyés` : "envoyé"}` : "aucun enregistrement"}. Une proposition : rien n'est appliqué sans votre validation.</p>`;
+}
+
+/**
+ * "Estimer le temps de cycle avec l'IA": the AI of the IA page (the gateway,
+ * or Ollama) is given the data of the piece shown (ai-cycle.js cycleData),
+ * anonymised for the gateway and within its budget. Its estimate, checked, is
+ * kept with the piece (estimationCycleIA) and with the answers of the AI on
+ * the quote (q.analysesIA): nothing of it is used before "Utiliser cette
+ * valeur".
+ */
+async function estimateCycle() {
+  if (cycleJob) return;
+  const c = compute();
+  const r = c?.results.find((x) => x.piece.key === c.selected);
+  if (!r?.route) return;
+  const data = cycleData(r, { settings, history: sendSimilar() ? store.loadHistorique() : [], trend: trendSettings(), serie: q.tailleSerie, volumeAnnuel: q.volumeAnnuel });
+  const question = cycleQuestion(data);
+  // For the gateway: the names of the quote, of the 3D file and of the body, and the references of the history replaced by labels.
+  const names = namesOf(q);
+  const file = c.p3d?.file ?? null;
+  const label = Number.isInteger(r.piece.index) ? `Corps ${r.piece.index + 1}` : "Pièce";
+  const job = { key: r.piece.key, tab: store.currentQuoteTab(), file, controller: new AbortController(), start: Date.now() };
+  cycleJob = job;
+  cycleError = null;
+  const timer = setInterval(() => {
+    const status = el?.chiffrage.querySelector("#ccycle-status");
+    if (status) status.textContent = `Estimation en cours… ${Math.round((Date.now() - job.start) / 1000)} s`;
+  }, 1000);
+  render();
+  let anonymous = null;
+  try {
+    const answer = await askJSON("cycle_time", ({ budget, local, anonymize, model }) => {
+      anonymous = anonymize ? anonymiseCycleData(data, { file, label, names }) : null;
+      return {
+        context: fitCycleData(anonymous ? anonymous.data : data, budget),
+        question: anonymous ? anonymous.text(question) : question,
+        ...(local ? { system: localCycleRules(model) } : {}),
+      };
+    }, { signal: job.controller.signal });
+    const sent = answer.sent.context;
+    const estimate = readCycleAnswer(answer.output, sent);
+    const unknown = cycleNumbers(estimate, sent, [answer.sent.question]);
+    const legend = anonymous ? anonymous.legend(answer.output) : [];
+    // The quote it is about: the tab and the 3D file of the question.
+    if (store.currentQuoteTab() !== job.tab || (window.reader3d?.part?.()?.file ?? null) !== job.file) {
+      message = { kind: "warn", text: "Estimation IA du temps de cycle abandonnée : l'onglet ou le modèle 3D a changé pendant la demande." };
+      return;
+    }
+    const { avertissements, ...rest } = estimate;
+    const record = {
+      date: new Date().toISOString(),
+      fournisseur: answer.provider ?? null,
+      modele: answer.model ?? null,
+      ilot: data.coulee.ilot,
+      ...rest,
+      pieces_similaires_utilisees: rest.pieces_similaires_utilisees.map((ref) => (anonymous ? anonymous.ref(ref) : ref)),
+      avertissements,
+      nombres_inconnus: unknown,
+      noms: legend,
+      ...(answer.notice ? { repli: answer.notice } : {}),
+      // The data it was made with: told when they change, and compared in the card.
+      donnees: {
+        ilot: data.coulee.ilot, poids_kg: data.piece.poids_kg, module_mm: data.piece.module_mm ?? null, pieces_par_cycle: data.coulee.pieces_par_cycle, noyaux: data.piece.noyaux,
+        formule_s: data.formule.valeur_s, tendance_s: data.tendance?.valeur_s ?? null, cycle_devis_s: data.cycle_devis.valeur_s, similaires: sent.pieces_similaires?.length ?? 0,
+      },
+    };
+    pieceStore(job.key).estimationCycleIA = record;
+    store.saveQuote(q);
+    addAIAnalysis({
+      date: record.date, provider: record.fournisseur, model: record.modele, question, tache: "cycle_time", verified: !unknown.length,
+      answer: [cycleText(record), legend.length ? `Noms réels : ${legend.map(([l, n]) => `${l} = ${n}`).join(" ; ")}` : ""].filter(Boolean).join("\n\n"),
+    });
+  } catch (err) {
+    cycleError = { key: job.key, text: err?.name === "AbortError" ? "Estimation annulée." : err?.message || String(err) };
+  } finally {
+    clearInterval(timer);
+    cycleJob = null;
+    render();
+  }
+}
+
+/**
+ * "Utiliser cette valeur": the estimate of the piece shown becomes its cycle
+ * typed in, the input of the casting card (ai-cycle.js adoptEstimate), traced
+ * "estimation IA validée" (provenance.js); its island imposed with it.
+ */
+function adoptCycle() {
+  const c = compute();
+  const r = c?.results.find((x) => x.piece.key === c.selected);
+  const e = r?.inputs.estimationCycleIA;
+  // Not for another island nor for data changed since (the button is disabled then).
+  if (!e || r.route?.process !== e.ilot || changedSince(e, r).length) return;
+  const imposed = r.inputs.procede === e.ilot;
+  const valeur = adoptEstimate(pieceStore(r.piece.key), r.inputs, r.route);
+  if (valeur === null) return;
+  store.saveQuote(q);
+  message = {
+    kind: "ok",
+    text: `Temps de cycle de ${valeur} s utilisé dans le devis : estimation IA validée (${[e.fournisseur, e.modele].filter(Boolean).join(" · ")}), îlot ${e.ilot}${imposed ? "" : " désormais imposé (un temps de cycle est propre à son îlot)"}. « Ne plus utiliser cette valeur », ou « Estimé » dans la liste du temps de cycle, revient à la formule.`,
+  };
+}
+
+/** "Ne plus utiliser cette valeur": the cycle and the island of before the adoption, when the cycle is still the one adopted. */
+function undoCycle() {
+  const piece = pieceStore(currentKey);
+  if (!undoAdoption(piece)) return;
+  store.saveQuote(q);
+  message = {
+    kind: "ok",
+    text: `Estimation IA retirée du devis : ${piece.cycle > 0 ? `temps de cycle saisi avant elle (${piece.cycle} s)` : "temps de cycle estimé par la formule"}${piece.procede === "auto" ? ", îlot choisi automatiquement" : ""}.`,
+  };
+}
+
+/** The data of the estimate `e` that differ from those of the piece now (its island, weight, modulus, pieces per cycle, cores). */
+function changedSince(e, r) {
+  const now = cycleData(r, { settings });
+  const d = e.donnees ?? {};
+  return [["ilot", "îlot", now.coulee.ilot], ["poids_kg", "poids", now.piece.poids_kg], ["module_mm", "module", now.piece.module_mm], ["pieces_par_cycle", "pièces par cycle", now.coulee.pieces_par_cycle], ["noyaux", "noyaux", now.piece.noyaux]]
+    .filter(([k, , v]) => (d[k] ?? null) !== (v ?? null))
+    .map(([, name]) => name);
+}
+
+/**
+ * Card "Estimation IA du temps de cycle" of the piece shown: the estimate, its
+ * range and confidence, its breakdown, its comparison with the formula, the
+ * trend and the similar parts, its hypotheses and points to verify, the
+ * numbers it writes that come from none of the data sent; "Utiliser cette
+ * valeur", or "Ne plus utiliser cette valeur" once used.
+ */
+function cycleCard(r) {
+  const e = r?.inputs.estimationCycleIA;
+  const error = cycleError?.key === r?.piece.key ? cycleError.text : "";
+  if (!e && !error) return "";
+  const head = `<h3>Estimation IA du temps de cycle — ${esc(r.piece.name)}</h3><p class="ai-label">Proposition IA — rien n'est appliqué sans votre validation</p>${error ? `<p class="cmsg error">${esc(error)}</p>` : ""}`;
+  if (!e) return `<section class="ccard ccycle-ia" id="ccycle-ia">${head}</section>`;
+  const code = r.route?.process;
+  // The estimate used in the quote: this one, or an earlier one.
+  const used = adoptedEstimate(r.inputs, code);
+  const adopted = used?.estimation.date === e.date ? used : null;
+  const changed = code === e.ilot ? changedSince(e, r) : [];
+  const warnings = [
+    ...(code && code !== e.ilot ? [`estimation faite pour l'îlot ${e.ilot}, îlot retenu ${code} : relancez l'estimation pour l'utiliser`] : []),
+    ...(changed.length && !adopted ? [`données de la pièce changées depuis l'estimation (${changed.join(", ")}) : relancez l'estimation pour l'utiliser`] : []),
+    ...(e.avertissements ?? []),
+  ];
+  const d = e.donnees ?? {};
+  const total = e.decomposition.reduce((n, step) => n + step.secondes, 0);
+  const steps = e.decomposition.map((step) => `<tr><td>${esc(step.etape)}</td><td class="num">${sec(step.secondes)}</td><td class="small">${esc(step.justification)}</td></tr>`).join("");
+  const c = e.comparaison;
+  const compared = [
+    ["Formule", d.formule_s > 0 ? sec(d.formule_s) : "", c.formule_commentaire],
+    ["Tendance", d.tendance_s > 0 ? sec(d.tendance_s) : "aucune", c.tendance_commentaire],
+    ["Pièces semblables", plural(d.similaires ?? 0, "envoyée"), [c.pieces_similaires_commentaire, e.pieces_similaires_utilisees.length ? `utilisées : ${e.pieces_similaires_utilisees.join(", ")}` : ""].filter(Boolean).join(" — ")],
+  ].map(([what, value, comment]) => `<li><strong>${what}</strong>${value ? ` (${esc(value)})` : ""} : ${esc(comment || "—")}</li>`).join("");
+  const items = (title, list) => (list?.length ? `<h4>${title}</h4><ul class="small">${list.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : "");
+  const unknown = e.nombres_inconnus ?? [];
+  const value = Math.round(e.estimation_s);
+  const usable = code === e.ilot && !changed.length;
+  return `<section class="ccard ccycle-ia" id="ccycle-ia">
+    ${head}
+    <p class="ccycle-value"><strong>${sec(e.estimation_s)}</strong> par cycle — fourchette de ${sec(e.fourchette_s[0])} à ${sec(e.fourchette_s[1])}, confiance <span class="cconf ${esc(e.confiance)}">${esc(e.confiance)}</span> — îlot ${esc(e.ilot)}</p>
+    <p class="small muted">${esc([e.fournisseur, e.modele].filter(Boolean).join(" · "))} · ${dateLabel(e.date)}${e.repli ? ` — ${esc(e.repli)}` : ""}</p>
+    ${warnings.length ? `<p class="cmsg warn">${warnings.map(esc).join(" — ")}</p>` : ""}
+    <div class="cscroll"><table class="ctable compact ccycle-steps">
+      <thead><tr><th>Étape</th><th class="num">Durée</th><th>Justification</th></tr></thead>
+      <tbody>${steps}</tbody>
+      <tfoot><tr class="total"><td>Total de la décomposition</td><td class="num">${sec(total)}</td><td></td></tr></tfoot>
+    </table></div>
+    <h4>Comparaison</h4>
+    <ul class="small ccycle-compare">${compared}</ul>
+    ${items("Hypothèses", e.hypotheses)}
+    ${items("À vérifier", e.a_verifier)}
+    ${unknown.length ? `<p class="ai-numbers" title="${esc(unknown.join(" ; "))}">${esc(numbersLabel(unknown))} ni de l'estimation</p>` : ""}
+    ${e.noms?.length ? `<p class="ai-names">Noms réels : ${esc(e.noms.map(([l, n]) => `${l} = ${n}`).join(" ; "))}</p>` : ""}
+    <p class="cactions">${adopted
+      ? `<span class="small"><strong>Utilisée dans le devis</strong> : ${sec(adopted.valeur)} depuis le ${dateLabel(adopted.date)}.</span> <button type="button" class="small" data-action="undo-cycle">Ne plus utiliser cette valeur</button>`
+      : `<button type="button" class="small" data-action="adopt-cycle"${usable ? "" : " disabled"}>Utiliser cette valeur</button>${used
+        ? ` <span class="small">Utilisée dans le devis : ${sec(used.valeur)}, estimation du ${dateLabel(used.estimation.date)} validée le ${dateLabel(used.date)}.</span> <button type="button" class="small" data-action="undo-cycle">Ne plus utiliser cette valeur</button>`
+        : ""}`}</p>
+    <p class="small muted">« Utiliser cette valeur » met ${value} s dans le temps de cycle de l'îlot ${esc(e.ilot)}${r.inputs.procede === e.ilot ? "" : ", qui devient l'îlot imposé (un temps de cycle est propre à son îlot)"} : une saisie du devis, tracée « estimation IA validée » (carte Traçabilité), qui passe avant la formule et la tendance. « Estimé » dans la liste du temps de cycle, ou « Ne plus utiliser cette valeur », revient à la formule. Non utilisée, l'estimation reste une autre source du temps de cycle dans la trace. Elle est gardée avec le devis et, avec le temps réel mesuré, dans le retour d'expérience.</p>
+  </section>`;
+}
+
 // --------------------------------------------------------------------------- traceability
 
 /** The traced values shown: those of the quote, and of the pieces shown (one, or every piece of the set). */
@@ -1504,8 +1755,8 @@ function traceBanner(sum) {
     <button type="button" class="small" data-action="show-trace">Voir le détail</button></p>`;
 }
 
-/** The name of another source: the field of the customer request (its reference), else the type of source. */
-const altName = (a) => (a.source === "rfq" && a.ref ? a.ref : TRACE_SOURCES[a.source]?.label ?? a.source);
+/** The name of another source: the field of the customer request or the estimate of the AI (its reference), else the type of source. */
+const altName = (a) => ((a.source === "rfq" || a.source === "ia") && a.ref ? a.ref : TRACE_SOURCES[a.source]?.label ?? a.source);
 
 function traceRow(cle, t) {
   const s = t.source;
@@ -1546,7 +1797,7 @@ function traceCard(sections, sum) {
         <thead><tr><th>Valeur tracée</th><th class="num">Valeur</th><th>Source</th><th>Autorité</th><th>Confiance</th><th class="num">Écart à la tendance</th><th>Validation requise</th></tr></thead>
         <tbody>${rows}</tbody></table></div>
     </details>
-    <p class="small muted">Ordre des sources : commande client et saisies du devis, puis Paramètres, classeur et indices (hard), puis géométrie 3D (evidence), puis tendances du fichier de paramètres calés (soft_prior), qui ne remplacent jamais une valeur actuelle. Défaut du code : valeur neutre, à remplacer par une valeur de l'entreprise. Une valeur calculée a la confiance de sa plus faible entrée et demande une validation si l'une d'elles en demande une. Écart à la tendance signalé au-delà de ${pct(settings.seuilTendance ?? SEUIL_TENDANCE, 0)} (Paramètres). Aucune valeur ne vient de l'IA.</p>
+    <p class="small muted">Ordre des sources : commande client et saisies du devis, puis Paramètres, classeur et indices (hard), puis géométrie 3D (evidence), puis tendances du fichier de paramètres calés (soft_prior), qui ne remplacent jamais une valeur actuelle. Défaut du code : valeur neutre, à remplacer par une valeur de l'entreprise. Une valeur calculée a la confiance de sa plus faible entrée et demande une validation si l'une d'elles en demande une. Écart à la tendance signalé au-delà de ${pct(settings.seuilTendance ?? SEUIL_TENDANCE, 0)} (Paramètres). Une valeur de l'IA n'entre dans le devis que validée par une personne : une saisie du devis, source « estimation IA validée » (temps de cycle) ; non validée, elle n'est qu'une autre source.</p>
   </section>`;
 }
 
@@ -1567,7 +1818,11 @@ function saveFeedback() {
   const r = c?.results.find((x) => x.piece.key === c.selected);
   const ref = r?.route ? feedbackRef(c, r) : null;
   if (!ref || !(r.inputs.cycleReel > 0)) return;
-  const record = productionRecord(r, { ref, tempsCycle: r.inputs.cycleReel, fichier: c.p3d?.file ?? null, serie: q.tailleSerie || null });
+  // The estimate of the AI used in the quote, else the last one for this island: compared with the time measured (Historique).
+  const used = adoptedEstimate(r.inputs, r.route.process);
+  const e = used ? used.estimation : r.inputs.estimationCycleIA?.ilot === r.route.process ? r.inputs.estimationCycleIA : null;
+  const estimation = e?.estimation_s > 0 ? { temps_cycle_s: e.estimation_s, fournisseur: e.fournisseur, modele: e.modele, date: e.date, adoptee: !!used } : null;
+  const record = productionRecord(r, { ref, tempsCycle: r.inputs.cycleReel, fichier: c.p3d?.file ?? null, serie: q.tailleSerie || null, estimation });
   const before = store.loadHistorique().find((x) => x.source === "production" && x.ref === ref);
   const saved = store.saveHistorique(mergeHistory(store.loadHistorique(), [record]).pieces);
   pieceStore(currentKey).cycleReel = null;
@@ -1974,7 +2229,7 @@ async function exportXlsx() {
     ["Date de l'export", new Date().toLocaleString("fr-FR")],
     ["Statut", status],
     ["Seuil d'écart à la tendance", P(settings.seuilTendance ?? SEUIL_TENDANCE)],
-    ["Ordre des sources", "commande client et saisies du devis, puis Paramètres, classeur et indices (hard) ; géométrie 3D (evidence) ; tendances (soft_prior), jamais au-dessus d'une valeur actuelle ; défaut du code : hypothèse à valider ; aucune valeur ne vient de l'IA"],
+    ["Ordre des sources", "commande client et saisies du devis, puis Paramètres, classeur et indices (hard) ; géométrie 3D (evidence) ; tendances (soft_prior), jamais au-dessus d'une valeur actuelle ; défaut du code : hypothèse à valider ; une valeur de l'IA seulement validée par une personne (source « estimation IA validée », une saisie du devis)"],
     ["Confidentialité", "document interne : taux, coûts et marges de l'entreprise"],
     [],
     ["Pièce", "Clé", "Valeur tracée", "Valeur", "Unité", "Source", "Référence", "Fichier", "Date", "Entrées", "Autorité", "Niveau", "Confiance", "Raison", "Tendance", "Écart à la tendance", "Autres sources", "Hypothèses", "Alertes", "Validation requise"].map(H),
@@ -1997,10 +2252,10 @@ async function exportXlsx() {
   const analyses = q.analysesIA ?? [];
   const analysesIA = [
     [H("Analyses IA"), null],
-    ["Statut", "raisonnements de l'IA gardés pour mémoire : aucune valeur n'a été appliquée au devis ni aux paramètres"],
+    ["Statut", "raisonnements et estimations de l'IA gardés pour mémoire : aucune valeur n'a été appliquée au devis ni aux paramètres sans validation ; une estimation du temps de cycle validée est une saisie du devis (onglet Traçabilité, source « estimation IA validée »)"],
     [],
     ["Date", "Fournisseur", "Modèle", "Question", "Réponse", "Nombres vérifiés"].map(H),
-    ...analyses.map((a) => [dateLabel(a.date), a.provider, a.model, a.question, String(a.answer ?? "").slice(0, 32000), a.verified ? "oui" : "non : nombres absents de la trace"]),
+    ...analyses.map((a) => [dateLabel(a.date), a.provider, a.model, a.question, String(a.answer ?? "").slice(0, 32000), a.verified ? "oui" : a.tache === "cycle_time" ? "non : nombres absents des données envoyées" : "non : nombres absents de la trace"]),
   ];
 
   const bytes = buildXlsx([

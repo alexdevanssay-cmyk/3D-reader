@@ -401,7 +401,8 @@ const ABOUT = /^(schema|.*version|note|masque|compaction|reasoning_contract)$/;
 
 /**
  * The unit of the numbers under a key of a context, read from its name
- * (volume_mm3, bbox_mm, mass_g, cone_semi_angle_rad, fill_ratio, ecart_pct);
+ * (volume_mm3, bbox_mm, mass_g, cone_semi_angle_rad, fill_ratio, ecart_pct,
+ * temps_cycle_s);
  * undefined: the unit of the field that holds it.
  */
 function unitOfKey(key) {
@@ -412,6 +413,7 @@ function unitOfKey(key) {
   if (/_rad$/.test(key)) return "rad";
   if (/ratio$|^confidence$/.test(key)) return "fraction";
   if (/_pct$/.test(key)) return "%";
+  if (/_s$/.test(key)) return "s";
   return undefined;
 }
 
@@ -424,12 +426,15 @@ const CONVERSIONS = {
   rad: [180 / Math.PI], // degrees
   fraction: [100], // percent
   "%": [0.01], // a fraction
+  s: [1 / 60], // minutes
 };
+// The smallest value written in a converted unit: a time under a minute is not written in minutes.
+const SMALLEST = { s: 1 };
 
 /**
  * Every number a context gives (its values, and the numbers of its texts) as
  * absolute values, with the other forms an answer may write them in: another
- * unit (cm, cm³, kg, degrees, a fraction in percent and back), a radius as a
+ * unit (cm, cm³, kg, degrees, minutes, a fraction in percent and back), a radius as a
  * diameter and a diameter as a radius.
  */
 function contextNumbers(context) {
@@ -438,7 +443,7 @@ function contextNumbers(context) {
     if (typeof v === "number" && Number.isFinite(v)) {
       const a = Math.abs(v);
       const sizes = /radius|radii/.test(key) ? [a, 2 * a] : /diameter/.test(key) ? [a, a / 2] : [a];
-      for (const s of sizes) known.push(s, ...(CONVERSIONS[unit] ?? []).map((f) => s * f));
+      for (const s of sizes) known.push(s, ...(CONVERSIONS[unit] ?? []).map((f) => s * f).filter((x) => !(x < (SMALLEST[unit] ?? 0))));
     } else if (typeof v === "string") known.push(...numbersOf(v).map((n) => Math.abs(n.valeur)));
     else if (Array.isArray(v)) v.forEach((x) => walk(x, unit, key));
     else if (v && typeof v === "object") {

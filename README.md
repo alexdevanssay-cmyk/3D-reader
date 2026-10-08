@@ -44,7 +44,11 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   the browser. The workbooks are read in the browser and never published. A history of
   cycle times (past quotes, and times measured in production typed in for the part shown)
   is kept in the browser too, imported and exported as JSON, and compared with the
-  cycle-time formula of the settings.
+  cycle-time formula of the settings. The casting cycle time can also be estimated by
+  the AI of the page *IA / analyse* (the gateway, or a local Ollama), from the geometry,
+  the formula, the trend and the similar parts of the history: a proposal, shown with
+  its breakdown and range, used in the quote only when the user clicks « Utiliser cette
+  valeur » (then traced as « estimation IA validée »).
 - Export of the results to **Excel** (.xlsx, one value per cell: a row per body, a
   column per quantity, plus a summary sheet), CSV (`;` and decimal comma in French)
   and JSON.

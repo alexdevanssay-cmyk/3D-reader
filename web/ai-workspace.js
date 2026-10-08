@@ -26,6 +26,10 @@
 // Every task with a part: the numbers of an answer that come from none of the
 // data sent are counted under it (engine/ai-context.js checkContextNumbers).
 //
+// The Chiffrage page asks the AI chosen here, outside the conversations, for
+// its estimate of the casting cycle time (askJSON, chiffrage/ai-cycle.js): a
+// JSON answer, a proposal that the quote uses only once a person adopts it.
+//
 // One conversation per tab of the 3D page (see conversationKey). The gateway
 // gets neutral labels in place of the names of the part, of its bodies and of
 // the quote ("Pièce", "Corps 1"...: engine/ai-context.js anonymizer), unless
@@ -279,6 +283,30 @@ export function gatewayLabel({ provider, model, quota } = {}) {
   ].filter(Boolean).join(" · ");
 }
 
+/**
+ * A request to the gateway `url` with the access code `code`: its JSON
+ * answer, or an Error with its message (in French), the HTTP status and
+ * whether an access code is needed (codeRequired).
+ */
+async function fetchGateway(url, code, init = {}) {
+  if (!url) throw new Error(`Renseignez l'adresse de la passerelle : collez son adresse Vercel (${GATEWAY_EXAMPLE}, voir api/README.md), ou choisissez « Ollama local ».`);
+  let response;
+  try {
+    response = await fetch(url, { cache: "no-store", ...init, headers: { Accept: "application/json", ...init.headers, ...(code ? { "X-Reader3D-Code": code } : {}) } });
+  } catch (err) {
+    if (err?.name === "AbortError") throw err;
+    throw new Error(`La passerelle est injoignable (${url}) : vérifiez son adresse (${GATEWAY_EXAMPLE}) et qu'elle autorise cette page, ${location.origin} (READER3D_ALLOWED_ORIGINS dans Vercel).`);
+  }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error((typeof data.error === "string" ? data.error : data.error?.message) || `La passerelle répond par une erreur HTTP ${response.status}.`);
+    error.codeRequired = !!data.access_code_required;
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
 /** The base address of Ollama from what was typed (an old /v1/chat/completions address is accepted). */
 function ollamaBase(value) {
   const text = (value || OLLAMA_URL).trim();
@@ -327,6 +355,110 @@ function withoutThinking(text) {
 /** That reasoning, when the model writes it in the answer. */
 function inlineThinking(text) {
   return /<think>([\s\S]*?)(<\/think>|$)/.exec(String(text ?? ""))?.[1].trim() ?? "";
+}
+
+/**
+ * The AI chosen on the IA page, as this browser keeps it (the fields are saved
+ * as soon as they are changed): {provider ("openai": the gateway, "ollama"),
+ * gateway: {url, code, model}, ollama: {base, model}, anonymize, fallback}.
+ */
+export function savedAI() {
+  const savedGateway = store.get(localStorage, KEYS.gateway);
+  return {
+    // As the page: "openai_compatible" of older versions, or nothing chosen yet, is Ollama.
+    provider: store.get(localStorage, KEYS.provider) === "openai" ? "openai" : "ollama",
+    gateway: {
+      url: savedGateway && !/:11434|\/api\/analyze/.test(savedGateway) ? savedGateway : defaultGateway(),
+      code: store.get(localStorage, KEYS.code) || "",
+      model: store.get(localStorage, `${KEYS.model}.openai`) || "",
+    },
+    ollama: { base: store.get(localStorage, KEYS.ollama) || OLLAMA_URL, model: store.get(localStorage, `${KEYS.model}.ollama`) || OLLAMA_MODEL },
+    anonymize: store.get(localStorage, KEYS.anonymize) !== "0",
+    fallback: store.get(localStorage, KEYS.fallback) !== "0",
+  };
+}
+
+/** Ask Ollama (`ollama`: {base, model}) for a JSON answer to `question` on the data `context`, with the instructions `system`. */
+async function askOllamaJSON({ system, question, context }, { base, model }, signal) {
+  const space = addressSpace(base);
+  const messages = [{ role: "system", content: system }, { role: "user", content: `${question}\n\nDONNÉES (JSON) :\n${JSON.stringify(context)}` }];
+  // The JSON of the answer, without the reasoning before it (much slower on a CPU); the schema is in the instructions.
+  const body = { model, messages, stream: false, format: "json", think: false, keep_alive: "15m", options: { num_ctx: contextWindow(JSON.stringify(messages).length), temperature: 0.2 } };
+  const post = () => fetch(`${base}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+    ...(space ? { targetAddressSpace: space } : {}),
+  }).catch((err) => {
+    if (err?.name === "AbortError") throw err;
+    throw new Error("La connexion à Ollama a été coupée. Ollama s'est peut-être arrêté (mémoire insuffisante pour le modèle ?) : vérifiez qu'il tourne, puis réessayez.");
+  });
+  let response = await post();
+  if (response.status === 400) {
+    // Models (or Ollama versions) without the thinking switch refuse "think".
+    const text = await response.text();
+    if (!/think/i.test(text)) throw new Error(`Ollama : ${text}`);
+    delete body.think;
+    response = await post();
+  }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.error) throw new Error(`Ollama : ${data.error || `HTTP ${response.status}`}`);
+  return data.message?.content ?? "";
+}
+
+/**
+ * A JSON answer to the task `task` from the AI chosen on the IA page
+ * (savedAI), outside its conversations: the estimate of the cycle time of the
+ * Chiffrage page (chiffrage/ai-cycle.js). `build({budget, local, anonymize,
+ * model})` gives what is sent within `budget` characters: {context, question,
+ * system (the instructions of the local model `model`)}; the gateway has its
+ * own instructions for the task. When the gateway refuses for its free quota,
+ * Ollama answers, if it can and the box "Repli automatique" is ticked, as for
+ * the questions of the IA page. Resolves to {output, provider, model, quota,
+ * sent (what was built for the AI that answered), local, notice}.
+ */
+export async function askJSON(task, build, { signal } = {}) {
+  const ai = savedAI();
+  // Ollama, its address and model of the IA page; `quota`: the refusal of the gateway it answers in place of, told when it cannot.
+  const askLocal = async (ollama, quota = null) => {
+    let base;
+    let problem;
+    try {
+      base = ollamaBase(ollama.base);
+      problem = await diagnoseOllama(base, ollama.model);
+    } catch (err) {
+      problem = err.message;
+    }
+    if (problem) throw quota ?? new Error(problem);
+    const sent = build({ budget: LOCAL_CONTEXT_CHARS, local: true, anonymize: false, model: ollama.model });
+    const output = await askOllamaJSON(sent, { base, model: ollama.model }, signal);
+    return { output, provider: "Ollama", model: ollama.model, quota: null, sent, local: true };
+  };
+  if (ai.provider === "ollama") return askLocal(ai.ollama);
+  const { url, code, model } = ai.gateway;
+  if (!url) throw new Error(`Aucune passerelle IA renseignée : dans la page IA / analyse, collez l'adresse Vercel de la passerelle (${GATEWAY_EXAMPLE}) ou choisissez « Ollama local ».`);
+  // The budget of the gateway; an older gateway, without its configuration: the default one.
+  const info = await fetchGateway(url, code, { signal }).catch((err) => {
+    if (err?.name === "AbortError") throw err;
+    return null; // the question tells what is wrong
+  });
+  const sent = build({ budget: info?.context_chars > 0 ? info.context_chars : GATEWAY_CONTEXT_CHARS, local: false, anonymize: ai.anonymize });
+  try {
+    const data = await fetchGateway(url, code, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gateway_schema_version: "1.0", task, model: model || undefined, context: sent.context, messages: [{ role: "user", content: sent.question }] }),
+      signal,
+    });
+    const output = data.output ?? data.text;
+    if (typeof output !== "string" || !output.trim()) throw new Error("La passerelle a renvoyé une réponse vide : réessayez.");
+    return { output, provider: data.provider ?? null, model: data.model ?? null, quota: data.quota ?? null, sent, local: false };
+  } catch (err) {
+    // The free quota reached: the local model, when it answers (its own address and model).
+    if (err?.name === "AbortError" || !QUOTA_STATUSES.includes(err?.status) || !ai.fallback) throw err;
+    return { ...(await askLocal(ai.ollama, err)), notice: `Quota en ligne atteint : réponse du modèle local (${ai.ollama.model})` };
+  }
 }
 
 export function mount({ page, reader }) {
@@ -639,27 +771,14 @@ export function mount({ page, reader }) {
     return answer;
   }
 
-  /** A request to the gateway: its JSON answer, or an Error with its message (in French) and the HTTP status. */
+  /** A request to the gateway of this page (its address and access code): see fetchGateway. */
   async function gatewayFetch(init = {}) {
-    const url = $("ai-url").value.trim();
-    if (!url) throw new Error(`Renseignez l'adresse de la passerelle : collez son adresse Vercel (${GATEWAY_EXAMPLE}, voir api/README.md), ou choisissez « Ollama local ».`);
-    const code = $("ai-code").value.trim();
-    let response;
     try {
-      response = await fetch(url, { cache: "no-store", ...init, headers: { Accept: "application/json", ...init.headers, ...(code ? { "X-Reader3D-Code": code } : {}) } });
+      return await fetchGateway($("ai-url").value.trim(), $("ai-code").value.trim(), init);
     } catch (err) {
-      if (err?.name === "AbortError") throw err;
-      throw new Error(`La passerelle est injoignable (${url}) : vérifiez son adresse (${GATEWAY_EXAMPLE}) et qu'elle autorise cette page, ${location.origin} (READER3D_ALLOWED_ORIGINS dans Vercel).`);
+      if (err.codeRequired) showCode(true);
+      throw err;
     }
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      if (data.access_code_required) showCode(true);
-      const error = new Error((typeof data.error === "string" ? data.error : data.error?.message) || `La passerelle répond par une erreur HTTP ${response.status}.`);
-      error.codeRequired = !!data.access_code_required;
-      error.status = response.status;
-      throw error;
-    }
-    return data;
   }
 
   /** The configuration of the gateway (GET): provider, model, context budget, access code; asked again when its address or the code changes. */

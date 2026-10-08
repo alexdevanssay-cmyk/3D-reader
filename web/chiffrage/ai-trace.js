@@ -53,7 +53,8 @@ export function maskNumbers(text) {
 const round = (v) => (typeof v !== "number" || !Number.isFinite(v) ? v ?? null : Math.abs(v) >= 100 ? Math.round(v * 100) / 100 : Number(v.toPrecision(6)));
 const percent = (v) => (typeof v === "number" && Number.isFinite(v) ? round(v * 100) : null);
 const sourceName = (s) => `${SOURCES[s.type]?.label ?? s.type}${s.fichier ? ` « ${s.fichier} »` : ""}`;
-const altName = (a) => (a.source === "rfq" && a.ref ? a.ref : SOURCES[a.source]?.label ?? a.source);
+// The field of the customer request, the estimate of the AI: by their reference.
+const altName = (a) => ((a.source === "rfq" || a.source === "ia") && a.ref ? a.ref : SOURCES[a.source]?.label ?? a.source);
 
 /**
  * One traced value for a model: its value (unit "%": in percent), unit,
