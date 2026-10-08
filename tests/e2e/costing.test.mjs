@@ -341,13 +341,15 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     });
     const gateway = createServer(async (req, res) => {
       if (cors(req, res)) return;
+      res.setHeader('Content-Type', 'application/json');
+      // Its configuration: the context budget the page compacts to.
+      if (req.method === 'GET') return res.end(JSON.stringify({ provider: 'Groq', model: 'openai/gpt-oss-120b', models: [], context_chars: 6000, access_code_required: false }));
       const request = await body(req);
       gatewayRequests.push(request);
-      res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({ output: JSON.stringify({
         conclusion: 'Prix à valider.', observations: [], inferences: [], recommendations: [], uncertainties: [], needs_human_validation: true,
         analyse_chiffrage: { explications: [answer(request.context.costing_trace)], ecarts_signales: [{ cle: 'devis.densite', commentaire: 'défaut du code' }], questions: [], hypotheses: [] },
-      }) }));
+      }), provider: 'Groq', model: 'openai/gpt-oss-120b', quota: { requests_remaining_day: 997, requests_limit_day: 1000 } }));
     });
     await Promise.all([ollama, gateway].map((s) => new Promise((resolve) => s.listen(0, '127.0.0.1', resolve))));
     // Closed even when an assertion fails: a server left open would keep the test process running.
@@ -427,6 +429,11 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.doesNotMatch(JSON.stringify(masked), new RegExp(`\\b${String(price.valeur).replace('.', '\\.')}\\b`));
     assert.equal(gatewayRequests[0].context.costing_contract, undefined);
     assert.ok(gatewayRequests[0].messages.every((m) => Object.keys(m).join() === 'role,content'));
+    // The costing task named; the trace within two thirds of the gateway's budget, the whole context within it.
+    assert.equal(gatewayRequests[0].task, 'costing');
+    assert.ok(JSON.stringify(masked).length <= 4000, `trace of ${JSON.stringify(masked).length} characters`);
+    assert.ok(JSON.stringify(gatewayRequests[0].context).length <= 6000);
+    assert.match(await page.textContent('#ai-status'), /^Réponse en \d+ s · Groq · openai\/gpt-oss-120b · 997 questions restantes aujourd'hui$/);
     assert.match(await reply.locator('.ai-text').textContent(), /Analyse du chiffrage :\nExplications :\n- Le prix de vente \(piece\.prix\.vente\) est masqué\.\nÉcarts signalés :\n- devis\.densite : défaut du code/);
     assert.equal(await reply.locator('.ai-check').textContent(), 'Aucun nombre cité.');
     await page.check('#ai-amounts');

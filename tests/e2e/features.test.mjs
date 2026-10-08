@@ -1,6 +1,6 @@
 // End-to-end tests of the user-facing features of the built site (dist/):
 // French interface, analysis progress, memory gauge, Excel export, wall
-// thickness, and the
+// thickness, the IA page (a local Ollama, the AI gateway), and the
 // link-driven mode for AI assistants (?url=…&report=1, window.reader3d).
 //
 //   npm run build && node --test tests/e2e/features.test.mjs
@@ -443,6 +443,132 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.deepEqual(errors, []);
     await page.context().close();
     await new Promise((resolve) => ollama.close(resolve));
+  });
+
+  test('IA page through the gateway (api/ai.js, a stand-in for Groq): configuration, access code, context to its budget, quota, errors', { timeout: CAD_TIMEOUT }, async (t) => {
+    // The gateway itself in a node:http server; its provider a stand-in for Groq's chat completions.
+    const { default: gatewayHandler } = await import('../../api/ai.js');
+    const completions = [];
+    let reply = () => ({ status: 200, body: { model: 'openai/gpt-oss-120b', choices: [{ message: { role: 'assistant', content: 'Conclusion : une boîte fermée.' }, finish_reason: 'stop' }] } });
+    const groq = createServer((req, res) => {
+      let text = '';
+      req.on('data', (c) => (text += c));
+      req.on('end', () => {
+        completions.push({ url: req.url, authorization: req.headers.authorization, body: JSON.parse(text) });
+        const { status, body, headers = {} } = reply();
+        res.writeHead(status, { 'Content-Type': 'application/json', 'x-ratelimit-limit-requests': '1000', 'x-ratelimit-remaining-requests': String(1000 - completions.length), 'x-ratelimit-limit-tokens': '8000', 'x-ratelimit-remaining-tokens': '5000', ...headers });
+        res.end(JSON.stringify(body));
+      });
+    });
+    const gateway = createServer((req, res) => gatewayHandler(req, res));
+    await Promise.all([groq, gateway].map((s) => new Promise((resolve) => s.listen(0, '127.0.0.1', resolve))));
+    const saved = { ...process.env };
+    // Only these settings (none of this machine's): the key named as it was created in Vercel; the page
+    // served from another port, an origin to allow.
+    for (const k of Object.keys(process.env)) if (/^(groq_api_key|ai_|openai_|reader3d_)/i.test(k)) delete process.env[k];
+    Object.assign(process.env, {
+      Groq_API_KEY: 'gsk_made_up',
+      AI_BASE_URL: `http://127.0.0.1:${groq.address().port}/openai/v1`,
+      READER3D_ALLOWED_ORIGINS: base.replace(/\/$/, ''),
+      AI_CONTEXT_CHARS: '2500',
+    });
+    t.after(() => {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+      return Promise.all([groq, gateway].map((s) => new Promise((resolve) => {
+        s.closeAllConnections();
+        s.close(resolve);
+      })));
+    });
+    const gatewayUrl = `http://127.0.0.1:${gateway.address().port}/api/ai`;
+    const status = () => page.textContent('#ai-status');
+    const waitStatus = (re) => page.waitForFunction((source) => new RegExp(source).test(document.getElementById('ai-status').textContent), re.source, { timeout: 30_000 });
+    const ask = async (question) => {
+      await page.fill('#ai-input', question);
+      await page.press('#ai-input', 'Enter');
+      await page.waitForFunction(() => !document.getElementById('ai-send').disabled && !/Analyse/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+    };
+    const contextOf = (completion) => completion.body.messages[1].content.replace(/^[\s\S]*?<<<DONNEES_3D_READER\n/, '').replace(/\nDONNEES_3D_READER>>>$/, '');
+
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    await page.click('.tab[data-page="ia"]');
+    await page.selectOption('#ai-provider', 'openai');
+    assert.equal(await page.textContent('#ai-provider option[value="openai"]'), 'En ligne via la passerelle (Groq…)');
+    // Not on Vercel (GitHub Pages here): no address until it is pasted, the placeholder tells which.
+    assert.equal(await page.inputValue('#ai-url'), '');
+    assert.equal(await page.getAttribute('#ai-url', 'placeholder'), "Collez l'adresse Vercel : https://<projet>.vercel.app/api/ai");
+    await ask('Bonjour');
+    assert.match(await page.textContent('#ai-chat .ai-error'), /^Erreur\s*Renseignez l'adresse de la passerelle : collez son adresse Vercel/);
+    await page.click('#ai-clear');
+
+    // The connection test: provider, model, no access code.
+    await page.fill('#ai-url', gatewayUrl);
+    await page.click('#ai-test');
+    await waitStatus(/^Passerelle connectée/);
+    assert.equal(await status(), "Passerelle connectée : Groq · openai/gpt-oss-120b · sans code d'accès");
+    assert.equal(await page.isVisible('#ai-code-field'), false);
+    assert.equal(await page.getAttribute('#ai-model', 'placeholder'), 'openai/gpt-oss-120b (par défaut)');
+
+    // An access code on the gateway: the field shown, a question without it refused, the provider not asked.
+    process.env.READER3D_ACCESS_CODE = 'made-up code';
+    await page.click('#ai-test');
+    await waitStatus(/code d'accès requis$/);
+    assert.equal(await page.isVisible('#ai-code-field'), true);
+    assert.equal(await page.getAttribute('#ai-code', 'type'), 'password');
+    await ask('Quelles règles de dépouille en coquille gravité ?');
+    assert.match(await page.textContent('#ai-chat .ai-error'), /Code d'accès requis : saisissez le code de la passerelle\./);
+    assert.equal(completions.length, 0);
+    await page.fill('#ai-code', 'wrong code');
+    await page.click('#ai-test');
+    await waitStatus(/^Code d'accès incorrect\.$/);
+    await page.fill('#ai-code', 'made-up code');
+    await page.click('#ai-test');
+    await waitStatus(/code d'accès accepté$/);
+    await page.click('#ai-clear');
+
+    // A general question without a 3D model: the answer, then where it comes from and the questions left today.
+    await ask('Quelles règles de dépouille en coquille gravité ?');
+    assert.match(await page.textContent('#ai-chat .ai-assistant'), /Conclusion : une boîte fermée\./);
+    assert.match(await status(), /^Réponse en \d+ s · Groq · openai\/gpt-oss-120b · 999 questions restantes aujourd'hui$/);
+    assert.equal(completions[0].url, '/openai/v1/chat/completions');
+    assert.equal(completions[0].authorization, 'Bearer gsk_made_up');
+    assert.equal(completions[0].body.model, 'openai/gpt-oss-120b');
+    assert.equal(completions[0].body.reasoning_effort, 'low');
+    assert.equal(completions[0].body.max_completion_tokens, 1200);
+    assert.deepEqual(completions[0].body.messages.map((m) => m.role), ['system', 'user', 'user']);
+    assert.match(contextOf(completions[0]), /"no_model_loaded":true/);
+    assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.ai.gatewayCode')), 'made-up code');
+
+    // A part: the analysis tasks get its detail compacted to the gateway's budget, the general questions a summary.
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.click('.tab[data-page="ia"]');
+    await page.click('.ai-task[data-task="feature_analysis"]');
+    await ask('Quelles features ?');
+    const detail = contextOf(completions[1]);
+    const whole = await page.evaluate(() => JSON.stringify(window.reader3d.aiContext({ task: 'feature_analysis' })).length);
+    assert.match(detail, /"compaction"/);
+    assert.ok(detail.length <= 2500 && whole > 2500, `context of ${detail.length} characters, ${whole} whole`);
+    // The conversation goes with it.
+    assert.deepEqual(completions[1].body.messages.slice(2).map((m) => m.role), ['user', 'assistant', 'user']);
+    await page.click('.ai-task[data-task="general"]');
+    await ask('Résume la pièce.');
+    assert.match(contextOf(completions[2]), /"summary_only":true/);
+
+    // The free quota reached: the message of the gateway as it is, the question not kept.
+    t.mock.method(console, 'error', () => {}); // the gateway logs the provider's refusal
+    reply = () => ({ status: 429, headers: { 'retry-after': '12' }, body: { error: { message: 'Rate limit reached for model openai/gpt-oss-120b', type: 'tokens' } } });
+    const kept = await page.locator('#ai-chat .ai-msg').count();
+    await ask('Et les noyaux ?');
+    assert.equal(await status(), 'Erreur');
+    assert.equal(await page.textContent('#ai-chat .ai-msg:last-child .ai-text'), 'Quota de Groq (offre gratuite) atteint. Réessayez dans 12 s.');
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), kept + 2, 'the question and the error');
+    const stored = await page.evaluate(() => JSON.parse(sessionStorage.getItem('reader3d.ai.messages')).length);
+    assert.equal(stored, 6);
+    assert.deepEqual(errors, []);
+    await page.context().close();
   });
 
   test('tabs: several parts open side by side, each with its own analysis', { timeout: CAD_TIMEOUT }, async () => {

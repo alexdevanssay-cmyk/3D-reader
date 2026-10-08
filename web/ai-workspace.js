@@ -1,7 +1,12 @@
 // "IA / analyse" page: questions on the part shown, answered either by a
-// language model behind the AI gateway (api/ai.js, OpenAI Responses API) or by
-// a local model run by Ollama on this computer or on a device of the local
-// network, a Jetson for instance (nothing leaves the site).
+// language model behind the AI gateway (api/ai.js on Vercel: Groq or another
+// OpenAI-compatible provider) or by a local model run by Ollama on this
+// computer or on a device of the local network, a Jetson for instance
+// (nothing leaves the site).
+//
+// The gateway gives its configuration (GET): provider, model, the size of
+// context it takes (the free plan of Groq allows 8,000 tokens a minute), and
+// whether it asks for an access code, sent in the X-Reader3D-Code header.
 //
 // Local Ollama from a page on the web needs two permissions, both outside this
 // page: Ollama must allow the page's origin (OLLAMA_ORIGINS), and the browser
@@ -20,7 +25,7 @@
 import { buildAIContext, compactAIContext, summaryAIContext } from "./engine/ai-context.js";
 
 const PROVIDERS = [
-  ["openai", "OpenAI / Responses API (gateway)"],
+  ["openai", "En ligne via la passerelle (Groq…)"], // value of earlier versions, kept in this browser's storage
   ["ollama", "Ollama local (sur ce PC)"],
 ];
 const OLLAMA_URL = "http://localhost:11434";
@@ -29,8 +34,11 @@ const OLLAMA_MODEL = "qwen3:8b";
 // time to read the prompt on a CPU grow with it.
 const LOCAL_CONTEXT_CHARS = 12000;
 const LOCAL_TRACE_CHARS = 8000; // of which the costing trace (task "Chiffrage"), the geometry having the rest
-const LOCAL_HISTORY = 6; // messages of the conversation sent again with a question
+const HISTORY = 6; // messages of the conversation sent again with a question
 const MAX_WINDOW = 16384; // largest window (tokens) asked of Ollama
+// Context budget of a gateway that does not give its own (GET), sized for the free plan of Groq.
+const GATEWAY_CONTEXT_CHARS = 9000;
+const GATEWAY_EXAMPLE = "https://<projet>.vercel.app/api/ai";
 
 const TASKS = [
   ["general", "Analyse générale"],
@@ -41,7 +49,7 @@ const TASKS = [
   ["costing", "Chiffrage"],
 ];
 
-const KEYS = { gateway: "reader3d.ai.gateway", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider", messages: "reader3d.ai.messages", think: "reader3d.ai.think", amounts: "reader3d.ai.costingAmounts" };
+const KEYS = { gateway: "reader3d.ai.gateway", code: "reader3d.ai.gatewayCode", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider", messages: "reader3d.ai.messages", think: "reader3d.ai.think", amounts: "reader3d.ai.costingAmounts" };
 const COSTING_LABEL = "Raisonnement IA — aucune valeur n'est appliquée";
 
 function escapeHtml(value) {
@@ -190,9 +198,18 @@ Le détail exact est affiché dans la console du navigateur (F12).`;
   return null;
 }
 
-/** The gateway of this deployment: api/ai.js is served with the site on Vercel, not on GitHub Pages. */
-function defaultGateway() {
-  return /\.vercel\.app$/.test(location.hostname) ? new URL("/api/ai", location.origin).href : "";
+/** The gateway of this deployment: api/ai.js is served with the site on Vercel, not on GitHub Pages (its address is pasted there). */
+export function defaultGateway(where = location) {
+  return /\.vercel\.app$/.test(where.hostname) ? new URL("/api/ai", where.origin).href : "";
+}
+
+/** Where an answer of the gateway comes from, and what is left of its free quota: "Groq · openai/gpt-oss-120b · 998 questions restantes aujourd'hui". */
+export function gatewayLabel({ provider, model, quota } = {}) {
+  const left = quota?.requests_remaining_day;
+  return [
+    [provider, model].filter(Boolean).join(" · "),
+    Number.isFinite(left) ? `${left.toLocaleString("fr-FR")} question${left > 1 ? "s restantes" : " restante"} aujourd'hui` : "",
+  ].filter(Boolean).join(" · ");
 }
 
 /** The base address of Ollama from what was typed (an old /v1/chat/completions address is accepted). */
@@ -264,6 +281,9 @@ export function mount({ page, reader }) {
           <label class="field">Modèle
             <input id="ai-model" spellcheck="false">
           </label>
+          <label class="field" id="ai-code-field" hidden title="Code demandé par la passerelle (variable READER3D_ACCESS_CODE dans Vercel), gardé dans ce navigateur.">Code d'accès
+            <input id="ai-code" type="password" autocomplete="off" spellcheck="false">
+          </label>
           <label class="check" id="ai-think-field" title="Le modèle raisonne avant de répondre : réponses plus sûres, mais bien plus lentes sur un PC sans carte graphique. Le raisonnement s'affiche sous la réponse."><input type="checkbox" id="ai-think"> Réflexion du modèle (plus lent)</label>
           <label class="check" id="ai-amounts-field" hidden title="Sans cette case, la passerelle reçoit la trace du chiffrage sans les montants internes (taux, coûts, prix, marges, pertes au feu, TRS) : leurs sources et leurs écarts relatifs seulement. Le modèle local (Ollama) reçoit toujours la trace complète, rien ne quitte le site."><input type="checkbox" id="ai-amounts"> Envoyer les montants internes du chiffrage à la passerelle</label>
           <button id="ai-test" class="btn" type="button">Tester la connexion</button>
@@ -300,22 +320,32 @@ export function mount({ page, reader }) {
 
   const provider = () => $("ai-provider").value;
   const isLocal = () => provider() === "ollama";
+  let codeRequired = false; // the gateway asks for an access code
+  let gatewayInfo = null; // {key, data}: the configuration the gateway gave, for its address and code
+
+  /** The access code field: shown when the gateway asks for one, or when one is kept. */
+  function showCode(required = codeRequired) {
+    codeRequired = !!required;
+    $("ai-code-field").hidden = isLocal() || !(codeRequired || $("ai-code").value);
+  }
 
   function showProvider() {
     const local = isLocal();
-    $("ai-url-label").textContent = local ? "Adresse d'Ollama" : "Adresse du AI Gateway";
+    $("ai-url-label").textContent = local ? "Adresse d'Ollama" : "Adresse de la passerelle";
     const savedGateway = store.get(localStorage, KEYS.gateway);
     // Older versions stored the Ollama address, or the Vercel analysis API, as the gateway.
     const gateway = savedGateway && !/:11434|\/api\/analyze/.test(savedGateway) ? savedGateway : defaultGateway();
     $("ai-url").value = local ? store.get(localStorage, KEYS.ollama) || OLLAMA_URL : gateway;
-    $("ai-url").placeholder = local ? OLLAMA_URL : "https://<votre-gateway>/api/ai";
+    $("ai-url").placeholder = local ? OLLAMA_URL : `Collez l'adresse Vercel : ${GATEWAY_EXAMPLE}`;
     const savedModel = store.get(localStorage, `${KEYS.model}.${provider()}`);
     $("ai-model").value = savedModel || (local ? OLLAMA_MODEL : "");
-    $("ai-model").placeholder = local ? OLLAMA_MODEL : "modèle par défaut du gateway";
+    $("ai-model").placeholder = local ? OLLAMA_MODEL : "modèle par défaut de la passerelle";
     $("ai-think-field").hidden = !local;
     $("ai-amounts-field").hidden = local || task !== "costing";
+    showCode();
   }
   {
+    $("ai-code").value = store.get(localStorage, KEYS.code) || "";
     const saved = store.get(localStorage, KEYS.provider);
     // Older versions stored "openai_compatible" for Ollama.
     $("ai-provider").value = saved === "openai_compatible" ? "ollama" : saved === "openai" || saved === "ollama" ? saved : "ollama";
@@ -370,10 +400,12 @@ export function mount({ page, reader }) {
   /**
    * The context of the question: the part shown, or none (general questions
    * are allowed without a model); for the task "Chiffrage", the traced values
-   * of the quote (costing_trace, read only): smaller for the local model, its
-   * internal amounts masked for the gateway unless the box is ticked.
+   * of the quote (costing_trace, read only): smaller for the local model; for
+   * the gateway, its internal amounts masked unless the box is ticked, within
+   * two thirds of the gateway's budget (`budget`, characters) as for the
+   * local model.
    */
-  async function contextForCurrentTask(local) {
+  async function contextForCurrentTask(local, budget = GATEWAY_CONTEXT_CHARS) {
     const semantic = reader.semantic;
     const aiTask = task === "costing" ? "manufacturing_analysis" : task;
     const context = semantic ? buildAIContext(semantic, { task: aiTask }) : {
@@ -395,7 +427,7 @@ export function mount({ page, reader }) {
       problem = `trace du chiffrage indisponible : ${err?.message || err}`;
     }
     const { traceForAI } = await import("./chiffrage/ai-trace.js");
-    const costingTrace = traceForAI(snapshot, local ? { maxChars: LOCAL_TRACE_CHARS } : { mask: !$("ai-amounts").checked });
+    const costingTrace = traceForAI(snapshot, local ? { maxChars: LOCAL_TRACE_CHARS } : { mask: !$("ai-amounts").checked, maxChars: Math.round((budget * 2) / 3) });
     return { ...context, costing_trace: costingTrace, ...(problem ? { costing_note: problem } : {}) };
   }
 
@@ -414,7 +446,7 @@ export function mount({ page, reader }) {
     const system = `${systemPrompt(model, space === "loopback" ? "sur ce PC" : "sur un appareil du réseau local", task === "costing")}\n\nCONTEXTE :\n${JSON.stringify(compact)}`;
     const think = $("ai-think").checked;
     const reserve = think ? 4096 : 2048; // room for the answer, and for the reasoning written before it
-    let history = messages.slice(-LOCAL_HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
+    let history = messages.slice(-HISTORY).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: String(m.content ?? "") }));
     const promptChars = () => system.length + JSON.stringify(history).length + question.length;
     // The oldest exchanges are left out rather than the prompt cut by Ollama.
     while (history.length && Math.ceil(promptChars() / 3) + reserve > MAX_WINDOW) history = history.slice(2);
@@ -499,27 +531,61 @@ export function mount({ page, reader }) {
     return answer;
   }
 
-  async function askGateway(question, context, signal) {
+  /** A request to the gateway: its JSON answer, or an Error with its message (in French). */
+  async function gatewayFetch(init = {}) {
     const url = $("ai-url").value.trim();
-    if (!url) throw new Error("Renseignez l'adresse du AI Gateway (déployé sur Vercel, voir api/README.md), ou choisissez « Ollama local ».");
-    const response = await fetch(url, {
+    if (!url) throw new Error(`Renseignez l'adresse de la passerelle : collez son adresse Vercel (${GATEWAY_EXAMPLE}, voir api/README.md), ou choisissez « Ollama local ».`);
+    const code = $("ai-code").value.trim();
+    let response;
+    try {
+      response = await fetch(url, { cache: "no-store", ...init, headers: { Accept: "application/json", ...init.headers, ...(code ? { "X-Reader3D-Code": code } : {}) } });
+    } catch (err) {
+      if (err?.name === "AbortError") throw err;
+      throw new Error(`La passerelle est injoignable (${url}) : vérifiez son adresse (${GATEWAY_EXAMPLE}) et qu'elle autorise cette page, ${location.origin} (READER3D_ALLOWED_ORIGINS dans Vercel).`);
+    }
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      if (data.access_code_required) showCode(true);
+      const error = new Error((typeof data.error === "string" ? data.error : data.error?.message) || `La passerelle répond par une erreur HTTP ${response.status}.`);
+      error.codeRequired = !!data.access_code_required;
+      throw error;
+    }
+    return data;
+  }
+
+  /** The configuration of the gateway (GET): provider, model, context budget, access code; asked again when its address or the code changes. */
+  async function gatewayConfig(signal) {
+    const key = `${$("ai-url").value.trim()}\n${$("ai-code").value.trim()}`;
+    if (gatewayInfo?.key === key) return gatewayInfo.data;
+    const data = await gatewayFetch({ signal });
+    gatewayInfo = { key, data };
+    showCode(data.access_code_required);
+    if (data.model) $("ai-model").placeholder = `${data.model} (par défaut)`;
+    return data;
+  }
+
+  /** Ask the gateway, the context compacted to its budget. Resolves to its answer: {output, provider, model, quota}. */
+  async function askGateway(question, context, signal, budget) {
+    // General questions: a summary of the part; the analysis tasks: the detail, as much as the budget allows.
+    const compact = context.no_model_loaded ? context : task === "general" ? summaryAIContext(context) : compactAIContext(context, { maxChars: budget });
+    // The latest exchanges, while they take no more than half the room of the context.
+    let history = messages.slice(-HISTORY).map(({ role, content }) => ({ role, content }));
+    while (history.length && JSON.stringify(history).length > budget / 2) history = history.slice(2);
+    const data = await gatewayFetch({
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         gateway_schema_version: "1.0",
-        provider: "openai",
+        task,
         model: $("ai-model").value.trim() || undefined,
-        context,
-        messages: [...messages.map(({ role, content }) => ({ role, content })), { role: "user", content: question }],
+        context: compact,
+        messages: [...history, { role: "user", content: question }],
       }),
       signal,
     });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const error = typeof data.error === "string" ? data.error : data.error?.message;
-      throw new Error(error || `Gateway HTTP ${response.status}`);
-    }
-    return data.output || data.text || "";
+    const output = data.output ?? data.text;
+    if (typeof output !== "string" || !output.trim()) throw new Error("La passerelle a renvoyé une réponse vide : réessayez.");
+    return { ...data, output };
   }
 
   async function send(question) {
@@ -575,7 +641,14 @@ export function mount({ page, reader }) {
     tick();
     const timer = setInterval(tick, 1000);
     try {
-      const context = await contextForCurrentTask(local);
+      // The gateway's budget; an older gateway, without its configuration: the default one.
+      const info = local ? null : await gatewayConfig(busy.signal).catch((err) => {
+        if (err?.name === "AbortError") throw err;
+        return null; // the question tells what is wrong
+      });
+      const budget = info?.context_chars > 0 ? info.context_chars : GATEWAY_CONTEXT_CHARS;
+      const context = await contextForCurrentTask(local, budget);
+      let answer = null; // of the gateway
       const output = local
         ? await askOllama(question, context, busy.signal, (text) => {
           showThought(inlineThinking(text));
@@ -587,7 +660,7 @@ export function mount({ page, reader }) {
           answerBox.textContent = visible;
           $("ai-chat").scrollTop = $("ai-chat").scrollHeight;
         }, showThought)
-        : await askGateway(question, context, busy.signal);
+        : (answer = await askGateway(question, context, busy.signal, budget)).output;
       foldThought();
       answerBox.classList.remove("ai-thinking");
       answerBox.textContent = formatAnswer(output) || "(réponse vide)";
@@ -601,7 +674,8 @@ export function mount({ page, reader }) {
       // Only answered questions are kept: a failed one is not sent again with the next.
       messages.push({ role: "user", content: question }, { role: "assistant", content: withoutThinking(output), ...(check ? { costing: check } : {}) });
       saveMessages();
-      setStatus(`Réponse en ${Math.round((performance.now() - start) / 1000)} s${local && timing ? ` (${timing})` : ""}`);
+      const source = answer ? gatewayLabel(answer) : "";
+      setStatus(`Réponse en ${Math.round((performance.now() - start) / 1000)} s${local && timing ? ` (${timing})` : ""}${source ? ` · ${source}` : ""}`);
       timing = "";
     } catch (err) {
       answerBox.parentElement.remove();
@@ -621,6 +695,7 @@ export function mount({ page, reader }) {
   }
 
   $("ai-think").addEventListener("change", () => store.set(localStorage, KEYS.think, $("ai-think").checked ? "1" : null));
+  $("ai-code").addEventListener("input", () => store.set(localStorage, KEYS.code, $("ai-code").value.trim() || null));
   $("ai-amounts").addEventListener("change", () => store.set(sessionStorage, KEYS.amounts, $("ai-amounts").checked ? "1" : null));
 
   $("ai-provider").addEventListener("change", () => {
@@ -630,7 +705,22 @@ export function mount({ page, reader }) {
 
   $("ai-test").addEventListener("click", async () => {
     if (!isLocal()) {
-      setStatus($("ai-url").value.trim() ? "Gateway configuré (testé à la première question)" : "Adresse du gateway manquante");
+      setStatus("Test de la passerelle…");
+      gatewayInfo = null; // asked again
+      try {
+        const info = await gatewayConfig();
+        const code = $("ai-code").value.trim();
+        setStatus(`Passerelle connectée : ${gatewayLabel(info)} · ${info.access_code_required ? (code ? "code d'accès accepté" : "code d'accès requis") : "sans code d'accès"}`);
+        if (info.access_code_required && !code) $("ai-code").focus();
+      } catch (err) {
+        if (err.codeRequired) {
+          setStatus(err.message);
+          $("ai-code").focus();
+        } else {
+          bubble("error", err.message);
+          setStatus("Passerelle inaccessible");
+        }
+      }
       return;
     }
     setStatus("Test d'Ollama…");

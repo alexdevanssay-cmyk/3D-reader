@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { addressSpace, costingText, formatAnswer } from "../../web/ai-workspace.js";
+import { addressSpace, costingText, defaultGateway, formatAnswer, gatewayLabel } from "../../web/ai-workspace.js";
 
 test("Ollama's address declares the address space the browser checks it against", () => {
   // This computer.
@@ -37,37 +37,18 @@ test("a costing answer of the gateway: analyse_chiffrage laid out, its text chec
   assert.equal(formatAnswer(JSON.stringify({ conclusion: "x", quote: { total: 12 } })), "x");
 });
 
-test("the gateway asks for analyse_chiffrage, never a quote, and gives the costing trace read only", async () => {
-  const { default: handler } = await import("../../api/ai.js");
-  const trace = { schema: "3d-reader-costing-trace", lecture_seule: true, pieces: [{ nom: "A", valeurs: { "piece.prix.vente": { valeur: "masqué", unite: "€" } } }] };
-  const requests = [];
-  const { fetch } = globalThis;
-  globalThis.fetch = async (url, init) => {
-    requests.push(JSON.parse(init.body));
-    // First the model reads the trace (a tool), then it answers.
-    const output = requests.length === 1 ? [{ type: "function_call", name: "get_costing_trace", call_id: "c1", arguments: "{}" }] : [{ type: "message", role: "assistant", content: [] }];
-    return new Response(JSON.stringify({ id: `r${requests.length}`, output }), { status: 200, headers: { "Content-Type": "application/json" } });
-  };
-  process.env.OPENAI_API_KEY = "test";
-  const res = { headers: {}, setHeader(k, v) { this.headers[k] = v; }, status(code) { this.code = code; return this; }, json(body) { this.body = body; return this; }, end() { return this; } };
-  try {
-    await handler({ method: "POST", body: { context: { task: "manufacturing_analysis", costing_trace: trace }, messages: [{ role: "user", content: "Pourquoi ce prix ?" }] } }, res);
-  } finally {
-    globalThis.fetch = fetch;
-    delete process.env.OPENAI_API_KEY;
-  }
-  assert.equal(res.code, 200);
-  assert.equal(requests.length, 2);
-  const { schema } = requests[0].text.format;
-  assert.equal(schema.properties.quote, undefined);
-  assert.ok(schema.required.includes("analyse_chiffrage") && !schema.required.includes("quote"));
-  const analyse = schema.properties.analyse_chiffrage.anyOf.find((x) => x.type === "object");
-  assert.deepEqual(analyse.required, ["explications", "ecarts_signales", "questions", "hypotheses"]);
-  assert.deepEqual(analyse.properties.ecarts_signales.items.required, ["cle", "commentaire"]);
-  assert.match(requests[0].instructions, /Never invent a price, rate, cycle time or number of cores, and only cite numbers present in costing_trace/);
-  assert.match(requests[0].instructions, /You never set a value/);
-  assert.ok(!requests[0].tools.some((t) => /costing_inputs/.test(t.name)));
-  // The tool gives the trace as it was sent, nothing else.
-  const result = requests[1].input.find((i) => i.type === "function_call_output");
-  assert.deepEqual(JSON.parse(result.output), trace);
+test("the gateway's address: the site's own on Vercel, pasted on GitHub Pages", () => {
+  assert.equal(defaultGateway(new URL("https://3-d-reader-git-groq-cycle-ai-3-d-madness.vercel.app/?page=ia")), "https://3-d-reader-git-groq-cycle-ai-3-d-madness.vercel.app/api/ai");
+  assert.equal(defaultGateway(new URL("https://alexdevanssay-cmyk.github.io/3D-reader/")), "");
+  assert.equal(defaultGateway(new URL("http://127.0.0.1:8000/")), "");
+});
+
+test("an answer of the gateway tells its provider, model and the questions left today", () => {
+  const quota = { requests_remaining_day: 1234, requests_limit_day: 2000, tokens_remaining_minute: 5000, tokens_limit_minute: 8000 };
+  assert.equal(gatewayLabel({ provider: "Groq", model: "openai/gpt-oss-120b", quota }), "Groq · openai/gpt-oss-120b · 1\u202f234 questions restantes aujourd'hui");
+  assert.equal(gatewayLabel({ provider: "Groq", model: "openai/gpt-oss-120b", quota: { requests_remaining_day: 1 } }), "Groq · openai/gpt-oss-120b · 1 question restante aujourd'hui");
+  assert.equal(gatewayLabel({ provider: "Groq", model: "openai/gpt-oss-120b", quota: { requests_remaining_day: 0 } }), "Groq · openai/gpt-oss-120b · 0 question restante aujourd'hui");
+  // Unknown quota (another provider), or an older gateway.
+  assert.equal(gatewayLabel({ provider: "Mistral", model: "m", quota: null }), "Mistral · m");
+  assert.equal(gatewayLabel({ output: "x" }), "");
 });
