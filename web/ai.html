@@ -67,7 +67,7 @@ reader3d analyze part.step --json</pre>
   <h2>3D Semantic JSON</h2>
   <p><strong>V3 B-Rep evidence:</strong> cylindrical candidates now carry boundary evidence (<code>wire_count</code>, <code>edge_count</code>) and can be promoted to <code>possible_through_hole</code> or <code>possible_bore</code> only when the geometric and boundary signals agree. The semantic layer keeps uncertainty explicit.</p>\n\n  <p><strong>V2 feature layer:</strong> CAD bodies may now expose analytic surfaces (cylinder radius/axis/centre, cone angle, sphere radius, torus radii) and conservative feature candidates such as <code>possible_hole_or_bore</code>. A candidate always carries a confidence, a detection method, and may require topology confirmation.</p>\n\n  <p>The AI-facing semantic contract is exposed in <code>#reader3d-semantic-result</code> and as <code>window.reader3d.semantic</code>.
   It is versioned independently from the raw measurement result: <code>schema = 3d-semantic-json</code>,
-  <code>schema_version = 1.0</code> and feature schema <code>9.0</code>. Features expose stable IDs, evidence status and evidence counts. It contains model/body metrology, topology, principal axes and conservative geometric feature candidates.
+  <code>schema_version = 1.0</code> and feature schema <code>10.0</code>. Features expose stable IDs (scoped by body since 10.0), evidence status and evidence counts. It contains model/body metrology, topology, principal axes and conservative geometric feature candidates.
   Tessellation buffers are deliberately excluded from this payload.</p>
   <pre>{
   "schema": "3d-semantic-json",
@@ -121,9 +121,9 @@ reader3d analyze part.step --json</pre>
   <pre>const context = reader3d.aiContext({ task: "manufacturing_analysis" });
 const featureContext = reader3d.aiContext({
   task: "feature_analysis",
-  featureIds: ["feature-..."]
+  featureIds: ["body-0/feature-..."]
 });</pre>
-  <p>Supported tasks are <code>general</code>, <code>feature_analysis</code>, <code>manufacturing_analysis</code>, <code>dfm</code> and <code>planning</code>. The context preserves feature/relation IDs, evidence, confidence, provisional status and unresolved manufacturing constraints. The LLM must treat provisional features as hypotheses, cite the supplied evidence for conclusions, preserve units and never invent dimensions. V7 remains a reasoning context layer, not an LLM itself and not a CAM generator.</p>
+  <p>Supported tasks are <code>general</code>, <code>feature_analysis</code>, <code>manufacturing_analysis</code>, <code>dfm</code> and <code>planning</code>. The context preserves feature/relation IDs (scoped by body, e.g. <code>body-0/feature-1a2b3c4d</code>, <code>body-0/relation-3</code>), evidence, confidence, provisional status and unresolved manufacturing constraints. The LLM must treat provisional features as hypotheses, cite the supplied evidence for conclusions, preserve units and never invent dimensions. V7 remains a reasoning context layer, not an LLM itself and not a CAM generator.</p>
 
   <h2>JSON results</h2>
   <pre>{

@@ -22,7 +22,7 @@ function featureContext(feature) {
     evidence: evidenceFor(feature),
     evidence_count: feature.evidence_count ?? evidenceFor(feature).length,
     geometry: Object.fromEntries(Object.entries(feature).filter(([k]) =>
-      ["diameter_mm","radius_mm","minor_radius_mm","cone_semi_angle_rad","surface_index","floor_surface","boundary_planes","wall_surfaces","surfaces","centers_mm","axes","adjacent_surfaces","support_or_termination_planes"].includes(k)
+      ["diameter_mm","radius_mm","radii_mm","minor_radius_mm","cone_semi_angle_rad","surface_index","floor_surface","boundary_planes","wall_surfaces","surfaces","centers_mm","axes","adjacent_surfaces","support_or_termination_planes"].includes(k)
     )),
     needs_topology_confirmation: feature.needs_topology_confirmation === true,
   };
@@ -94,13 +94,15 @@ export function buildAIContext(semantic, options = {}) {
   const requestedTask = options.task ?? "general";
   const task = TASKS.has(requestedTask) ? requestedTask : "general";
   const selected = selectFeatures(semantic, options.featureIds);
+  // Feature ids are scoped by body (body-0/feature-…): one id names one feature.
+  const found = new Set(selected?.map(s => s.feature_id));
   const source = semantic.source ?? {};
   const warnings = [];
   if (semantic.analysis_hints?.length) warnings.push(...semantic.analysis_hints);
-  if (selected && selected.length < options.featureIds.length) warnings.push("some_requested_features_not_found");
+  if (selected && options.featureIds.some(id => !found.has(id))) warnings.push("some_requested_features_not_found");
   const bodies = (semantic.bodies ?? []).map(body => bodyContext(body, task));
   if (task === "feature_analysis" && selected) {
-    for (const body of bodies) body.features = body.features.filter(f => selected.some(s => s.feature_id === f.feature_id));
+    for (const body of bodies) body.features = body.features.filter(f => found.has(f.feature_id));
   }
   const provisional = bodies.flatMap(b => b.features).filter(f => f.status === "provisional");
   const evidenceErrors = bodies.flatMap(b => b.quality?.evidence?.validation_errors ?? []);
@@ -168,24 +170,36 @@ function slimFeature(feature) {
   return out;
 }
 
+/** The distinct sizes of a group, largest first: the first 12 under `key`, the others counted under `more`. */
+function sizeList(sizes, key, more) {
+  const sorted = [...sizes].sort((a, b) => b - a);
+  return sorted.length ? { [key]: sorted.slice(0, 12), ...(sorted.length > 12 ? { [more]: sorted.length - 12 } : {}) } : {};
+}
+
 /** Features grouped by type: counts and the distinct dimensions (largest first). */
 function featureGroups(features) {
   const groups = new Map();
   for (const f of features) {
     const key = `${f.type}|${f.subtype ?? ""}`;
-    const g = groups.get(key) ?? { type: f.type, ...(f.subtype ? { subtype: f.subtype } : {}), count: 0, evidenced: 0, provisional: 0, diameters_mm: new Set() };
+    const g = groups.get(key) ?? { type: f.type, ...(f.subtype ? { subtype: f.subtype } : {}), count: 0, evidenced: 0, provisional: 0, diameters_mm: new Set(), radii_mm: new Set() };
     g.count++;
     if (f.status === "provisional") g.provisional++;
     else g.evidenced++;
-    const d = f.geometry?.diameter_mm ?? (finite(f.geometry?.radius_mm) ? 2 * f.geometry.radius_mm : null);
-    if (finite(d)) g.diameters_mm.add(round(d, 2));
+    if (f.type === "fillet_feature_candidate") {
+      // A fillet is sized by its radius: an R5 rounded edge is no Ø10.
+      const r = f.geometry?.radius_mm ?? f.geometry?.minor_radius_mm;
+      if (finite(r)) g.radii_mm.add(round(r, 2));
+    } else {
+      const d = f.geometry?.diameter_mm ?? (finite(f.geometry?.radius_mm) ? 2 * f.geometry.radius_mm : null);
+      if (finite(d)) g.diameters_mm.add(round(d, 2));
+    }
     groups.set(key, g);
   }
-  return [...groups.values()].map((g) => {
-    const diameters = [...g.diameters_mm].sort((a, b) => b - a);
-    const { diameters_mm, ...rest } = g;
-    return { ...rest, ...(diameters.length ? { diameters_mm: diameters.slice(0, 12), ...(diameters.length > 12 ? { more_diameters: diameters.length - 12 } : {}) } : {}) };
-  });
+  return [...groups.values()].map(({ diameters_mm, radii_mm, ...rest }) => ({
+    ...rest,
+    ...sizeList(diameters_mm, "diameters_mm", "more_diameters"),
+    ...sizeList(radii_mm, "radii_mm", "more_radii"),
+  }));
 }
 
 function relationCounts(relations) {
