@@ -831,8 +831,9 @@ function describeGeometricSurface(oc, face, out, index) {
     const orientation = face.Orientation_1();
     const reversed = orientation === TopAbs_REVERSED;
     const item = { index, type: name, orientation: orientation === TopAbs_FORWARD ? "forward" : reversed ? "reversed" : null, wire_count: countSubShapes(oc, face, oc.TopAbs_ShapeEnum.TopAbs_WIRE), edge_count: boundaryEdgeCount(oc, face), edge_signatures: edgeSignatures(oc, face) };
-    // The middle of the face (of its UV bounds), on its surface. The origin of
-    // the surface's placement can be anywhere: off the face, outside the part.
+    // The middle of the face's UV bounds: on its surface, not always on the face
+    // (a plane with a hole: the centre of the hole). The origin of the surface's
+    // placement can be anywhere: far off the face, outside the part.
     const middle = () => tmp(surface.Value((surface.FirstUParameter() + surface.LastUParameter()) / 2, (surface.FirstVParameter() + surface.LastVParameter()) / 2));
     // That point projected on the axis of a cylinder or a cone (o: gp_Pnt, d: gp_Dir).
     const onAxis = (o, d) => {
@@ -866,7 +867,9 @@ function describeGeometricSurface(oc, face, out, index) {
       const d = tmp(ax.Direction());
       const o = tmp(ax.Location());
       item.semi_angle_rad = c.SemiAngle();
+      // The radius at the origin of the placement, kept with it: not that at center_mm.
       item.ref_radius_mm = c.RefRadius();
+      item.axis_origin_mm = [o.X(), o.Y(), o.Z()];
       item.axis = [d.X(), d.Y(), d.Z()];
       item.center_mm = onAxis(o, d);
     }

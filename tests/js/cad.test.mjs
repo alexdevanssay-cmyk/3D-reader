@@ -327,13 +327,14 @@ describe('CAD specifics', () => {
     approxVec(bodies[0].bbox.size, [10, 20, 30], 0, 1e-9, 'size in mm');
   });
 
-  test('analytic surfaces for the semantic layer: orientation, outward normal, centre on the face, bounding edges', (t) => {
+  test('analytic surfaces for the semantic layer: orientation, outward normal, centre on the surface, bounding edges', (t) => {
     // Block (0, 0, 0) + (100, 60, 20) with a through hole of radius 10 along z
     // at (50, 30). Structured clone: the result comes from the engine worker.
     const [block] = structuredClone(timedAnalyze(t, 'holed_block.step', undefined, undefined, 'holed_block.step (surfaces)')).bodies;
     const surfaces = block.geometric_surfaces;
     assert.ok(surfaces.every((s) => s.orientation === 'forward' || s.orientation === 'reversed'), 'orientation as a string');
-    // Each face of the block once, its normal out of the material, its centre in its middle.
+    // Each face of the block once, its normal out of the material, its centre in the
+    // middle of its UV bounds: on its plane, not always on the face (the top one: in the hole).
     const faces = [
       [[0, 0, -1], [50, 30, 0]], [[0, 0, 1], [50, 30, 20]],
       [[-1, 0, 0], [0, 30, 10]], [[1, 0, 0], [100, 30, 10]],
@@ -353,6 +354,18 @@ describe('CAD specifics', () => {
     assert.equal(hole.edge_count, 2);
     approxVec(hole.axis.map(Math.abs), [0, 0, 1], 0, 1e-12, 'hole axis');
     approxVec(hole.center_mm, [50, 30, 10], 0, 1e-9, 'hole centre');
+  });
+
+  test('a cone gives the point of its reference radius: it can be rebuilt from its centre', () => {
+    // Truncated cone along z: radius 6 at z = 0, 2 at z = 8.
+    const shape = new oc.BRepPrimAPI_MakeCone_1(6, 2, 8).Shape();
+    const [body] = analyzeCad(oc, brepBytes('cone.brep', shape), 'cone.brep').bodies;
+    const cone = body.geometric_surfaces.find((s) => s.type === 'cone');
+    approxVec(cone.axis_origin_mm, [0, 0, 0], 0, 1e-12, 'axis origin');
+    approx(cone.ref_radius_mm, 6, 1e-12, 0, 'radius at the axis origin');
+    approxVec(cone.center_mm, [0, 0, 4], 0, 1e-9, 'centre: half way up');
+    const along = cone.axis.reduce((n, x, k) => n + x * (cone.center_mm[k] - cone.axis_origin_mm[k]), 0);
+    approx(cone.ref_radius_mm + along * Math.tan(cone.semi_angle_rad), 4, 1e-9, 0, 'radius at the centre');
   });
 
   test('quality presets change the tessellation, not the volume', (t) => {
