@@ -548,6 +548,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await drag(null, 'dragover');
     assert.equal(await page.isVisible('#drop-hint'), true);
     await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage [data-drop="historique"]'); // the costing page is loaded when first shown
     await drag('#page-chiffrage [data-drop="historique"]', 'dragover');
     await drag('#page-chiffrage [data-drop="historique"]', 'drop', JSON.stringify({ schema: 'reader3d-historique-cycles', version: 1, pieces: [] }));
     await page.click('.tab[data-page="viewer"]');

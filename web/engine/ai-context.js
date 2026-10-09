@@ -322,7 +322,16 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   // Last resort: the largest body without its foundry screen, nor the foundry notes that only explain it.
   omitted.push("foundry screen of the largest body", "foundry sources and policies");
   const { foundry_common, ...rest } = out;
-  return { ...rest, bodies: out.bodies.map(({ foundry, feature_groups, ...b }) => b), compaction: { ...out.compaction, omitted: [...omitted] } };
+  out = { ...rest, bodies: out.bodies.map(({ foundry, feature_groups, ...b }) => b), compaction: { ...out.compaction, omitted: [...omitted] } };
+  // Still over (a small budget): fewer warnings, down to none; their count stays.
+  const warningsAt = omitted.findIndex((o) => / warnings$/.test(o));
+  for (const keep of [3, 1, 0]) {
+    if (size(out) <= maxChars || out.warnings.length <= keep) break;
+    const label = `${warningCount - keep} warnings`;
+    const omittedNow = warningsAt >= 0 ? omitted.map((o, i) => (i === warningsAt ? label : o)) : [...omitted, label];
+    out = { ...out, warnings: (context.warnings ?? []).slice(0, keep), warning_count: warningCount, compaction: { ...out.compaction, omitted: omittedNow } };
+  }
+  return out;
 }
 
 /**

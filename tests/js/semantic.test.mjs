@@ -1031,6 +1031,24 @@ test("the compacted AI context of a large assembly fits the budget of a local mo
   assert.ok(compact.warnings.length <= 5);
 });
 
+test("a small budget: past the last resort, fewer warnings, their count kept", () => {
+  const semantic = buildSemantic3D({
+    file: "part.step", kind: "cad", engine: "browser", source_unit: "mm",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [body()],
+  });
+  const warnings = Array.from({ length: 8 }, (_, i) => `Avertissement ${i} : une remarque assez longue sur la pièce analysée.`);
+  const context = { ...buildAIContext(semantic, { task: "feature_analysis" }), warnings };
+  const none = compactAIContext(context, { maxChars: 1 });
+  assert.deepEqual([none.warnings, none.warning_count], [[], 8]);
+  assert.ok(none.compaction.omitted.includes("8 warnings") && !none.compaction.omitted.includes("3 warnings"));
+  const budget = JSON.stringify(none).length + 120;
+  const one = compactAIContext(context, { maxChars: budget });
+  assert.ok(JSON.stringify(one).length <= budget, `${JSON.stringify(one).length} characters`);
+  assert.deepEqual([one.warnings, one.warning_count], [[warnings[0]], 8]);
+  assert.ok(one.compaction.omitted.includes("7 warnings"));
+});
+
 test("the costing trace of the task \"Chiffrage\" is kept whole by the compaction; the geometry has the room it leaves", () => {
   const count = 60;
   const semantic = buildSemantic3D({
