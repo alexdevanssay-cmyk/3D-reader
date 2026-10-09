@@ -326,6 +326,7 @@ export function isMarkdown(text) {
  */
 export function markdownToHtml(text) {
   const ITEM = /^(\s*)([-*•]|(\d+)[.)])\s+(.*)$/; // a list item: its indent, its mark, its number, its text
+  const indent = (l) => /^\s*/.exec(l)[0].replace(/\t/g, "    ").length; // a tab as four spaces
   const inline = (line) => escapeHtml(line)
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
@@ -340,10 +341,11 @@ export function markdownToHtml(text) {
   };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (/^```/.test(line)) {
+    if (/^```[\w+-]*\s*$/.test(line)) {
+      // A fence line only (```, ```js): a line that starts with ``` and goes on is text, its code inline.
       flush();
       const code = [];
-      while (++i < lines.length && !/^```/.test(lines[i])) code.push(lines[i]);
+      while (++i < lines.length && !/^```\s*$/.test(lines[i])) code.push(lines[i]);
       out.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
     } else if (/^\s*\|.*\|\s*$/.test(line)) {
       flush();
@@ -357,13 +359,12 @@ export function markdownToHtml(text) {
       else out.push(`<table class="ai-table"><thead><tr>${head.map((c) => `<th>${inline(c)}</th>`).join("")}</tr></thead><tbody>${rest.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
     } else if (ITEM.test(line)) {
       flush();
-      // One list per kind: a numbered list after bullets starts a list of its own. The items indented
-      // under an item are a list in it; blank lines between items (a loose list) and lines indented
-      // under an item keep the list open.
-      const indent = (l) => /^\s*/.exec(l)[0].length;
+      // One list per kind: a numbered list after bullets starts a list of its own. The lines indented
+      // under an item (a list of its own, at any depth) are laid out in it; blank lines between items
+      // (a loose list) keep the list open.
       const base = indent(line);
       const ordered = !!ITEM.exec(line)[3];
-      const items = []; // {lines, sub: {ordered, start, items: [lines]}}
+      const items = []; // {lines: its text, kids: the lines under it, start}
       for (; i < lines.length; i++) {
         const l = lines[i];
         if (!l.trim()) {
@@ -378,19 +379,14 @@ export function markdownToHtml(text) {
         }
         const m = ITEM.exec(l);
         const last = items[items.length - 1];
-        if (m && indent(l) >= base + 2 && last) {
-          (last.sub ??= { ordered: !!m[3], start: Number(m[3] ?? 1), items: [] }).items.push([m[4]]);
-        } else if (m && indent(l) < base + 2 && !!m[3] === ordered) {
-          items.push({ lines: [m[4]], sub: null, start: Number(m[3] ?? 1) });
-        } else if (!m && indent(l) >= base + 2 && last) {
-          if (last.sub) last.sub.items[last.sub.items.length - 1].push(l.trim());
-          else last.lines.push(l.trim());
-        } else break;
+        if (indent(l) >= base + 2 && last && (m || last.kids.length)) last.kids.push(l);
+        else if (m && indent(l) < base + 2 && !!m[3] === ordered) items.push({ lines: [m[4]], kids: [], start: Number(m[3] ?? 1) });
+        else if (!m && indent(l) >= base + 2 && last) last.lines.push(l.trim());
+        else break;
       }
       i--;
-      const list = (isOrdered, start, lis) => (isOrdered ? `<ol${start !== 1 ? ` start="${start}"` : ""}>${lis}</ol>` : `<ul>${lis}</ul>`);
-      const li = (texts, sub = null) => `<li>${texts.map(inline).join("<br>")}${sub ? list(sub.ordered, sub.start, sub.items.map((t) => li(t)).join("")) : ""}</li>`;
-      out.push(list(ordered, items[0].start, items.map((it) => li(it.lines, it.sub)).join("")));
+      const lis = items.map((it) => `<li>${it.lines.map(inline).join("<br>")}${it.kids.length ? markdownToHtml(it.kids.join("\n")) : ""}</li>`).join("");
+      out.push(ordered ? `<ol${items[0].start !== 1 ? ` start="${items[0].start}"` : ""}>${lis}</ol>` : `<ul>${lis}</ul>`);
     } else if (/^#{1,4} /.test(line)) {
       flush();
       out.push(`<p class="ai-h">${inline(line.replace(/^#{1,4} /, ""))}</p>`);
@@ -527,8 +523,8 @@ function inlineThinking(text) {
 export function savedAI() {
   const savedGateway = store.get(localStorage, KEYS.gateway);
   return {
-    // As the page: "openai_compatible" of older versions, or nothing chosen yet, is Ollama.
-    provider: store.get(localStorage, KEYS.provider) === "openai" ? "openai" : "ollama",
+    // As the page: the gateway (Groq) unless Ollama was chosen ("openai_compatible" of older versions is Ollama).
+    provider: ["ollama", "openai_compatible"].includes(store.get(localStorage, KEYS.provider)) ? "ollama" : "openai",
     gateway: {
       url: savedGateway && !/:11434|\/api\/analyze/.test(savedGateway) ? savedGateway : defaultGateway(),
       code: store.get(localStorage, KEYS.code) || "",
@@ -766,8 +762,8 @@ export function mount({ page, reader }) {
   {
     $("ai-code").value = store.get(localStorage, KEYS.code) || "";
     const saved = store.get(localStorage, KEYS.provider);
-    // Older versions stored "openai_compatible" for Ollama.
-    $("ai-provider").value = saved === "openai_compatible" ? "ollama" : saved === "openai" || saved === "ollama" ? saved : "ollama";
+    // Nothing chosen yet: the gateway (Groq). Older versions stored "openai_compatible" for Ollama.
+    $("ai-provider").value = saved === "openai_compatible" || saved === "ollama" ? "ollama" : "openai";
     showProvider();
     $("ai-think").checked = store.get(localStorage, KEYS.think) === "1";
     // Anonymised names and the fallback on the local model: on unless unticked.
@@ -1167,6 +1163,8 @@ export function mount({ page, reader }) {
         }
       }
       const questions = (q, h) => [q, ...h.filter((m) => m.role === "user").map((m) => m.content)];
+      // The names of the part, kept with the conversation: after a reload, no part open, its history may name them.
+      const ofPart = part?.scope ? partNames({ bodies: part.scope.all_names, file: part.scope.file }) : [];
       let sent; // the context the model was given
       let asked; // and the questions
       let names = null; // the labels put in place of the names (gateway)
@@ -1207,8 +1205,7 @@ export function mount({ page, reader }) {
           // Before the compaction: the labels count in the budget. With the names this conversation
           // replaced before: one changed since in the quote may be in its history.
           // The names of the part too, sent or not: a body not sent may be named in the question or the history.
-          const ofPart = part?.scope ? partNames({ bodies: part.scope.all_names, file: part.scope.file }) : [];
-          names = anonymizer(whole, [...ofPart, ...unionNames(quoteNames, conversation.names)]);
+          names = anonymizer(whole, unionNames(quoteNames, conversation.names), ofPart);
           whole = names.context(whole);
           online = { question: names.text(online.question), history: online.history.map((m) => ({ ...m, content: names.text(m.content) })) };
         }
@@ -1255,7 +1252,7 @@ export function mount({ page, reader }) {
       // conversation started since about another part of the tab.
       const kept = readConversation(conv.key);
       if (!(kept.file && conv.file && kept.file !== conv.file)) {
-        const known = quoteNames ? unionNames(kept.names, quoteNames) : kept.names;
+        const known = unionNames(quoteNames ? unionNames(kept.names, quoteNames) : kept.names, ofPart);
         writeConversation(conv.key, { file: kept.file ?? conv.file, messages: [...kept.messages, { role: "user", content: question }, message], names: known });
       }
       const source = answer ? { provider: answer.provider, model: answer.model } : { provider: "Ollama", model: localModel };

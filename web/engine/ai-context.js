@@ -496,12 +496,13 @@ const bodyLabel = (body, i) => `Corps ${Number(/^body-(\d+)$/.exec(body?.id ?? "
  * client, reference, designation... of ui.js costingSnapshot noms), all
  * replaced by neutral labels: as whole values, and wherever they are written
  * in a text (the reasons, hypotheses and alerts of the trace, the question).
- * Built from the whole context (every body), applied to the context sent
- * (compacted). Returns {context(c): the copy of `c` sent, text(s): a text
+ * Built from the whole context (every body) and `part` ([{name, label}] of
+ * partNames: the bodies of the file not sent, its name), applied to the
+ * context sent (compacted). Returns {context(c): the copy of `c` sent, text(s): a text
  * (the question, the conversation), legend(answer): [[label, name]] of the
  * labels an answer writes}.
  */
-export function anonymizer(context, names = []) {
+export function anonymizer(context, names = [], part = []) {
   const byName = new Map(); // name -> label
   const byLabel = new Map(); // label -> name, for the legend
   const add = (name, label) => {
@@ -511,6 +512,9 @@ export function anonymizer(context, names = []) {
     if (!byLabel.has(label)) byLabel.set(label, n);
   };
   (context?.bodies ?? []).forEach((b, i) => add(b?.name, bodyLabel(b, i)));
+  // The names of the part open the context may not hold (partNames): each body by its own label,
+  // before the file, whose name one of them may bear.
+  for (const { name, label } of part) add(name, label);
   const file = context?.source?.file;
   const ext = /\.[^./\\]+$/.exec(file ?? "")?.[0] ?? "";
   add(file, `Pièce${ext}`);

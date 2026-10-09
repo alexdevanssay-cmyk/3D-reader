@@ -240,6 +240,11 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     assert.doesNotMatch(await page.textContent('#method'), /mémorisés/);
     assert.equal(await page.textContent('#total-volume'), volume);
+    // Analysed again, cancelled at once: the model of before stays, its status with it (not "analysing" for good).
+    await page.click('#refresh');
+    await page.evaluate(() => document.getElementById('cancel').click());
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: 10_000 });
+    assert.equal(await page.textContent('#total-volume'), volume);
     assert.deepEqual(errors, []);
     await page.context().close();
   });

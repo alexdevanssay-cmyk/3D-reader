@@ -142,6 +142,11 @@ test("the names of the part not sent are replaced too: a body not selected, the 
   // No body checked: the context has no part, the file name is replaced.
   assert.equal(anonymizer({ no_model_loaded: true, bodies: [] }, all).text("Que sais-tu de Projet X.step ?"), "Que sais-tu de Pièce.step ?");
   assert.deepEqual(partNames(), []);
+  // A body that bears the file's name, not sent: its own label, whatever the bodies sent.
+  const part = partNames({ bodies: ["04R504033", "04R504033-NOYAU"], file: "04R504033.step" });
+  const one = anonymizer({ source: { file: "04R504033.step" }, bodies: [{ id: "body-1", name: "04R504033-NOYAU" }] }, [], part);
+  assert.equal(one.text("Et 04R504033 face à 04R504033-NOYAU ?"), "Et Corps 1 face à Corps 2 ?");
+  assert.equal(one.text("Le fichier 04R504033.step"), "Le fichier Pièce.step");
 });
 
 test("the numbers of an answer checked against the data sent: rounded, in another unit, from the question; the others counted", () => {
@@ -226,6 +231,17 @@ test("numbered lists keep their numbers: items under an item in a list of its ow
   assert.equal(markdownToHtml("- a\n\n1. b\nTexte"), "<ul><li>a</li></ul><ol><li>b</li></ol><p>Texte</p>");
   // A list indented as a whole is a list.
   assert.equal(markdownToHtml("  - a\n  - b"), "<ul><li>a</li><li>b</li></ul>");
+  // Three levels: each in the item above it, numbered on its own.
+  assert.equal(markdownToHtml("1. Préparation\n   1. Nettoyer le moule\n      - vérifier les évents\n   2. Poser les noyaux\n2. Coulée"),
+    "<ol><li>Préparation<ol><li>Nettoyer le moule<ul><li>vérifier les évents</li></ul></li><li>Poser les noyaux</li></ol></li><li>Coulée</li></ol>");
+  // Indented with a tab.
+  assert.equal(markdownToHtml("1. A\n\t1. x\n\t2. y\n2. B"), "<ol><li>A<ol><li>x</li><li>y</li></ol></li><li>B</li></ol>");
+});
+
+test("a line that starts with ``` and goes on is text, not a code block that swallows the answer", () => {
+  assert.equal(markdownToHtml("Le corps le plus épais :\n```body-0``` (12 mm), à surveiller.\n\nRecommandation : **noyau** sable."),
+    "<p>Le corps le plus épais :<br>``<code>body-0</code>`` (12 mm), à surveiller.</p><p>Recommandation : <strong>noyau</strong> sable.</p>");
+  assert.equal(markdownToHtml("```js\n<b>x</b>\n```\nfin"), "<pre><code>&lt;b&gt;x&lt;/b&gt;</code></pre><p>fin</p>");
 });
 
 test("pipe lines that are no table (separator rows only) are shown as text, the answer kept", () => {

@@ -1796,7 +1796,11 @@ function cancelTab(tab) {
   tab.loading = null;
   stopProgress(tab);
   stopAnalysis(tab);
-  if (tab === activeTab) renderLoading();
+  if (tab === activeTab) {
+    renderLoading();
+    // Its openFile ends without a word (another seq): the status is no longer "analysing".
+    if (document.body.dataset.status === "analysing") setStatus(tab.result ? "done" : "idle");
+  }
   renderTabs();
 }
 
