@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { addressSpace, answerText, costingText, defaultGateway, formatAnswer, gatewayLabel, numbersLabel, quotaLabel, onlineMessages } from "../../web/ai-workspace.js";
+import { addressSpace, answerText, costingText, defaultGateway, formatAnswer, gatewayLabel, isMarkdown, markdownToHtml, numbersLabel, quotaLabel, selectionOf, onlineMessages } from "../../web/ai-workspace.js";
 import { anonymizer, checkContextNumbers } from "../../web/engine/ai-context.js";
 
 test("Ollama's address declares the address space the browser checks it against", () => {
@@ -185,4 +185,24 @@ test("the conversation sent online: an answer given with the internal amounts of
   assert.deepEqual(onlineMessages(messages, { amounts: true, gateway }), messages);
   // An answer of the local model: never, whatever the box.
   assert.deepEqual(onlineMessages([{ role: "user", content: "Q" }, { role: "assistant", content: "R", local: true }], { amounts: true, gateway }), []);
+});
+
+test("an answer in Markdown is laid out, and nothing of it becomes a tag of its own", () => {
+  const answer = "## Analyse\n**Conclusion** : 2 noyaux, `body-0`.\n\n| Élément | Valeur |\n|---|---|\n| Noyaux | 2 <img src=x onerror=alert(1)> |\n\n- tiroir *proposé*\n  - sous-point\n1. premier";
+  assert.equal(isMarkdown(answer), true);
+  assert.equal(isMarkdown("Conclusion : une boîte.\n- point"), false);
+  const html = markdownToHtml(answer);
+  assert.match(html, /<p class="ai-h">Analyse<\/p>/);
+  assert.match(html, /<strong>Conclusion<\/strong> : 2 noyaux, <code>body-0<\/code>\./);
+  assert.match(html, /<table class="ai-table"><thead><tr><th>Élément<\/th><th>Valeur<\/th><\/tr><\/thead><tbody><tr><td>Noyaux<\/td><td>2 &lt;img src=x onerror=alert\(1\)&gt;<\/td><\/tr><\/tbody><\/table>/);
+  assert.match(html, /<ul><li>tiroir <em>proposé<\/em><\/li><li class="ai-sub">sous-point<\/li><\/ul><ol><li>premier<\/li><\/ol>/);
+  assert.doesNotMatch(html, /<img/);
+  assert.match(markdownToHtml("```\n<b>x</b>\n```"), /<pre><code>&lt;b&gt;x&lt;\/b&gt;<\/code><\/pre>/);
+});
+
+test("the bodies sent are told to the model, without their names", () => {
+  assert.deepEqual(Object.keys(selectionOf({ mode: "selected", bodies_sent: 1, bodies_in_file: 18, names: ["Carter"] })), ["mode", "bodies_sent", "bodies_in_file", "note"]);
+  assert.match(selectionOf({ mode: "selected", bodies_sent: 1, bodies_in_file: 18 }).note, /Seul le corps sélectionné/);
+  assert.match(selectionOf({ mode: "checked", bodies_sent: 3, bodies_in_file: 18 }).note, /Seuls 3 des 18 corps/);
+  assert.deepEqual(selectionOf({ mode: "all", bodies_sent: 18, bodies_in_file: 18 }), { mode: "all", bodies_sent: 18, bodies_in_file: 18 });
 });

@@ -302,6 +302,92 @@ export function defaultGateway(where = location) {
   return /\.vercel\.app$/.test(where.hostname) ? new URL("/api/ai", where.origin).href : "";
 }
 
+/**
+ * Which bodies of the part a context holds, without their names (the context
+ * may go online): the model answers about them only.
+ */
+export function selectionOf({ mode, bodies_sent, bodies_in_file }) {
+  // Short: it counts in the budget of the context. The whole part needs no note.
+  const note = mode === "selected"
+    ? "Seul le corps sélectionné est envoyé : réponds sur lui seulement."
+    : mode === "checked" ? `Seuls ${bodies_sent} des ${bodies_in_file} corps (les cochés) sont envoyés : réponds sur eux seulement.` : null;
+  return { mode, bodies_sent, bodies_in_file, ...(note ? { note } : {}) }; // mode: "selected" (in the list), "checked" or "all"
+}
+
+/** Whether an answer is written in Markdown (bold, headings, tables, code): else it is shown as plain text. */
+export function isMarkdown(text) {
+  return /\*\*[^*\n]+\*\*|^#{1,4} |^\s*\|.*\|\s*$|^```/m.test(String(text ?? ""));
+}
+
+/**
+ * The simple Markdown of an answer (headings, bold, italics, code, lists,
+ * tables, paragraphs) as HTML. Everything is escaped first: no tag or
+ * attribute of the answer reaches the page, only the ones written here.
+ */
+export function markdownToHtml(text) {
+  const inline = (line) => escapeHtml(line)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*\s][^*]*)\*(?=[\s.,;:!?)]|$)/g, "$1<em>$2</em>");
+  const cells = (line) => line.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+  const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let paragraph = [];
+  const flush = () => {
+    if (paragraph.length) out.push(`<p>${paragraph.map(inline).join("<br>")}</p>`);
+    paragraph = [];
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^```/.test(line)) {
+      flush();
+      const code = [];
+      while (++i < lines.length && !/^```/.test(lines[i])) code.push(lines[i]);
+      out.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+    } else if (/^\s*\|.*\|\s*$/.test(line)) {
+      flush();
+      const rows = [];
+      for (; i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]); i++) rows.push(lines[i]);
+      i--;
+      const body = rows.filter((r) => !/^\s*\|[\s:|-]+\|\s*$/.test(r)).map(cells);
+      const [head, ...rest] = body;
+      out.push(`<table class="ai-table"><thead><tr>${head.map((c) => `<th>${inline(c)}</th>`).join("")}</tr></thead><tbody>${rest.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
+    } else if (/^\s*([-*•]|\d+[.)])\s+/.test(line)) {
+      flush();
+      const ordered = /^\s*\d+[.)]\s+/.test(line);
+      const items = [];
+      // One list per kind: a numbered list after bullets starts a list of its own (indented items stay in).
+      const sameList = (l) => /^\s*([-*•]|\d+[.)])\s+/.test(l) && (/^\s{2,}/.test(l) || /^\s*\d+[.)]\s+/.test(l) === ordered);
+      for (; i < lines.length && sameList(lines[i]); i++) {
+        const depth = /^\s{2,}/.test(lines[i]) ? " class=\"ai-sub\"" : "";
+        items.push(`<li${depth}>${inline(lines[i].replace(/^\s*([-*•]|\d+[.)])\s+/, ""))}</li>`);
+      }
+      i--;
+      out.push(`<${ordered ? "ol" : "ul"}>${items.join("")}</${ordered ? "ol" : "ul"}>`);
+    } else if (/^#{1,4} /.test(line)) {
+      flush();
+      out.push(`<p class="ai-h">${inline(line.replace(/^#{1,4} /, ""))}</p>`);
+    } else if (!line.trim()) {
+      flush();
+    } else {
+      paragraph.push(line);
+    }
+  }
+  flush();
+  return out.join("");
+}
+
+/** An answer in its bubble: laid out when written in Markdown, else as plain text (line breaks kept). */
+function setAnswer(el, text) {
+  if (isMarkdown(text)) {
+    el.classList.add("ai-md");
+    el.innerHTML = markdownToHtml(text);
+  } else {
+    el.classList.remove("ai-md");
+    el.textContent = text;
+  }
+}
+
 /** Where an answer of the gateway comes from: "Groq · openai/gpt-oss-120b". */
 export function gatewayLabel({ provider, model } = {}) {
   return [provider, model].filter(Boolean).join(" · ");
@@ -380,12 +466,13 @@ Si costing_trace est null, aucun classeur de chiffrage n'est importé : dis-le e
 /** Instructions of the local model: plain French text, laid out only when the question is about the part. */
 function systemPrompt(model, where = "sur ce PC", costing = false) {
   return `Tu es l'assistant d'ingénierie de 3D Reader, pour une fonderie d'aluminium. Tu es un modèle de langage (${model}) qui tourne en local ${where} avec Ollama : aucune donnée n'est envoyée sur Internet.
-Réponds en français, en texte simple (jamais de JSON), de façon claire et concise.
+Réponds en français, en texte (jamais de JSON ; gras, listes et petits tableaux Markdown permis), de façon claire et concise.
 Pour une conversation ou une question générale (fonderie, procédés, chiffrage, méthode), réponds directement et brièvement.
 Pour une question sur la pièce, organise la réponse en courtes sections, celles qui sont utiles seulement : « Conclusion », « Mesuré » (valeurs du contexte, avec leurs identifiants), « Déduit », « Recommandations », « À valider ».
 N'utilise que le contexte fourni (analyse géométrique et sémantique de la pièce, connaissances fonderie). N'invente jamais de dimensions, de paramètres de procédé, de propriétés matière, de prix, de taux, de temps de cycle, de nombre de noyaux, de probabilités de défaut, d'attaques, de masselottes ni de résultats de simulation.
 Pour la fonderie, cite les identifiants de sources fournis et dis clairement quand une conclusion demande une simulation de remplissage/solidification ou une validation fonderie.
-Si le contexte est partiel (champ "compaction"), dis-le quand cela limite la réponse.
+Ce contexte est l'analyse de la pièce par 3D Reader (features détectées avec leurs identifiants, criblage fonderie, pistes de fabrication) : ne renvoie jamais vers un module ou un outil de 3D Reader que tu supposes. S'il manque du détail (champ "summary_only" ou "compaction"), dis-le et indique l'analyse à choisir dans la page IA : « Features », « Fabrication », « DFM » ou « Chiffrage ».
+Champ "selection" : seuls ces corps de la pièce sont envoyés ; réponds sur eux seulement.
 Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.${costing ? `\n${COSTING_RULES}` : ""}`;
 }
 
@@ -549,6 +636,7 @@ export function mount({ page, reader }) {
         <div class="ai-row ai-tasks" role="group" aria-label="Type d'analyse">
           ${TASKS.map(([v, l]) => `<button type="button" class="small ai-task" data-task="${v}" aria-pressed="${v === "general"}">${l}</button>`).join("")}
         </div>
+        <p id="ai-scope" class="ai-scope"></p>
       </section>
 
       <section class="card">
@@ -709,7 +797,8 @@ export function mount({ page, reader }) {
   /** A message kept in a conversation, on screen. */
   function showMessage(m) {
     if (m.role !== "assistant") return bubble("user", m.content);
-    const body = bubble("assistant", formatAnswer(m.content), !!m.costing);
+    const body = bubble("assistant", "", !!m.costing);
+    setAnswer(body, formatAnswer(m.content));
     if (m.notice) line(body, "ai-notice", m.notice, true);
     decorate(body, m);
   }
@@ -745,21 +834,26 @@ export function mount({ page, reader }) {
 
   /**
    * The whole context of a question, before its compaction: the part
-   * (`semantic`), or none (general questions are allowed without a model);
+   * (`part`: {semantic, scope}, its bodies sent), or none (general questions
+   * are allowed without a model);
    * for the task "Chiffrage", the traced values of the quote (`costing`:
    * {snapshot, problem}, read only): smaller for the local model; for the
    * gateway, its internal amounts masked unless the box is ticked, within
    * two thirds of the gateway's budget (`budget`, characters) as for the
    * local model.
    */
-  async function contextOf(semantic, costing, askedTask, local, budget = GATEWAY_CONTEXT_CHARS) {
+  async function contextOf(part, costing, askedTask, local, budget = GATEWAY_CONTEXT_CHARS) {
     const aiTask = askedTask === "costing" ? "manufacturing_analysis" : askedTask;
-    const context = semantic ? buildAIContext(semantic, { task: aiTask }) : {
+    const semantic = part?.semantic ?? null;
+    const scope = part?.scope ?? null;
+    const context = semantic ? { ...buildAIContext(semantic, { task: aiTask }), ...(scope ? { selection: selectionOf(scope) } : {}) } : {
       schema: "3d-ai-reasoning-context",
       schema_version: "1.0",
       task: aiTask,
       no_model_loaded: true,
-      note: "Aucun modèle 3D n'est chargé : aucune donnée de pièce n'est disponible.",
+      note: scope && !scope.bodies_sent
+        ? "Une pièce est ouverte mais aucun de ses corps n'est coché : aucune donnée de pièce n'est envoyée."
+        : "Aucun modèle 3D n'est chargé : aucune donnée de pièce n'est disponible.",
       model: null,
       bodies: [],
       warnings: [],
@@ -771,13 +865,45 @@ export function mount({ page, reader }) {
   }
 
   /**
-   * The context sent: for general questions, a summary of the part (read in
-   * seconds by a local model on a CPU); for the analysis tasks, the detail,
+   * The context sent: for the general questions of the local model, a
+   * summary of the part (read in seconds on a CPU); otherwise the detail,
    * as much as `maxChars` allows (the costing trace is kept whole by the
    * compaction, the geometry has the room it leaves).
    */
-  const compacted = (context, askedTask, maxChars) =>
-    context.no_model_loaded ? context : askedTask === "general" ? summaryAIContext(context) : compactAIContext(context, { maxChars });
+  const compacted = (context, askedTask, maxChars, local) => {
+    if (context.no_model_loaded) return context;
+    // The summary for the general questions of the local model only (read in seconds on a CPU); the gateway reads the detail in seconds.
+    const out = local && askedTask === "general" ? summaryAIContext(context) : compactAIContext(context, { maxChars });
+    return context.selection ? { ...out, selection: context.selection } : out; // the summary keeps which bodies were sent
+  };
+
+  /** The part of the tab shown, as the IA page sends it: the body selected in the list, else the bodies checked (app.js aiPart). */
+  const readPart = (options) => (reader.aiPart ? reader.aiPart(options) : reader.semantic ? { semantic: reader.semantic, scope: null } : null);
+
+  /** Under the tasks: what the AI is given of the part, read when the page is shown and after each question. */
+  function showScope() {
+    const el = $("ai-scope");
+    if (reader.status === "analysing") {
+      el.textContent = "Pièce en cours d'analyse : l'IA ne la verra qu'à la fin de l'analyse.";
+      return;
+    }
+    const scope = readPart({ withSemantic: false })?.scope;
+    if (!scope) {
+      el.textContent = "Aucune pièce ouverte : questions générales seulement.";
+      return;
+    }
+    const names = scope.names.map((n) => `« ${n} »`);
+    el.textContent = scope.mode === "selected"
+      ? `Envoyé à l'IA : le corps sélectionné ${names[0]} seulement (1 sur ${scope.bodies_in_file}). Cliquez à nouveau sa ligne dans la liste des corps pour envoyer les corps cochés.`
+      : !scope.bodies_sent
+        ? "Aucun corps coché dans la liste : l'IA ne reçoit pas la pièce."
+        : scope.mode === "checked"
+          ? scope.bodies_sent === 1
+            ? `Envoyé à l'IA : le corps coché ${names[0]} seulement (1 sur ${scope.bodies_in_file}).`
+            : `Envoyé à l'IA : les ${scope.bodies_sent} corps cochés sur ${scope.bodies_in_file}${scope.bodies_sent <= 3 ? ` (${names.join(", ")})` : ""}.`
+          : `Envoyé à l'IA : toute la pièce${scope.file ? ` « ${scope.file} »` : ""} (${scope.bodies_in_file} corps).`;
+  }
+  document.addEventListener("reader3d-part", showScope);
 
   let timing = ""; // time spent by Ollama on the last answer, shown with it
 
@@ -929,7 +1055,7 @@ export function mount({ page, reader }) {
     showConversation();
     const conv = shown;
     const tabId = reader.tab?.id;
-    const semantic = reader.semantic ?? null;
+    const part = readPart();
     const snapshot = costing ? (async () => reader.costing?.())() : null;
     snapshot?.catch(() => {}); // read below
     const conversation = readConversation(conv.key);
@@ -1017,7 +1143,7 @@ export function mount({ page, reader }) {
       let localModel = null; // of Ollama
       let output;
       const askLocal = async (ollama) => {
-        sent = compacted(await contextOf(semantic, read, askedTask, true), askedTask, LOCAL_CONTEXT_CHARS);
+        sent = compacted(await contextOf(part, read, askedTask, true), askedTask, LOCAL_CONTEXT_CHARS, true);
         asked = questions(question, history);
         localModel = ollama.model;
         return askOllama(question, sent, history, askedTask, ollama, signal, onText, showThought);
@@ -1038,7 +1164,7 @@ export function mount({ page, reader }) {
         const models = Array.isArray(info?.models) ? info.models : [];
         const model = info && wanted && !models.includes(wanted) ? null : wanted;
         if (info && wanted && !model) notice = `Modèle « ${wanted} » non proposé par la passerelle (variable AI_MODELS dans Vercel) : réponse de son modèle par défaut`;
-        let whole = await contextOf(semantic, read, askedTask, false, budget);
+        let whole = await contextOf(part, read, askedTask, false, budget);
         // The names of the quote of the tab, whatever the task: a question may name the customer.
         const { costingNames } = await import("./chiffrage/ui.js");
         quoteNames = costingNames({ tab: tabId });
@@ -1051,7 +1177,7 @@ export function mount({ page, reader }) {
           whole = names.context(whole);
           online = { question: names.text(online.question), history: online.history.map((m) => ({ ...m, content: names.text(m.content) })) };
         }
-        sent = compacted(whole, askedTask, budget);
+        sent = compacted(whole, askedTask, budget, false);
         asked = questions(online.question, online.history);
         try {
           answer = await askGateway(online.question, sent, online.history, askedTask, model, signal, budget);
@@ -1071,7 +1197,7 @@ export function mount({ page, reader }) {
       }
       foldThought();
       answerBox.classList.remove("ai-thinking");
-      answerBox.textContent = formatAnswer(output) || "(réponse vide)";
+      setAnswer(answerBox, formatAnswer(output) || "(réponse vide)");
       answerBox.parentElement.removeAttribute("aria-busy");
       // Costing: every number of the answer must be in the trace the model was given.
       let check = null;
@@ -1217,15 +1343,23 @@ export function mount({ page, reader }) {
     const input = $("ai-input");
     const question = input.value.trim();
     if (!question) return;
+    // A question about the part while it is analysed: it would be answered without it.
+    if (reader.status === "analysing" && task !== "general") {
+      setStatus("La pièce est encore en cours d'analyse : attendez la fin, puis reposez la question.");
+      showScope();
+      return;
+    }
     input.value = "";
     await send(question).catch((err) => bubble("error", err?.message || String(err)));
+    showScope();
   });
 
   return {
     show() {
       showConversation();
       $("ai-input")?.focus();
-      if (!busy) setStatus(reader.semantic ? "Modèle analysé : posez votre question" : "Aucun modèle 3D chargé : questions générales possibles");
+      showScope();
+      if (!busy) setStatus(reader.status === "analysing" ? "Analyse de la pièce en cours" : readPart({ withSemantic: false }) ? "Modèle analysé : posez votre question" : "Aucun modèle 3D chargé : questions générales possibles");
     },
     /** The tab `id` of the 3D page was closed (app.js): its conversation is forgotten, its question dropped. */
     forgetTab(id) {

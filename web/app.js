@@ -593,10 +593,9 @@ function includedIndices() {
  * Null when none is checked. The oriented envelope of a part of the bodies is
  * computed from their display meshes.
  */
-function currentSummary() {
+function currentSummary(indices = includedIndices()) {
   const r = state.result;
   if (!r) return null;
-  const indices = includedIndices();
   if (indices.length === r.bodies.length) return r.summary;
   if (!indices.length) return null;
   if (state.subsetSummary?.key === indices.join(",")) return state.subsetSummary.summary;
@@ -740,7 +739,7 @@ function select(i) {
 // ---------------------------------------------------------------- exports
 
 /** Results without the display meshes, for files and for scripts. */
-function exportableResult(r) {
+function exportableResult(r, indices = includedIndices()) {
   const density = parseFloat($("density").value);
   const mass = (v) => (v != null && Number.isFinite(density) && density >= 0 ? (v / 1000) * density : null);
   return {
@@ -750,12 +749,12 @@ function exportableResult(r) {
     units: { length: "mm", area: "mm2", volume: "mm3", mass: "g", density: "g/cm3" },
     engine: r.engine ?? "python",
     density,
-    summary: { ...(currentSummary() ?? r.summary), mass: mass((currentSummary() ?? r.summary).volume) },
-    bodies: includedIndices().map((i) => {
+    summary: { ...(currentSummary(indices) ?? r.summary), mass: mass((currentSummary(indices) ?? r.summary).volume) },
+    bodies: indices.map((i) => {
       const { mesh, ...b } = r.bodies[i];
       return { ...b, mass: mass(b.volume), ...thicknessExport(r, [i]) };
     }),
-    ...thicknessExport(r, includedIndices()),
+    ...thicknessExport(r, indices),
     elapsed_s: r.elapsed_s,
   };
 }
@@ -1074,9 +1073,17 @@ renderer.domElement.addEventListener("pointerup", (e) => {
 const hint = $("drop-hint");
 window.addEventListener("dragover", (e) => {
   e.preventDefault();
+  // The hint is the 3D page's: not shown under the other pages, whose drops it never sees end.
+  if ($("page-viewer").hidden) return;
   hint.hidden = false;
   hint.classList.add("dragging");
 });
+// Whatever takes the drop (a data file row of the costing pages stops it there), the hint goes away:
+// captured on the way down, before anything can stop it.
+window.addEventListener("drop", () => {
+  hint.classList.remove("dragging");
+  if (state.result) hint.hidden = true;
+}, true);
 window.addEventListener("dragleave", (e) => {
   if (e.relatedTarget) return;
   hint.classList.remove("dragging");
@@ -2105,24 +2112,47 @@ function updatePublished(r) {
 // is built when asked for, kept until the published result changes, and
 // written into #reader3d-semantic-result when the page is idle, so that it
 // never holds up or breaks the result itself.
-let semanticKept = null; // {result, density, method, semantic}
+let semanticKept = null; // {result, density, method, key (bodies), semantic}
 let semanticPending = null; // idle callback writing #reader3d-semantic-result
 
-/** The semantic contract of the result shown (null without one). */
-function currentSemantic() {
+/** The semantic contract of the result shown (null without one): of the bodies checked, or of these bodies (indices into r.bodies). */
+function currentSemantic(indices = includedIndices()) {
   const r = state.result;
   if (!r) return null;
   const density = $("density").value;
   // The thickness method changes the statistics exported without republishing.
   const method = thickMethod();
-  if (semanticKept?.result !== r || semanticKept.density !== density || semanticKept.method !== method) {
-    // The bodies checked, each with its index in r.bodies (what setSelection takes).
-    const data = exportableResult(r);
-    const indices = includedIndices();
+  const key = indices.join(",");
+  if (semanticKept?.result !== r || semanticKept.density !== density || semanticKept.method !== method || semanticKept.key !== key) {
+    // Each body with its index in r.bodies (what setSelection takes).
+    const data = exportableResult(r, indices);
     data.bodies = data.bodies.map((b, k) => ({ ...b, source_index: indices[k] }));
-    semanticKept = { result: r, density, method, semantic: buildSemantic3D(data) };
+    semanticKept = { result: r, density, method, key, semantic: buildSemantic3D(data) };
   }
   return semanticKept.semantic;
+}
+
+/**
+ * The bodies the IA page sends: the body selected in the list (its row
+ * clicked) when there is one, else the bodies checked; and which they are,
+ * for the page to say it (names never sent: the context has the counts).
+ */
+function aiPart({ withSemantic = true } = {}) {
+  const r = state.result;
+  if (!r) return null;
+  const selected = state.selected >= 0 && state.selected < r.bodies.length;
+  const indices = selected ? [state.selected] : includedIndices();
+  return {
+    // Seconds on a large part: not built when only the scope is wanted.
+    semantic: withSemantic && indices.length ? currentSemantic(indices) : null,
+    scope: {
+      mode: selected ? "selected" : indices.length === r.bodies.length ? "all" : "checked",
+      bodies_sent: indices.length,
+      bodies_in_file: r.bodies.length,
+      names: indices.map((i) => r.bodies[i].name),
+      file: r.file ?? null,
+    },
+  };
 }
 
 /** #reader3d-semantic-result: "null" at once (never that of another state), the new contract when the page is idle. */
@@ -2172,6 +2202,10 @@ window.reader3d = {
   },
   get semantic() {
     return currentSemantic();
+  },
+  /** For the IA page: {semantic, scope} of the body selected in the list, else of the bodies checked (null without a result). */
+  aiPart(options) {
+    return aiPart(options);
   },
   get result() {
     return state.result ? exportableResult(state.result) : null;

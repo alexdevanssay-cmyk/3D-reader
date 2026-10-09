@@ -388,7 +388,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(request.think, false);
     // Plain French text (a forced JSON form made the small model copy an empty template).
     assert.equal(request.format, undefined);
-    assert.match(request.messages[0].content, /en texte simple \(jamais de JSON\)/);
+    assert.match(request.messages[0].content, /en texte \(jamais de JSON ; gras, listes et petits tableaux Markdown permis\)/);
     assert.match(request.messages[0].content, /qwen3:8b\) qui tourne en local sur ce PC/);
     assert.equal(request.keep_alive, '15m');
     assert.equal(request.options.num_ctx, 8192);
@@ -446,6 +446,118 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.deepEqual(errors, []);
     await page.context().close();
     await new Promise((resolve) => ollama.close(resolve));
+  });
+
+  test('IA page: the body selected (else the bodies checked) is what the AI gets, said on the page; answers in Markdown laid out; no drop hint left over the model', { timeout: CAD_TIMEOUT }, async (t) => {
+    const { default: gatewayHandler } = await import('../../api/ai.js');
+    const completions = [];
+    // An answer in Markdown, with a tag of its own that must stay text.
+    const answer = '**Conclusion** : proposition à valider.\n\n| Élément | Valeur |\n|---|---|\n| Noyaux | 1 <b>gras</b> |\n\n- tiroir *proposé*';
+    const groq = createServer((req, res) => {
+      let text = '';
+      req.on('data', (c) => (text += c));
+      req.on('end', () => {
+        completions.push(JSON.parse(text));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ model: 'openai/gpt-oss-120b', choices: [{ message: { role: 'assistant', content: answer }, finish_reason: 'stop' }] }));
+      });
+    });
+    const gateway = createServer((req, res) => {
+      req.headers['x-forwarded-for'] = '198.51.100.3';
+      return gatewayHandler(req, res);
+    });
+    await Promise.all([groq, gateway].map((x) => new Promise((resolve) => x.listen(0, '127.0.0.1', resolve))));
+    const saved = { ...process.env };
+    for (const k of Object.keys(process.env)) if (/^(groq_api_key|ai_|openai_|reader3d_)/i.test(k)) delete process.env[k];
+    Object.assign(process.env, { GROQ_API_KEY: 'gsk_made_up', AI_BASE_URL: `http://127.0.0.1:${groq.address().port}/openai/v1`, READER3D_ALLOWED_ORIGINS: base.replace(/\/$/, ''), READER3D_PUBLIC: '1' });
+    t.after(() => {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+      return Promise.all([groq, gateway].map((x) => new Promise((resolve) => {
+        x.closeAllConnections();
+        x.close(resolve);
+      })));
+    });
+    const contextOf = (body) => JSON.parse(body.messages[1].content.replace(/^[\s\S]*?<<<DONNEES_3D_READER\n/, '').replace(/\nDONNEES_3D_READER>>>$/, ''));
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    await page.click('.tab[data-page="ia"]');
+    assert.equal(await page.textContent('#ai-scope'), 'Aucune pièce ouverte : questions générales seulement.');
+    await page.selectOption('#ai-provider', 'openai');
+    await page.fill('#ai-url', `http://127.0.0.1:${gateway.address().port}/api/ai`);
+    await page.dispatchEvent('#ai-url', 'change');
+    const ask = async () => {
+      await page.fill('#ai-input', 'Combien de noyaux ?');
+      await page.press('#ai-input', 'Enter');
+      await page.waitForFunction(() => /^Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+      return contextOf(completions.at(-1));
+    };
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+
+    // The whole part: both bodies, said so.
+    await page.click('.tab[data-page="ia"]');
+    assert.equal(await page.textContent('#ai-scope'), "Envoyé à l'IA : toute la pièce « named_assembly.step » (2 corps).");
+    let sent = await ask();
+    assert.deepEqual([sent.bodies.length, sent.selection.mode, sent.selection.bodies_sent, sent.selection.bodies_in_file], [2, 'all', 2, 2]);
+    // The answer laid out: bold, a table, a list; the tag of the answer kept as text.
+    const reply = page.locator('#ai-chat .ai-assistant').last();
+    assert.equal(await reply.locator('.ai-md strong').first().textContent(), 'Conclusion');
+    assert.equal(await reply.locator('.ai-table td').nth(1).textContent(), '1 <b>gras</b>');
+    assert.equal(await reply.locator('.ai-md b').count(), 0);
+    assert.equal(await reply.locator('.ai-md li em').textContent(), 'proposé');
+    assert.doesNotMatch(await reply.locator('.ai-text').textContent(), /\*\*|\|---/);
+
+    // A body selected in the list: that body only, its name never sent.
+    await page.click('.tab[data-page="viewer"]');
+    const name = (await page.textContent('#bodies tr[data-index="1"] td.name')).trim();
+    await page.click('#bodies tr[data-index="1"] td.name');
+    await page.click('.tab[data-page="ia"]');
+    assert.match(await page.textContent('#ai-scope'), /^Envoyé à l'IA : le corps sélectionné « .+ » seulement \(1 sur 2\)\./);
+    sent = await ask();
+    assert.deepEqual([sent.bodies.length, sent.model.body_count, sent.selection.mode, sent.selection.bodies_sent], [1, 1, 'selected', 1]);
+    assert.match(sent.selection.note, /Seul le corps sélectionné/);
+    assert.ok(!JSON.stringify(completions.at(-1)).includes(name), 'the real name stays in the browser');
+
+    // Unselected, one body unchecked: the body checked only.
+    await page.click('.tab[data-page="viewer"]');
+    await page.click('#bodies tr[data-index="1"] td.name');
+    await page.uncheck('#bodies tr[data-index="1"] input');
+    await page.click('.tab[data-page="ia"]');
+    assert.match(await page.textContent('#ai-scope'), /^Envoyé à l'IA : le corps coché « .+ » seulement \(1 sur 2\)\.$/);
+    sent = await ask();
+    assert.deepEqual([sent.bodies.length, sent.selection.mode], [1, 'checked']);
+    // None checked: the part is not sent.
+    await page.click('.tab[data-page="viewer"]');
+    await page.uncheck('#bodies tr[data-index="0"] input');
+    await page.click('.tab[data-page="ia"]');
+    assert.equal(await page.textContent('#ai-scope'), "Aucun corps coché dans la liste : l'IA ne reçoit pas la pièce.");
+    sent = await ask();
+    assert.equal(sent.no_model_loaded, true);
+    assert.match(sent.note, /aucun de ses corps n'est coché/);
+
+    // A file dragged over the 3D view, then dropped on a data file row of the costing page (which keeps the drop):
+    // the hint does not stay over the model; dragged over the costing page, it is not shown.
+    await page.click('.tab[data-page="viewer"]');
+    const drag = (selector, type, json) => page.evaluate(({ selector, type, json }) => {
+      const data = new DataTransfer();
+      if (json) data.items.add(new File([json], 'historique.json', { type: 'application/json' }));
+      (selector ? document.querySelector(selector) : document.body).dispatchEvent(new DragEvent(type, { dataTransfer: data, bubbles: true, cancelable: true }));
+    }, { selector, type, json });
+    await drag(null, 'dragover');
+    assert.equal(await page.isVisible('#drop-hint'), true);
+    await page.click('.tab[data-page="chiffrage"]');
+    await drag('#page-chiffrage [data-drop="historique"]', 'dragover');
+    await drag('#page-chiffrage [data-drop="historique"]', 'drop', JSON.stringify({ schema: 'reader3d-historique-cycles', version: 1, pieces: [] }));
+    await page.click('.tab[data-page="viewer"]');
+    assert.equal(await page.isVisible('#drop-hint'), false);
+    await page.click('.tab[data-page="chiffrage"]');
+    await drag('#page-chiffrage', 'dragover');
+    await page.click('.tab[data-page="viewer"]');
+    assert.equal(await page.isVisible('#drop-hint'), false);
+    assert.deepEqual(errors, []);
+    await page.context().close();
   });
 
   test('IA page through the gateway (api/ai.js, a stand-in for Groq): closed without an access code, configuration, access code, context to its budget, models, quota, errors', { timeout: CAD_TIMEOUT }, async (t) => {
@@ -572,9 +684,13 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(detail.length <= 2500 && whole > 2500, `context of ${detail.length} characters, ${whole} whole`);
     // The conversation goes with it.
     assert.deepEqual(completions[1].body.messages.slice(2).map((m) => m.role), ['user', 'assistant', 'user']);
+    // The general questions too get the detail (the gateway reads it in seconds), within its budget, with the bodies sent.
     await page.click('.ai-task[data-task="general"]');
     await ask('Résume la pièce.');
-    assert.match(contextOf(completions[2]), /"summary_only":true/);
+    const general = contextOf(completions[2]);
+    assert.doesNotMatch(general, /"summary_only"/);
+    assert.ok(general.length <= 2500, `context of ${general.length} characters`);
+    assert.match(general, /"selection":\{"mode":"all","bodies_sent":1,"bodies_in_file":1\}/);
 
     // The free quota reached: the message of the gateway as it is, the question not kept.
     t.mock.method(console, 'error', () => {}); // the gateway logs the provider's refusal

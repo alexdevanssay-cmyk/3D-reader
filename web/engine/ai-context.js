@@ -319,9 +319,10 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
     });
     if (size(out) <= maxChars) return out;
   }
-  // Last resort: the largest body without its foundry screen.
-  omitted.push("foundry screen of the largest body");
-  return { ...out, bodies: out.bodies.map(({ foundry, feature_groups, ...b }) => b), compaction: { ...out.compaction, omitted: [...omitted] } };
+  // Last resort: the largest body without its foundry screen, nor the foundry notes that only explain it.
+  omitted.push("foundry screen of the largest body", "foundry sources and policies");
+  const { foundry_common, ...rest } = out;
+  return { ...rest, bodies: out.bodies.map(({ foundry, feature_groups, ...b }) => b), compaction: { ...out.compaction, omitted: [...omitted] } };
 }
 
 /**
