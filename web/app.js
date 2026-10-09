@@ -2296,15 +2296,21 @@ window.reader3d = {
     if (tab && tab !== activeTab) showTab(tab);
   },
   /**
-   * A new tab for a conversation of the history of the IA page: its part
-   * ({id, file}) known, its model not open. `before(id)` is called with the
-   * tab's id before it is shown (its conversation written). Returns that id.
+   * A tab for a conversation of the history of the IA page: its part ({id,
+   * file}) known, its model not open. A new one; the tab shown when `reuse`
+   * and it is empty (no file, no part, nothing being opened): no empty tab
+   * left behind. `before(id)` is called with the tab's id before it is shown
+   * (its conversation written). Returns that id.
    */
-  openPartTab(part, before) {
-    const tab = createTab();
+  openPartTab(part, before, { reuse = false } = {}) {
+    const empty = reuse && activeTab && !activeTab.file && !activeTab.result && !activeTab.loading && !activeTab.part?.id;
+    const tab = empty ? activeTab : createTab();
     tab.part = { id: part?.id ?? null, file: part?.file ?? null };
     before?.(tab.id);
-    showTab(tab);
+    if (tab === activeTab) {
+      renderTabs();
+      document.dispatchEvent(new CustomEvent("reader3d-part"));
+    } else showTab(tab);
     return tab.id;
   },
   /** Material of the part (alloy name and density g/cm³), e.g. from a customer request. */

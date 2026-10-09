@@ -1105,6 +1105,12 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.click('#ai-hist-list-local .ai-hist-item:nth-child(1) .ai-hist-del');
     await page.waitForFunction(() => document.querySelectorAll('#ai-hist-list-local .ai-hist-item').length === 1, null, { timeout: 10_000 });
     assert.equal(Object.values(await folderFiles()).flatMap((f) => f.conversations).length, 2);
+    // From an empty tab (a new conversation, no part): the conversation opened there, no empty tab left behind.
+    await page.click('#ai-clear');
+    await page.click('#ai-hist-list-local .ai-hist-item:nth-child(1) .ai-hist-open');
+    await page.waitForFunction(() => document.querySelectorAll('#ai-chat .ai-msg').length === 6, null, { timeout: 10_000 });
+    assert.equal(await page.locator('.doc-tab').count(), 1);
+    assert.equal(await page.getAttribute('.doc-tab.active', 'class'), 'doc-tab active chat-only');
 
     // A phone: one column, the history under the conversation, nothing wider than the screen.
     await page.setViewportSize({ width: 375, height: 800 });

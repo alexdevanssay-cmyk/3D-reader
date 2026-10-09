@@ -71,7 +71,7 @@ const KEYS = {
   gateway: "reader3d.ai.gateway", code: "reader3d.ai.gatewayCode", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider",
   messages: "reader3d.ai.messages", think: "reader3d.ai.think", amounts: "reader3d.ai.costingAmounts", anonymize: "reader3d.ai.anonymize", fallback: "reader3d.ai.fallback",
   codeRequired: "reader3d.ai.gatewayCodeRequired", // the gateway asked for an access code: its field shown at once
-  quota: "reader3d.ai.quota", // what is left of the free quota of the gateway, from its last answer
+  quota: "reader3d.ai.quota", // what is left of the free quota of the gateway, from its last answer in any tab of this browser
   historyTab: "reader3d.ai.historyTab", // the history shown on the right: "local" or "reseau"
 };
 // Sent on window when an answer of the gateway tells what is left of its free quota (the IA page shows it).
@@ -439,8 +439,9 @@ export function quotaLabel(quota) {
 /** Keeps what is left of the free quota of a gateway answer, for the badge of the IA page (also after the Chiffrage page asked). */
 function noteQuota({ provider, quota } = {}) {
   if (!Number.isFinite(quota?.requests_remaining_day)) return;
-  const kept = { provider: provider ?? null, ...quota };
-  if (typeof sessionStorage !== "undefined") store.set(sessionStorage, KEYS.quota, JSON.stringify(kept));
+  // For every tab of this browser (the quota is the account's, whatever the tab that asked): the latest answer's.
+  const kept = { provider: provider ?? null, ...quota, at: new Date().toISOString() };
+  if (typeof localStorage !== "undefined") store.set(localStorage, KEYS.quota, JSON.stringify(kept));
   globalThis.dispatchEvent?.(new CustomEvent(QUOTA_EVENT, { detail: kept })); // the page, not the unit tests
 }
 
@@ -782,19 +783,27 @@ export function mount({ page, reader }) {
   function showQuota() {
     let kept = null;
     try {
-      kept = JSON.parse(store.get(sessionStorage, KEYS.quota) || "null");
+      kept = JSON.parse(store.get(localStorage, KEYS.quota) || "null");
     } catch {
       kept = null;
     }
+    // A day old: the quota of the day has been given back since.
+    const at = Date.parse(kept?.at ?? "");
+    if (Number.isFinite(at) && Date.now() - at > 24 * 3600 * 1000) kept = null;
     const text = isLocal() ? "" : quotaLabel(kept);
     $("ai-quota").hidden = !text;
     $("ai-quota").textContent = text;
     const limit = kept?.requests_limit_day;
+    const when = Number.isFinite(at) ? new Date(at).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : "";
     $("ai-quota").title = text
-      ? `Quota gratuit${kept.provider ? ` de ${kept.provider}` : ""} : ${text}${Number.isFinite(limit) ? ` sur ${limit.toLocaleString("fr-FR")}` : ""}, d'après sa dernière réponse.`
+      ? `Quota gratuit${kept.provider ? ` de ${kept.provider}` : ""} : ${text}${Number.isFinite(limit) ? ` sur ${limit.toLocaleString("fr-FR")}` : ""}, d'après sa dernière réponse${when ? ` (${when})` : ""}, dans n'importe quel onglet de ce navigateur. Les questions posées depuis un autre PC ne comptent qu'à la réponse suivante.`
       : "";
   }
   window.addEventListener(QUOTA_EVENT, showQuota);
+  // An answer in another tab of this browser: its quota, here too.
+  window.addEventListener("storage", (event) => {
+    if (event.key === KEYS.quota) showQuota();
+  });
   {
     $("ai-code").value = store.get(localStorage, KEYS.code) || "";
     const saved = store.get(localStorage, KEYS.provider);
@@ -1725,8 +1734,18 @@ export function mount({ page, reader }) {
     const { synced, ...kept } = conversation;
     if (!reader.openPartTab) return;
     const file = kept.file ?? kept.part?.file ?? null; // the name the part was last opened under
-    reader.openPartTab(kept.part ? { ...kept.part, file } : { id: null, file: null }, (tabId) => writeConversation(conversationKey(tabId), { ...kept, file }));
-    setStatus(kept.part ? "Discussion ouverte dans un nouvel onglet : ouvrez le fichier de la pièce pour la voir en 3D" : "Discussion ouverte dans un nouvel onglet");
+    // The tab shown, when it is empty (no part, no conversation, no question under way): it takes the conversation.
+    const shownTab = reader.tab;
+    const shownKey = shownTab ? conversationKey(shownTab.id) : null;
+    const reuse = !!shownTab && !shownTab.file && !shownTab.part && !readConversation(shownKey).messages.length && pending?.key !== shownKey;
+    const tabId = reader.openPartTab(kept.part ? { ...kept.part, file } : { id: null, file: null }, (id) => writeConversation(conversationKey(id), { ...kept, file }), { reuse });
+    if (tabId === shownTab?.id) {
+      // The same tab (a conversation without part does not change it): shown again.
+      shown = null;
+      showConversation();
+    }
+    const where = tabId === shownTab?.id ? "dans cet onglet" : "dans un nouvel onglet";
+    setStatus(kept.part ? `Discussion ouverte ${where} : ouvrez le fichier de la pièce pour la voir en 3D` : `Discussion ouverte ${where}`);
     $("ai-input").focus();
   }
 
