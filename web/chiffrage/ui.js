@@ -16,6 +16,8 @@ import { DEFAULT_INTERVAL_S, backtestCsv, backtestItems, backtestReading, backte
 import { addressSpace, askJSON, numbersLabel, savedAI } from "../ai-workspace.js";
 import * as store from "./store.js";
 import { PROPOSAL_FIELDS, sameValue, valueLabel } from "./ai-apply.js";
+import * as network from "../network-folder.js";
+import { forgetRead, syncFeedback, writeFeedback } from "./feedback.js";
 
 let el = null;
 let page = "chiffrage";
@@ -64,6 +66,10 @@ export function mount(targets) {
   document.addEventListener("reader3d-part", () => {
     if (!el.chiffrage.hidden) render();
   });
+  // The shared folder chosen or granted in the IA page: checked again, its retours d'expérience read.
+  document.addEventListener(network.CHANGED, () => {
+    if (!el.chiffrage.hidden || !el.parametres.hidden) refreshNetwork();
+  });
   return { show, setTab, forgetTab };
 }
 
@@ -98,6 +104,7 @@ export function reload() {
 export function show(name) {
   page = name;
   render();
+  refreshNetwork(); // the retours d'expérience of the other PCs, in the background
 }
 
 /** The tab `id` of the 3D page is shown: its own quote (the settings and the workbooks are shared). */
@@ -460,6 +467,7 @@ async function onClick(event) {
   const action = button.dataset.action;
   if (action === "import-workbook" || action === "import-indices" || action === "import-tendances" || action === "import-rfq" || action === "import-historique") button.parentElement.querySelector("input[data-file]")?.click();
   else if (action === "show-parametres") document.querySelector('.tab[data-page="parametres"]')?.click();
+  else if (action.startsWith("network-")) networkAction(action);
   else if (action === "thickness") {
     thicknessBusy = true;
     render();
@@ -619,8 +627,10 @@ async function onClick(event) {
     download("historique_cycles.json", new Blob([JSON.stringify(exportHistory(store.loadHistorique()), null, 2)], { type: "application/json" }));
   } else if (action === "clear-historique") {
     const n = countHistory(store.loadHistorique());
-    if (!n.total || !confirm(`Effacer l'historique des temps de cycle (${plural(n.total, "enregistrement")}, dont ${n.production} temps mesuré${n.production > 1 ? "s" : ""} en production) ?\n\nIl n'est gardé que dans ce navigateur : exportez-le d'abord pour le conserver. Le chiffrage et les paramètres ne changent pas.`)) return;
+    const shared = netFolder && !["none", "unsupported"].includes(netFolder.state) ? " Les retours d'expérience du dossier réseau partagé y restent : ils reviennent à sa prochaine lecture." : "";
+    if (!n.total || !confirm(`Effacer l'historique des temps de cycle (${plural(n.total, "enregistrement")}, dont ${n.production} temps mesuré${n.production > 1 ? "s" : ""} en production) ?\n\nIl n'est gardé que dans ce navigateur : exportez-le d'abord pour le conserver. Le chiffrage et les paramètres ne changent pas.${shared}`)) return;
     store.saveHistorique([]);
+    forgetRead();
     message = { kind: "ok", text: "Historique des temps de cycle effacé." };
     render();
   } else if (action === "export-xlsx") {
@@ -2241,6 +2251,7 @@ function saveFeedback() {
   const record = productionRecord(r, { ref, tempsCycle: r.inputs.cycleReel, fichier: c.p3d?.file ?? null, serie: q.tailleSerie || null, estimation });
   const before = store.loadHistorique().find((x) => x.source === "production" && x.ref === ref);
   const saved = store.saveHistorique(mergeHistory(store.loadHistorique(), [record]).pieces);
+  shareFeedback(record);
   pieceStore(currentKey).cycleReel = null;
   store.saveQuote(q);
   message = {
@@ -2266,7 +2277,8 @@ function feedbackCard(c, r) {
     </div>
     <p><button type="button" class="small" data-action="save-feedback"${missing ? " disabled" : ""}>Enregistrer dans le retour d'expérience</button>${missing ? ` <small class="muted">${missing}</small>` : ""}</p>
     ${saved ? `<p class="small">Déjà enregistré pour « ${esc(ref)} » : ${sec(saved.temps_cycle_s)} sur ${esc(saved.ilot)}${saved.date ? ` le ${dateLabel(saved.date)}` : ""}. Un nouvel enregistrement le remplace.</p>` : ""}
-    <p class="small muted">Gardé dans l'historique des temps de cycle de ce navigateur (source « production »)${ref ? ` sous la référence « ${esc(ref)} »` : ""}, avec la géométrie de la pièce (poids, module, épaisseurs, encombrement, volume, surface, noyaux) et l'îlot, les pièces par cycle, le TRS et la mise au mille du chiffrage. L'enregistrement n'envoie rien ; comme tout l'historique, il peut partir ensuite à l'IA parmi les pièces semblables (case « Envoyer les pièces similaires de l'historique »). Le temps mesuré ne change ni le chiffrage ni les paramètres.</p>
+    ${feedbackNetHtml()}
+    <p class="small muted">Gardé dans l'historique des temps de cycle de ce navigateur (source « production »)${ref ? ` sous la référence « ${esc(ref)} »` : ""}, avec la géométrie de la pièce (poids, module, épaisseurs, encombrement, volume, surface, noyaux) et l'îlot, les pièces par cycle, le TRS et la mise au mille du chiffrage, et écrit aussi dans le dossier réseau partagé de l'entreprise quand il est choisi (Paramètres), pour les autres postes. L'enregistrement n'envoie rien sur Internet ; comme tout l'historique, il peut partir ensuite à l'IA parmi les pièces semblables (case « Envoyer les pièces similaires de l'historique »). Le temps mesuré ne change ni le chiffrage ni les paramètres.</p>
   </section>`;
 }
 
@@ -2543,6 +2555,7 @@ function historyCard() {
     <h3>Historique des temps de cycle</h3>
     <div class="crow"><span>Historique :</span> <strong>${historyCount(n)}</strong>
       <button type="button" class="small" data-action="show-parametres" title="Le fichier d'historique s'importe, s'exporte et s'efface dans Paramètres, avec les autres fichiers">Importer ou exporter dans Paramètres…</button></div>
+    ${netSyncHtml()}
     ${n.ilots.length ? `<div class="cscroll"><table class="ctable compact chisto-count">
       <thead><tr><th>Îlot</th><th class="num">Devis</th><th class="num">Production</th></tr></thead>
       <tbody>${n.ilots.map((x) => `<tr><td><strong>${esc(x.ilot)}</strong>${settings.processes[x.ilot] ? ` ${esc(settings.processes[x.ilot].famille)}` : ""}</td><td class="num">${x.devis}</td><td class="num">${x.production}</td></tr>`).join("")}</tbody></table></div>` : ""}
@@ -2564,6 +2577,149 @@ function historyFileRow() {
       <button type="button" class="small" data-action="export-historique"${n.total ? "" : " disabled"}>Exporter l'historique</button>
       <button type="button" class="small" data-action="clear-historique"${n.total ? "" : " disabled"}>Effacer l'historique…</button></div>
     <p class="small muted">Historique : fichier JSON « reader3d-historique-cycles », version 1. Il complète celui de ce navigateur : un enregistrement de même référence et même source remplace le précédent. Il sert au chiffrage (carte « Historique des temps de cycle ») et, si la case est cochée, à l'IA. L'export reprend tout, temps mesurés compris. Données confidentielles : ne pas publier.</p>`;
+}
+
+// --------------------------------------------------------------------------- the shared network folder
+
+// The shared folder of the company network (network-folder.js) as last checked, what the readings of its
+// retours d'expérience brought during this visit (feedback.js), and where the last real time saved went.
+let netFolder = null; // {state, name, error} (checkSharedFolder); null: being checked
+let netSync = null; // the last reading (syncFeedback), with the records it brought since the page was opened: {..., total: {added, replaced}}
+let netFeedback = null; // {ref, state: "writing" | "written" | "pending", name, error}
+let netChecking = null;
+
+/** The folder checked again, its retours d'expérience read and merged when it is accessible; the rows that show them drawn again. */
+function refreshNetwork() {
+  netChecking ??= (async () => {
+    netFolder = await network.checkSharedFolder().catch((err) => ({ state: "unreadable", name: null, error: err?.message || String(err) }));
+    drawNetwork();
+    if (netFolder.state !== "accessible") return;
+    const report = await syncFeedback({ load: store.loadHistorique, save: store.saveHistorique });
+    const total = { added: (netSync?.total.added ?? 0) + (report.added ?? 0), replaced: (netSync?.total.replaced ?? 0) + (report.replaced ?? 0) };
+    netSync = { ...report, total };
+    // A real time that was waiting for the folder: written with the others.
+    if (netFeedback?.state === "pending" && report.state === "done" && !report.waiting) netFeedback = { ...netFeedback, state: "written", name: null };
+    drawNetwork();
+  })().finally(() => {
+    netChecking = null;
+  });
+  return netChecking;
+}
+
+const fragment = (html) => {
+  const t = document.createElement("template");
+  t.innerHTML = html.trim();
+  return t.content.firstElementChild;
+};
+
+/** The rows of the shared folder, of the history and of the real time saved drawn again alone: what is being typed in the page is kept. */
+function drawNetwork() {
+  if (!el) return;
+  if (pointerDown) {
+    pending = true;
+    return;
+  }
+  if (page === "parametres") {
+    el.parametres.querySelector("#cnetwork")?.replaceWith(fragment(networkRow()));
+    el.parametres.querySelector("#chisto-file")?.replaceWith(fragment(historyFileRow()));
+  } else {
+    refreshHistory();
+    el.chiffrage.querySelector("#cfeedback-net")?.replaceWith(fragment(feedbackNetHtml()));
+  }
+}
+
+const NET_STATES = {
+  unsupported: "indisponible dans ce navigateur (il faut Chrome ou Edge)",
+  none: "aucun",
+  prompt: "accès à autoriser (le navigateur le demande après chaque redémarrage)",
+  denied: "accès refusé",
+  unreadable: "illisible",
+  accessible: "accessible",
+};
+
+/** Paramètres: the row of the shared network folder, with the files: its state, its choice, what it brought. */
+function networkRow() {
+  const f = netFolder;
+  const button = (action, label) => ` <button type="button" class="small" data-action="network-${action}">${label}</button>`;
+  const named = f && !["none", "unsupported"].includes(f.state);
+  const state = !f ? "vérification…" : named ? `« ${esc(f.name)} » — ${NET_STATES[f.state]}${f.error ? ` (${esc(f.error)})` : ""}` : NET_STATES[f.state];
+  const buttons = !f || f.state === "unsupported" ? "" : [
+    named ? "" : button("choose", "Choisir le dossier…"),
+    ["prompt", "denied"].includes(f.state) ? button("grant", "Autoriser l'accès") : "",
+    ["accessible", "unreadable"].includes(f.state) ? button("refresh", "Actualiser") : "",
+    named ? button("choose", "Changer de dossier…") : "",
+    named ? button("forget", "Ne plus utiliser") : "",
+  ].join("");
+  return `<div id="cnetwork">
+    <div class="crow"><span>Dossier réseau partagé :</span> <strong>${state}</strong>${buttons}</div>
+    ${netSyncHtml()}
+    <p class="small muted">Un dossier du réseau de l'entreprise, choisi une fois sur chaque poste, où chacun profite du travail des autres : les analyses 3D des pièces (sous-dossier « analyses-3d » : une pièce analysée sur un poste s'ouvre aussitôt sur les autres), les retours d'expérience (« retours-experience » : les temps de cycle mesurés en production, lus à chaque ouverture de Chiffrage ou de Paramètres) et l'historique IA (« historique-ia »). Il reste sur le réseau de l'entreprise : rien n'est envoyé sur Internet.</p>
+  </div>`;
+}
+
+/** What the readings of the retours d'expérience of the folder brought during this visit, in a line (empty before any). */
+function netSyncHtml() {
+  const s = netSync;
+  if (!s || s.state === "none") return "";
+  if (s.state === "prompt") return s.waiting ? `<p class="small cnetwork-sync">${plural(s.waiting, "retour")} d'expérience de ce poste à écrire dans le dossier réseau partagé dès que son accès est autorisé.</p>` : "";
+  if (s.state === "error") return `<p class="small cnetwork-sync">Dossier réseau partagé non lu : ${esc(s.error)}.</p>`;
+  const time = new Date(s.at).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+  const { added, replaced } = s.total;
+  const brought = added || replaced ? `${plural(added, "temps mesuré")} ajouté${added > 1 ? "s" : ""} à l'historique, ${replaced} mis à jour depuis l'ouverture de la page` : "aucun temps mesuré nouveau depuis l'ouverture de la page";
+  const more = [
+    s.written ? `${plural(s.written, "retour")} de ce poste écrit${s.written > 1 ? "s" : ""}` : "",
+    s.waiting ? `${s.waiting} encore à écrire` : "",
+    s.unreadable?.length ? `fichier${s.unreadable.length > 1 ? "s" : ""} illisible${s.unreadable.length > 1 ? "s" : ""} : ${esc(list(s.unreadable, (x) => x))}` : "",
+  ].filter(Boolean);
+  return `<p class="small cnetwork-sync">Retours d'expérience du dossier réseau partagé, lu à ${time} : ${brought}${more.length ? ` ; ${more.join(" ; ")}` : ""}.</p>`;
+}
+
+/** The real time saved last, written in the shared folder too (in the background). */
+function shareFeedback(record) {
+  netFeedback = { ref: record.ref, state: "writing" };
+  writeFeedback(record)
+    .catch((err) => ({ state: "pending", error: err?.message || String(err) }))
+    .then((result) => {
+      netFeedback = result.state === "none" ? null : { ref: record.ref, ...result };
+      drawNetwork();
+    });
+}
+
+/** The card Retour d'expérience: where the real time saved last went on the network. */
+function feedbackNetHtml() {
+  const f = netFeedback;
+  const ref = esc(f?.ref ?? "");
+  const text = !f ? ""
+    : f.state === "writing" ? `Retour « ${ref} » : écriture dans le dossier réseau partagé…`
+    : f.state === "written" ? `Retour « ${ref} » écrit aussi dans le dossier réseau partagé${f.name ? ` (retours-experience/${esc(f.name)})` : ""} : les autres postes le lisent.`
+    : `Retour « ${ref} » pas encore écrit dans le dossier réseau partagé (${esc(f.error)}) : il le sera à la prochaine lecture du dossier, son accès autorisé ou le réseau revenu.`;
+  return `<p class="small" id="cfeedback-net"${text ? "" : " hidden"}>${text}</p>`;
+}
+
+/** The buttons of the row of the shared folder (Paramètres). */
+async function networkAction(action) {
+  try {
+    if (action === "network-choose") {
+      const handle = await network.chooseSharedFolder();
+      message = { kind: "ok", text: `Dossier réseau partagé « ${handle.name} » choisi : les analyses 3D, les retours d'expérience et l'historique IA de ce poste y sont écrits, ceux des autres postes y sont lus.` };
+      // The conversations of the IA page go to its subfolder (ai-history.js): those kept before on this PC when the user says so.
+      import("../ai-history.js")
+        .then((h) => h.adoptSharedFolder({ ask: (n) => confirm(`Écrire aussi dans le dossier réseau partagé les ${plural(n, "discussion")} IA de pièces déjà gardée${n > 1 ? "s" : ""} sur ce PC ?`) }))
+        .catch(() => {});
+    } else if (action === "network-grant") {
+      if (!(await network.grantSharedFolder())) message = { kind: "warn", text: "Accès au dossier réseau partagé non autorisé." };
+    } else if (action === "network-forget") {
+      if (!confirm(`Ne plus utiliser le dossier réseau partagé « ${netFolder?.name ?? ""} » sur ce poste ?\n\nSes fichiers y restent, pour les autres postes ; ce poste n'y écrit et n'y lit plus les analyses 3D, les retours d'expérience ni l'historique IA.`)) return;
+      await network.forgetSharedFolder();
+      netSync = null;
+      message = { kind: "ok", text: "Dossier réseau partagé : plus utilisé sur ce poste." };
+    }
+  } catch (err) {
+    if (err?.name !== "AbortError") message = { kind: "error", text: `Dossier réseau partagé : ${err?.message || err}` };
+  }
+  netFolder = null;
+  render();
+  refreshNetwork();
 }
 
 // Where each setting comes from (store.js layers): its label, and its letter in the tables.
@@ -2629,6 +2785,7 @@ function settingsSourcesCard() {
       <input type="file" data-file="tendances" accept=".json,application/json" hidden>${t ? ` <button type="button" class="small" data-action="export-tendances">Exporter les tendances</button>` : ""}</div>
     ${base ? `<div class="crow"><span>Classeur de chiffrage :</span> <strong>${esc(base.source?.fileName)} — importé le ${dateLabel(base.source?.importedAt)}</strong></div>` : ""}
     ${historyFileRow()}
+    ${networkRow()}
     ${migrated}
     ${settingsNotApplied()}
     <div class="cfields">${field("Seuil d'alerte : écart à la tendance", sinput("seuilTendance", settings.seuilTendance, { kind: "pct" }), "% — au-delà, le chiffrage signale l'écart (carte Traçabilité)")}</div>
