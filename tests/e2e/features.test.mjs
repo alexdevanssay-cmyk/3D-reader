@@ -548,7 +548,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(sent.no_model_loaded, true);
     assert.match(sent.note, /aucun de ses corps n'est coché/);
 
-    // A file dragged over the 3D view, then dropped on a data file row of the costing page (which keeps the drop):
+    // A file dragged over the 3D view, then dropped on a data file row of the settings page (which keeps the drop):
     // the hint does not stay over the model; dragged over the costing page, it is not shown.
     await page.click('.tab[data-page="viewer"]');
     const drag = (selector, type, json) => page.evaluate(({ selector, type, json }) => {
@@ -558,10 +558,10 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     }, { selector, type, json });
     await drag(null, 'dragover');
     assert.equal(await page.isVisible('#drop-hint'), true);
-    await page.click('.tab[data-page="chiffrage"]');
-    await page.waitForSelector('#page-chiffrage [data-drop="historique"]'); // the costing page is loaded when first shown
-    await drag('#page-chiffrage [data-drop="historique"]', 'dragover');
-    await drag('#page-chiffrage [data-drop="historique"]', 'drop', JSON.stringify({ schema: 'reader3d-historique-cycles', version: 1, pieces: [] }));
+    await page.click('.tab[data-page="parametres"]');
+    await page.waitForSelector('#page-parametres [data-drop="historique"]'); // the costing pages are loaded when first shown
+    await drag('#page-parametres [data-drop="historique"]', 'dragover');
+    await drag('#page-parametres [data-drop="historique"]', 'drop', JSON.stringify({ schema: 'reader3d-historique-cycles', version: 1, pieces: [] }));
     await page.click('.tab[data-page="viewer"]');
     assert.equal(await page.isVisible('#drop-hint'), false);
     await page.click('.tab[data-page="chiffrage"]');
