@@ -457,11 +457,10 @@ function classify(mesh, grid, d, list, sinDraft) {
   for (let s = 0; s < n; s++) {
     const f = list ? list[s] : s;
     const nx = normals[3 * f], ny = normals[3 * f + 1], nz = normals[3 * f + 2];
-    if (!(nx || ny || nz)) continue; // degenerate: no side, no area
     const nd = nx * d[0] + ny * d[1] + nz * d[2];
     let flag = Math.abs(nd) < sinDraft ? ZERO_DRAFT : 0;
-    // A sliver (no area, a normal of no meaning): either half, as its neighbours.
-    if (mesh.areas[f] < mesh.sliver) {
+    // A sliver (no area, a normal of no meaning, or none): either half, as its neighbours.
+    if (mesh.areas[f] < mesh.sliver || !(nx || ny || nz)) {
       flags[s] = flag | REACH_UP | REACH_DOWN;
       continue;
     }
