@@ -70,7 +70,10 @@ const KEYS = {
   gateway: "reader3d.ai.gateway", code: "reader3d.ai.gatewayCode", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider",
   messages: "reader3d.ai.messages", think: "reader3d.ai.think", amounts: "reader3d.ai.costingAmounts", anonymize: "reader3d.ai.anonymize", fallback: "reader3d.ai.fallback",
   codeRequired: "reader3d.ai.gatewayCodeRequired", // the gateway asked for an access code: its field shown at once
+  quota: "reader3d.ai.quota", // what is left of the free quota of the gateway, from its last answer
 };
+// Sent on window when an answer of the gateway tells what is left of its free quota (the IA page shows it).
+const QUOTA_EVENT = "reader3d-ai-quota";
 const COSTING_LABEL = "Raisonnement IA — aucune valeur n'est appliquée";
 // HTTP statuses of the gateway when the free quota of its provider is reached (api/ai.js): the local model may answer instead.
 const QUOTA_STATUSES = [413, 429];
@@ -299,13 +302,23 @@ export function defaultGateway(where = location) {
   return /\.vercel\.app$/.test(where.hostname) ? new URL("/api/ai", where.origin).href : "";
 }
 
-/** Where an answer of the gateway comes from, and what is left of its free quota: "Groq · openai/gpt-oss-120b · 998 questions restantes aujourd'hui". */
-export function gatewayLabel({ provider, model, quota } = {}) {
+/** Where an answer of the gateway comes from: "Groq · openai/gpt-oss-120b". */
+export function gatewayLabel({ provider, model } = {}) {
+  return [provider, model].filter(Boolean).join(" · ");
+}
+
+/** What is left of the free quota of the day: "998 questions restantes aujourd'hui"; "" when the provider does not say. */
+export function quotaLabel(quota) {
   const left = quota?.requests_remaining_day;
-  return [
-    [provider, model].filter(Boolean).join(" · "),
-    Number.isFinite(left) ? `${left.toLocaleString("fr-FR")} question${left > 1 ? "s restantes" : " restante"} aujourd'hui` : "",
-  ].filter(Boolean).join(" · ");
+  return Number.isFinite(left) ? `${left.toLocaleString("fr-FR")} question${left > 1 ? "s restantes" : " restante"} aujourd'hui` : "";
+}
+
+/** Keeps what is left of the free quota of a gateway answer, for the badge of the IA page (also after the Chiffrage page asked). */
+function noteQuota({ provider, quota } = {}) {
+  if (!Number.isFinite(quota?.requests_remaining_day)) return;
+  const kept = { provider: provider ?? null, ...quota };
+  if (typeof sessionStorage !== "undefined") store.set(sessionStorage, KEYS.quota, JSON.stringify(kept));
+  globalThis.dispatchEvent?.(new CustomEvent(QUOTA_EVENT, { detail: kept })); // the page, not the unit tests
 }
 
 /**
@@ -494,6 +507,7 @@ export async function askJSON(task, build, { signal, fallback } = {}) {
     });
     const output = data.output ?? data.text;
     if (typeof output !== "string" || !output.trim()) throw new Error("La passerelle a renvoyé une réponse vide : réessayez.");
+    noteQuota(data);
     return { output, provider: data.provider ?? null, model: data.model ?? null, quota: data.quota ?? null, usage: data.usage ?? null, sent, local: false };
   } catch (err) {
     // The free quota reached: the local model, when it answers (its own address and model).
@@ -509,6 +523,7 @@ export function mount({ page, reader }) {
       <section class="card">
         <div class="card-head">
           <h2>IA / analyse</h2>
+          <span id="ai-quota" class="ai-quota" hidden></span>
           <span id="ai-status" class="muted small" role="status">Non connecté</span>
         </div>
         <div class="ai-row">
@@ -607,7 +622,26 @@ export function mount({ page, reader }) {
     $("ai-fallback-field").hidden = local;
     $("ai-amounts-field").hidden = local || task !== "costing";
     showCode();
+    showQuota();
   }
+
+  /** The badge of what is left of the free quota of the gateway, from its last answer (hidden for Ollama). */
+  function showQuota() {
+    let kept = null;
+    try {
+      kept = JSON.parse(store.get(sessionStorage, KEYS.quota) || "null");
+    } catch {
+      kept = null;
+    }
+    const text = isLocal() ? "" : quotaLabel(kept);
+    $("ai-quota").hidden = !text;
+    $("ai-quota").textContent = text;
+    const limit = kept?.requests_limit_day;
+    $("ai-quota").title = text
+      ? `Quota gratuit${kept.provider ? ` de ${kept.provider}` : ""} : ${text}${Number.isFinite(limit) ? ` sur ${limit.toLocaleString("fr-FR")}` : ""}, d'après sa dernière réponse.`
+      : "";
+  }
+  window.addEventListener(QUOTA_EVENT, showQuota);
   {
     $("ai-code").value = store.get(localStorage, KEYS.code) || "";
     const saved = store.get(localStorage, KEYS.provider);
@@ -1070,6 +1104,7 @@ export function mount({ page, reader }) {
         const text = [formatAnswer(output), legend.length ? namesLine(legend) : ""].filter(Boolean).join("\n\n");
         addAIAnalysis({ date: new Date().toISOString(), provider: source.provider ?? null, model: source.model ?? null, question, answer: text, verified: check.verifiee }, { tab: tabId });
       }
+      if (answer) noteQuota(answer);
       const label = answer ? gatewayLabel(answer) : fallback ? `repli local : Ollama · ${fallback.model}` : "";
       setStatus(`Réponse en ${Math.round((performance.now() - start) / 1000)} s${(local || fallback) && timing ? ` (${timing})` : ""}${label ? ` · ${label}` : ""}`);
       timing = "";

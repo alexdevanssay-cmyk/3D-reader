@@ -12,6 +12,9 @@
   --error-bg: #fdecec;
   --error-text: #a12020;
   --select: #ffb020;
+  --quota-bg: #e8f0fe;
+  --quota-text: #0b3d91;
+  --quota-border: #2f6fed;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -27,6 +30,9 @@
     --ok: #4cc983;
     --error-bg: #3a1c1c;
     --error-text: #ffb4b4;
+    --quota-bg: #13284a;
+    --quota-text: #a8c7ff;
+    --quota-border: #5b8cff;
   }
 }
 
@@ -340,6 +346,8 @@ table.bodies .open { color: var(--warn); }
 .ai-page { max-width: 1100px; margin: 0 auto; padding: 24px 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .ai-page h2 { margin: 0; font-size: 18px; }
 .ai-page .card-head { flex-wrap: wrap; gap: 4px 12px; }
+/* What is left of the free quota of the online AI: a framed blue badge, readable in both themes. */
+.ai-quota { margin-left: auto; padding: 3px 10px; border: 1px solid var(--quota-border); border-radius: 6px; background: var(--quota-bg); color: var(--quota-text); font-size: 13px; font-weight: 600; white-space: nowrap; }
 .ai-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-top: 12px; }
 /* Fields as wide as the room they have, never wider than the page (a phone: one per row). */
 .ai-row .field { flex-direction: column; align-items: stretch; gap: 4px; min-width: 0; max-width: 100%; }

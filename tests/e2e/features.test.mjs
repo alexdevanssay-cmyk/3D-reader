@@ -546,7 +546,10 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // A general question without a 3D model: the answer, then where it comes from and the questions left today.
     await ask('Quelles règles de dépouille en coquille gravité ?');
     assert.match(await page.textContent('#ai-chat .ai-assistant'), /Conclusion : une boîte fermée\./);
-    assert.match(await status(), /^Réponse en \d+ s · Groq · openai\/gpt-oss-120b · 999 questions restantes aujourd'hui$/);
+    assert.match(await status(), /^Réponse en \d+ s · Groq · openai\/gpt-oss-120b$/);
+    // The questions left today: a framed badge beside the title, hidden for the local model.
+    assert.equal(await page.textContent('#ai-quota'), "999 questions restantes aujourd'hui");
+    assert.ok(await page.isVisible('#ai-quota'));
     assert.equal(completions[0].url, '/openai/v1/chat/completions');
     assert.equal(completions[0].authorization, 'Bearer gsk_made_up');
     assert.equal(completions[0].body.model, 'openai/gpt-oss-120b');
