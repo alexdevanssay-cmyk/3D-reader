@@ -240,6 +240,11 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     assert.doesNotMatch(await page.textContent('#method'), /mémorisés/);
     assert.equal(await page.textContent('#total-volume'), volume);
+    // Analysed again, cancelled at once: the model of before stays, its status with it (not "analysing" for good).
+    await page.click('#refresh');
+    await page.evaluate(() => document.getElementById('cancel').click());
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: 10_000 });
+    assert.equal(await page.textContent('#total-volume'), volume);
     assert.deepEqual(errors, []);
     await page.context().close();
   });
@@ -388,7 +393,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(request.think, false);
     // Plain French text (a forced JSON form made the small model copy an empty template).
     assert.equal(request.format, undefined);
-    assert.match(request.messages[0].content, /en texte simple \(jamais de JSON\)/);
+    assert.match(request.messages[0].content, /en texte \(jamais de JSON ; gras, listes et petits tableaux Markdown permis\)/);
     assert.match(request.messages[0].content, /qwen3:8b\) qui tourne en local sur ce PC/);
     assert.equal(request.keep_alive, '15m');
     assert.equal(request.options.num_ctx, 8192);
@@ -446,6 +451,126 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.deepEqual(errors, []);
     await page.context().close();
     await new Promise((resolve) => ollama.close(resolve));
+  });
+
+  test('IA page: the body selected (else the bodies checked) is what the AI gets, said on the page; answers in Markdown laid out; no drop hint left over the model', { timeout: CAD_TIMEOUT }, async (t) => {
+    const { default: gatewayHandler } = await import('../../api/ai.js');
+    const completions = [];
+    // An answer in Markdown, with a tag of its own that must stay text.
+    const answer = '**Conclusion** : proposition à valider.\n\n| Élément | Valeur |\n|---|---|\n| Noyaux | 1 <b>gras</b> |\n\n- tiroir *proposé*';
+    const groq = createServer((req, res) => {
+      let text = '';
+      req.on('data', (c) => (text += c));
+      req.on('end', () => {
+        completions.push(JSON.parse(text));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ model: 'openai/gpt-oss-120b', choices: [{ message: { role: 'assistant', content: answer }, finish_reason: 'stop' }] }));
+      });
+    });
+    const gateway = createServer((req, res) => {
+      req.headers['x-forwarded-for'] = '198.51.100.3';
+      return gatewayHandler(req, res);
+    });
+    await Promise.all([groq, gateway].map((x) => new Promise((resolve) => x.listen(0, '127.0.0.1', resolve))));
+    const saved = { ...process.env };
+    for (const k of Object.keys(process.env)) if (/^(groq_api_key|ai_|openai_|reader3d_)/i.test(k)) delete process.env[k];
+    Object.assign(process.env, { GROQ_API_KEY: 'gsk_made_up', AI_BASE_URL: `http://127.0.0.1:${groq.address().port}/openai/v1`, READER3D_ALLOWED_ORIGINS: base.replace(/\/$/, ''), READER3D_PUBLIC: '1' });
+    t.after(() => {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+      return Promise.all([groq, gateway].map((x) => new Promise((resolve) => {
+        x.closeAllConnections();
+        x.close(resolve);
+      })));
+    });
+    const contextOf = (body) => JSON.parse(body.messages[1].content.replace(/^[\s\S]*?<<<DONNEES_3D_READER\n/, '').replace(/\nDONNEES_3D_READER>>>$/, ''));
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    await page.click('.tab[data-page="ia"]');
+    assert.equal(await page.textContent('#ai-scope'), 'Aucune pièce ouverte : questions générales seulement.');
+    await page.selectOption('#ai-provider', 'openai');
+    await page.fill('#ai-url', `http://127.0.0.1:${gateway.address().port}/api/ai`);
+    await page.dispatchEvent('#ai-url', 'change');
+    const ask = async (question = 'Combien de noyaux ?') => {
+      await page.fill('#ai-input', question);
+      await page.press('#ai-input', 'Enter');
+      await page.waitForFunction(() => /^Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+      return contextOf(completions.at(-1));
+    };
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
+    // The IA page shown while the part is analysed: told when it is done, without leaving the page.
+    await page.click('.tab[data-page="ia"]');
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    assert.equal(await page.textContent('#ai-status'), 'Modèle analysé : posez votre question');
+
+    // The whole part: both bodies, said so.
+    assert.equal(await page.textContent('#ai-scope'), "Envoyé à l'IA : toute la pièce « named_assembly.step » (2 corps).");
+    let sent = await ask();
+    assert.deepEqual([sent.bodies.length, sent.selection.mode, sent.selection.bodies_sent, sent.selection.bodies_in_file], [2, 'all', 2, 2]);
+    // The answer laid out: bold, a table, a list; the tag of the answer kept as text.
+    const reply = page.locator('#ai-chat .ai-assistant').last();
+    assert.equal(await reply.locator('.ai-md strong').first().textContent(), 'Conclusion');
+    assert.equal(await reply.locator('.ai-table td').nth(1).textContent(), '1 <b>gras</b>');
+    assert.equal(await reply.locator('.ai-md b').count(), 0);
+    assert.equal(await reply.locator('.ai-md li em').textContent(), 'proposé');
+    assert.doesNotMatch(await reply.locator('.ai-text').textContent(), /\*\*|\|---/);
+
+    // A body selected in the list: that body only, its name never sent.
+    await page.click('.tab[data-page="viewer"]');
+    const name = (await page.textContent('#bodies tr[data-index="1"] td.name')).trim();
+    const other = (await page.textContent('#bodies tr[data-index="0"] td.name')).trim();
+    await page.click('#bodies tr[data-index="1"] td.name');
+    await page.click('.tab[data-page="ia"]');
+    assert.match(await page.textContent('#ai-scope'), /^Envoyé à l'IA : le corps sélectionné « .+ » seulement \(1 sur 2\)\./);
+    sent = await ask();
+    assert.deepEqual([sent.bodies.length, sent.model.body_count, sent.selection.mode, sent.selection.bodies_sent], [1, 1, 'selected', 1]);
+    assert.match(sent.selection.note, /Seul le corps sélectionné/);
+    assert.ok(!JSON.stringify(completions.at(-1)).includes(name), 'the real name stays in the browser');
+    // The other body, not sent, named in the question (then in the history): replaced all the same.
+    await ask(`Et ${other} ?`);
+    const online = JSON.stringify(completions.at(-1).messages);
+    assert.ok(!online.includes(other) && online.includes('Et Corps 1 ?'), 'a body not sent, named in the question, stays in the browser');
+
+    // Unselected, one body unchecked: the body checked only.
+    await page.click('.tab[data-page="viewer"]');
+    await page.click('#bodies tr[data-index="1"] td.name');
+    await page.uncheck('#bodies tr[data-index="1"] input');
+    await page.click('.tab[data-page="ia"]');
+    assert.match(await page.textContent('#ai-scope'), /^Envoyé à l'IA : le corps coché « .+ » seulement \(1 sur 2\)\.$/);
+    sent = await ask();
+    assert.deepEqual([sent.bodies.length, sent.selection.mode], [1, 'checked']);
+    // None checked: the part is not sent.
+    await page.click('.tab[data-page="viewer"]');
+    await page.uncheck('#bodies tr[data-index="0"] input');
+    await page.click('.tab[data-page="ia"]');
+    assert.equal(await page.textContent('#ai-scope'), "Aucun corps coché dans la liste : l'IA ne reçoit pas la pièce.");
+    sent = await ask();
+    assert.equal(sent.no_model_loaded, true);
+    assert.match(sent.note, /aucun de ses corps n'est coché/);
+
+    // A file dragged over the 3D view, then dropped on a data file row of the costing page (which keeps the drop):
+    // the hint does not stay over the model; dragged over the costing page, it is not shown.
+    await page.click('.tab[data-page="viewer"]');
+    const drag = (selector, type, json) => page.evaluate(({ selector, type, json }) => {
+      const data = new DataTransfer();
+      if (json) data.items.add(new File([json], 'historique.json', { type: 'application/json' }));
+      (selector ? document.querySelector(selector) : document.body).dispatchEvent(new DragEvent(type, { dataTransfer: data, bubbles: true, cancelable: true }));
+    }, { selector, type, json });
+    await drag(null, 'dragover');
+    assert.equal(await page.isVisible('#drop-hint'), true);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage [data-drop="historique"]'); // the costing page is loaded when first shown
+    await drag('#page-chiffrage [data-drop="historique"]', 'dragover');
+    await drag('#page-chiffrage [data-drop="historique"]', 'drop', JSON.stringify({ schema: 'reader3d-historique-cycles', version: 1, pieces: [] }));
+    await page.click('.tab[data-page="viewer"]');
+    assert.equal(await page.isVisible('#drop-hint'), false);
+    await page.click('.tab[data-page="chiffrage"]');
+    await drag('#page-chiffrage', 'dragover');
+    await page.click('.tab[data-page="viewer"]');
+    assert.equal(await page.isVisible('#drop-hint'), false);
+    assert.deepEqual(errors, []);
+    await page.context().close();
   });
 
   test('IA page through the gateway (api/ai.js, a stand-in for Groq): closed without an access code, configuration, access code, context to its budget, models, quota, errors', { timeout: CAD_TIMEOUT }, async (t) => {
@@ -572,9 +697,13 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(detail.length <= 2500 && whole > 2500, `context of ${detail.length} characters, ${whole} whole`);
     // The conversation goes with it.
     assert.deepEqual(completions[1].body.messages.slice(2).map((m) => m.role), ['user', 'assistant', 'user']);
+    // The general questions too get the detail (the gateway reads it in seconds), within its budget, with the bodies sent.
     await page.click('.ai-task[data-task="general"]');
     await ask('Résume la pièce.');
-    assert.match(contextOf(completions[2]), /"summary_only":true/);
+    const general = contextOf(completions[2]);
+    assert.doesNotMatch(general, /"summary_only"/);
+    assert.ok(general.length <= 2500, `context of ${general.length} characters`);
+    assert.match(general, /"selection":\{"mode":"all","bodies_sent":1,"bodies_in_file":1\}/);
 
     // The free quota reached: the message of the gateway as it is, the question not kept.
     t.mock.method(console, 'error', () => {}); // the gateway logs the provider's refusal
@@ -774,13 +903,213 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.click('.doc-tab:nth-child(2) .doc-tab-close');
     assert.equal(await page.evaluate(() => sessionStorage.getItem('reader3d.ai.messages.2')), null);
     assert.equal(await page.locator('#ai-chat .ai-msg').count(), 8);
-    // Another part opened in tab 1: a new conversation, the one of the other part is not sent with it.
+    // Another part opened in tab 1: not its conversation, but the one of that part kept in the history (tab 2's, closed).
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
     await page.waitForFunction(() => window.reader3d.tab.file === 'box.stl' && document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.waitForFunction(() => document.querySelectorAll('#ai-chat .ai-msg').length === 4, null, { timeout: 10_000 });
+    assert.match(await page.textContent('#ai-chat'), /Résume la pièce\.[\s\S]*Réponse locale/);
+    assert.doesNotMatch(await page.textContent('#ai-chat'), /Équerre/);
+    answer = await ask('Quel volume ?');
+    // Sent with it: its exchange with the gateway; not the one the local model answered, nor the other part's.
+    assert.deepEqual(completions.at(-1).messages.map((m) => m.role), ['system', 'user', 'user', 'assistant', 'user']);
+    assert.doesNotMatch(JSON.stringify(completions.at(-1).messages), /Réponse locale|Équerre|Fonderie|Et ses arêtes/);
+    assert.equal(await answer.locator('.ai-numbers').count(), 0, 'every number of the answer comes from the context');
+    // A new conversation about it: empty, sent alone; the one before stays in the history.
+    await page.click('#ai-clear');
     assert.equal(await page.locator('#ai-chat .ai-msg').count(), 0);
-    await ask('Quel volume ?');
+    await ask('Quelle masse ?');
     assert.deepEqual(completions.at(-1).messages.map((m) => m.role), ['system', 'user', 'user']);
-    assert.equal(await page.locator('#ai-chat .ai-numbers').count(), 0, 'every number of the answer comes from the context');
+    await page.waitForFunction(() => document.querySelectorAll('#ai-hist-list-local .ai-hist-item').length === 3, null, { timeout: 10_000 });
+    assert.deepEqual(await page.$$eval('#ai-hist-list-local .ai-hist-item', (items) => items.map((li) => [li.querySelector('.ai-hist-part').textContent, li.classList.contains('current'), li.classList.contains('this-part')])),
+      [['box', true, true], ['box', false, true], ['named_assembly', false, false]]);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
+  test('IA page: the conversation down to the bottom of the window; its history kept per part, on this PC and in a network folder; a conversation of it opened in a tab of its own', { timeout: CAD_TIMEOUT }, async (t) => {
+    const { default: gatewayHandler } = await import('../../api/ai.js');
+    const completions = [];
+    const groq = createServer((req, res) => {
+      let text = '';
+      req.on('data', (c) => (text += c));
+      req.on('end', () => {
+        completions.push(JSON.parse(text));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ model: 'openai/gpt-oss-120b', choices: [{ message: { role: 'assistant', content: `Réponse ${completions.length}.` }, finish_reason: 'stop' }] }));
+      });
+    });
+    const gateway = createServer((req, res) => {
+      req.headers['x-forwarded-for'] = '198.51.100.4';
+      return gatewayHandler(req, res);
+    });
+    await Promise.all([groq, gateway].map((x) => new Promise((resolve) => x.listen(0, '127.0.0.1', resolve))));
+    const saved = { ...process.env };
+    for (const k of Object.keys(process.env)) if (/^(groq_api_key|ai_|openai_|reader3d_)/i.test(k)) delete process.env[k];
+    Object.assign(process.env, { GROQ_API_KEY: 'gsk_made_up', AI_BASE_URL: `http://127.0.0.1:${groq.address().port}/openai/v1`, READER3D_ALLOWED_ORIGINS: base.replace(/\/$/, ''), READER3D_PUBLIC: '1' });
+    t.after(() => {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+      return Promise.all([groq, gateway].map((x) => new Promise((resolve) => {
+        x.closeAllConnections();
+        x.close(resolve);
+      })));
+    });
+    const { page, errors } = await newPage('fr-FR');
+    // The network folder: the private file system of the browser, in place of the folder one would choose.
+    await page.addInitScript(() => {
+      window.showDirectoryPicker = async () => navigator.storage.getDirectory();
+    });
+    page.on('dialog', (dialog) => dialog.accept());
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(base);
+    await page.click('.tab[data-page="ia"]');
+    await page.selectOption('#ai-provider', 'openai');
+    await page.fill('#ai-url', `http://127.0.0.1:${gateway.address().port}/api/ai`);
+    await page.dispatchEvent('#ai-url', 'change');
+    const ask = async (question) => {
+      const n = completions.length;
+      await page.fill('#ai-input', question);
+      await page.press('#ai-input', 'Enter');
+      await page.waitForFunction(() => /^Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+      assert.equal(completions.length, n + 1);
+    };
+    const items = (list) => page.$$eval(`#ai-hist-list-${list} .ai-hist-item`, (els) => els.map((li) => [li.querySelector('.ai-hist-part').textContent, /\d+ messages?/.exec(li.querySelector('.ai-hist-meta').textContent)[0], li.querySelector('.ai-hist-q').textContent]));
+    // Its .json files (Chrome writes each through a .crswap file of its own, there for a moment), read once written.
+    const folderFiles = () => page.evaluate(async () => {
+      for (let i = 0; ; i++) {
+        try {
+          const out = {};
+          const dir = await navigator.storage.getDirectory();
+          for await (const entry of dir.values()) if (entry.name.endsWith('.json')) out[entry.name] = JSON.parse(await (await (await dir.getFileHandle(entry.name)).getFile()).text());
+          return out;
+        } catch (err) {
+          if (i > 20) throw err;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+    });
+
+    // As a chat: the question field at the bottom of the window, the page itself not scrolled; the history on the right.
+    const box = await page.evaluate(() => ({ form: document.getElementById('ai-form').getBoundingClientRect().bottom, side: document.querySelector('.ai-history').getBoundingClientRect(), height: innerHeight, scroll: document.documentElement.scrollHeight }));
+    assert.ok(box.height - box.form < 60 && box.scroll <= box.height, JSON.stringify(box));
+    assert.ok(box.side.left > 1000 && box.height - box.side.bottom < 40, JSON.stringify(box.side));
+    assert.equal(await page.getAttribute('#ai-hist-tab-local', 'aria-selected'), 'true');
+    assert.equal(await page.textContent('#ai-hist-list-local'), 'Aucune discussion gardée sur ce PC.');
+
+    // A part, a question: its conversation kept on this PC, under its name.
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done' && window.reader3d.tab.part, null, { timeout: CAD_TIMEOUT });
+    const part = await page.evaluate(() => window.reader3d.tab.part);
+    assert.match(part.id, /^sha256:[0-9a-f]{64}$/);
+    assert.equal(part.file, 'box.stl');
+    await page.click('.tab[data-page="ia"]');
+    await ask('Quel volume ?');
+    await page.waitForFunction(() => document.querySelector('#ai-hist-list-local .ai-hist-item.current.this-part'), null, { timeout: 10_000 });
+    assert.deepEqual(await items('local'), [['box', '2 messages', '« Quel volume ? »']]);
+
+    // The network folder chosen: the conversation written there, one file per part named by its file and its hash.
+    await page.click('#ai-hist-tab-reseau');
+    await page.waitForFunction(() => /Aucun dossier réseau choisi/.test(document.getElementById('ai-hist-folder').textContent), null, { timeout: 10_000 });
+    await page.click('[data-hist-action="choose"]');
+    await page.waitForFunction(() => document.querySelectorAll('#ai-hist-list-reseau .ai-hist-item').length === 1, null, { timeout: 10_000 });
+    let files = await folderFiles();
+    // One file per conversation: the part's name, its hash, the conversation's id.
+    const conversationId = await page.evaluate(() => JSON.parse(sessionStorage.getItem('reader3d.ai.messages')).id);
+    const name = `box__${part.id.slice(7, 23)}__${conversationId}.json`;
+    assert.deepEqual(Object.keys(files), [name]);
+    assert.equal(files[name].schema, 'reader3d-historique-ia');
+    assert.deepEqual(files[name].part, part);
+    // The next answer written there too, merged in the same conversation.
+    await ask('Et sa masse ?');
+    // Its file as written: the four messages, and still them a moment later (a file that went back to two
+    // would be a write lost; Chromium's own file system may give a read of before for a moment).
+    const written = (file) => page.waitForFunction(async (f) => {
+      try {
+        const dir = await navigator.storage.getDirectory();
+        const messages = JSON.parse(await (await (await dir.getFileHandle(f)).getFile()).text()).conversations[0].messages;
+        return JSON.stringify(messages.map((m) => [m.role, m.role === 'user' ? m.content : m.provider])) === JSON.stringify([['user', 'Quel volume ?'], ['assistant', 'Groq'], ['user', 'Et sa masse ?'], ['assistant', 'Groq']]);
+      } catch {
+        return false; // being written
+      }
+    }, file, { timeout: 10_000 });
+    await written(name);
+    await page.waitForTimeout(300);
+    await written(name);
+    assert.equal(await page.getAttribute('#ai-hist-tab-reseau', 'aria-selected'), 'true');
+
+    // The tab closed, the same file opened again: its conversation back.
+    await page.click('.doc-tab:first-child .doc-tab-close');
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 0);
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.click('.tab[data-page="ia"]');
+    await page.waitForFunction(() => document.querySelectorAll('#ai-chat .ai-msg').length === 4, null, { timeout: 10_000 });
+    assert.match(await page.textContent('#ai-chat'), /Quel volume \?[\s\S]*Et sa masse \?/);
+
+    // The same part under another name (renamed, downloaded again): its conversation goes on, kept and sent.
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', { name: 'box (1).stl', mimeType: 'application/octet-stream', buffer: readFileSync(fixturePath('box.stl')) });
+    await page.waitForFunction(() => window.reader3d.tab.file === 'box (1).stl' && document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.click('.tab[data-page="ia"]');
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 4);
+    await ask('Et sa surface ?');
+    assert.deepEqual(completions.at(-1).messages.slice(2).map((m) => m.content), ['Quel volume ?', 'Réponse 1.', 'Et sa masse ?', 'Réponse 2.', 'Et sa surface ?']);
+    await page.waitForFunction(() => /6 messages/.test(document.querySelector('#ai-hist-list-reseau .ai-hist-item .ai-hist-meta')?.textContent), null, { timeout: 10_000 });
+    // The same part opened in a second tab: a conversation of its own there, not the same one twice.
+    await page.click('.doc-tab-new');
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => window.reader3d.tab.id === 2 && document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.click('.tab[data-page="ia"]');
+    await page.waitForTimeout(500); // the history read for the part
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 0);
+    await page.click('.doc-tab:nth-child(2) .doc-tab-close');
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 6);
+
+    // A new conversation; the one before, clicked in the history: a tab of its own, its model not open.
+    await page.click('#ai-clear');
+    await ask('Une autre question ?');
+    await page.click('#ai-hist-tab-local');
+    await page.waitForFunction(() => document.querySelectorAll('#ai-hist-list-local .ai-hist-item').length === 2, null, { timeout: 10_000 });
+    // Under the name the part was last opened under.
+    assert.deepEqual(await items('local'), [['box (1)', '2 messages', '« Une autre question ? »'], ['box (1)', '6 messages', '« Quel volume ? »']]);
+    assert.equal(await page.getAttribute('#ai-hist-list-local .ai-hist-item:nth-child(1) .ai-hist-open', 'aria-current'), 'true');
+    await page.click('#ai-hist-list-local .ai-hist-item:nth-child(2) .ai-hist-open');
+    await page.waitForFunction(() => document.querySelectorAll('.doc-tab').length === 2 && window.reader3d.tab.id !== 1, null, { timeout: 10_000 });
+    const archiveTab = await page.evaluate(() => window.reader3d.tab.id);
+    assert.equal(await page.isVisible('#page-ia'), true);
+    assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'box (1)');
+    assert.equal(await page.getAttribute('.doc-tab.active', 'class'), 'doc-tab active chat-only');
+    assert.match(await page.getAttribute('.doc-tab.active', 'title'), /^box \(1\)\.stl : discussion de l'historique, modèle non ouvert/);
+    assert.equal(await page.evaluate(() => [window.reader3d.status, window.reader3d.result]).then(([s, r]) => `${s} ${r}`), 'idle null');
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 6);
+    assert.equal(await page.evaluate(() => document.activeElement.id), 'ai-input');
+    assert.equal(await page.textContent('#ai-scope'), 'Aucune pièce ouverte : questions générales seulement.');
+    // Clicked again: the tab that shows it, not another one.
+    await page.click('.doc-tab:first-child');
+    await page.click('#ai-hist-list-local .ai-hist-item:nth-child(2) .ai-hist-open');
+    await page.waitForFunction((id) => window.reader3d.tab.id === id, archiveTab, { timeout: 10_000 });
+    assert.equal(await page.locator('.doc-tab').count(), 2);
+
+    // After a reload: the history of this PC and the folder still there (this folder: its access kept).
+    await page.reload();
+    await page.click('.tab[data-page="ia"]');
+    await page.waitForFunction(() => document.querySelectorAll('#ai-hist-list-local .ai-hist-item').length === 2, null, { timeout: 10_000 });
+    await page.click('#ai-hist-tab-reseau');
+    await page.waitForFunction(() => document.querySelectorAll('#ai-hist-list-reseau .ai-hist-item').length === 2, null, { timeout: 10_000 });
+    assert.match(await page.textContent('#ai-hist-folder'), /les discussions des pièces y sont écrites/);
+    // Deleted from this PC: the folder keeps its copy.
+    await page.click('#ai-hist-tab-local');
+    await page.click('#ai-hist-list-local .ai-hist-item:nth-child(1) .ai-hist-del');
+    await page.waitForFunction(() => document.querySelectorAll('#ai-hist-list-local .ai-hist-item').length === 1, null, { timeout: 10_000 });
+    assert.equal(Object.values(await folderFiles()).flatMap((f) => f.conversations).length, 2);
+
+    // A phone: one column, the history under the conversation, nothing wider than the screen.
+    await page.setViewportSize({ width: 375, height: 800 });
+    const narrow = await page.evaluate(() => ({ width: document.documentElement.scrollWidth, chat: document.querySelector('.ai-convo').getBoundingClientRect().bottom, side: document.querySelector('.ai-history').getBoundingClientRect().top }));
+    assert.ok(narrow.width === 375 && narrow.side > narrow.chat, JSON.stringify(narrow));
     assert.deepEqual(errors, []);
     await page.context().close();
   });

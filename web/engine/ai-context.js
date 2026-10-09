@@ -319,9 +319,19 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
     });
     if (size(out) <= maxChars) return out;
   }
-  // Last resort: the largest body without its foundry screen.
-  omitted.push("foundry screen of the largest body");
-  return { ...out, bodies: out.bodies.map(({ foundry, feature_groups, ...b }) => b), compaction: { ...out.compaction, omitted: [...omitted] } };
+  // Last resort: the largest body without its foundry screen, nor the foundry notes that only explain it.
+  omitted.push("foundry screen of the largest body", "foundry sources and policies");
+  const { foundry_common, ...rest } = out;
+  out = { ...rest, bodies: out.bodies.map(({ foundry, feature_groups, ...b }) => b), compaction: { ...out.compaction, omitted: [...omitted] } };
+  // Still over (a small budget): fewer warnings, down to none; their count stays.
+  const warningsAt = omitted.findIndex((o) => / warnings$/.test(o));
+  for (const keep of [3, 1, 0]) {
+    if (size(out) <= maxChars || out.warnings.length <= keep) break;
+    const label = `${warningCount - keep} warnings`;
+    const omittedNow = warningsAt >= 0 ? omitted.map((o, i) => (i === warningsAt ? label : o)) : [...omitted, label];
+    out = { ...out, warnings: (context.warnings ?? []).slice(0, keep), warning_count: warningCount, compaction: { ...out.compaction, omitted: omittedNow } };
+  }
+  return out;
 }
 
 /**
@@ -486,12 +496,13 @@ const bodyLabel = (body, i) => `Corps ${Number(/^body-(\d+)$/.exec(body?.id ?? "
  * client, reference, designation... of ui.js costingSnapshot noms), all
  * replaced by neutral labels: as whole values, and wherever they are written
  * in a text (the reasons, hypotheses and alerts of the trace, the question).
- * Built from the whole context (every body), applied to the context sent
- * (compacted). Returns {context(c): the copy of `c` sent, text(s): a text
+ * Built from the whole context (every body) and `part` ([{name, label}] of
+ * partNames: the bodies of the file not sent, its name), applied to the
+ * context sent (compacted). Returns {context(c): the copy of `c` sent, text(s): a text
  * (the question, the conversation), legend(answer): [[label, name]] of the
  * labels an answer writes}.
  */
-export function anonymizer(context, names = []) {
+export function anonymizer(context, names = [], part = []) {
   const byName = new Map(); // name -> label
   const byLabel = new Map(); // label -> name, for the legend
   const add = (name, label) => {
@@ -501,6 +512,9 @@ export function anonymizer(context, names = []) {
     if (!byLabel.has(label)) byLabel.set(label, n);
   };
   (context?.bodies ?? []).forEach((b, i) => add(b?.name, bodyLabel(b, i)));
+  // The names of the part open the context may not hold (partNames): each body by its own label,
+  // before the file, whose name one of them may bear.
+  for (const { name, label } of part) add(name, label);
   const file = context?.source?.file;
   const ext = /\.[^./\\]+$/.exec(file ?? "")?.[0] ?? "";
   add(file, `Pièce${ext}`);
@@ -546,6 +560,20 @@ export function anonymizer(context, names = []) {
       });
     },
   };
+}
+
+/**
+ * The names of the part open, for the anonymizer, whatever its context holds:
+ * every body of the file (`bodies`: their names, by their index in it), with
+ * the label of the context ("Corps 1"...), and the file. A body not sent, or
+ * the file when no body is, may still be named in a question or the history.
+ */
+export function partNames({ bodies = [], file = null } = {}) {
+  const ext = /\.[^./\\]+$/.exec(file ?? "")?.[0] ?? "";
+  return [
+    ...bodies.map((name, i) => ({ name, label: bodyLabel({ id: `body-${i}` }, i) })),
+    ...(file ? [{ name: file, label: `Pièce${ext}` }, { name: file.slice(0, file.length - ext.length), label: "Pièce" }] : []),
+  ];
 }
 
 export const AI_CONTEXT_VERSION = "1.0";

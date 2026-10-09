@@ -91,6 +91,14 @@ function resize() {
 new ResizeObserver(resize).observe(viewport);
 resize();
 
+// The pages fill the window under the top bar, whatever its height (it wraps on a narrow window): --topbar-h of style.css.
+{
+  const topbar = document.querySelector(".topbar");
+  const measure = () => document.documentElement.style.setProperty("--topbar-h", `${topbar.offsetHeight}px`);
+  new ResizeObserver(measure).observe(topbar);
+  measure();
+}
+
 renderer.setAnimationLoop(() => {
   controls.update();
   renderer.render(scene, camera);
@@ -447,10 +455,14 @@ async function openFile(file, { refresh = false, handle = null, close = false, t
   try {
     data = currentEngine() === "server" ? await analyzeOnServer(file, tab) : await analyzeInBrowser(file, { refresh, close, tab });
     if (seq !== tab.seq) return;
+    // The part's identity before the tab shows the file: the IA page knows its conversations by it.
+    const partId = await partIdFor(file, data);
+    if (seq !== tab.seq) return;
     // Only now does the tab show this file (a failed file leaves the previous one).
     tab.handle = handle ?? (file === tab.file ? tab.handle : null);
     tab.file = file;
     tab.result = data;
+    tab.part = { id: partId, file: file.name };
     if (!shown()) {
       // Opened in a tab not shown: its model is built when the tab is shown.
       if (tab.view) disposeObjects(tab.view.meshes);
@@ -593,10 +605,9 @@ function includedIndices() {
  * Null when none is checked. The oriented envelope of a part of the bodies is
  * computed from their display meshes.
  */
-function currentSummary() {
+function currentSummary(indices = includedIndices()) {
   const r = state.result;
   if (!r) return null;
-  const indices = includedIndices();
   if (indices.length === r.bodies.length) return r.summary;
   if (!indices.length) return null;
   if (state.subsetSummary?.key === indices.join(",")) return state.subsetSummary.summary;
@@ -740,7 +751,7 @@ function select(i) {
 // ---------------------------------------------------------------- exports
 
 /** Results without the display meshes, for files and for scripts. */
-function exportableResult(r) {
+function exportableResult(r, indices = includedIndices()) {
   const density = parseFloat($("density").value);
   const mass = (v) => (v != null && Number.isFinite(density) && density >= 0 ? (v / 1000) * density : null);
   return {
@@ -750,12 +761,12 @@ function exportableResult(r) {
     units: { length: "mm", area: "mm2", volume: "mm3", mass: "g", density: "g/cm3" },
     engine: r.engine ?? "python",
     density,
-    summary: { ...(currentSummary() ?? r.summary), mass: mass((currentSummary() ?? r.summary).volume) },
-    bodies: includedIndices().map((i) => {
+    summary: { ...(currentSummary(indices) ?? r.summary), mass: mass((currentSummary(indices) ?? r.summary).volume) },
+    bodies: indices.map((i) => {
       const { mesh, ...b } = r.bodies[i];
       return { ...b, mass: mass(b.volume), ...thicknessExport(r, [i]) };
     }),
-    ...thicknessExport(r, includedIndices()),
+    ...thicknessExport(r, indices),
     elapsed_s: r.elapsed_s,
   };
 }
@@ -1074,9 +1085,17 @@ renderer.domElement.addEventListener("pointerup", (e) => {
 const hint = $("drop-hint");
 window.addEventListener("dragover", (e) => {
   e.preventDefault();
+  // The hint is the 3D page's: not shown under the other pages, whose drops it never sees end.
+  if ($("page-viewer").hidden) return;
   hint.hidden = false;
   hint.classList.add("dragging");
 });
+// Whatever takes the drop (a data file row of the costing pages stops it there), the hint goes away:
+// captured on the way down, before anything can stop it.
+window.addEventListener("drop", () => {
+  hint.classList.remove("dragging");
+  if (state.result) hint.hidden = true;
+}, true);
 window.addEventListener("dragleave", (e) => {
   if (e.relatedTarget) return;
   hint.classList.remove("dragging");
@@ -1789,8 +1808,23 @@ function cancelTab(tab) {
   tab.loading = null;
   stopProgress(tab);
   stopAnalysis(tab);
-  if (tab === activeTab) renderLoading();
+  if (tab === activeTab) {
+    renderLoading();
+    // Its openFile ends without a word (another seq): the status is no longer "analysing".
+    if (document.body.dataset.status === "analysing") setStatus(tab.result ? "done" : "idle");
+  }
   renderTabs();
+}
+
+/**
+ * The id of the part a file holds, for the history of the IA page
+ * (ai-history.js): "sha256:<hex>" of the file, as the browser's analysis read
+ * it (its result's cacheKey), else computed (server engine).
+ */
+async function partIdFor(file, data) {
+  const hash = /^\d+\|([0-9a-f]{64})\|/.exec(data?.cacheKey ?? "")?.[1];
+  if (hash) return `sha256:${hash}`;
+  return import("./ai-history.js").then(({ partIdOf }) => partIdOf(file)).catch(() => null);
 }
 
 /** Close a tab: its model and its quote are forgotten. */
@@ -1800,7 +1834,7 @@ function closeTab(tab) {
   cancelTab(tab);
   if (tab === activeTab) clearModel();
   else if (tab.view) disposeObjects(tab.view.meshes);
-  tab.view = tab.result = tab.file = null;
+  tab.view = tab.result = tab.file = tab.part = null;
   tabs.splice(i, 1);
   forgetQuote(tab.id);
   forgetConversation(tab.id);
@@ -1847,15 +1881,18 @@ function resetTabs() {
 function renderTabs() {
   const strip = $("doc-tabs");
   const items = tabs.map((tab) => {
-    const name = tab.loading?.file ?? tab.file?.name ?? null;
+    // A conversation of the history opened in its own tab: its part's name, its model not open.
+    const chatOnly = !tab.loading && !tab.file && !!tab.part?.file;
+    const name = tab.loading?.file ?? tab.file?.name ?? tab.part?.file ?? null;
     const el = document.createElement("div");
     el.className = "doc-tab";
     el.classList.toggle("active", tab === activeTab);
     el.classList.toggle("busy", !!tab.loading);
+    el.classList.toggle("chat-only", chatOnly);
     el.dataset.tab = tab.id;
     el.setAttribute("role", "tab");
     el.setAttribute("aria-selected", String(tab === activeTab));
-    el.title = name ?? t("tabs.new");
+    el.title = chatOnly ? t("tabs.chatOnly", { name }) : name ?? t("tabs.new");
     el.innerHTML = '<span class="doc-tab-spin" aria-hidden="true"></span><span class="doc-tab-name"></span><button type="button" class="doc-tab-close">×</button>';
     // The part, without the extension of its file (the whole name as a tip).
     el.querySelector(".doc-tab-name").textContent = name ? name.replace(/\.[^.]+$/, "") : t("tabs.new");
@@ -2042,10 +2079,18 @@ setInterval(() => document.visibilityState === "visible" && !$("memory-card").hi
 // <body data-status="analysing|done|error"> and window.reader3d.
 const params = new URLSearchParams(location.search);
 
+/** A tab as window.reader3d gives it: {id, file (its name), part ({id, file}: the part it shows or its conversation is about, once known)}. */
+function tabInfo(tab) {
+  return { id: tab.id, file: tab.file?.name ?? null, part: tab.part?.id ? { id: tab.part.id, file: tab.part.file ?? null } : null };
+}
+
 function setStatus(status, message = "") {
+  const changed = document.body.dataset.status !== status;
   document.body.dataset.status = status;
   if (message) document.body.dataset.error = message;
   else delete document.body.dataset.error;
+  // The IA page says when the part is still analysed: told when it is no longer.
+  if (changed) document.dispatchEvent(new CustomEvent("reader3d-status"));
 }
 
 function plainReport(data) {
@@ -2105,24 +2150,49 @@ function updatePublished(r) {
 // is built when asked for, kept until the published result changes, and
 // written into #reader3d-semantic-result when the page is idle, so that it
 // never holds up or breaks the result itself.
-let semanticKept = null; // {result, density, method, semantic}
+let semanticKept = null; // {result, density, method, key (bodies), semantic}
 let semanticPending = null; // idle callback writing #reader3d-semantic-result
 
-/** The semantic contract of the result shown (null without one). */
-function currentSemantic() {
+/** The semantic contract of the result shown (null without one): of the bodies checked, or of these bodies (indices into r.bodies). */
+function currentSemantic(indices = includedIndices()) {
   const r = state.result;
   if (!r) return null;
   const density = $("density").value;
   // The thickness method changes the statistics exported without republishing.
   const method = thickMethod();
-  if (semanticKept?.result !== r || semanticKept.density !== density || semanticKept.method !== method) {
-    // The bodies checked, each with its index in r.bodies (what setSelection takes).
-    const data = exportableResult(r);
-    const indices = includedIndices();
+  const key = indices.join(",");
+  if (semanticKept?.result !== r || semanticKept.density !== density || semanticKept.method !== method || semanticKept.key !== key) {
+    // Each body with its index in r.bodies (what setSelection takes).
+    const data = exportableResult(r, indices);
     data.bodies = data.bodies.map((b, k) => ({ ...b, source_index: indices[k] }));
-    semanticKept = { result: r, density, method, semantic: buildSemantic3D(data) };
+    semanticKept = { result: r, density, method, key, semantic: buildSemantic3D(data) };
   }
   return semanticKept.semantic;
+}
+
+/**
+ * The bodies the IA page sends: the body selected in the list (its row
+ * clicked) when there is one, else the bodies checked; and which they are,
+ * for the page to say it (names never sent: the context has the counts).
+ */
+function aiPart({ withSemantic = true } = {}) {
+  const r = state.result;
+  if (!r) return null;
+  const selected = state.selected >= 0 && state.selected < r.bodies.length;
+  const indices = selected ? [state.selected] : includedIndices();
+  return {
+    // Seconds on a large part: not built when only the scope is wanted.
+    semantic: withSemantic && indices.length ? currentSemantic(indices) : null,
+    scope: {
+      mode: selected ? "selected" : indices.length === r.bodies.length ? "all" : "checked",
+      bodies_sent: indices.length,
+      bodies_in_file: r.bodies.length,
+      names: indices.map((i) => r.bodies[i].name),
+      // Every body, sent or not, for the anonymizer of the IA page only: a question may name one not sent.
+      all_names: r.bodies.map((b) => b.name),
+      file: r.file ?? null,
+    },
+  };
 }
 
 /** #reader3d-semantic-result: "null" at once (never that of another state), the new contract when the page is idle. */
@@ -2173,6 +2243,10 @@ window.reader3d = {
   get semantic() {
     return currentSemantic();
   },
+  /** For the IA page: {semantic, scope} of the body selected in the list, else of the bodies checked (null without a result). */
+  aiPart(options) {
+    return aiPart(options);
+  },
   get result() {
     return state.result ? exportableResult(state.result) : null;
   },
@@ -2210,7 +2284,28 @@ window.reader3d = {
   },
   /** The tab shown: its id and the name of the file of its part (null: none). The IA page keeps a conversation per tab. */
   get tab() {
-    return activeTab ? { id: activeTab.id, file: activeTab.file?.name ?? null } : null;
+    return activeTab ? tabInfo(activeTab) : null;
+  },
+  /** Every tab of the 3D page: [{id, file, part}]. */
+  get tabs() {
+    return tabs.map(tabInfo);
+  },
+  /** Show the tab `id` of the 3D page (the page shown stays). */
+  showTab(id) {
+    const tab = tabs.find((x) => x.id === id);
+    if (tab && tab !== activeTab) showTab(tab);
+  },
+  /**
+   * A new tab for a conversation of the history of the IA page: its part
+   * ({id, file}) known, its model not open. `before(id)` is called with the
+   * tab's id before it is shown (its conversation written). Returns that id.
+   */
+  openPartTab(part, before) {
+    const tab = createTab();
+    tab.part = { id: part?.id ?? null, file: part?.file ?? null };
+    before?.(tab.id);
+    showTab(tab);
+    return tab.id;
   },
   /** Material of the part (alloy name and density g/cm³), e.g. from a customer request. */
   setMaterial(label, density) {
