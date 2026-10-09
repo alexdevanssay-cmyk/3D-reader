@@ -6,7 +6,7 @@ import { summarize } from "./engine/summary.js";
 import { buildSemantic3D, SEMANTIC_VERSION } from "./engine/semantic.js";
 import { buildAIContext, AI_CONTEXT_VERSION } from "./engine/ai-context.js";
 import {
-  PARTING_VERSION, SIDE_LOWER, SIDE_NONE, SIDE_UPPER, ZERO_DRAFT,
+  PARTING_VERSION, REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_NONE, SIDE_UPPER, ZERO_DRAFT,
   applyOverrides, canonicalAxis, faceRegions, lineMesh, lineSummary, partingLine,
 } from "./engine/parting.js";
 
@@ -1921,16 +1921,17 @@ function setPartingDefinition(i, { base, source, overrides = {}, candidate = nul
     let { side, segments } = base;
     let line = base.summary.parting;
     let faces = null;
+    let fixed = null; // the triangles of the faces moved
     if (moved) {
       const g = partingGeometry(i);
       faces = g.count;
       side = applyOverrides(base.side, g.region, overrides);
-      const fixed = Uint8Array.from(g.region, (face) => (face in overrides ? 1 : 0));
+      fixed = Uint8Array.from(g.region, (face) => (face in overrides ? 1 : 0));
       const l = partingLine(g.line, side, base.direction, { flags: base.flags, plane: base.plane, fixed, height: base.summary.mould_height_mm });
       segments = l.segments;
       line = lineSummary(l);
     }
-    p.current.set(i, { manual: true, source, overrides, candidate, base, direction: base.direction, summary: { ...base.summary, parting: line }, side, flags: base.flags, plane: base.plane, segments });
+    p.current.set(i, { manual: true, source, overrides, candidate, base, direction: base.direction, summary: { ...base.summary, parting: line }, side, flags: base.flags, plane: base.plane, segments, fixed });
     savePartingDef(partIdOf(r), i, { direction: base.direction, source, candidate, overrides, faces });
   }
   applyParting();
@@ -2036,8 +2037,10 @@ function applyParting() {
     const colors = geom.attributes.color.array;
     const triangles = colors.length / 12;
     for (let f = 0; f < triangles; f++) {
-      color.copy(PARTING_COLORS[field.side[f]] ?? PARTING_COLORS[SIDE_NONE]);
-      if (field.flags[f] & ZERO_DRAFT && field.side[f] !== SIDE_NONE) color.lerp(WHITE, 0.45);
+      // Undercuts in red, unless moved to a half by hand.
+      const undercut = !(field.flags[f] & (REACH_UP | REACH_DOWN)) && !field.fixed?.[f];
+      color.copy(PARTING_COLORS[undercut ? SIDE_NONE : field.side[f]] ?? PARTING_COLORS[SIDE_NONE]);
+      if (field.flags[f] & ZERO_DRAFT && !undercut) color.lerp(WHITE, 0.45);
       for (let k = 0; k < 3; k++) {
         colors[12 * f + 4 * k] = color.r;
         colors[12 * f + 4 * k + 1] = color.g;
