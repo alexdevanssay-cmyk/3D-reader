@@ -66,10 +66,11 @@ export const ALERTES = {
   ecart_tendance: "écart à la tendance",
   divergence: "sources divergentes",
   infaisable: "îlot infaisable",
+  hors_limites: "au-delà des limites de l'îlot",
   saisie_ignoree: "saisie ignorée",
   ecart_demande: "écart à la demande client",
 };
-const TO_VALIDATE = new Set(["defaut_code", "repli_zero", "valeur_manquante", "divergence", "infaisable", "saisie_ignoree", "ecart_demande"]);
+const TO_VALIDATE = new Set(["defaut_code", "repli_zero", "valeur_manquante", "divergence", "infaisable", "hors_limites", "saisie_ignoree", "ecart_demande"]);
 
 // Deviation from the trend above which an alert is raised (setting seuilTendance).
 export const SEUIL_TENDANCE = 0.15;
@@ -746,6 +747,9 @@ export function tracePiece(r, ctx, devis) {
     hypotheses: mamTyped ? [`kg coulés estimés avec la mise au mille estimée (${fr(e.miseAuMille, 2)}), pas celle saisie`] : [],
   });
   T["piece.empreintes"] = resolve([cavitiesTyped ? input("empreintes", "") : null, cavitiesEstimate], { seuil, comparer: () => false });
+  // Cavities past the island's limits (its cavities, its cluster): not rejected, to validate by the methods.
+  for (const message of route.alertesEmpreintes) alert(T["piece.empreintes"], "hors_limites", message);
+  T["piece.empreintes"].validation_requise ||= needsValidation(T["piece.empreintes"]);
   const cavitiesKey = cavitiesTyped ? "piece.empreintes.estimee" : "piece.empreintes";
   if (cavitiesTyped && !mouldTyped) T[cavitiesKey] = { ...cavitiesEstimate, hypotheses: [...cavitiesEstimate.hypotheses, "non retenues : le prix du moule part d'elles"] };
 

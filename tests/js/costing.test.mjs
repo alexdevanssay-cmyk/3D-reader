@@ -1559,6 +1559,40 @@ describe('the costing read by the AI page (read only)', () => {
     assert.equal(set.devis.trace['ensemble.prix.vente'].valeur, cs.ensemble.years[0].prixVente);
   });
 
+  test('costingSnapshot: the island retained as it is quoted, in its rank: its cavities, their alerts, its price; the alerts in the trace', () => {
+    // Nothing typed in: the first route, at the price of the ranking.
+    const [auto, ca] = snapshotOf();
+    const best = ca.results[0].best;
+    assert.deepEqual(auto.pieces[0].routes.map((x) => [x.rang, x.ilot, x.retenue, x.empreintes]), best.map((b, i) => [i + 1, b.process, i === 0, b.parCycle]));
+    close(auto.pieces[0].routes[0].prix, best[0].prix, 1e-9, 'price of the route retained, nothing typed in');
+    // CG4, among the three best, imposed with 4 cavities (2 at most).
+    const [s, c] = snapshotOf({ quote: { pieces: { manuel: { ...PART, procede: 'CG4', empreintes: 4 } } } });
+    const r = c.results[0];
+    const at = r.best.findIndex((b) => b.process === 'CG4');
+    assert.ok(at >= 0, 'CG4 among the three best');
+    const routes = s.pieces[0].routes;
+    assert.equal(routes.length, r.best.length);
+    const own = routes[at];
+    assert.deepEqual([own.rang, own.ilot, own.finition, own.retenue, own.empreintes], [at + 1, 'CG4', r.route.finition, true, 4]);
+    assert.ok(own.raisons.includes('4 empreintes > 2 maxi de l\'îlot'), String(own.raisons));
+    close(own.prix, r.final.pri + r.route.outillagePiece, 1e-12, 'price of the route retained');
+    assert.ok(Math.abs(own.prix - r.best[at].prix) > 0.01, 'not the price of the estimate');
+    // The others: their estimate in the ranking.
+    routes.forEach((x, i) => i !== at && assert.deepEqual([x.rang, x.ilot, x.retenue, x.empreintes, x.prix], [i + 1, r.best[i].process, false, r.best[i].parCycle, r.best[i].prix]));
+    // The trace: the cavities past the island, to validate; in the alerts of the snapshot and of what the AI is sent.
+    const T = s.pieces[0].trace['piece.empreintes'];
+    assert.deepEqual(T.alertes, [{ type: 'hors_limites', message: '4 empreintes > 2 maxi de l\'îlot' }]);
+    assert.equal(T.validation_requise, true);
+    assert.equal(s.pieces[0].trace['piece.prix.vente'].validation_requise, true);
+    assert.ok(s.alertes.some((a) => a.cle === 'piece.empreintes' && a.type === 'hors_limites'));
+    assert.ok(traceForAI(s).alertes.some((a) => a.cle === 'piece.empreintes' && a.type === 'au-delà des limites de l\'îlot' && a.message === '4 empreintes > 2 maxi de l\'îlot'));
+    // An island imposed outside the three best: after them, without a rank, with its own alerts too.
+    const [out] = snapshotOf({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', empreintes: 3 } } } });
+    const last = out.pieces[0].routes.at(-1);
+    assert.deepEqual([last.rang, last.ilot, last.retenue, last.empreintes, Number.isFinite(last.prix)], [null, 'CG3', true, 3, true]);
+    assert.deepEqual(out.pieces[0].trace['piece.empreintes'].alertes.map((a) => a.message), ['3 empreintes > 1 maxi de l\'îlot']);
+  });
+
   test('costingSnapshot: a frozen copy, computed without saving anything; null without a costing workbook', () => {
     const [s, c] = snapshotOf();
     assert.ok(deeplyFrozen(s));

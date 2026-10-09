@@ -1135,19 +1135,24 @@ export function costingSnapshot({ tab } = {}) {
   }
   const routes = (r) => {
     const best = r.best ?? [];
-    // The island retained when it was chosen in the page outside the three best.
-    const shown = r.route && !best.some((b) => b.process === r.route.process) ? [...best, r.route] : best;
-    return shown.map((x, i) => ({
-      rang: best.includes(x) ? i + 1 : null,
+    const entry = (x, rang, prix) => ({
+      rang,
       ilot: x.process,
       famille: x.famille,
       finition: x.finition,
-      retenue: x.process === r.route?.process,
+      retenue: x === r.route,
       faisable: x.feasible,
       qualite: x.qualite,
-      prix: Number.isFinite(x.prix) ? x.prix : null, // PRI + tooling per piece (€): the ranking is by quality / price
+      empreintes: x.parCycle,
+      prix: Number.isFinite(prix) ? prix : null, // PRI + tooling per piece (€): the ranking is by quality / price
       raisons: [...x.reasons, ...x.warnings],
-    }));
+    });
+    // The island retained: its own route (cavities, cycle and mode retained, their alerts; the PRI of the
+    // quote and, as in the ranking, the tool estimated for its cavities), in its rank in place of its
+    // estimate, or after the three best when chosen outside them.
+    const at = r.route ? best.findIndex((b) => b.process === r.route.process) : -1;
+    const own = r.route ? entry(r.route, at >= 0 ? at + 1 : null, r.final.pri + r.route.outillagePiece) : null;
+    return [...best.map((b, i) => (i === at ? own : entry(b, i + 1, b.prix))), ...(own && at < 0 ? [own] : [])];
   };
   const name = pieceNames(c.results.map((r) => r.piece));
   const sections = [{ piece: null, trace: c.trace ?? {} }, ...c.results.map((r) => ({ piece: name.get(r.piece), trace: r.trace ?? {} }))];
