@@ -2625,7 +2625,13 @@ function drawNetwork() {
   }
   if (page === "parametres") {
     el.parametres.querySelector("#cnetwork")?.replaceWith(fragment(networkRow()));
-    el.parametres.querySelector("#chisto-file")?.replaceWith(fragment(historyFileRow()));
+    // The row of the history file: its count only (its file input may be open in the file picker).
+    const row = el.parametres.querySelector("#chisto-file");
+    if (row) {
+      const n = countHistory(store.loadHistorique());
+      row.querySelector("strong").textContent = historyCount(n);
+      for (const b of row.querySelectorAll('[data-action="export-historique"], [data-action="clear-historique"]')) b.disabled = !n.total;
+    }
   } else {
     refreshHistory();
     el.chiffrage.querySelector("#cfeedback-net")?.replaceWith(fragment(feedbackNetHtml()));
