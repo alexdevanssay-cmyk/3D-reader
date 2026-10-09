@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { addressSpace, answerText, costingText, defaultGateway, formatAnswer, gatewayLabel, isMarkdown, markdownToHtml, numbersLabel, quotaLabel, selectionOf, onlineMessages } from "../../web/ai-workspace.js";
+import { addressSpace, answerText, costingText, defaultGateway, formatAnswer, gatewayLabel, isMarkdown, markdownToHtml, numbersLabel, questionsLeft, quotaLabel, selectionOf, onlineMessages } from "../../web/ai-workspace.js";
 import { anonymizer, checkContextNumbers, partNames } from "../../web/engine/ai-context.js";
 
 test("Ollama's address declares the address space the browser checks it against", () => {
@@ -55,6 +55,25 @@ test("an answer of the gateway tells its provider and model, and the questions l
   assert.equal(quotaLabel({ requests_remaining: 50 }), "");
   assert.equal(gatewayLabel({ provider: "Mistral", model: "m", quota: null }), "Mistral · m");
   assert.equal(gatewayLabel({ output: "x" }), "");
+});
+
+test("the questions left today, from the tokens: those of a day, less the requests made from every PC, at the mean tokens of a question", () => {
+  const quota = { requests_remaining_day: 900, requests_limit_day: 1000, tokens_limit_day: 200000, tokens_limit_minute: 8000 };
+  // 100 requests today (any PC) of 1 000 tokens on average: 100 000 tokens left, questions of 5 000 tokens: 20.
+  const tokens = { questions: [4000, 6000], all: [4000, 6000, ...Array(16).fill(500)] };
+  assert.deepEqual(questionsLeft(quota, tokens), { left: 20, perQuestion: 5000, measured: 2, requests: 100, used: 100000, perDay: 200000 });
+  assert.equal(quotaLabel(quota, tokens), "≈ 20 questions restantes aujourd'hui");
+  // No question of the IA page yet (the Chiffrage page asked): the requests of any kind.
+  assert.equal(questionsLeft(quota, { questions: [], all: [1000] }).left, 100);
+  // Never more than the requests left, never less than 0.
+  assert.equal(questionsLeft({ ...quota, requests_limit_day: 103, requests_remaining_day: 3 }, tokens).left, 3);
+  assert.equal(quotaLabel({ ...quota, requests_limit_day: 101, requests_remaining_day: 1 }, tokens), "≈ 1 question restante aujourd'hui");
+  assert.equal(questionsLeft({ ...quota, requests_remaining_day: 700 }, { questions: [5000], all: [5000] }).left, 0);
+  // Without the tokens of a day, or none measured yet: the requests left.
+  assert.equal(questionsLeft({ requests_remaining_day: 900, requests_limit_day: 1000 }, tokens), null);
+  assert.equal(quotaLabel({ requests_remaining_day: 900, requests_limit_day: 1000 }, tokens), "900 questions restantes aujourd'hui");
+  assert.equal(quotaLabel(quota, { questions: [], all: [] }), "900 questions restantes aujourd'hui");
+  assert.equal(quotaLabel(quota), "900 questions restantes aujourd'hui");
 });
 
 // A made-up context as the IA page sends it: the part (engine/ai-context.js) and the costing trace (chiffrage/ai-trace.js).

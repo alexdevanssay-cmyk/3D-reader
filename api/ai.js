@@ -42,6 +42,9 @@ const PROVIDER_NAMES = {
 const GROQ_CONTEXT_CHARS = 9000;
 const CONTEXT_CHARS = 16000;
 const MAX_TOKENS = 1200;
+// The tokens of a day of Groq's free tier, per model (console.groq.com/docs/rate-limits): the page estimates the
+// questions left from them. Another tier or provider: AI_TOKENS_PER_DAY.
+const GROQ_TOKENS_PER_DAY = { "openai/gpt-oss-120b": 200000, "openai/gpt-oss-20b": 200000 };
 const MAX_BODY = 200 * 1024; // bytes of a request
 const MAX_MESSAGES = 20; // of the conversation, the latest
 const RATE_LIMIT = 20; // requests a minute per address, per instance of the function
@@ -180,6 +183,7 @@ function providerConfig() {
     models: list(env("AI_MODELS")),
     contextChars: positive(env("AI_CONTEXT_CHARS"), groq ? GROQ_CONTEXT_CHARS : CONTEXT_CHARS),
     maxTokens: positive(env("AI_MAX_TOKENS"), MAX_TOKENS),
+    tokensPerDay: positive(env("AI_TOKENS_PER_DAY"), null),
     reasoningEffort: env("AI_REASONING_EFFORT").toLowerCase(),
   };
   if (!config.key) {
@@ -296,9 +300,10 @@ function duration(value) {
 /**
  * What is left of the free quota, from the x-ratelimit-* headers of an answer;
  * null without them. Groq counts the requests per day; OpenAI per minute, and
- * another provider as it says: "_day" for Groq only.
+ * another provider as it says: "_day" for Groq only. With them, the tokens of
+ * a day of `model` (AI_TOKENS_PER_DAY, else Groq's free tier), when known.
  */
-function quotaOf(headers, config) {
+function quotaOf(headers, config, model) {
   const number = (name) => {
     const v = headers.get(name);
     return v !== null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : null;
@@ -312,7 +317,9 @@ function quotaOf(headers, config) {
     reset_requests: headers.get("x-ratelimit-reset-requests"),
     reset_tokens: headers.get("x-ratelimit-reset-tokens"),
   };
-  return Object.values(quota).some((v) => v !== null) ? quota : null;
+  if (!Object.values(quota).some((v) => v !== null)) return null;
+  const perDay = config.tokensPerDay ?? (config.groq ? GROQ_TOKENS_PER_DAY[model] ?? null : null);
+  return perDay ? { ...quota, tokens_limit_day: perDay } : quota;
 }
 
 /** The tokens an answer took (its usage): {prompt_tokens, completion_tokens, total_tokens}; null without them. The page paces its backtest with them. */
@@ -548,11 +555,12 @@ export default async function handler(req, res) {
     if (json) body.response_format = { type: "json_schema", json_schema: { name: json.name, strict: true, schema: json.schema } };
     const { data, headers } = await complete(config, body, task);
     const usage = usageOf(data);
+    const answered = typeof data?.model === "string" && data.model ? data.model : model;
     return reply(res, 200, {
       output: answerOf(data, !!json, config, task),
       provider: config.name,
-      model: typeof data?.model === "string" && data.model ? data.model : model,
-      quota: quotaOf(headers, config),
+      model: answered,
+      quota: quotaOf(headers, config, answered),
       ...(usage ? { usage } : {}),
     });
   } catch (error) {

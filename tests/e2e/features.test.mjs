@@ -576,7 +576,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // The gateway itself in a node:http server; its provider a stand-in for Groq's chat completions.
     const { default: gatewayHandler } = await import('../../api/ai.js');
     const completions = [];
-    let reply = () => ({ status: 200, body: { model: 'openai/gpt-oss-120b', choices: [{ message: { role: 'assistant', content: 'Conclusion : une boîte fermée.' }, finish_reason: 'stop' }] } });
+    let reply = () => ({ status: 200, body: { model: 'openai/gpt-oss-120b', choices: [{ message: { role: 'assistant', content: 'Conclusion : une boîte fermée.' }, finish_reason: 'stop' }], usage: { prompt_tokens: 4200, completion_tokens: 800, total_tokens: 5000 } } });
     const groq = createServer((req, res) => {
       let text = '';
       req.on('data', (c) => (text += c));
@@ -677,8 +677,10 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await ask('Quelles règles de dépouille en coquille gravité ?');
     assert.match(await page.textContent('#ai-chat .ai-assistant'), /Conclusion : une boîte fermée\./);
     assert.match(await status(), /^Réponse en \d+ s · Groq · openai\/gpt-oss-120b$/);
-    // The questions left today: a framed badge beside the title, hidden for the local model.
-    assert.equal(await page.textContent('#ai-quota'), "999 questions restantes aujourd'hui");
+    // The questions left today: a framed badge beside the title, hidden for the local model. Estimated from the
+    // tokens of a day of the free tier (200 000), less the request already made (5 000 tokens), at 5 000 a question.
+    assert.equal(await page.textContent('#ai-quota'), "≈ 39 questions restantes aujourd'hui");
+    assert.match(await page.getAttribute('#ai-quota', 'title'), /^Estimation d'après la dernière réponse \(\d\d:\d\d\) : 200\u202f000 tokens par jour de Groq ; une question en prend 5\u202f000 en moyenne \(1 réponse de ce navigateur\) ; 1 requête déjà faite aujourd'hui avec la clé de la passerelle, depuis tous les PC \(≈ 5\u202f000 tokens\) ; 999 requêtes restantes sur 1\u202f000\. Au plus 1 question par minute \(8\u202f000 tokens par minute\)\.$/);
     assert.ok(await page.isVisible('#ai-quota'));
     assert.equal(completions[0].url, '/openai/v1/chat/completions');
     assert.equal(completions[0].authorization, 'Bearer gsk_made_up');

@@ -81,6 +81,7 @@ const KEYS = {
   messages: "reader3d.ai.messages", think: "reader3d.ai.think", amounts: "reader3d.ai.costingAmounts", anonymize: "reader3d.ai.anonymize", fallback: "reader3d.ai.fallback",
   codeRequired: "reader3d.ai.gatewayCodeRequired", // the gateway asked for an access code: its field shown at once
   quota: "reader3d.ai.quota", // what is left of the free quota of the gateway, from its last answer in any tab of this browser
+  tokens: "reader3d.ai.tokens", // the tokens of the latest answers of the gateway: {questions, all} (questions left estimated with them)
   historyTab: "reader3d.ai.historyTab", // the history shown on the right: "local" or "reseau"
 };
 // Sent on window when an answer of the gateway tells what is left of its free quota (the IA page shows it).
@@ -439,14 +440,63 @@ export function gatewayLabel({ provider, model } = {}) {
   return [provider, model].filter(Boolean).join(" · ");
 }
 
-/** What is left of the free quota of the day: "998 questions restantes aujourd'hui"; "" when the provider does not say. */
-export function quotaLabel(quota) {
-  const left = quota?.requests_remaining_day;
-  return Number.isFinite(left) ? `${left.toLocaleString("fr-FR")} question${left > 1 ? "s restantes" : " restante"} aujourd'hui` : "";
+const mean = (list) => list.reduce((a, b) => a + b, 0) / list.length;
+
+/**
+ * The questions left today, from the tokens: those of a day (`quota`
+ * tokens_limit_day), less those of the requests already made today with the
+ * key of the gateway, from any PC (requests_limit_day − requests_remaining_day,
+ * at the mean tokens of a request), at the mean tokens of a question of this
+ * browser (`tokens`: {questions, all}, the total tokens of its latest answers);
+ * never more than the requests left. Null when the provider or the gateway
+ * does not tell enough.
+ */
+export function questionsLeft(quota, tokens) {
+  const { tokens_limit_day: perDay, requests_limit_day: limit, requests_remaining_day: remaining } = quota ?? {};
+  const questions = (tokens?.questions ?? []).filter((n) => n > 0);
+  const all = (tokens?.all ?? []).filter((n) => n > 0);
+  if (!(perDay > 0 && Number.isFinite(limit) && Number.isFinite(remaining) && (questions.length || all.length))) return null;
+  const perQuestion = Math.round(mean(questions.length ? questions : all));
+  const perRequest = Math.round(mean(all.length ? all : questions));
+  const requests = Math.max(0, limit - remaining);
+  const used = requests * perRequest;
+  const left = Math.max(0, Math.min(remaining, Math.floor((perDay - used) / perQuestion)));
+  return { left, perQuestion, measured: questions.length || all.length, requests, used, perDay };
 }
 
-/** Keeps what is left of the free quota of a gateway answer, for the badge of the IA page (also after the Chiffrage page asked). */
-function noteQuota({ provider, quota } = {}) {
+/**
+ * What is left of the free quota of the day: "≈ 36 questions restantes
+ * aujourd'hui" from the tokens (questionsLeft), else from the requests left
+ * "998 questions restantes aujourd'hui"; "" when the provider does not say.
+ */
+export function quotaLabel(quota, tokens) {
+  const estimate = questionsLeft(quota, tokens);
+  const left = estimate ? estimate.left : quota?.requests_remaining_day;
+  return Number.isFinite(left) ? `${estimate ? "≈ " : ""}${left.toLocaleString("fr-FR")} question${left > 1 ? "s restantes" : " restante"} aujourd'hui` : "";
+}
+
+/** The tokens of the latest answers of the gateway kept in this browser: {questions, all}. */
+function readTokens() {
+  try {
+    const kept = JSON.parse(store.get(localStorage, KEYS.tokens) || "null");
+    return { questions: Array.isArray(kept?.questions) ? kept.questions : [], all: Array.isArray(kept?.all) ? kept.all : [] };
+  } catch {
+    return { questions: [], all: [] };
+  }
+}
+
+/**
+ * Keeps what is left of the free quota of a gateway answer, for the badge of
+ * the IA page (also after the Chiffrage page asked), and the tokens it took:
+ * those of the latest 20 questions of the IA page (`question`), of the latest
+ * 50 requests of any kind.
+ */
+function noteQuota({ provider, quota, usage } = {}, question = false) {
+  const total = usage?.total_tokens;
+  if (typeof localStorage !== "undefined" && Number.isFinite(total) && total > 0) {
+    const kept = readTokens();
+    store.set(localStorage, KEYS.tokens, JSON.stringify({ questions: question ? [...kept.questions, total].slice(-20) : kept.questions.slice(-20), all: [...kept.all, total].slice(-50) }));
+  }
   if (!Number.isFinite(quota?.requests_remaining_day)) return;
   // For every tab of this browser (the quota is the account's, whatever the tab that asked): the latest answer's.
   const kept = { provider: provider ?? null, ...quota, at: new Date().toISOString() };
@@ -800,19 +850,27 @@ export function mount({ page, reader }) {
     // A day old: the quota of the day has been given back since.
     const at = Date.parse(kept?.at ?? "");
     if (Number.isFinite(at) && Date.now() - at > 24 * 3600 * 1000) kept = null;
-    const text = isLocal() ? "" : quotaLabel(kept);
+    const tokens = readTokens();
+    const text = isLocal() ? "" : quotaLabel(kept, tokens);
     $("ai-quota").hidden = !text;
     $("ai-quota").textContent = text;
     const limit = kept?.requests_limit_day;
     const when = Number.isFinite(at) ? new Date(at).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : "";
-    $("ai-quota").title = text
-      ? `Quota gratuit${kept.provider ? ` de ${kept.provider}` : ""} : ${text}${Number.isFinite(limit) ? ` sur ${limit.toLocaleString("fr-FR")}` : ""}, d'après sa dernière réponse${when ? ` (${when})` : ""}, dans n'importe quel onglet de ce navigateur. Les questions posées depuis un autre PC ne comptent qu'à la réponse suivante.`
-      : "";
+    const fr = (n) => n.toLocaleString("fr-FR");
+    const plural = (n, word) => `${fr(n)} ${word}${n > 1 ? "s" : ""}`;
+    const estimate = questionsLeft(kept, tokens);
+    const perMinute = estimate && kept.tokens_limit_minute > 0 ? Math.max(1, Math.floor(kept.tokens_limit_minute / estimate.perQuestion)) : 0;
+    const of = kept?.provider ? ` de ${kept.provider}` : "";
+    $("ai-quota").title = !text
+      ? ""
+      : estimate
+        ? `Estimation d'après la dernière réponse${when ? ` (${when})` : ""} : ${fr(estimate.perDay)} tokens par jour${of} ; une question en prend ${fr(estimate.perQuestion)} en moyenne (${plural(estimate.measured, "réponse")} de ce navigateur) ; ${plural(estimate.requests, "requête")} déjà faite${estimate.requests > 1 ? "s" : ""} aujourd'hui avec la clé de la passerelle, depuis tous les PC (≈ ${fr(estimate.used)} tokens) ; ${plural(kept.requests_remaining_day, "requête")} restante${kept.requests_remaining_day > 1 ? "s" : ""}${Number.isFinite(limit) ? ` sur ${fr(limit)}` : ""}.${perMinute ? ` Au plus ${plural(perMinute, "question")} par minute (${fr(kept.tokens_limit_minute)} tokens par minute).` : ""}`
+        : `Quota gratuit${of} : ${text}${Number.isFinite(limit) ? ` sur ${fr(limit)}` : ""}, d'après sa dernière réponse${when ? ` (${when})` : ""}, dans n'importe quel onglet de ce navigateur. Les questions posées depuis un autre PC ne comptent qu'à la réponse suivante.`;
   }
   window.addEventListener(QUOTA_EVENT, showQuota);
   // An answer in another tab of this browser: its quota, here too.
   window.addEventListener("storage", (event) => {
-    if (event.key === KEYS.quota) showQuota();
+    if (event.key === KEYS.quota || event.key === KEYS.tokens) showQuota();
   });
   {
     $("ai-code").value = store.get(localStorage, KEYS.code) || "";
@@ -1413,7 +1471,7 @@ export function mount({ page, reader }) {
         const text = [formatAnswer(output), legend.length ? namesLine(legend) : ""].filter(Boolean).join("\n\n");
         addAIAnalysis({ date: new Date().toISOString(), provider: source.provider ?? null, model: source.model ?? null, question, answer: text, verified: check.verifiee }, { tab: tabId });
       }
-      if (answer) noteQuota(answer);
+      if (answer) noteQuota(answer, true);
       const label = answer ? gatewayLabel(answer) : fallback ? `repli local : Ollama · ${fallback.model}` : "";
       setStatus(`Réponse en ${Math.round((performance.now() - start) / 1000)} s${(local || fallback) && timing ? ` (${timing})` : ""}${label ? ` · ${label}` : ""}`);
       timing = "";
