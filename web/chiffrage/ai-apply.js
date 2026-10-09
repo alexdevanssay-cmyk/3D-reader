@@ -8,7 +8,7 @@
 // values are then the piece's inputs ("saisie"), marked as applied from the
 // AI, and can be undone. Pure functions, no DOM.
 
-import { checkContextNumbers } from "../engine/ai-context.js";
+import { numbersOf } from "../engine/ai-context.js";
 
 /**
  * Key of a proposal → the input of the piece it sets (q.pieces[key]): its
@@ -41,6 +41,19 @@ export const PROPOSAL_KEYS = Object.keys(PROPOSAL_FIELDS);
 
 // Where a proposed value comes from, as the model says it.
 export const PROPOSAL_SOURCES = ["question", "trace", "analyse_3d"];
+
+// The units a value may be written in, by the unit of its input: their factor to it.
+const UNITS = {
+  kg: { kg: 1, g: 0.001, t: 1000 },
+  mm: { mm: 1, cm: 10, m: 1000 },
+  s: { s: 1, min: 60, h: 3600 },
+  "kg/kg": { "kg/kg": 1 },
+};
+const UNIT_NAMES = { sec: "s", seconde: "s", secondes: "s", mn: "min", minute: "min", minutes: "min", heure: "h", heures: "h", gramme: "g", grammes: "g", kilo: "kg", kilos: "kg", kilogramme: "kg", kilogrammes: "kg", tonne: "t", tonnes: "t" };
+const unitOf = (u) => {
+  const s = text(u).toLowerCase().replace(/\s+/g, "");
+  return UNIT_NAMES[s] ?? s;
+};
 
 const text = (v) => (typeof v === "string" ? v.trim() : v === null || v === undefined ? "" : String(v));
 
@@ -97,7 +110,14 @@ export function readProposals(list, trace) {
     const piece = text(p.piece);
     let index = pieces.findIndex((x) => x.nom === piece);
     if (index < 0 && pieces.length === 1 && !piece) index = 0;
-    const read = field ? proposalValue(field, p.valeur) : { refus: "valeur que l'IA ne peut pas proposer (prix, taux, paramètre ou valeur du devis entier)" };
+    // A number in another unit of its kind (g, t, cm, m, min, h): converted to the unit of the input; another unit: refused.
+    const unit = unitOf(p.unite);
+    const factor = !field?.unite || !unit ? 1 : UNITS[field.unite]?.[unit];
+    const written = numberOf(p.valeur);
+    const converted = factor !== undefined && Number.isFinite(written) && factor !== 1 ? written * factor : p.valeur;
+    const read = !field
+      ? { refus: "valeur que l'IA ne peut pas proposer (prix, taux, paramètre ou valeur du devis entier)" }
+      : factor === undefined ? { refus: `unité « ${text(p.unite)} » : ${field.unite} attendu` } : proposalValue(field, converted);
     const refus = read.refus ?? (index < 0 ? `pièce « ${piece} » absente du chiffrage envoyé` : null);
     return {
       piece: index >= 0 ? pieces[index].nom : piece,
@@ -105,8 +125,10 @@ export function readProposals(list, trace) {
       cle,
       ...(field ? { champ: field.champ } : {}),
       valeur: read.refus ? (p.valeur ?? null) : read.valeur,
+      // As the model wrote it, for its check against the user's messages.
+      ...(Number.isFinite(written) && factor !== undefined && factor !== 1 ? { ecrit: { valeur: written, unite: unit } } : {}),
       ...(mode ? { ilot_mode: mode[1] } : {}),
-      unite: text(p.unite) || field?.unite || "",
+      unite: field?.unite || text(p.unite) || "",
       source: PROPOSAL_SOURCES.includes(text(p.source)) ? text(p.source) : "",
       justification: text(p.justification),
       refus,
@@ -114,24 +136,83 @@ export function readProposals(list, trace) {
   });
 }
 
+const close = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(Math.abs(a), Math.abs(b), 1);
+
+/** A number the user wrote (`said`: numbersOf of their messages), as written or in another unit of the input's kind. */
+function fromQuestion(p, field, said) {
+  const factors = Object.values(UNITS[field.unite] ?? { "": 1 });
+  for (const n of said) {
+    for (const f of factors) if (close(n.valeur * f, p.valeur)) return n.valeur * f;
+    // Converted by the model from the unit the user wrote in: the number as the model wrote it.
+    if (p.ecrit && close(n.valeur, p.ecrit.valeur)) return p.valeur;
+  }
+  return null;
+}
+
+/** The value of the same key for the same piece in the trace sent (its value or another source's), as it was sent. */
+function fromTrace(p, trace) {
+  const t = trace?.pieces?.[p.index]?.valeurs?.[p.cle];
+  const values = [t?.valeur, ...(t?.autres_sources ?? []).map((a) => a.valeur)].filter((v) => typeof v === "number");
+  return values.find((v) => sameValue(v, p.valeur)) ?? null;
+}
+
+/** The measure of the analysis of the part sent that gives this input (its size, modulus, wall thicknesses), as sent. */
+function fromAnalysis(p, sent) {
+  const bodies = Array.isArray(sent?.bodies) ? sent.bodies : [];
+  const measures = bodies.flatMap((b) => {
+    const m = b.metrics ?? {};
+    const size = m.bbox_mm?.size ?? m.bbox_size_mm;
+    const thickness = b.foundry?.evidence?.thickness ?? b.foundry?.thickness ?? {};
+    return {
+      "piece.dimMax": Array.isArray(size) ? [Math.max(...size)] : [],
+      "piece.module": m.volume_mm3 > 0 && m.surface_area_mm2 > 0 ? [m.volume_mm3 / m.surface_area_mm2] : [],
+      "piece.toileMini": [thickness.min_mm, b.manufacturing?.functional_thickness?.minimum_wall_thickness_mm],
+      "piece.epaisseurMax": [thickness.max_mm],
+    }[p.cle] ?? [];
+  }).filter((v) => typeof v === "number" && v > 0);
+  // The analysis sent rounds to the thousandth: within half a thousandth, or 0.1 %.
+  return measures.find((v) => Math.abs(v - p.valeur) <= Math.max(5e-4, 1e-3 * v)) ?? null;
+}
+
+const NOT_FOUND = {
+  question: "nombre absent de vos messages",
+  trace: "valeur absente de la trace de cette pièce pour cette clé",
+  analyse_3d: "mesure absente de l'analyse de la pièce pour cette clé",
+};
+
 /**
- * The proposals not refused whose numbers come from the data: each number
- * proposed must be in the user's messages (`asked`), the costing trace or
- * the analysis of the part sent (`sent`, the context of the question), to the
- * rounding it is written with; one the model computed is refused ("nombre
- * absent des données"). Codes and yes / no are checked when applied.
+ * The proposals not refused whose numbers come from the source they claim,
+ * for their own key: a number the user wrote in their messages (`asked`, as
+ * written or in another unit of the input's kind), the value of that key for
+ * that piece in the costing trace sent (`sent.costing_trace`, its value or
+ * another source's), or the measure of the part sent that gives that input
+ * (size, modulus, wall thicknesses); the value applied is the one found, not
+ * the model's. One the model computed, or found elsewhere, is refused. Codes
+ * and yes / no are checked when applied.
  */
 export function checkProposals(proposals, sent, asked = []) {
+  const said = asked.flatMap((q) => numbersOf(q));
   return proposals.map((p) => {
     if (p.refus || typeof p.valeur !== "number") return p;
-    const { inconnus } = checkContextNumbers(String(p.valeur), sent ?? {}, asked);
-    return inconnus.length ? { ...p, refus: "nombre absent des données envoyées et de vos messages" } : p;
+    const field = PROPOSAL_FIELDS[p.cle];
+    const found = p.source === "question" ? fromQuestion(p, field, said)
+      : p.source === "trace" ? fromTrace(p, sent?.costing_trace)
+        : p.source === "analyse_3d" ? fromAnalysis(p, sent) : null;
+    if (found === null) return { ...p, refus: NOT_FOUND[p.source] ?? "source du nombre non indiquée (question, trace ou analyse_3d)" };
+    return { ...p, valeur: found };
   });
 }
 
-/** Two values of an input equal for an application: numbers within the rounding of the trace sent (6 significant digits). */
+/**
+ * Two values of an input equal for an application: numbers within the
+ * rounding of the trace sent (ai-trace.js: 6 significant digits, 2 decimals
+ * from 100), so that a value read in the trace changes nothing.
+ */
 export function sameValue(a, b) {
-  if (typeof a === "number" && typeof b === "number") return Math.abs(a - b) <= 5e-6 * Math.max(Math.abs(a), Math.abs(b), 1e-9) + 1e-12;
+  if (typeof a === "number" && typeof b === "number") {
+    const m = Math.max(Math.abs(a), Math.abs(b));
+    return Math.abs(a - b) <= (m >= 100 ? 0.005 : 5e-6 * Math.max(m, 1e-9)) + 1e-12;
+  }
   return (a ?? null) === (b ?? null);
 }
 

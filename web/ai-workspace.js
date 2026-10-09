@@ -180,11 +180,33 @@ function writeConversation(key, conversation) {
   }
 }
 
-// The block of proposals that ends an answer of the local model (task "Chiffrage"), whole or still being written.
-const PROPOSALS_BLOCK = /\n*```(?:json)?\s*\{\s*"propositions"[\s\S]*?(?:```\s*$|$)/;
+// The block of proposals of an answer of the local model (task "Chiffrage"): closed, or still being written at its end.
+const PROPOSALS_BLOCK = /```(?:json)?\s*(\{\s*"propositions"[\s\S]*?\})\s*```/;
+const OPEN_BLOCK = /```(?:json)?\s*(\{\s*"propositions"(?![\s\S]*```)[\s\S]*)$/;
 
-/** An answer without the block of proposals that ends it (shown apart, under the answer). */
-const withoutProposals = (text) => String(text ?? "").replace(PROPOSALS_BLOCK, "").trimEnd();
+/** The block of proposals of an answer when it can be read: {list, start, end}; null otherwise. */
+function proposalsBlock(text) {
+  const m = PROPOSALS_BLOCK.exec(text) ?? OPEN_BLOCK.exec(text);
+  if (!m) return null;
+  try {
+    const parsed = JSON.parse(m[1]);
+    return Array.isArray(parsed?.propositions) ? { list: parsed.propositions, start: m.index, end: m.index + m[0].length } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * An answer without its block of proposals, shown apart under it: the block
+ * read taken out, the text after it kept; one still being written at the end
+ * hidden. One that cannot be read stays in the answer, as it was written.
+ */
+function withoutProposals(text) {
+  const s = String(text ?? "");
+  const block = proposalsBlock(s);
+  if (block) return `${s.slice(0, block.start).trimEnd()}${s.slice(block.end).trim() ? `\n\n${s.slice(block.end).trim()}` : ""}`;
+  return PROPOSALS_BLOCK.test(s) ? s : s.replace(/\n*```(?:json)?\s*\{\s*"propositions"(?![\s\S]*```)[\s\S]*$/, "").trimEnd();
+}
 
 /**
  * The values an answer of the task "Chiffrage" proposes for the inputs of a
@@ -198,16 +220,14 @@ export function proposalsOf(content) {
   try {
     parsed = JSON.parse(text);
   } catch {
-    const block = /```(?:json)?\s*(\{\s*"propositions"[\s\S]*?\})\s*```/.exec(text)?.[1];
-    try {
-      parsed = block ? { analyse_chiffrage: JSON.parse(block) } : null;
-    } catch {
-      parsed = null;
-    }
+    return proposalsBlock(text)?.list ?? [];
   }
   const list = parsed?.analyse_chiffrage?.propositions;
   return Array.isArray(list) ? list : [];
 }
+
+/** An answer of the local model that ends with proposals that cannot be read (JSON not valid). */
+export const unreadableProposals = (content) => /```(?:json)?\s*\{\s*"propositions"/.test(withoutThinking(content)) && !proposalsBlock(withoutThinking(content));
 
 /** The text of an answer: the JSON of the structured contract laid out, or the raw text. */
 export function formatAnswer(content) {
@@ -592,7 +612,7 @@ const seconds = (ns) => Math.round((ns ?? 0) / 1e9);
 const COSTING_RULES = `Tâche « Chiffrage » : le contexte contient costing_trace, les valeurs du devis en cours (devis, pièces, îlots classés), chacune avec sa trace : valeur, unité, source, autorité, confiance, écart à la tendance, autres sources, validation requise ; et les alertes. Tu ne les modifies pas toi-même : ta réponse est un raisonnement.
 Explique les valeurs et leurs sources, signale les écarts et les valeurs à valider, pose les questions utiles, énonce tes hypothèses. Cite la clé de chaque valeur dont tu parles (par exemple piece.prix.vente).
 N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux. Ne cite que des nombres présents dans costing_trace, tels quels ou arrondis, sans en calculer de nouveaux : une réponse qui contient un autre nombre est marquée « non vérifiée ».
-Propositions : quand l'utilisateur demande de changer une saisie d'une pièce ou en donne la bonne valeur, ou quand costing_trace ou l'analyse de la pièce donnent une valeur plus juste d'une saisie, termine ta réponse par un seul bloc \`\`\`json {"propositions": [{"piece": "nom de la pièce dans costing_trace.pieces", "cle": "piece.poids", "valeur": 1.35, "unite": "kg", "source": "question", "justification": "une phrase"}]} \`\`\` ; cle : piece.poids, piece.toileMini, piece.epaisseurMax, piece.module, piece.dimMax, piece.ilot, piece.finition, piece.miseAuMille, piece.empreintes, piece.cycle, piece.mode, piece.tth, piece.tthMode, piece.noyaux, piece.tribo, piece.redressage, piece.outillage.tiroirs ou piece.outillage.complexite ; source : question (écrite par l'utilisateur), trace (lue dans costing_trace) ou analyse_3d. Jamais un prix, un taux, une marge, un paramètre ni un nombre que tu calcules : seulement un nombre écrit par l'utilisateur, dans costing_trace ou dans l'analyse de la pièce. Une personne accepte chaque proposition avant qu'elle soit appliquée. Sans proposition, pas de bloc.
+Propositions : quand l'utilisateur demande de changer une saisie d'une pièce ou en donne la bonne valeur, ou quand costing_trace ou l'analyse de la pièce donnent une valeur plus juste d'une saisie, termine ta réponse par un seul bloc \`\`\`json {"propositions": [{"piece": "nom de la pièce dans costing_trace.pieces", "cle": "piece.poids", "valeur": 1.35, "unite": "kg", "source": "question", "justification": "une phrase"}]} \`\`\` ; cle : piece.poids, piece.toileMini, piece.epaisseurMax, piece.module, piece.dimMax, piece.ilot, piece.finition, piece.miseAuMille, piece.empreintes, piece.cycle, piece.mode, piece.tth, piece.tthMode, piece.noyaux, piece.tribo, piece.redressage, piece.outillage.tiroirs ou piece.outillage.complexite ; valeur dans l'unité de la saisie (kg, mm, s) ; source : question (le nombre que l'utilisateur a écrit), trace (la valeur de cette même clé pour cette pièce dans costing_trace) ou analyse_3d (la cote mesurée de la pièce : plus grande dimension, module, épaisseurs) ; un nombre absent de la source indiquée est refusé. Jamais un prix, un taux, une marge, un paramètre ni un nombre que tu calcules : seulement un nombre écrit par l'utilisateur, dans costing_trace ou dans l'analyse de la pièce. Une personne accepte chaque proposition avant qu'elle soit appliquée. Sans proposition, pas de bloc.
 Si costing_trace est null, aucun classeur de chiffrage n'est importé : dis-le et propose de l'importer dans la page Chiffrage.`;
 
 // As the gateway's text tasks (api/ai.js TEXT_RULES): not in the task « Chiffrage », which proposes values in its own block.
@@ -1509,6 +1529,12 @@ export function mount({ page, reader }) {
       // Costing: the values proposed for the inputs of a piece, each number from the data sent or the questions;
       // the piece by its rank in the trace sent (its labels online), its key and real name from the snapshot.
       let proposals = [];
+      if (costing && unreadableProposals(output)) {
+        // Said now and kept with the answer (shown with it again).
+        const unreadable = "Propositions de l'IA illisibles (JSON non valide) : rien à appliquer.";
+        line(answerBox, "ai-notice", unreadable, true);
+        notice = [notice, unreadable].filter(Boolean).join(" ");
+      }
       if (costing && sent.costing_trace && read?.snapshot && tabId !== undefined) {
         proposals = checkProposals(readProposals(proposalsOf(output), sent.costing_trace), sent, asked).map(({ index, ...p }) => {
           const piece = read.snapshot.pieces[index];
@@ -2057,7 +2083,11 @@ export function mount({ page, reader }) {
       setStatus(plans.find((p) => p.dry.error)?.dry.error ?? "Les valeurs proposées sont déjà celles du chiffrage.");
       return updateSuggestion();
     }
-    const lines = todo.flatMap((p) => [`« ${p.dry.piece} » :`, ...p.dry.applied.map((x) => `  ${changeLine(x)}`), ...p.dry.refused.map((x) => `  non appliqué, ${x.label} : ${x.refus}`)]);
+    const lines = todo.flatMap((p) => [
+      `« ${p.dry.piece} » :`, ...p.dry.applied.map((x) => `  ${changeLine(x)}`),
+      ...(p.dry.consequences ?? []).map((x) => `  et par conséquent, ${changeLine(x)}`),
+      ...p.dry.refused.map((x) => `  non appliqué, ${x.label} : ${x.refus}`),
+    ]);
     if (!confirm(`Appliquer ces valeurs au chiffrage de cet onglet ?\n\n${lines.join("\n")}\n\nElles deviennent des saisies de la pièce, tracées « proposition IA appliquée » ; « Annuler l'application » remet les valeurs d'avant.`)) {
       setStatus("Valeurs non appliquées");
       return;
@@ -2065,7 +2095,7 @@ export function mount({ page, reader }) {
     const answer = readConversation(s.key).messages.find((m) => m.id === s.message);
     const origin = { date: new Date().toISOString(), provider: answer?.provider ?? null, model: answer?.model ?? null, message: s.message };
     const done = todo.map((p) => applyAIValues({ ...s.target, key: p.key }, p.proposals, origin));
-    const changes = done.flatMap((r) => (r.error ? [] : r.applied.map((x) => ({ ...x, label: `${x.label} de « ${r.piece} »` }))));
+    const changes = done.flatMap((r) => (r.error ? [] : [...r.applied, ...(r.consequences ?? [])].map((x) => ({ ...x, label: `${x.label} de « ${r.piece} »` }))));
     const failed = done.filter((r) => r.error).map((r) => r.error);
     const unsaved = done.some((r) => r.saved === false);
     const content = [
@@ -2078,6 +2108,7 @@ export function mount({ page, reader }) {
       { role: "assistant", content, ...(changes.length ? { application: { message: s.message, undone: false, changes } } : {}) },
     ]);
     setStatus(changes.length ? `Valeurs appliquées au chiffrage (${changes.length}) : voir la page Chiffrage` : "Aucune valeur appliquée");
+    $("ai-input").focus(); // its button gone with the suggestion
     updateSuggestion();
   }
 
@@ -2092,12 +2123,18 @@ export function mount({ page, reader }) {
     const results = [...pieces].map(([key, name]) => undoAIValues({ ...answer.target, key, name }, { message: answerId }));
     const changes = results.flatMap((r) => (r.error ? [] : r.undone.map((x) => ({ ...x, label: `${x.label} de « ${r.piece} »` }))));
     const kept = results.flatMap((r) => r.kept ?? []);
+    // Nothing undone, nothing kept (no workbook, another tab shown): said, the button left to try again.
+    if (results.every((r) => r.error)) {
+      setStatus(results[0]?.error ?? "Rien à annuler");
+      return;
+    }
     const content = [
-      changes.length ? `Application annulée :\n- ${changes.map(changeLine).join("\n- ")}` : results.find((r) => r.error)?.error ?? "Rien à annuler.",
+      changes.length ? `Application annulée :\n- ${changes.map(changeLine).join("\n- ")}` : "Rien à annuler : les valeurs ont été modifiées depuis.",
       kept.length ? `Modifiées depuis, gardées : ${kept.join(", ")}.` : "",
     ].filter(Boolean).join("\n\n");
     appendMessages([{ role: "assistant", content, application: { message: answerId, undone: true, changes } }]);
     setStatus(changes.length ? "Application des valeurs de l'IA annulée" : "Rien à annuler");
+    $("ai-input").focus(); // its button gone with the message redrawn
     updateSuggestion();
   }
 

@@ -20,7 +20,7 @@ import {
 import { DEMANDE, QUOTE_KEYS, SOURCES, demandeComparee, derive, missing, pieceKeys, resolve, summarize, traced, weakest } from '../../web/chiffrage/provenance.js';
 import { MASQUE, checkNumbers, isInternal, maskNumbers, numbersOf, traceForAI } from '../../web/chiffrage/ai-trace.js';
 import { anonymizer } from '../../web/engine/ai-context.js';
-import { checkProposals, readProposals } from '../../web/chiffrage/ai-apply.js';
+import { checkProposals, readProposals, sameValue } from '../../web/chiffrage/ai-apply.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -1786,7 +1786,7 @@ describe('values of a piece proposed by the AI, applied once accepted', () => {
   const trace = { pieces: [{ nom: 'Pièce', valeurs: { 'piece.poids': { valeur: 1.2, unite: 'kg' }, 'piece.empreintes': { valeur: 2 } } }] };
   const sent = { costing_trace: trace, bodies: [] };
 
-  test('read and checked: only the inputs of a piece, each number from the data sent or the questions, the piece by its name', () => {
+  test('read and checked: only the inputs of a piece, each number from the source it claims for its own key, in the unit of the input', () => {
     const read = readProposals([
       { piece: 'Pièce', cle: 'piece.poids', valeur: '1,35', unite: 'kg', source: 'question', justification: 'donné par l\'utilisateur' },
       { piece: 'Pièce', cle: 'piece.prix.vente', valeur: 12, unite: '€', source: 'trace', justification: '' },
@@ -1810,14 +1810,35 @@ describe('values of a piece proposed by the AI, applied once accepted', () => {
     assert.match(read[1].refus, /prix, taux, paramètre ou valeur du devis entier/);
     assert.match(read[3].refus, /pièce « Autre » absente/);
     assert.equal(read[6].refus, 'nombre entier attendu');
-    // Each number from the data: 1,35 kg written by the user; 137 s in none of them (computed by the model).
+    // 1,35 kg written by the user; 137 s is not the cycle of the trace (computed by the model).
     const checked = checkProposals(read, sent, ['Le poids réel est de 1,35 kg.']);
     assert.equal(checked[0].refus, null);
-    assert.match(checked[2].refus, /nombre absent des données envoyées et de vos messages/);
-    assert.equal(checkProposals(read, sent, [])[0].refus, 'nombre absent des données envoyées et de vos messages');
-    // Read from the trace sent: 2 cavities.
-    assert.equal(checkProposals(readProposals([{ piece: 'Pièce', cle: 'piece.empreintes', valeur: 2 }], trace), sent, [])[0].refus, null);
+    assert.equal(checked[2].refus, 'valeur absente de la trace de cette pièce pour cette clé');
+    assert.equal(checkProposals(read, sent, [])[0].refus, 'nombre absent de vos messages');
+    // Read from the trace sent for the same key: 2 cavities; the weight of the trace is no cavity count.
+    const cavities = (valeur, source = 'trace') => checkProposals(readProposals([{ piece: 'Pièce', cle: 'piece.empreintes', valeur, source }], trace), sent, [])[0];
+    assert.deepEqual([cavities(2).refus, cavities(2).valeur], [null, 2]);
+    assert.equal(cavities(1.2).refus, 'nombre entier attendu');
+    assert.match(cavities(2, '').refus, /source du nombre non indiquée/);
     assert.deepEqual(readProposals('rien', trace), []);
+  });
+
+  test('a number another source or field gives, or in another unit, is not taken for the one proposed', () => {
+    const t = { pieces: [{ nom: 'P', valeurs: { 'piece.poids': { valeur: 2.1, unite: 'kg', autres_sources: [{ source: 'demande client', valeur: 2.05 }] }, 'piece.cycle': { valeur: 302, unite: 's' } } }] };
+    const context = { costing_trace: t, bodies: [{ metrics: { bbox_mm: { size: [135, 48, 22] }, volume_mm3: 90000, surface_area_mm2: 30000 } }] };
+    const check = (list, asked = []) => checkProposals(readProposals(list.map((p) => ({ piece: 'P', ...p })), t), context, asked).map((p) => [p.cle, p.valeur, p.refus]);
+    // The user's units converted: 1350 g → 1,35 kg, 4 min → 240 s; the model may have converted them itself.
+    assert.deepEqual(check([{ cle: 'piece.poids', valeur: 1350, unite: 'g', source: 'question' }, { cle: 'piece.cycle', valeur: 4, unite: 'min', source: 'question' }, { cle: 'piece.poids', valeur: 1.35, unite: 'kg', source: 'question' }], ['Le poids réel est de 1350 g et le cycle mesuré est de 4 min']),
+      [['piece.poids', 1.35, null], ['piece.cycle', 240, null], ['piece.poids', 1.35, null]]);
+    assert.match(readProposals([{ piece: 'P', cle: 'piece.poids', valeur: 3, unite: 'lb', source: 'question' }], t)[0].refus, /unité « lb » : kg attendu/);
+    // The trace: the same key of the same piece, its value or another source's, to its rounding only.
+    assert.deepEqual(check([{ cle: 'piece.cycle', valeur: 300, source: 'trace' }, { cle: 'piece.poids', valeur: 2.05, source: 'trace' }, { cle: 'piece.cycle', valeur: 302, source: 'trace' }]).map((x) => x[2] === null), [false, true, true]);
+    // The analysis of the part: the measure of that input only (135 mm is no weight, 22 mm no cavity count).
+    assert.deepEqual(check([{ cle: 'piece.poids', valeur: 13.5, source: 'analyse_3d' }, { cle: 'piece.dimMax', valeur: 135, source: 'analyse_3d' }, { cle: 'piece.module', valeur: 3, source: 'analyse_3d' }, { cle: 'piece.empreintes', valeur: 22, source: 'analyse_3d' }]).map((x) => x[2] === null), [false, true, true, false]);
+    // The rounding of the trace: 194,02 sent for 194,0173 is the same value.
+    assert.equal(sameValue(194.0173, 194.02), true);
+    assert.equal(sameValue(1.234567, 1.23457), true);
+    assert.equal(sameValue(1.2345, 1.2346), false);
   });
 
   test('applied: the inputs of the piece that differ, the island imposed for a value of its route, traced; undone: what was there before', () => {
@@ -1857,6 +1878,74 @@ describe('values of a piece proposed by the AI, applied once accepted', () => {
     assert.deepEqual([back.poids, back.empreintes, back.procede, back.finition, back.valeursIA], [1.2, undefined, undefined, undefined, undefined]);
     assert.equal(ui.compute().results[0].chosen, false);
     assert.match(ui.undoAIValues(target).error, /Aucune valeur appliquée/);
+  });
+
+  test('the island first: refused with the values of its route; another island resets the route typed before; undone only with its route', () => {
+    const target = { tab: 1, file: null, key: 'manuel' };
+    const stored = () => loadQuote(base, indices).pieces.manuel;
+    const setPiece = (over) => {
+      const q = loadQuote(base, indices);
+      saveQuote({ ...q, pieces: { manuel: { ...q.pieces.manuel, ...over } } });
+    };
+    // An island refused: the values of its route refused with it, nothing written.
+    let c = computed();
+    const code = c.results[0].route.process;
+    let dry = ui.applyAIValues(target, [{ cle: 'piece.ilot', valeur: 'ZZZ' }, { cle: 'piece.cycle', valeur: 60 }, { cle: 'piece.poids', valeur: 1.35 }], {}, { dryRun: true });
+    assert.deepEqual(dry.refused.map((x) => [x.cle, x.refus]), [['piece.ilot', 'îlot « ZZZ » absent du classeur ou de Paramètres'], ['piece.cycle', 'proposée avec un îlot refusé']]);
+    assert.deepEqual([dry.applied.map((x) => x.champ), dry.consequences], [['poids'], []]);
+    // A value of the route on an automatic piece: the island imposed, said in the consequences.
+    dry = ui.applyAIValues(target, [{ cle: 'piece.cycle', valeur: 60 }], {}, { dryRun: true });
+    assert.deepEqual(dry.consequences.map((x) => [x.champ, x.avant, x.apres]), [['procede', 'automatique', `${code} imposé`], ['finition', c.results[0].route.finition, `${c.results[0].route.finition} imposée`]]);
+
+    // Another island: the cycle typed for the one before reset (said), the finishing proposed compared with nothing.
+    c = computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', finition: 'FTR', cycle: 120 } } } });
+    const other = Object.keys(c.results[0].ranked.reduce((m, r) => ({ ...m, [r.process]: 1 }), {})).find((x) => x !== 'CG3' && x.startsWith('CG') && ui.applyAIValues(target, [{ cle: 'piece.ilot', valeur: x }, { cle: 'piece.finition', valeur: 'FTR' }], {}, { dryRun: true }).refused.length === 0);
+    dry = ui.applyAIValues(target, [{ cle: 'piece.ilot', valeur: other }, { cle: 'piece.finition', valeur: 'FTR' }], {}, { dryRun: true });
+    assert.deepEqual(dry.applied.map((x) => [x.champ, x.avant, x.apres]), [['procede', 'CG3', other], ['finition', null, 'FTR']]);
+    assert.deepEqual(dry.consequences.map((x) => [x.champ, x.avant, x.apres]), [['cycle', 120, null]]);
+    ui.applyAIValues(target, [{ cle: 'piece.ilot', valeur: other }], { message: 'a' });
+    assert.deepEqual([stored().procede, stored().finition, stored().cycle], [other, 'auto', null]);
+    // A second answer: a cycle for the new island; undone, back to its estimate, not to the 120 s typed for CG3.
+    ui.applyAIValues(target, [{ cle: 'piece.cycle', valeur: 80 }], { message: 'b' });
+    assert.equal(stored().cycle, 80);
+    ui.undoAIValues(target, { message: 'b' });
+    assert.equal(stored().cycle ?? null, null);
+    // Another island chosen since by a person: the finishing and the route of the first answer are left as they are.
+    setPiece({ procede: 'CG3', finition: 'auto', cycle: null });
+    const undone = ui.undoAIValues(target, { message: 'a' });
+    assert.deepEqual([stored().procede, stored().finition, stored().cycle ?? null], ['CG3', 'auto', null]);
+    assert.ok(undone.kept.includes('procédé / îlot') && undone.kept.includes('finition'));
+
+    // A cycle applied (island imposed), then typed by a person: undone, the island and its cycle stay.
+    computed();
+    ui.applyAIValues(target, [{ cle: 'piece.cycle', valeur: 60 }], { message: 'c' });
+    setPiece({ cycle: 90 });
+    const u = ui.undoAIValues(target, { message: 'c' });
+    assert.deepEqual([stored().procede, stored().cycle], [code, 90]);
+    assert.deepEqual(u.undone, []);
+  });
+
+  test('cores added only when the application checks them, taken back with it; an adopted estimate of the cycle back with an undo', () => {
+    const target = { tab: 1, file: null, key: 'manuel' };
+    const stored = () => loadQuote(base, indices).pieces.manuel;
+    // Cores already checked without a core described: another value applied adds none.
+    computed({ quote: { pieces: { manuel: { ...PART, noyaux: true, cores: [] } } } });
+    ui.applyAIValues(target, [{ cle: 'piece.dimMax', valeur: 260 }], { message: 'd' });
+    assert.deepEqual(stored().cores, []);
+    // Checked by the application: a first core, removed by the undo.
+    computed();
+    ui.applyAIValues(target, [{ cle: 'piece.noyaux', valeur: true }], { message: 'e' });
+    assert.equal(stored().cores.length, 1);
+    ui.undoAIValues(target, { message: 'e' });
+    assert.deepEqual([stored().noyaux, stored().cores], [undefined, undefined]);
+    // An estimate of the cycle adopted (traced "estimation IA validée"): replaced by the AI's cycle, back with the undo.
+    const c = computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', cycle: 75, cycleIA: { date: '2026-10-01T00:00:00.000Z', valeur: 75, avant: { procede: 'auto', finition: 'auto', cycle: null }, estimation: { ilot: 'CG3', estimation_s: 75, fournisseur: 'Groq', modele: 'm', date: '2026-10-01T00:00:00.000Z', confiance: 'moyenne' } } } } } });
+    assert.equal(c.results[0].trace['piece.cycle'].source.type, 'ia_validee');
+    ui.applyAIValues(target, [{ cle: 'piece.cycle', valeur: 60 }], { message: 'f' });
+    assert.equal(stored().cycleIA, undefined);
+    ui.undoAIValues(target, { message: 'f' });
+    assert.deepEqual([stored().cycle, stored().cycleIA?.valeur], [75, 75]);
+    assert.equal(ui.compute().results[0].trace['piece.cycle'].source.type, 'ia_validee');
   });
 
   test('a value changed since by a person is kept when undone; the codes checked against the settings; another 3D model refused', () => {

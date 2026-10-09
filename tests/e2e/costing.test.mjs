@@ -834,11 +834,11 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.fill('#ai-url', `http://127.0.0.1:${gateway.address().port}/api/ai`);
     const answered = (n) => page.waitForFunction((count) => document.querySelectorAll('#ai-chat .ai-msg').length >= count && /^Réponse en/.test(document.getElementById('ai-status').textContent), n, { timeout: 30_000 });
     const weight = { piece: 'Pièce', cle: 'piece.poids', valeur: 1.35, unite: 'kg', source: 'question', justification: 'poids réel donné par l\'utilisateur' };
-    // The task clicked: 1,35 kg in none of the data sent nor the question: shown, not applicable, nothing suggested.
+    // The task clicked: 1,35 kg said to come from the user's message, in none of them: shown, not applicable, nothing suggested.
     propositions = [weight];
     await page.click('.ai-task[data-task="costing"]');
     await answered(2);
-    assert.match(await page.textContent('#ai-chat .ai-msg:last-child .ai-proposals'), /poids pièce de « Pièce » : 1,35 kg \(votre message\) — poids réel donné par l'utilisateur — non applicable : nombre absent des données envoyées et de vos messages/);
+    assert.match(await page.textContent('#ai-chat .ai-msg:last-child .ai-proposals'), /poids pièce de « Pièce » : 1,35 kg \(votre message\) — poids réel donné par l'utilisateur — non applicable : nombre absent de vos messages/);
     assert.equal(await page.isVisible('#ai-suggest'), false);
     // Written by the user: the reply suggested, beside the box and in it.
     await page.fill('#ai-input', 'Le poids réel est de 1,35 kg : corrige-le.');

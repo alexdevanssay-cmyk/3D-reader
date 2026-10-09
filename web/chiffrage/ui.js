@@ -146,22 +146,30 @@ function quoteOfTab(tab) {
   return base ? null : "Aucun classeur de chiffrage importé : importez-le dans la page Chiffrage.";
 }
 
+// The inputs of the casting route of a piece: they are for its island (the island select resets them).
+const ROUTE_FIELDS = ["cycle", "empreintes", "miseAuMille", "mode"];
+const changeText = (x) => `${x.label} : ${valueLabel(x.avant, x.unite)} → ${valueLabel(x.apres, x.unite)}`;
+
 /**
  * Values proposed by the AI for one piece (task "Chiffrage" of the IA page,
  * ai-apply.js readProposals and checkProposals), applied once a person accepts
  * them: written as the inputs of that piece ("saisie"), only where they differ
  * from its values now, each kept with what was there before
  * (q.pieces[key].valeursIA, undoAIValues; traced "proposition IA appliquée").
- * A value of the casting route (cycle, cavities, mise au mille, mode) imposes
- * the island it was proposed for, as the casting card does; another island
- * proposed resets them. Never a price, a rate, a setting nor a value of the
- * whole quote: only the keys of PROPOSAL_FIELDS. dryRun: nothing changed,
- * what would be. The quote is saved; the Chiffrage page shows it recomputed
- * with a message when it is next shown.
+ * A value of the casting route (cycle, cavities, mise au mille, mode) is for
+ * its island: it imposes the island of the route, as the casting card does;
+ * another island proposed (and accepted) resets the route's values typed for
+ * the island before. Values proposed with an island refused are refused with
+ * it. Never a price, a rate, a setting nor a value of the whole quote: only the
+ * keys of PROPOSAL_FIELDS. dryRun: nothing changed, what would be. The quote
+ * is saved; the Chiffrage page shows it recomputed with a message when it is
+ * next shown.
  *   target: {tab, file (the 3D file of the question; null: none), key (the piece, ui.js piecesOf)}
  *   proposals: [{cle, valeur, ilot_mode}] (those not refused)
  *   origin: {date, provider, model, message (id of the answer)}
- * Returns {piece (its name), applied: [{cle, champ, label, avant, apres, unite}], same, refused: [{cle, label, valeur, refus}], saved}, or {error}.
+ * Returns {piece (its name), applied: [{cle, champ, label, avant, apres, unite}],
+ * consequences (the island imposed, the values reset, in the same form), same,
+ * refused: [{cle, label, valeur, refus}], saved}, or {error}.
  */
 export function applyAIValues(target, proposals, origin = {}, { dryRun = false } = {}) {
   const error = quoteOfTab(target.tab);
@@ -176,28 +184,32 @@ export function applyAIValues(target, proposals, origin = {}, { dryRun = false }
     const name = pieceNames(c.results.map((x) => x.piece)).get(r.piece);
     const i = r.inputs;
     const code = r.route?.process ?? null;
-    const byKey = new Map(proposals.map((p) => [p.cle, p]));
-    const island = byKey.get("piece.ilot")?.valeur ?? code;
     const refused = [];
+    const refuse = (p, refus) => refused.push({ cle: p.cle, label: PROPOSAL_FIELDS[p.cle]?.label ?? p.cle, valeur: p.valeur, refus });
+    // The island first: the one proposed when the workbook and the settings have it, else the one of the route.
+    const ilot = proposals.find((p) => p.cle === "piece.ilot");
+    const ilotOk = !!ilot && Object.hasOwn(settings.processes, ilot.valeur) && c.rates.has(ilot.valeur);
+    if (ilot && !ilotOk) refuse(ilot, `îlot « ${ilot.valeur} » absent du classeur ou de Paramètres`);
+    const island = ilotOk ? ilot.valeur : code;
+    const newIsland = ilotOk && island !== code;
     const wanted = [];
     for (const p of proposals) {
-      const spec = PROPOSAL_FIELDS[p.cle];
-      const label = spec?.label ?? p.cle;
-      const refuse = (refus) => refused.push({ cle: p.cle, label, valeur: p.valeur, refus });
-      if (!spec) {
-        refuse("valeur que l'IA ne peut pas proposer");
+      if (p === ilot) {
+        if (ilotOk) wanted.push({ p, spec: PROPOSAL_FIELDS[p.cle] });
         continue;
       }
+      const spec = PROPOSAL_FIELDS[p.cle];
       const v = p.valeur;
-      // The codes, against the workbook and the settings of now.
-      if (spec.type === "ilot" && !(settings.processes[v] && c.rates.has(v))) refuse(`îlot « ${v} » absent du classeur ou de Paramètres`);
-      else if (spec.type === "finition" && !settings.processes[island]?.finitions?.includes(v)) refuse(`finition « ${v} » inconnue de l'îlot ${island ?? "retenu"}`);
-      else if (spec.type === "mode" && !MODES.includes(v)) refuse(`fonctionnement « ${v} » inconnu (${MODES.join(", ")})`);
-      else if (spec.type === "mode" && p.ilot_mode && p.ilot_mode !== island) refuse(`fonctionnement proposé pour ${p.ilot_mode}, l'îlot retenu est ${island ?? "inconnu"}`);
-      else if (spec.type === "tth" && v !== "none" && !settings.tth?.[v]) refuse(`traitement thermique « ${v} » absent de Paramètres`);
-      else if (spec.type === "complexite" && !(v in (settings.tooling?.etude ?? {}))) refuse(`complexité « ${v} » inconnue`);
-      else if (spec.ilot && !island) refuse("aucun îlot retenu pour cette pièce");
-      else wanted.push({ p, spec, label });
+      // The codes, against the workbook and the settings of now; the values of a route, for the island accepted.
+      if (!spec) refuse(p, "valeur que l'IA ne peut pas proposer");
+      else if (ilot && !ilotOk && (spec.ilot || spec.type === "finition")) refuse(p, "proposée avec un îlot refusé");
+      else if (spec.type === "finition" && !settings.processes[island]?.finitions?.includes(v)) refuse(p, `finition « ${v} » inconnue de l'îlot ${island ?? "retenu"}`);
+      else if (spec.type === "mode" && !MODES.includes(v)) refuse(p, `fonctionnement « ${v} » inconnu (${MODES.join(", ")})`);
+      else if (spec.type === "mode" && p.ilot_mode && p.ilot_mode !== island) refuse(p, `fonctionnement proposé pour ${p.ilot_mode}, l'îlot retenu est ${island ?? "inconnu"}`);
+      else if (spec.type === "tth" && v !== "none" && !Object.hasOwn(settings.tth ?? {}, v)) refuse(p, `traitement thermique « ${v} » absent de Paramètres`);
+      else if (spec.type === "complexite" && !Object.hasOwn(settings.tooling?.etude ?? {}, v)) refuse(p, `complexité « ${v} » inconnue`);
+      else if (spec.ilot && !island) refuse(p, "aucun îlot retenu pour cette pièce");
+      else wanted.push({ p, spec });
     }
     // The value of each input now: the one the costing uses (traced), else the one of the inputs or the settings.
     const tool = r.route?.tooling;
@@ -211,41 +223,58 @@ export function applyAIValues(target, proposals, origin = {}, { dryRun = false }
       outillageTiroirs: tool?.tiroirs ?? i.outillageTiroirs ?? settings.tooling?.tiroirs ?? 0,
       outillageComplexite: tool?.complexite ?? i.outillageComplexite ?? settings.tooling?.complexite ?? null,
     };
-    // Another island: its route's values are its own (those of the island before are not kept).
-    const newIsland = byKey.has("piece.ilot") && wanted.some((w) => w.spec.type === "ilot") && !sameValue(island, code);
     const same = [];
     const changes = [];
-    for (const { p, spec, label } of wanted) {
-      const before = spec.ilot && newIsland ? null : now[spec.champ] ?? null;
-      if (before !== null && sameValue(p.valeur, before)) same.push({ cle: p.cle, champ: spec.champ, label, valeur: p.valeur, unite: spec.unite ?? "" });
-      else changes.push({ cle: p.cle, champ: spec.champ, label, avant: before, apres: p.valeur, unite: spec.unite ?? "" });
+    for (const { p, spec } of wanted) {
+      // On another island, the values of its route (its finishing too) are new: compared with nothing.
+      const before = newIsland && (spec.ilot || spec.type === "finition") ? null : now[spec.champ] ?? null;
+      const x = { cle: p.cle, champ: spec.champ, label: spec.label, unite: spec.unite ?? "" };
+      if (before !== null && sameValue(p.valeur, before)) same.push({ ...x, valeur: p.valeur });
+      else changes.push({ ...x, avant: before, apres: p.valeur });
     }
-    const out = { piece: name, key: r.piece.key, applied: changes, same, refused };
+    // What the changes bring with them: the island imposed for a value of its route (as "Retenir" does), its
+    // finishing; the values of the route typed before, for another island or unused while it was automatic, reset.
+    const imposing = !newIsland && !r.chosen && changes.some((x) => PROPOSAL_FIELDS[x.cle].ilot);
+    const islandSet = newIsland || imposing;
+    const proposed = new Set(changes.map((x) => x.champ));
+    const finitionProposed = wanted.find((w) => w.spec.type === "finition")?.p.valeur ?? null;
+    const consequences = [];
+    if (imposing) consequences.push({ cle: "piece.ilot", champ: "procede", label: "procédé / îlot", avant: "automatique", apres: `${island} imposé`, unite: "" });
+    if (islandSet && finitionProposed === null) consequences.push({ cle: "piece.finition", champ: "finition", label: "finition", avant: now.finition, apres: newIsland ? "automatique" : `${r.route.finition} imposée`, unite: "" });
+    if (islandSet) for (const champ of ROUTE_FIELDS) if ((i[champ] ?? null) !== null && !proposed.has(champ)) consequences.push({ cle: "piece.ilot", champ, label: Object.values(PROPOSAL_FIELDS).find((f) => f.champ === champ).label, avant: i[champ], apres: null, unite: Object.values(PROPOSAL_FIELDS).find((f) => f.champ === champ).unite ?? "" });
+    const out = { piece: name, key: r.piece.key, applied: changes, consequences, same, refused };
     if (dryRun || !changes.length) return out;
 
-    // Written: the inputs of the piece, each with what was there before (kept from a first application).
+    // Written: the inputs of the piece, each with what was there before; a second application keeps what was there
+    // before the first, for a value of a route only on the same island.
     const piece = pieceStore(r.piece.key);
     const record = (piece.valeursIA ??= {});
     const date = origin.date ?? new Date().toISOString();
-    const write = (champ, valeur, cle) => {
+    const procede = islandSet ? island : piece.procede ?? "auto";
+    const write = (champ, valeur, cle, extra = {}) => {
       const was = record[champ];
-      const avant = was && sameValue(piece[champ] ?? null, was.valeur) ? was.avant : piece[champ] ?? null;
-      record[champ] = { valeur, avant, date, provider: origin.provider ?? null, model: origin.model ?? null, message: origin.message ?? null, cle };
+      // Not from a value reset by another island: what was there before was for that one.
+      const keep = was && sameValue(piece[champ] ?? null, was.valeur) && (!["procede", "finition", ...ROUTE_FIELDS].includes(champ) || (was.procede === procede && was.cle !== "piece.ilot"));
+      record[champ] = { valeur, avant: keep ? was.avant : piece[champ] ?? null, procede, date, provider: origin.provider ?? null, model: origin.model ?? null, message: origin.message ?? null, cle, ...extra };
       piece[champ] = valeur;
     };
-    const imposing = changes.some((x) => PROPOSAL_FIELDS[x.cle].ilot) && !r.chosen;
-    if (newIsland || imposing) {
-      // The island imposed (as "Retenir" does), its finishing the one proposed or the best one.
+    if (islandSet) {
       write("procede", island, "piece.ilot");
-      const finition = changes.find((x) => x.champ === "finition")?.apres ?? (newIsland ? "auto" : r.route.finition);
-      write("finition", finition, "piece.finition");
-      if (newIsland) for (const champ of ["cycle", "empreintes", "miseAuMille", "mode"]) if ((piece[champ] ?? null) !== null) write(champ, null, "piece.ilot");
+      write("finition", finitionProposed ?? (newIsland ? "auto" : r.route.finition), "piece.finition");
+      for (const champ of ROUTE_FIELDS) if ((piece[champ] ?? null) !== null && !proposed.has(champ)) write(champ, null, "piece.ilot");
     }
-    for (const x of changes) if (!["procede", "finition"].includes(x.champ) || !(newIsland || imposing)) write(x.champ, x.apres, x.cle);
-    // Cores checked: a first core to describe, as the casting card does.
-    if (piece.noyaux && !piece.cores?.length) piece.cores = [{ ...newCore(0, r.part.poids ?? 0), ...(piece.sableKg > 0 ? { masse: piece.sableKg } : {}) }];
+    for (const x of changes) {
+      if (islandSet && ["procede", "finition"].includes(x.champ)) continue;
+      // An adopted estimate of the cycle replaced: kept with the record, back with an undo.
+      write(x.champ, x.apres, x.cle, x.champ === "cycle" && piece.cycleIA ? { cycleIA: piece.cycleIA } : {});
+    }
+    // Cores checked by this application: a first core to describe, as the casting card does (taken back with an undo).
+    if (changes.some((x) => x.champ === "noyaux" && x.apres === true) && !piece.cores?.length) {
+      piece.cores = [{ ...newCore(0, r.part.poids ?? 0), ...(piece.sableKg > 0 ? { masse: piece.sableKg } : {}) }];
+      record.noyaux.cores = structuredClone(piece.cores);
+    }
     forgetAdoption(piece);
-    const list = changes.map((x) => `${x.label} : ${valueLabel(x.avant, x.unite)} → ${valueLabel(x.apres, x.unite)}`).join(" ; ");
+    const list = [...changes, ...consequences].map(changeText).join(" ; ");
     q.analysesIA = [...(q.analysesIA ?? []), { date, provider: origin.provider ?? null, model: origin.model ?? null, question: "Appliquer les valeurs au chiffrage", answer: `Appliqué à « ${name} » : ${list}.`, verified: true, tache: "application_ia" }];
     out.saved = store.saveQuote(q) !== false;
     message = { kind: "ok", text: `Valeurs proposées par l'IA appliquées à « ${name} » (page IA / analyse) : ${list}. Elles sont saisies dans le devis ; « Annuler l'application » dans la page IA les retire.` };
@@ -261,7 +290,9 @@ export function applyAIValues(target, proposals, origin = {}, { dryRun = false }
  * The values applied from the AI to one piece (applyAIValues) taken back:
  * those of the answer `message` (all of them without one) that are still as
  * applied come back to what was there before; one changed since by a person
- * is left. Returns {piece, undone: [{champ, label, avant, apres}], kept: [labels], saved}, or {error}.
+ * is left. The island comes back only with the values of its route: when one
+ * of them changed since (typed, an estimate adopted), the island and its
+ * route stay as they are. Returns {piece, undone: [{champ, label, avant, apres}], kept: [labels], saved}, or {error}.
  */
 export function undoAIValues(target, { message: answer = null } = {}) {
   const error = quoteOfTab(target.tab);
@@ -271,22 +302,37 @@ export function undoAIValues(target, { message: answer = null } = {}) {
   const entries = Object.entries(record ?? {}).filter(([, a]) => !answer || a.message === answer);
   if (!entries.length) return { error: "Aucune valeur appliquée depuis l'IA à annuler pour cette pièce." };
   const fieldOf = (champ) => Object.values(PROPOSAL_FIELDS).find((f) => f.champ === champ);
+  const json = (v) => JSON.stringify(v ?? null);
+  const islandBack = entries.some(([champ]) => champ === "procede");
+  const routeChanged = islandBack && (ROUTE_FIELDS.some((c) => (record[c] ? !sameValue(piece[c] ?? null, record[c].valeur) : (piece[c] ?? null) !== null))
+    || (!!piece.cycleIA && json(piece.cycleIA) !== json(record.cycle?.cycleIA)));
+  const procede = piece.procede ?? "auto";
   const undone = [];
   const kept = [];
   for (const [champ, a] of entries) {
     const label = fieldOf(champ)?.label ?? champ;
-    if (sameValue(piece[champ] ?? null, a.valeur)) {
-      // Nothing there before: the input of the piece by default again (from the 3D model, estimated, "auto").
-      if (a.avant === null) delete piece[champ];
-      else piece[champ] = a.avant;
-      undone.push({ champ, label, avant: a.valeur, apres: a.avant, unite: fieldOf(champ)?.unite ?? "" });
-    } else kept.push(label);
     delete record[champ];
+    // A value of a route applied for an island the piece is no longer on (another island chosen since): left.
+    const moved = ["finition", ...ROUTE_FIELDS].includes(champ) && a.procede !== undefined && procede !== a.procede;
+    if (moved || (routeChanged && ["procede", "finition", ...ROUTE_FIELDS].includes(champ))) {
+      kept.push(label);
+      continue;
+    }
+    if (!sameValue(piece[champ] ?? null, a.valeur)) {
+      kept.push(label);
+      continue;
+    }
+    // Nothing there before: the input of the piece by default again (from the 3D model, estimated, "auto").
+    if (a.avant === null) delete piece[champ];
+    else piece[champ] = a.avant;
+    if (champ === "cycle" && a.cycleIA) piece.cycleIA = a.cycleIA;
+    if (champ === "noyaux" && a.cores && json(piece.cores) === json(a.cores)) delete piece.cores;
+    undone.push({ champ, label, avant: a.valeur, apres: a.avant, unite: fieldOf(champ)?.unite ?? "" });
   }
   if (!Object.keys(record).length) delete piece.valeursIA;
   forgetAdoption(piece);
   const name = target.name ?? target.key;
-  const list = undone.map((x) => `${x.label} : ${valueLabel(x.avant, x.unite)} → ${valueLabel(x.apres, x.unite)}`).join(" ; ");
+  const list = undone.map(changeText).join(" ; ");
   q.analysesIA = [...(q.analysesIA ?? []), { date: new Date().toISOString(), provider: null, model: null, question: "Annuler l'application des valeurs de l'IA", answer: `Annulé pour « ${name} » : ${list || "aucune valeur (modifiées depuis)"}.`, verified: true, tache: "application_ia" }];
   const saved = store.saveQuote(q) !== false;
   message = { kind: "ok", text: `Application des valeurs de l'IA annulée pour « ${name} »${list ? ` : ${list}` : ""}.${kept.length ? ` Modifiées depuis, gardées : ${kept.join(", ")}.` : ""}` };
@@ -294,11 +340,18 @@ export function undoAIValues(target, { message: answer = null } = {}) {
   return { piece: name, undone, kept, saved };
 }
 
-/** The values applied from the AI to a piece (`piece`: its inputs saved) forgotten once a person changed them. */
+/**
+ * The values applied from the AI to a piece (`piece`: its inputs saved)
+ * forgotten once a person changed them; those of a casting route also once
+ * the piece is on another island than the one they were applied for.
+ */
 function forgetAIValues(piece) {
   const record = piece.valeursIA;
   if (!record) return;
-  for (const [champ, a] of Object.entries(record)) if (!sameValue(piece[champ] ?? null, a.valeur)) delete record[champ];
+  for (const [champ, a] of Object.entries(record)) {
+    const moved = ["finition", ...ROUTE_FIELDS].includes(champ) && a.procede !== undefined && (piece.procede ?? "auto") !== a.procede;
+    if (moved || !sameValue(piece[champ] ?? null, a.valeur)) delete record[champ];
+  }
   if (!Object.keys(record).length) delete piece.valeursIA;
 }
 
