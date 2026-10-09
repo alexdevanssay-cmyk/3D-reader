@@ -5,9 +5,11 @@
 // part are also written in a folder of the company network chosen once
 // ("Historique réseau", File System Access API: Chrome or Edge), one JSON file
 // per part, merged message by message: two PCs writing about the same part
-// keep both their messages. A part is known by the SHA-256 of its file
-// (app.js tab.part, "sha256:<hex>"): the same file, under any name, finds its
-// conversations; another version of it is another part.
+// keep both their messages (each one reads the file again after writing it,
+// and writes again what the other one's write left out). A part is known by
+// the SHA-256 of its file (app.js tab.part, "sha256:<hex>"): the same file,
+// under any name, finds its conversations; another version of it is another
+// part.
 //
 // Nothing here goes online: the conversations hold the real names of the
 // parts and of the quote (the names are replaced only in what is sent to the
@@ -44,26 +46,47 @@ const text = (v) => (typeof v === "string" ? v : null);
 const time = (v) => (typeof v === "string" && Number.isFinite(Date.parse(v)) ? v : null);
 
 /**
+ * A message as it is kept: its known fields, of their types (a file of the
+ * network folder may come from another version of the page, or be edited).
+ */
+function cleanMessage(m, id, date) {
+  const out = { id, role: m.role, content: m.content, date };
+  if (time(m.answered)) out.answered = m.answered;
+  for (const k of ["provider", "model", "gateway", "notice"]) if (typeof m[k] === "string") out[k] = m[k];
+  for (const k of ["local", "amounts"]) if (m[k] === true) out[k] = true;
+  const c = m.costing;
+  if (c && typeof c === "object" && Array.isArray(c.inconnus)) {
+    out.costing = { verifiee: c.verifiee === true, nombres: Number.isFinite(c.nombres) ? c.nombres : 0, inconnus: c.inconnus.filter((x) => typeof x === "string") };
+  }
+  if (Array.isArray(m.numbers)) out.numbers = m.numbers.filter((x) => typeof x === "string");
+  if (Array.isArray(m.names)) out.names = m.names.filter((n) => Array.isArray(n) && n.length === 2 && n.every((x) => typeof x === "string"));
+  return out;
+}
+
+/**
  * A conversation as it is kept, from what was stored (this browser, a file of
  * the network folder, a version of the page before): {id, part: {id, file} |
  * null, file, started, updated, messages, names}. Every message has an id and
- * a date (`at`: when it was written, else when the conversation was); a
+ * a date (`at`: when it was written, else when the conversation started); a
  * question and its answer share the date of the question, so that a merge
- * never parts them. Null when it is not a conversation.
+ * never parts them. The messages of a version before, without id, get the
+ * same ones at every reading ("<conversation>:<rank>"): two copies of them
+ * merge. Null when it is not a conversation.
  */
 export function normalizeConversation(data, at = new Date().toISOString()) {
   if (!data || typeof data !== "object" || !Array.isArray(data.messages)) return null;
   const part = data.part && typeof data.part.id === "string" ? { id: data.part.id, file: text(data.part.file) } : null;
-  const fallback = time(data.updated) ?? time(data.started) ?? at;
+  const id = text(data.id) ?? newId();
+  const fallback = time(data.started) ?? time(data.updated) ?? at;
   let asked = fallback;
   const messages = data.messages
     .filter((m) => m && typeof m === "object" && typeof m.content === "string" && ["user", "assistant"].includes(m.role))
-    .map((m) => {
+    .map((m, i) => {
       if (m.role === "user") asked = time(m.date) ?? fallback;
-      return { ...m, id: text(m.id) ?? newId(), date: time(m.date) ?? asked };
+      return cleanMessage(m, text(m.id) ?? `${id}:${i}`, time(m.date) ?? asked);
     });
   return {
-    id: text(data.id) ?? newId(),
+    id,
     part,
     file: text(data.file) ?? part?.file ?? null,
     started: time(data.started) ?? messages[0]?.date ?? fallback,
@@ -74,9 +97,9 @@ export function normalizeConversation(data, at = new Date().toISOString()) {
 }
 
 /**
- * Two copies of a conversation as one (this PC's and the network's): every
- * message of both once (by its id), in the order of their dates (a question
- * then its answer), the names of both. `a` gives the rest (the newer one).
+ * Two copies of a conversation as one (this PC's and the network's, two tabs'):
+ * every message of both once (by its id), in the order of their dates (a
+ * question then its answer), the names of both. `a` gives the rest (the newer one).
  */
 export function mergeConversation(a, b) {
   if (!a || !b) return a ?? b ?? null;
@@ -127,57 +150,76 @@ const request = (req) => new Promise((resolve, reject) => {
   req.onerror = () => reject(req.error);
 });
 
-async function store(name, mode = "readonly") {
-  return (await db()).transaction(name, mode).objectStore(name);
+async function store(name) {
+  return (await db()).transaction(name, "readonly").objectStore(name);
 }
 
-/** Change the record `id` of this browser in one transaction (`change(record or undefined)`: the record to put, or null). */
-async function update(id, change) {
-  const tx = (await db()).transaction(CONVERSATIONS, "readwrite");
-  const conversations = tx.objectStore(CONVERSATIONS);
+/**
+ * Change the store `name` in one transaction (`act(store)`, its requests
+ * made at once; its result given back): done once the transaction is
+ * committed (a quota exceeded fails then, not when the request succeeds).
+ */
+async function write(name, act) {
+  const tx = (await db()).transaction(name, "readwrite");
   let out = null;
   return new Promise((resolve, reject) => {
-    const get = conversations.get(id);
-    get.onsuccess = () => {
-      out = change(get.result);
-      if (out) conversations.put(out);
-    };
+    out = act(tx.objectStore(name), (value) => (out = value));
     tx.oncomplete = () => resolve(out);
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error ?? new Error("historique : écriture annulée"));
   });
 }
 
-/** Keep a conversation in this browser, as it is now (when it was last written in the network folder kept). */
-export async function saveLocal(conversation) {
-  const record = { ...normalizeConversation(conversation), part_id: conversation.part?.id ?? "" };
-  return update(record.id, (kept) => ({ ...record, synced: kept?.synced ?? null }));
+/** Change the record `id` of this browser (`change(record or undefined)`: the record to put, or null). */
+function update(id, change) {
+  return write(CONVERSATIONS, (conversations, result) => {
+    const get = conversations.get(id);
+    get.onsuccess = () => {
+      const out = change(get.result);
+      result(out);
+      if (out) conversations.put(out);
+    };
+  });
 }
 
-/** The conversation `id` of this browser written in the network folder as it was at `updated`. */
-export async function markSynced(id, updated) {
-  return update(id, (kept) => (kept ? { ...kept, synced: updated } : null));
+/**
+ * Keep a conversation in this browser, merged with what is kept of it (the
+ * same conversation may be continued in two tabs or two windows: the
+ * messages of both stay). Resolves to the record kept.
+ */
+export async function saveLocal(conversation) {
+  const record = normalizeConversation(conversation);
+  return update(record.id, (kept) => {
+    const merged = mergeConversation(record, kept ? normalizeConversation(kept) : null);
+    return { ...merged, part_id: merged.part?.id ?? "", synced: kept?.synced ?? null };
+  });
 }
+
+/** The conversation `id` of this browser written in the network folder as it was at `updated` (not when it changed since). */
+export async function markSynced(id, updated) {
+  return update(id, (kept) => (kept && Date.parse(kept.updated) <= Date.parse(updated) ? { ...kept, synced: updated } : null));
+}
+
+const fromRecord = (r) => ({ ...normalizeConversation(r), synced: r.synced ?? null });
+const latestFirst = (a, b) => Date.parse(b.updated) - Date.parse(a.updated);
 
 export async function getLocal(id) {
   const record = await request((await store(CONVERSATIONS)).get(id));
-  return record ? { ...normalizeConversation(record), synced: record.synced ?? null } : null;
+  return record ? fromRecord(record) : null;
 }
 
 /** The conversations of this browser, the latest first. */
 export async function listLocal() {
-  const all = await request((await store(CONVERSATIONS)).getAll());
-  return all.map((r) => ({ ...normalizeConversation(r), synced: r.synced ?? null })).filter((c) => c.id).sort((a, b) => Date.parse(b.updated) - Date.parse(a.updated));
+  return (await request((await store(CONVERSATIONS)).getAll())).map(fromRecord).sort(latestFirst);
 }
 
 /** The conversations of this browser about the part `partId`, the latest first. */
 export async function localFor(partId) {
-  const all = await request((await store(CONVERSATIONS)).index("part").getAll(partId));
-  return all.map((r) => ({ ...normalizeConversation(r), synced: r.synced ?? null })).sort((a, b) => Date.parse(b.updated) - Date.parse(a.updated));
+  return (await request((await store(CONVERSATIONS)).index("part").getAll(partId))).map(fromRecord).sort(latestFirst);
 }
 
 export async function deleteLocal(id) {
-  await request((await store(CONVERSATIONS, "readwrite")).delete(id));
+  await write(CONVERSATIONS, (conversations) => void conversations.delete(id));
 }
 
 async function setting(key) {
@@ -185,8 +227,7 @@ async function setting(key) {
 }
 
 async function setSetting(key, value) {
-  const s = await store(SETTINGS, "readwrite");
-  await request(value == null ? s.delete(key) : s.put(value, key));
+  await write(SETTINGS, (settings) => void (value == null ? settings.delete(key) : settings.put(value, key)));
 }
 
 // --------------------------------------------------------------------------- the network folder
@@ -213,6 +254,13 @@ export function parsePartFile(json) {
   return { part, conversations };
 }
 
+/** Conversations of several copies as one list: each conversation once (merged by its id). */
+function mergeAll(conversations) {
+  const byId = new Map();
+  for (const c of conversations) byId.set(c.id, mergeConversation(byId.get(c.id), c));
+  return [...byId.values()];
+}
+
 /** The file of a part with `conversation` in it, merged with what the file held (`existing`, parsePartFile). */
 export function mergePartFile(existing, conversation) {
   const conversations = [...(existing?.conversations ?? [])];
@@ -230,41 +278,16 @@ export function mergePartFile(existing, conversation) {
   };
 }
 
-const notFound = (err) => err?.name === "NotFoundError" || err?.name === "TypeMismatchError";
 // A file being written (by this PC or another one): missing or unreadable for a moment.
 const busyFile = (err) => ["NotFoundError", "NotReadableError", "InvalidStateError"].includes(err?.name);
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const TRIES = 4;
 
-/** The file of the part `part` in the folder `dir`: its handle, found by its hash whatever the file's name; null when none. */
-async function partFileHandle(dir, part) {
-  const name = partFileName(part);
-  if (!name) return null;
-  try {
-    return await dir.getFileHandle(name);
-  } catch (err) {
-    if (!notFound(err)) throw err;
-  }
-  const suffix = name.slice(name.lastIndexOf("__"));
-  for await (const entry of dir.values()) if (entry.kind === "file" && entry.name.endsWith(suffix)) return entry;
-  return null;
-}
-
-/**
- * The file of the part `part` in the folder `dir`, read: {handle (null: no
- * file yet), existing (parsePartFile; null: empty)}. A file being written,
- * by this PC or another one, is read again a moment later; one that stays
- * unreadable is an error, so that it is never replaced by this PC's copy
- * alone (the conversations of the others would be lost).
- */
-async function readPart(dir, part) {
+/** The text of the file `handle`, read again a moment later while it is being written. */
+async function readText(handle) {
   for (let i = 1; ; i++) {
     try {
-      const handle = await partFileHandle(dir, part);
-      const text = handle ? await (await handle.getFile()).text() : "";
-      const existing = text.trim() ? parsePartFile(text) : null;
-      if (!text.trim() || existing) return { handle, existing };
-      if (i >= TRIES) throw new Error(`le fichier « ${handle.name} » n'est pas un historique lisible : il n'est pas remplacé`);
+      return await (await handle.getFile()).text();
     } catch (err) {
       if (i >= TRIES || !busyFile(err)) throw err;
     }
@@ -272,21 +295,68 @@ async function readPart(dir, part) {
   }
 }
 
+/**
+ * The files of the part `part` in the folder `dir`: its own name first, then
+ * the others of its hash (the part written under another of its names, by
+ * another PC); Chrome's .crswap files of a write in progress left out.
+ */
+async function partFiles(dir, part) {
+  const name = partFileName(part);
+  const suffix = name.slice(name.lastIndexOf("__"));
+  const out = [];
+  for await (const entry of dir.values()) if (entry.kind === "file" && entry.name.endsWith(suffix)) out.push(entry);
+  return out.sort((a, b) => (a.name === name ? -1 : b.name === name ? 1 : a.name.localeCompare(b.name)));
+}
+
+/**
+ * The files of the part `part` in the folder `dir`, read: {handles,
+ * existing (their conversations merged; null: none, or empty)}. A file that
+ * stays unreadable is an error: it is never replaced by this PC's copy alone
+ * (the conversations of the others would be lost).
+ */
+async function readPart(dir, part) {
+  const handles = await partFiles(dir, part);
+  const conversations = [];
+  for (const handle of handles) {
+    let parsed = null;
+    for (let i = 1; ; i++) {
+      const content = await readText(handle);
+      if (!content.trim()) break; // created, not written yet: nothing to keep
+      parsed = parsePartFile(content);
+      if (parsed) break;
+      if (i >= TRIES) throw new Error(`le fichier « ${handle.name} » n'est pas un historique lisible : il n'est pas remplacé`);
+      await pause(100 * i);
+    }
+    if (parsed) conversations.push(...parsed.conversations);
+  }
+  return { handles, existing: conversations.length ? { part, conversations: mergeAll(conversations) } : null };
+}
+
 /** The conversations of the part `part` kept in the folder `dir` ([] when none). */
 export async function readPartFile(dir, part) {
   return (await readPart(dir, part)).existing?.conversations ?? [];
 }
 
-/** Write `conversation` (about a part) in the folder `dir`, merged with what its part's file holds. */
+/**
+ * Write `conversation` (about a part) in the folder `dir`, merged with what
+ * its part's files hold. Read again once written: another PC writing the
+ * same file at the same moment may have replaced it (the last write wins);
+ * written again then, merged with what it wrote. Resolves to false for a part
+ * not known by its file's hash (not written).
+ */
 export async function writePartFile(dir, conversation) {
   if (!partHash(conversation.part)) return false;
-  const { handle, existing } = await readPart(dir, conversation.part);
-  const doc = mergePartFile(existing, conversation);
-  const target = handle ?? (await dir.getFileHandle(partFileName(conversation.part), { create: true }));
-  const writable = await target.createWritable();
-  await writable.write(JSON.stringify(doc, null, 1));
-  await writable.close();
-  return true;
+  for (let attempt = 1; ; attempt++) {
+    const { handles, existing } = await readPart(dir, conversation.part);
+    const target = handles[0] ?? (await dir.getFileHandle(partFileName(conversation.part), { create: true }));
+    const writable = await target.createWritable();
+    await writable.write(JSON.stringify(mergePartFile(existing, conversation), null, 1));
+    await writable.close();
+    const back = parsePartFile(await readText(target).catch(() => ""))?.conversations.find((c) => c.id === conversation.id);
+    if (back && conversation.messages.every((m) => back.messages.some((k) => k.id === m.id))) return true;
+    if (attempt >= TRIES) throw new Error("le fichier de la pièce est écrit en même temps par un autre poste : réessayé plus tard");
+    await pause(150 * attempt + Math.random() * 300);
+  }
 }
 
 /** Every conversation of the folder `dir`, the latest first ({...conversation, part}); the files that are not of this history are left. */
@@ -294,19 +364,14 @@ export async function listFolder(dir) {
   const out = [];
   for await (const entry of dir.values()) {
     if (entry.kind !== "file" || !entry.name.endsWith(".json")) continue;
-    for (let i = 1; i <= TRIES; i++) {
-      try {
-        const parsed = parsePartFile(await (await entry.getFile()).text());
-        if (parsed) out.push(...parsed.conversations);
-        break;
-      } catch (err) {
-        // A file being written: read again a moment later; unreadable: the others are listed.
-        if (!busyFile(err)) break;
-        await pause(100 * i);
-      }
+    try {
+      const parsed = parsePartFile(await readText(entry));
+      if (parsed) out.push(...parsed.conversations);
+    } catch {
+      // unreadable: the others are listed
     }
   }
-  return out.sort((a, b) => Date.parse(b.updated) - Date.parse(a.updated));
+  return mergeAll(out).sort(latestFirst);
 }
 
 /** Whether this browser can open a folder (Chrome, Edge). */
@@ -343,19 +408,26 @@ export async function forgetNetworkFolder() {
 
 /**
  * Write in the network folder the conversations of this browser about a part
- * not written there since they changed. `all`: the conversations of before
- * the folder was chosen too (else they are marked as written, and stay here).
+ * not written there since they changed (`force`: all of them, another folder
+ * chosen). `all`: the conversations of before the folder was chosen too (else
+ * they are marked as written, and stay here). One that cannot be written is
+ * left for the next time; the others are written. Resolves to {written, failed}.
  */
-export async function syncFolder(dir, { all = true } = {}) {
+export async function syncFolder(dir, { all = true, force = false } = {}) {
   let written = 0;
+  let failed = 0;
   for (const { id } of await listLocal()) {
     const c = await getLocal(id); // as it is now: an answer may have come since the list
-    if (!c || !partHash(c.part) || (c.synced && Date.parse(c.synced) >= Date.parse(c.updated))) continue;
-    if (all) {
-      await writePartFile(dir, c);
-      written++;
+    if (!c || !partHash(c.part) || (!force && c.synced && Date.parse(c.synced) >= Date.parse(c.updated))) continue;
+    try {
+      if (all) {
+        await writePartFile(dir, c);
+        written++;
+      }
+      await markSynced(c.id, c.updated);
+    } catch {
+      failed++;
     }
-    await markSynced(c.id, c.updated);
   }
-  return written;
+  return { written, failed };
 }

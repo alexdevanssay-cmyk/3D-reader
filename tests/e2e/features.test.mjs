@@ -973,7 +973,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       await page.waitForFunction(() => /^Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
       assert.equal(completions.length, n + 1);
     };
-    const items = (list) => page.$$eval(`#ai-hist-list-${list} .ai-hist-item`, (els) => els.map((li) => [li.querySelector('.ai-hist-part').textContent, li.querySelector('.ai-hist-meta').textContent.replace(/^.* · /, ''), li.querySelector('.ai-hist-q').textContent]));
+    const items = (list) => page.$$eval(`#ai-hist-list-${list} .ai-hist-item`, (els) => els.map((li) => [li.querySelector('.ai-hist-part').textContent, /\d+ messages?/.exec(li.querySelector('.ai-hist-meta').textContent)[0], li.querySelector('.ai-hist-q').textContent]));
     // Its .json files (Chrome writes each through a .crswap file of its own, there for a moment), read once written.
     const folderFiles = () => page.evaluate(async () => {
       for (let i = 0; ; i++) {
@@ -1041,25 +1041,49 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.waitForFunction(() => document.querySelectorAll('#ai-chat .ai-msg').length === 4, null, { timeout: 10_000 });
     assert.match(await page.textContent('#ai-chat'), /Quel volume \?[\s\S]*Et sa masse \?/);
 
+    // The same part under another name (renamed, downloaded again): its conversation goes on, kept and sent.
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', { name: 'box (1).stl', mimeType: 'application/octet-stream', buffer: readFileSync(fixturePath('box.stl')) });
+    await page.waitForFunction(() => window.reader3d.tab.file === 'box (1).stl' && document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.click('.tab[data-page="ia"]');
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 4);
+    await ask('Et sa surface ?');
+    assert.deepEqual(completions.at(-1).messages.slice(2).map((m) => m.content), ['Quel volume ?', 'Réponse 1.', 'Et sa masse ?', 'Réponse 2.', 'Et sa surface ?']);
+    await page.waitForFunction(() => /6 messages/.test(document.querySelector('#ai-hist-list-reseau .ai-hist-item .ai-hist-meta')?.textContent), null, { timeout: 10_000 });
+    // The same part opened in a second tab: a conversation of its own there, not the same one twice.
+    await page.click('.doc-tab-new');
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => window.reader3d.tab.id === 2 && document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.click('.tab[data-page="ia"]');
+    await page.waitForTimeout(500); // the history read for the part
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 0);
+    await page.click('.doc-tab:nth-child(2) .doc-tab-close');
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 6);
+
     // A new conversation; the one before, clicked in the history: a tab of its own, its model not open.
     await page.click('#ai-clear');
     await ask('Une autre question ?');
     await page.click('#ai-hist-tab-local');
     await page.waitForFunction(() => document.querySelectorAll('#ai-hist-list-local .ai-hist-item').length === 2, null, { timeout: 10_000 });
-    assert.deepEqual(await items('local'), [['box', '2 messages', '« Une autre question ? »'], ['box', '4 messages', '« Quel volume ? »']]);
+    // Under the name the part was last opened under.
+    assert.deepEqual(await items('local'), [['box (1)', '2 messages', '« Une autre question ? »'], ['box (1)', '6 messages', '« Quel volume ? »']]);
+    assert.equal(await page.getAttribute('#ai-hist-list-local .ai-hist-item:nth-child(1) .ai-hist-open', 'aria-current'), 'true');
     await page.click('#ai-hist-list-local .ai-hist-item:nth-child(2) .ai-hist-open');
-    await page.waitForFunction(() => document.querySelectorAll('.doc-tab').length === 2 && window.reader3d.tab.id === 2, null, { timeout: 10_000 });
+    await page.waitForFunction(() => document.querySelectorAll('.doc-tab').length === 2 && window.reader3d.tab.id !== 1, null, { timeout: 10_000 });
+    const archiveTab = await page.evaluate(() => window.reader3d.tab.id);
     assert.equal(await page.isVisible('#page-ia'), true);
-    assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'box');
+    assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'box (1)');
     assert.equal(await page.getAttribute('.doc-tab.active', 'class'), 'doc-tab active chat-only');
-    assert.match(await page.getAttribute('.doc-tab.active', 'title'), /^box\.stl : discussion de l'historique, modèle non ouvert/);
+    assert.match(await page.getAttribute('.doc-tab.active', 'title'), /^box \(1\)\.stl : discussion de l'historique, modèle non ouvert/);
     assert.equal(await page.evaluate(() => [window.reader3d.status, window.reader3d.result]).then(([s, r]) => `${s} ${r}`), 'idle null');
-    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 4);
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 6);
+    assert.equal(await page.evaluate(() => document.activeElement.id), 'ai-input');
     assert.equal(await page.textContent('#ai-scope'), 'Aucune pièce ouverte : questions générales seulement.');
     // Clicked again: the tab that shows it, not another one.
     await page.click('.doc-tab:first-child');
     await page.click('#ai-hist-list-local .ai-hist-item:nth-child(2) .ai-hist-open');
-    await page.waitForFunction(() => window.reader3d.tab.id === 2, null, { timeout: 10_000 });
+    await page.waitForFunction((id) => window.reader3d.tab.id === id, archiveTab, { timeout: 10_000 });
     assert.equal(await page.locator('.doc-tab').count(), 2);
 
     // After a reload: the history of this PC and the folder still there (this folder: its access kept).

@@ -455,11 +455,14 @@ async function openFile(file, { refresh = false, handle = null, close = false, t
   try {
     data = currentEngine() === "server" ? await analyzeOnServer(file, tab) : await analyzeInBrowser(file, { refresh, close, tab });
     if (seq !== tab.seq) return;
+    // The part's identity before the tab shows the file: the IA page knows its conversations by it.
+    const partId = await partIdFor(file, data);
+    if (seq !== tab.seq) return;
     // Only now does the tab show this file (a failed file leaves the previous one).
     tab.handle = handle ?? (file === tab.file ? tab.handle : null);
     tab.file = file;
     tab.result = data;
-    identifyPart(tab, file, data);
+    tab.part = { id: partId, file: file.name };
     if (!shown()) {
       // Opened in a tab not shown: its model is built when the tab is shown.
       if (tab.view) disposeObjects(tab.view.meshes);
@@ -1814,23 +1817,14 @@ function cancelTab(tab) {
 }
 
 /**
- * The part a tab shows, for the history of the IA page (ai-history.js): {id:
- * "sha256:<hex>" of its file, file: its name}. The hash the browser's analysis
- * read the file by (its result's cacheKey), else computed (server engine, a
- * page without crypto.subtle): the IA page is told when it is known.
+ * The id of the part a file holds, for the history of the IA page
+ * (ai-history.js): "sha256:<hex>" of the file, as the browser's analysis read
+ * it (its result's cacheKey), else computed (server engine).
  */
-function identifyPart(tab, file, data) {
+async function partIdFor(file, data) {
   const hash = /^\d+\|([0-9a-f]{64})\|/.exec(data?.cacheKey ?? "")?.[1];
-  tab.part = { id: hash ? `sha256:${hash}` : null, file: file.name };
-  if (hash) return;
-  import("./ai-history.js")
-    .then(({ partIdOf }) => partIdOf(file))
-    .then((id) => {
-      if (tab.file !== file) return; // another file opened since
-      tab.part = { id, file: file.name };
-      if (tab === activeTab) document.dispatchEvent(new CustomEvent("reader3d-part"));
-    })
-    .catch(() => {});
+  if (hash) return `sha256:${hash}`;
+  return import("./ai-history.js").then(({ partIdOf }) => partIdOf(file)).catch(() => null);
 }
 
 /** Close a tab: its model and its quote are forgotten. */

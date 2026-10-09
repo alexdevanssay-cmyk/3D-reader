@@ -349,7 +349,7 @@ table.bodies .open { color: var(--warn); }
 .ai-page { max-width: 1400px; height: 100%; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) 300px; grid-template-rows: minmax(0, 1fr); gap: 16px; }
 .ai-main { display: flex; flex-direction: column; gap: 16px; min-width: 0; min-height: 0; }
 .ai-settings { flex: none; }
-.ai-convo { flex: 1 1 auto; min-height: 300px; display: flex; flex-direction: column; }
+.ai-convo { flex: 1 1 auto; min-height: 200px; display: flex; flex-direction: column; }
 .ai-page h2 { margin: 0; font-size: 18px; }
 .ai-page .card-head { flex-wrap: wrap; gap: 4px 12px; }
 /* An answer written in Markdown, laid out (ai-workspace.js markdownToHtml). */
@@ -419,10 +419,11 @@ table.bodies .open { color: var(--warn); }
 .ai-hist-del { flex: none; padding: 0 8px; border: none; background: transparent; color: var(--muted); font-size: 16px; }
 .ai-hist-del:hover { color: var(--error-text); }
 .ai-hist-empty { padding: 4px 2px; font-size: 12px; color: var(--muted); }
-/* A narrow window: one column, the page scrolls (the conversation grows), the history under it. */
+/* A narrow window: one column, the page scrolls, the conversation in a box of its own (it follows the
+   answer as it is written), the history under it. */
 @media (max-width: 900px) {
   .ai-page { height: auto; grid-template-columns: minmax(0, 1fr); grid-template-rows: none; }
-  .ai-convo { min-height: 70vh; }
-  .ai-chat { flex: 1 1 auto; }
+  .ai-convo { min-height: 0; }
+  .ai-chat { flex: none; max-height: 65vh; }
   .ai-hist-list { flex: none; max-height: 50vh; }
 }

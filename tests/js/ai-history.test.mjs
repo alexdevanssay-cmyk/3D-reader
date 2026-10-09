@@ -113,3 +113,62 @@ test("a part's conversations written in the network folder, merged with what ano
   assert.equal((await listFolder(dir)).length, 3);
   assert.deepEqual(mergePartFile(null, conversation("c9", [])).conversations.map((c) => c.id), ["c9"]);
 });
+
+test("messages of an earlier version, without id: the same ids at every reading, before the questions asked since", () => {
+  const legacy = { id: "c1", started: "2026-10-09T09:00:00.000Z", updated: "2026-10-09T09:05:00.000Z", messages: [{ role: "user", content: "Ancienne" }, { role: "assistant", content: "R0" }, { id: "n1", role: "user", content: "Nouvelle", date: "2026-10-09T09:00:00.000Z" }, { id: "n2", role: "assistant", content: "R1", date: "2026-10-09T09:00:00.000Z" }] };
+  const a = normalizeConversation(legacy);
+  const b = normalizeConversation(legacy);
+  assert.deepEqual(a.messages.map((m) => m.id), ["c1:0", "c1:1", "n1", "n2"]);
+  assert.deepEqual(b, a);
+  // Merged with itself (this PC's and the folder's copies): each message once, the old exchange first.
+  assert.deepEqual(mergeConversation(a, b).messages.map((m) => m.content), ["Ancienne", "R0", "Nouvelle", "R1"]);
+});
+
+test("a message from the folder is kept with its known fields of their types only", () => {
+  const c = normalizeConversation({ id: "c", messages: [
+    { id: "1", role: "assistant", content: "x", date: "2026-10-09T10:00:00Z", costing: true, numbers: "12", names: [["Corps 1", "Carter"], ["bad"]], local: "yes", provider: "Groq", onclick: "alert(1)" },
+    { id: "2", role: "assistant", content: "y", date: "2026-10-09T10:00:00Z", costing: { verifiee: false, nombres: 2, inconnus: ["7,5", 3] }, numbers: ["9"] },
+  ] });
+  assert.deepEqual(c.messages[0], { id: "1", role: "assistant", content: "x", date: "2026-10-09T10:00:00Z", provider: "Groq", names: [["Corps 1", "Carter"]] });
+  assert.deepEqual(c.messages[1].costing, { verifiee: false, nombres: 2, inconnus: ["7,5"] });
+  assert.deepEqual(c.messages[1].numbers, ["9"]);
+});
+
+test("the network folder: a part written by two PCs at once keeps both; its files under two names read together; an unreadable one never replaced", async () => {
+  const dir = folder();
+  const name = partFileName(PART);
+  const theirs = conversation("theirs", [message("t1", "user", "Leur question", "2026-10-09T10:00:00Z"), message("t2", "assistant", "R", "2026-10-09T10:00:00Z")]);
+  // Another PC closes its write right after ours: its file, without our conversation, replaces ours once.
+  let raced = false;
+  const createWritable = dir.getFileHandle;
+  dir.getFileHandle = async (n, options) => {
+    const handle = await createWritable.call(dir, n, options);
+    const write = handle.createWritable;
+    handle.createWritable = async () => {
+      const w = await write.call(handle);
+      const close = w.close;
+      w.close = async () => {
+        await close();
+        if (!raced) {
+          raced = true;
+          dir.store.set(n, JSON.stringify(mergePartFile(null, theirs)));
+        }
+      };
+      return w;
+    };
+    return handle;
+  };
+  const mine = conversation("mine", [message("m1", "user", "Ma question", "2026-10-09T10:01:00Z"), message("m2", "assistant", "R", "2026-10-09T10:01:00Z")]);
+  assert.equal(await writePartFile(dir, mine), true);
+  assert.deepEqual(JSON.parse(dir.store.get(name)).conversations.map((c) => c.id), ["theirs", "mine"]);
+  // The same part written under another of its names by another PC: both files read, and listed once each.
+  dir.getFileHandle = createWritable;
+  const other = `Autre nom__${HASH.slice(0, 16)}.json`;
+  dir.store.set(other, JSON.stringify(mergePartFile(null, { ...theirs, messages: [...theirs.messages, message("t3", "user", "Suite", "2026-10-09T10:02:00Z")], updated: "2026-10-09T10:02:00Z" })));
+  assert.deepEqual((await readPartFile(dir, PART)).map((c) => [c.id, c.messages.length]).sort(), [["mine", 2], ["theirs", 3]]);
+  assert.deepEqual((await listFolder(dir)).map((c) => [c.id, c.messages.length]), [["theirs", 3], ["mine", 2]]);
+  // A file that does not read as a history (cut, edited): an error, and the file left as it is.
+  dir.store.set(name, "{ coupé");
+  await assert.rejects(writePartFile(dir, mine), /n'est pas un historique lisible/);
+  assert.equal(dir.store.get(name), "{ coupé");
+});

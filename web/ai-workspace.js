@@ -720,6 +720,7 @@ export function mount({ page, reader }) {
   let network = null;
   let networkNote = "";
   let networkList = [];
+  let networkBehind = true; // conversations of this PC may not be in the folder yet (written at the first write that works)
   let historyRead = 0;
 
   const provider = () => $("ai-provider").value;
@@ -867,9 +868,9 @@ export function mount({ page, reader }) {
    * from none of the data sent, the real names of the labels it writes.
    */
   function decorate(body, m) {
-    if (m.costing) showCheck(body, m.costing);
-    if (m.numbers?.length) line(body, "ai-numbers", numbersLabel(m.numbers)).title = m.numbers.join(" ; ");
-    if (m.names?.length) line(body, "ai-names", namesLine(m.names));
+    if (Array.isArray(m.costing?.inconnus)) showCheck(body, m.costing);
+    if (Array.isArray(m.numbers) && m.numbers.length) line(body, "ai-numbers", numbersLabel(m.numbers)).title = m.numbers.join(" ; ");
+    if (Array.isArray(m.names) && m.names.length) line(body, "ai-names", namesLine(m.names));
   }
 
   /** A message kept in a conversation, on screen. */
@@ -893,7 +894,10 @@ export function mount({ page, reader }) {
     const partId = tab.part?.id ?? null;
     if (shown?.key === key && shown.file === tab.file && shown.part === partId) return;
     let conversation = readConversation(key);
-    const other = partId && conversation.part ? conversation.part.id !== partId : !!(tab.file && conversation.file && conversation.file !== tab.file);
+    // Another part: by its id; a conversation of before, without one: by its file's name. The file's
+    // name alone does not tell another part from the same one renamed (its id coming).
+    const renamed = !!(tab.file && conversation.file && conversation.file !== tab.file);
+    const other = partId ? (conversation.part ? conversation.part.id !== partId : renamed) : !conversation.part && renamed;
     if (other) {
       // Its question in progress is about the part that was there: dropped (its conversation is in the history).
       if (pending?.key === key) {
@@ -901,6 +905,16 @@ export function mount({ page, reader }) {
         busy?.abort();
       }
       conversation = { ...conversation, id: null, part: null, started: null, updated: null, file: tab.file, messages: [], names: [] };
+      writeConversation(key, conversation);
+    }
+    if (partId && conversation.part?.id === partId && renamed) {
+      // The same part under another name (renamed, or opened from the history): its conversation goes on.
+      conversation = { ...conversation, file: tab.file };
+      writeConversation(key, conversation);
+    }
+    if (!tab.file && !partId && conversation.part && !conversation.messages.length) {
+      // A new conversation of a part no longer open (the page reloaded): not about it any more.
+      conversation = { ...conversation, id: null, part: null, file: null, names: [] };
       writeConversation(key, conversation);
     }
     if (partId && !conversation.part) {
@@ -916,7 +930,7 @@ export function mount({ page, reader }) {
     shown = { key, file: tab.file, part: partId };
     $("ai-chat").replaceChildren();
     for (const m of conversation.messages) showMessage(m);
-    if (pending?.key === key) $("ai-chat").append(...pending.nodes);
+    if (pending?.key === key && !pending.dropped) $("ai-chat").append(...pending.nodes);
     toEnd(true);
     showHistory();
   }
@@ -929,8 +943,12 @@ export function mount({ page, reader }) {
     const found = await latestOf(part).catch(() => null);
     if (token !== loading || !found) return;
     const now = readConversation(key);
-    // A question asked meanwhile, a new conversation, another part: left as they are.
+    // A question asked meanwhile, a new conversation, another part, the tab closed: left as they are.
     if (now.messages.length || now.part || pending?.key === key) return;
+    const tabs = reader.tabs ?? [];
+    if (tabs.find((t) => conversationKey(t.id) === key)?.part?.id !== part.id) return;
+    // Already shown in another tab (the part open twice): a conversation of its own here, not the same one twice.
+    if (tabs.some((t) => conversationKey(t.id) !== key && readConversation(conversationKey(t.id)).id === found.id)) return;
     const { synced, ...conversation } = found;
     writeConversation(key, { ...conversation, part, file: part.file ?? conversation.file });
     if (shown?.key === key) {
@@ -1351,14 +1369,18 @@ export function mount({ page, reader }) {
       };
       signal.throwIfAborted();
       decorate(answerBox, message);
+      toEnd();
       // Only answered questions are kept: a failed one is not sent again with the next. Not in a
-      // conversation started since (another part of the tab, a new conversation, one of the history).
+      // conversation started since (another part of the tab, a new conversation: the question dropped).
       const kept = readConversation(conv.key);
-      if (kept.id === conversation.id && !(kept.file && conv.file && kept.file !== conv.file)) {
+      if (!mine.dropped && kept.id === conversation.id) {
         const known = unionNames(quoteNames ? unionNames(kept.names, quoteNames) : kept.names, ofPart);
+        // The part known since the question was asked (its file opened meanwhile): the conversation is about it.
+        const here = reader.tab?.id === tabId ? reader.tab.part : null;
+        const part = kept.part ?? here ?? tabPart;
         // Ids and dates given once (the messages of an earlier version have none): the history merges by them.
         const record = archives.normalizeConversation({
-          ...kept, id: kept.id ?? archives.newId(), part: kept.part ?? tabPart, file: kept.file ?? conv.file ?? tabPart?.file ?? null,
+          ...kept, id: kept.id ?? archives.newId(), part, file: kept.file ?? (here ? reader.tab.file ?? here.file : null) ?? conv.file ?? part?.file ?? null,
           started: kept.started ?? askedAt, updated: new Date().toISOString(),
           messages: [...kept.messages, { id: archives.newId(), role: "user", content: question, date: askedAt }, message], names: known,
         });
@@ -1507,15 +1529,21 @@ export function mount({ page, reader }) {
     }
     const folder = archives.partHash(conversation.part) ? await networkReady() : null;
     if (folder) {
+      // As kept on this PC (merged with what another tab added to it).
+      const kept = record ?? conversation;
       try {
-        await archives.writePartFile(folder, conversation);
-        if (record) await archives.markSynced(conversation.id, conversation.updated);
+        await archives.writePartFile(folder, kept);
+        if (record) await archives.markSynced(kept.id, kept.updated);
         networkNote = "";
+        networkList = []; // read again when shown
+        // What could not be written before (the folder unreachable): written now.
+        if (networkBehind) networkBehind = (await archives.syncFolder(folder)).failed > 0;
       } catch (err) {
-        networkNote = `Écriture dans le dossier réseau impossible : ${err?.message || err}`;
+        networkBehind = true;
+        networkNote = `Écriture dans le dossier réseau impossible (réessayée à la prochaine réponse, ou avec « Actualiser ») : ${err?.message || err}`;
       }
     }
-    showHistory();
+    showHistory({ folder: !!folder && historyTab === "reseau" });
   }
 
   const dateLabel = (iso) => {
@@ -1539,22 +1567,24 @@ export function mount({ page, reader }) {
     list.replaceChildren(...conversations.map((c) => {
       const li = document.createElement("li");
       li.className = "ai-hist-item";
+      const thisPart = !!c.part && c.part.id === tab?.part?.id;
       li.classList.toggle("current", c.id === current);
-      li.classList.toggle("this-part", !!c.part && c.part.id === tab?.part?.id);
+      li.classList.toggle("this-part", thisPart);
       const open = document.createElement("button");
       open.type = "button";
       open.className = "ai-hist-open";
       open.dataset.id = c.id;
       open.dataset.source = source;
+      if (c.id === current) open.setAttribute("aria-current", "true");
       const { question, count } = archives.conversationSummary(c);
-      const name = c.part?.file ?? c.file;
+      const name = c.file ?? c.part?.file; // the name it was last opened under
       open.title = `${name ?? "Sans pièce"} — ouvrir cette discussion dans un nouvel onglet${c.part ? " (le modèle 3D n'est pas ouvert)" : ""}`;
       const part = document.createElement("span");
       part.className = "ai-hist-part";
       part.textContent = name ? name.replace(/\.[^.]+$/, "") : "Sans pièce";
       const meta = document.createElement("span");
       meta.className = "ai-hist-meta";
-      meta.textContent = `${dateLabel(c.updated)} · ${count} message${count > 1 ? "s" : ""}`;
+      meta.textContent = `${dateLabel(c.updated)} · ${count} message${count > 1 ? "s" : ""}${c.id === current ? " · affichée" : thisPart ? " · pièce ouverte" : ""}`;
       const first = document.createElement("span");
       first.className = "ai-hist-q";
       first.textContent = question ? `« ${question} »` : "";
@@ -1574,9 +1604,24 @@ export function mount({ page, reader }) {
     }));
   }
 
-  /** The history on the right, as kept now (`folder`: read the network folder again). */
-  async function showHistory({ folder = false } = {}) {
+  /** The element of the history that has the focus, to give it back once the history is drawn again: a selector, or null. */
+  function historyFocus() {
+    const el = document.activeElement;
+    if (!el || !page.querySelector(".ai-history").contains(el)) return null;
+    if (el.dataset.histAction) return `[data-hist-action="${el.dataset.histAction}"]`;
+    if (el.dataset.history) return `.ai-hist-tab[data-history="${el.dataset.history}"]`;
+    if (el.dataset.id) return `.${el.classList.contains("ai-hist-del") ? "ai-hist-del" : "ai-hist-open"}[data-id="${CSS.escape(el.dataset.id)}"]`;
+    return null;
+  }
+
+  /** The history on the right, as kept now (`folder`: read the network folder again; `focus`: where the focus goes, else where it was). */
+  async function showHistory({ folder = false, focus = historyFocus() } = {}) {
     const token = ++historyRead;
+    const refocus = () => {
+      if (!focus || token !== historyRead) return;
+      const el = typeof focus === "function" ? focus() : page.querySelector(focus);
+      if (el && document.activeElement !== el && (!document.activeElement || document.activeElement === document.body || page.querySelector(".ai-history").contains(document.activeElement))) el.focus();
+    };
     for (const tabEl of page.querySelectorAll(".ai-hist-tab")) {
       const on = tabEl.dataset.history === historyTab;
       tabEl.setAttribute("aria-selected", String(on));
@@ -1589,6 +1634,7 @@ export function mount({ page, reader }) {
       if (token !== historyRead) return;
       if (local) historyItems($("ai-hist-list-local"), local, "local");
       else $("ai-hist-list-local").replaceChildren(Object.assign(document.createElement("li"), { className: "ai-hist-empty", textContent: "Historique indisponible dans ce navigateur (navigation privée ?)." }));
+      refocus();
       return;
     }
     const box = $("ai-hist-folder");
@@ -1599,30 +1645,43 @@ export function mount({ page, reader }) {
     if (!archives.folderSupported()) {
       box.innerHTML = '<p class="ai-hist-note">Ce navigateur ne peut pas ouvrir de dossier : l\'historique réseau demande Chrome ou Edge.</p>';
       $("ai-hist-list-reseau").replaceChildren();
+      refocus();
       return;
     }
     if (!network) {
       box.innerHTML = `<p class="ai-hist-note">Aucun dossier réseau choisi. Les discussions des pièces y seront écrites, un fichier par pièce, pour les retrouver depuis les autres postes.</p><div class="ai-hist-actions">${button("choose", "Choisir le dossier…")}</div>${note}`;
       $("ai-hist-list-reseau").replaceChildren();
+      refocus();
       return;
     }
     if (!handle) {
       box.innerHTML = `<p class="ai-hist-note">Dossier « ${escapeHtml(network.name)} » : accès à autoriser (le navigateur le demande après chaque redémarrage).</p><div class="ai-hist-actions">${button("grant", "Autoriser l'accès")}${button("choose", "Changer de dossier…")}</div>${note}`;
       $("ai-hist-list-reseau").replaceChildren();
+      refocus();
       return;
     }
-    box.innerHTML = `<p class="ai-hist-note">Dossier « ${escapeHtml(network.name)} » : les discussions des pièces y sont écrites après chaque réponse.</p><div class="ai-hist-actions">${button("refresh", "Actualiser")}${button("choose", "Changer de dossier…")}</div>${note}`;
+    const drawFolder = () => {
+      const note = networkNote ? `<p class="ai-hist-error">${escapeHtml(networkNote)}</p>` : "";
+      box.innerHTML = `<p class="ai-hist-note">Dossier « ${escapeHtml(network.name)} » : les discussions des pièces y sont écrites après chaque réponse.</p><div class="ai-hist-actions">${button("refresh", "Actualiser")}${button("choose", "Changer de dossier…")}</div>${note}`;
+    };
+    drawFolder();
     if (folder || !networkList.length) {
       $("ai-hist-list-reseau").replaceChildren(Object.assign(document.createElement("li"), { className: "ai-hist-empty", textContent: "Lecture du dossier…" }));
+      let read = null;
       try {
-        networkList = await archives.listFolder(handle);
+        read = await archives.listFolder(handle);
       } catch (err) {
-        networkList = [];
+        read = null;
         networkNote = `Lecture du dossier réseau impossible : ${err?.message || err}`;
       }
       if (token !== historyRead) return;
+      networkList = read ?? [];
+      // Read: what went wrong reading it before is past (a note of a write stays until the next one works).
+      if (read && networkNote.startsWith("Lecture")) networkNote = "";
+      drawFolder();
     }
     historyItems($("ai-hist-list-reseau"), networkList, "reseau");
+    refocus();
   }
 
   /** Open a conversation of the history: the tab that shows it, else a new tab of its part (its model not opened). */
@@ -1632,6 +1691,7 @@ export function mount({ page, reader }) {
     const there = (reader.tabs ?? []).find((t) => readConversation(conversationKey(t.id)).id === id);
     if (there) {
       reader.showTab?.(there.id);
+      $("ai-input").focus();
       return;
     }
     let conversation = found;
@@ -1640,8 +1700,10 @@ export function mount({ page, reader }) {
     if (local) conversation = archives.mergeConversation(found, local);
     const { synced, ...kept } = conversation;
     if (!reader.openPartTab) return;
-    reader.openPartTab(kept.part ?? { id: null, file: null }, (tabId) => writeConversation(conversationKey(tabId), { ...kept, file: kept.part?.file ?? kept.file }));
+    const file = kept.file ?? kept.part?.file ?? null; // the name the part was last opened under
+    reader.openPartTab(kept.part ? { ...kept.part, file } : { id: null, file: null }, (tabId) => writeConversation(conversationKey(tabId), { ...kept, file }));
     setStatus(kept.part ? "Discussion ouverte dans un nouvel onglet : ouvrez le fichier de la pièce pour la voir en 3D" : "Discussion ouverte dans un nouvel onglet");
+    $("ai-input").focus();
   }
 
   page.querySelector(".ai-hist-tabs").addEventListener("click", (event) => {
@@ -1664,22 +1726,37 @@ export function mount({ page, reader }) {
     const del = event.target.closest(".ai-hist-del");
     if (del) {
       if (!confirm("Supprimer cette discussion de l'historique de ce PC ? (Une copie écrite dans le dossier réseau y reste.)")) return;
+      const rank = [...$("ai-hist-list-local").children].indexOf(del.closest("li"));
       await archives.deleteLocal(del.dataset.id).catch(() => {});
-      return showHistory();
+      // The focus to the discussion that took its place, else to the tab of the list.
+      const next = () => {
+        const opens = $("ai-hist-list-local").querySelectorAll(".ai-hist-open");
+        return opens[Math.min(rank, opens.length - 1)] ?? $("ai-hist-tab-local");
+      };
+      return showHistory({ focus: next });
     }
     const action = event.target.closest("[data-hist-action]")?.dataset.histAction;
     if (!action) return;
+    const sync = async (handle, options) => {
+      const { failed } = await inTurn(() => archives.syncFolder(handle, options));
+      networkBehind = failed > 0;
+      networkNote = failed ? `${failed} discussion${failed > 1 ? "s" : ""} non écrite${failed > 1 ? "s" : ""} dans le dossier : réessayé${failed > 1 ? "es" : "e"} à la prochaine réponse, ou avec « Actualiser ».` : "";
+    };
     try {
       if (action === "choose") {
+        const previous = network?.handle ?? null;
         const handle = await archives.chooseNetworkFolder();
         networkList = [];
         networkNote = "";
-        // The conversations of before kept on this PC: written there too, if wanted.
-        const before = (await archives.listLocal()).filter((c) => archives.partHash(c.part) && !(c.synced && Date.parse(c.synced) >= Date.parse(c.updated))).length;
+        // Another folder: every conversation of a part written there (what was written in the other one too).
+        const same = previous ? await previous.isSameEntry(handle).catch(() => false) : false;
+        const before = (await archives.listLocal()).filter((c) => archives.partHash(c.part) && (!same || !(c.synced && Date.parse(c.synced) >= Date.parse(c.updated)))).length;
         const all = !before || confirm(`Écrire aussi dans ce dossier les ${before} discussion${before > 1 ? "s" : ""} de pièces déjà gardée${before > 1 ? "s" : ""} sur ce PC ?`);
-        await inTurn(() => archives.syncFolder(handle, { all }));
+        await sync(handle, { all, force: !same });
       } else if (action === "grant") {
-        if (network && (await archives.grantNetworkFolder(network.handle))) await inTurn(() => archives.syncFolder(network.handle));
+        if (network && (await archives.grantNetworkFolder(network.handle))) await sync(network.handle);
+      } else if (action === "refresh" && (await networkReady())) {
+        await sync(network.handle);
       }
     } catch (err) {
       if (err?.name !== "AbortError") networkNote = `Dossier réseau : ${err?.message || err}`;
@@ -1724,6 +1801,7 @@ export function mount({ page, reader }) {
   return {
     show() {
       showConversation();
+      toEnd(); // an answer written while the page was not shown
       $("ai-input")?.focus();
       showScope();
       showReady();
@@ -1732,6 +1810,7 @@ export function mount({ page, reader }) {
     /** The tab `id` of the 3D page was closed (app.js): its conversation is forgotten, its question dropped. */
     forgetTab(id) {
       const key = conversationKey(id);
+      loading++; // a reading of the history for its part, under way: not for the tab that gets its key
       if (pending?.key === key) {
         pending.dropped = true;
         busy?.abort();
