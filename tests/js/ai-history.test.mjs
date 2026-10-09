@@ -68,48 +68,52 @@ test("two copies of a conversation merged: every message once, a question right 
   assert.equal(conversationSummary(conversation("c2", [message("1", "user", "x".repeat(200), "2026-10-09T10:00:00Z")])).question.length, 90);
 });
 
-test("the file of a part in the network folder: its name, then its hash; only a part known by its file's hash", () => {
+test("the file of a conversation in the network folder: its part's name, the part's hash, its id; only a part known by its file's hash", () => {
   assert.equal(partHash(PART), HASH);
+  assert.equal(partFileName(PART, "c1"), `Carter 4711__${HASH.slice(0, 16)}__c1.json`);
+  assert.equal(partFileName({ id: PART.id, file: 'a/b:c*?"<>|.stp' }, "x/y"), `a_b_c___${HASH.slice(0, 16)}__x_y.json`);
+  assert.equal(partFileName({ id: PART.id, file: null }, "c"), `piece__${HASH.slice(0, 16)}__c.json`);
+  // The one file per part of the first version, still read.
   assert.equal(partFileName(PART), `Carter 4711__${HASH.slice(0, 16)}.json`);
-  assert.equal(partFileName({ id: PART.id, file: 'a/b:c*?"<>|.stp' }), `a_b_c_.stp`.replace(".stp", "") + `__${HASH.slice(0, 16)}.json`);
-  assert.equal(partFileName({ id: PART.id, file: null }), `piece__${HASH.slice(0, 16)}.json`);
-  assert.equal(partFileName({ id: "nom:a.step|12", file: "a.step" }), null);
+  assert.equal(partFileName({ id: "nom:a.step|12", file: "a.step" }, "c"), null);
   assert.equal(partHash({ id: "sha256:xyz" }), null);
   assert.equal(parsePartFile("{"), null);
   assert.equal(parsePartFile({ schema: "autre", part: PART, conversations: [] }), null);
 });
 
-test("a part's conversations written in the network folder, merged with what another PC wrote; found under another name; listed", async () => {
+test("a part's conversations written in the network folder, one file each; one continued on another PC merged; found under another name; listed", async () => {
   const dir = folder({ "notes.txt": "rien", "autre.json": JSON.stringify({ schema: "x" }) });
   const mine = conversation("c1", [message("1", "user", "Q1", "2026-10-09T10:00:00Z"), message("2", "assistant", "R1", "2026-10-09T10:00:00Z")]);
   assert.equal(await writePartFile(dir, mine), true);
-  const name = partFileName(PART);
-  assert.ok(dir.store.has(name));
-  const doc = JSON.parse(dir.store.get(name));
+  const c1 = partFileName(PART, "c1");
+  const doc = JSON.parse(dir.store.get(c1));
   assert.equal(doc.schema, HISTORY_SCHEMA);
   assert.deepEqual(doc.part, PART);
-  assert.equal(doc.conversations[0].part, undefined, "the part once, at the top");
-  // Another PC adds its answer to the same conversation, and a conversation of its own.
+  assert.deepEqual(doc.conversations.map((c) => [c.id, c.part]), [["c1", undefined]], "the part once, at the top");
+  // Another PC continues it, and writes a conversation of its own (its own file).
   const other = { ...mine, messages: [...mine.messages, message("3", "user", "Q2", "2026-10-09T10:05:00Z"), message("4", "assistant", "R2", "2026-10-09T10:05:00Z")], updated: "2026-10-09T10:05:00Z" };
   await writePartFile(dir, other);
   await writePartFile(dir, conversation("c2", [message("5", "user", "Autre", "2026-10-09T11:00:00Z")]));
+  assert.ok(dir.store.has(partFileName(PART, "c2")));
   // This PC writes its copy again, without the other's answer: kept all the same.
   await writePartFile(dir, mine);
   const read = await readPartFile(dir, PART);
-  assert.deepEqual(read.map((c) => [c.id, c.messages.map((m) => m.content)]), [["c1", ["Q1", "R1", "Q2", "R2"]], ["c2", ["Autre"]]]);
-  // The file renamed (another name of the part): found by its hash, written there.
-  dir.store.set("renommé__" + HASH.slice(0, 16) + ".json", dir.store.get(name));
-  dir.store.delete(name);
-  await writePartFile(dir, conversation("c3", [message("6", "user", "Q", "2026-10-09T12:00:00Z")], { part: { ...PART, file: "Carter 4711 v2.step" } }));
-  assert.deepEqual([...dir.store.keys()].filter((n) => n.endsWith(".json")), ["autre.json", "renommé__" + HASH.slice(0, 16) + ".json"]);
-  // Listed, the latest first; the files that are not of this history left.
+  assert.deepEqual(read.map((c) => [c.id, c.messages.map((m) => m.content)]).sort(), [["c1", ["Q1", "R1", "Q2", "R2"]], ["c2", ["Autre"]]]);
+  // Its file renamed (another name of the part): found by the hash and the id, written there.
+  const renamed = `renommé__${HASH.slice(0, 16)}__c1.json`;
+  dir.store.set(renamed, dir.store.get(c1));
+  dir.store.delete(c1);
+  await writePartFile(dir, { ...mine, part: { ...PART, file: "Carter 4711 v2.step" }, messages: [...mine.messages, message("6", "user", "Q3", "2026-10-09T12:00:00Z")], updated: "2026-10-09T12:00:00Z" });
+  assert.deepEqual([...dir.store.keys()].filter((n) => n.endsWith(".json")).sort(), ["autre.json", partFileName(PART, "c2"), renamed].sort());
+  // A file of the first version (one per part): read with the others, each conversation once.
+  dir.store.set(partFileName(PART), JSON.stringify(mergePartFile(null, conversation("c0", [message("0", "user", "Ancienne", "2026-10-08T10:00:00Z")]))));
   const listed = await listFolder(dir);
-  assert.deepEqual(listed.map((c) => c.id), ["c3", "c2", "c1"]);
-  assert.deepEqual(listed[0].part, { id: PART.id, file: "Carter 4711 v2.step" });
+  assert.deepEqual(listed.map((c) => c.id), ["c1", "c2", "c0"]);
+  assert.deepEqual(listed[0].messages.map((m) => m.content), ["Q1", "R1", "Q2", "R2", "Q3"]);
   // A part not known by its hash is not written there.
   assert.equal(await writePartFile(dir, conversation("c4", [message("7", "user", "Q", "2026-10-09T12:00:00Z")], { part: { id: "nom:a.step|1", file: "a.step" } })), false);
   // A file being written (not JSON yet): the others listed.
-  dir.store.set("x__0000000000000000.json", "{");
+  dir.store.set(`x__${HASH.slice(0, 16)}__z.json`, "{");
   assert.equal((await listFolder(dir)).length, 3);
   assert.deepEqual(mergePartFile(null, conversation("c9", [])).conversations.map((c) => c.id), ["c9"]);
 });
@@ -134,15 +138,15 @@ test("a message from the folder is kept with its known fields of their types onl
   assert.deepEqual(c.messages[1].numbers, ["9"]);
 });
 
-test("the network folder: a part written by two PCs at once keeps both; its files under two names read together; an unreadable one never replaced", async () => {
+test("the network folder: a conversation written by two PCs at once keeps both their messages; another conversation's unreadable file left; its own never replaced", async () => {
   const dir = folder();
-  const name = partFileName(PART);
-  const theirs = conversation("theirs", [message("t1", "user", "Leur question", "2026-10-09T10:00:00Z"), message("t2", "assistant", "R", "2026-10-09T10:00:00Z")]);
-  // Another PC closes its write right after ours: its file, without our conversation, replaces ours once.
+  const name = partFileName(PART, "shared");
+  const theirs = conversation("shared", [message("t1", "user", "Leur question", "2026-10-09T10:00:00Z"), message("t2", "assistant", "R", "2026-10-09T10:00:00Z")]);
+  // Another PC closes its write right after ours: its copy, without our messages, replaces ours once.
   let raced = false;
-  const createWritable = dir.getFileHandle;
+  const getFileHandle = dir.getFileHandle;
   dir.getFileHandle = async (n, options) => {
-    const handle = await createWritable.call(dir, n, options);
+    const handle = await getFileHandle.call(dir, n, options);
     const write = handle.createWritable;
     handle.createWritable = async () => {
       const w = await write.call(handle);
@@ -158,16 +162,16 @@ test("the network folder: a part written by two PCs at once keeps both; its file
     };
     return handle;
   };
-  const mine = conversation("mine", [message("m1", "user", "Ma question", "2026-10-09T10:01:00Z"), message("m2", "assistant", "R", "2026-10-09T10:01:00Z")]);
+  const mine = conversation("shared", [message("m1", "user", "Ma question", "2026-10-09T10:01:00Z"), message("m2", "assistant", "R", "2026-10-09T10:01:00Z")]);
   assert.equal(await writePartFile(dir, mine), true);
-  assert.deepEqual(JSON.parse(dir.store.get(name)).conversations.map((c) => c.id), ["theirs", "mine"]);
-  // The same part written under another of its names by another PC: both files read, and listed once each.
-  dir.getFileHandle = createWritable;
-  const other = `Autre nom__${HASH.slice(0, 16)}.json`;
-  dir.store.set(other, JSON.stringify(mergePartFile(null, { ...theirs, messages: [...theirs.messages, message("t3", "user", "Suite", "2026-10-09T10:02:00Z")], updated: "2026-10-09T10:02:00Z" })));
-  assert.deepEqual((await readPartFile(dir, PART)).map((c) => [c.id, c.messages.length]).sort(), [["mine", 2], ["theirs", 3]]);
-  assert.deepEqual((await listFolder(dir)).map((c) => [c.id, c.messages.length]), [["theirs", 3], ["mine", 2]]);
-  // A file that does not read as a history (cut, edited): an error, and the file left as it is.
+  assert.deepEqual(JSON.parse(dir.store.get(name)).conversations[0].messages.map((m) => m.id), ["t1", "t2", "m1", "m2"]);
+  dir.getFileHandle = getFileHandle;
+  // Another conversation's file that does not read: left as it is, this one written all the same.
+  const broken = partFileName(PART, "autre");
+  dir.store.set(broken, "{ coupé");
+  assert.equal(await writePartFile(dir, conversation("c5", [message("c5", "user", "Q", "2026-10-09T11:00:00Z")])), true);
+  assert.equal(dir.store.get(broken), "{ coupé");
+  // Its own file that does not read (cut, edited): an error, and the file left as it is.
   dir.store.set(name, "{ coupé");
   await assert.rejects(writePartFile(dir, mine), /n'est pas un historique lisible/);
   assert.equal(dir.store.get(name), "{ coupé");

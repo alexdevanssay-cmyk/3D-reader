@@ -1014,7 +1014,9 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.click('[data-hist-action="choose"]');
     await page.waitForFunction(() => document.querySelectorAll('#ai-hist-list-reseau .ai-hist-item').length === 1, null, { timeout: 10_000 });
     let files = await folderFiles();
-    const name = `box__${part.id.slice(7, 23)}.json`;
+    // One file per conversation: the part's name, its hash, the conversation's id.
+    const conversationId = await page.evaluate(() => JSON.parse(sessionStorage.getItem('reader3d.ai.messages')).id);
+    const name = `box__${part.id.slice(7, 23)}__${conversationId}.json`;
     assert.deepEqual(Object.keys(files), [name]);
     assert.equal(files[name].schema, 'reader3d-historique-ia');
     assert.deepEqual(files[name].part, part);
@@ -1098,7 +1100,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.click('#ai-hist-tab-local');
     await page.click('#ai-hist-list-local .ai-hist-item:nth-child(1) .ai-hist-del');
     await page.waitForFunction(() => document.querySelectorAll('#ai-hist-list-local .ai-hist-item').length === 1, null, { timeout: 10_000 });
-    assert.equal(Object.values(await folderFiles())[0].conversations.length, 2);
+    assert.equal(Object.values(await folderFiles()).flatMap((f) => f.conversations).length, 2);
 
     // A phone: one column, the history under the conversation, nothing wider than the screen.
     await page.setViewportSize({ width: 375, height: 800 });
