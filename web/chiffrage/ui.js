@@ -16,6 +16,7 @@ import {
 import { DEFAULT_INTERVAL_S, backtestCsv, backtestItems, backtestReading, backtestRows, fingerprint, leaveOneOut, resultOf, runBacktest, summarizeBacktest } from "./backtest.js";
 import { addressSpace, askJSON, numbersLabel, savedAI } from "../ai-workspace.js";
 import * as store from "./store.js";
+import { PROPOSAL_FIELDS, sameValue, valueLabel } from "./ai-apply.js";
 
 let el = null;
 let page = "chiffrage";
@@ -123,6 +124,183 @@ export function addAIAnalysis(entry, { tab = store.currentQuoteTab() } = {}) {
     q.analysesIA = [...(q.analysesIA ?? []), entry];
     store.saveQuote(q);
   } else store.appendToQuote(tab, "analysesIA", entry);
+}
+
+/**
+ * The quote of the tab `tab` of the 3D page, for a change asked by the IA
+ * page: the one of the Chiffrage page when it shows that tab (in memory),
+ * else read again from this browser's storage with the data files and the
+ * settings (as costingSnapshot: the storage may have changed since, an
+ * answer of the AI kept there). An error (French) otherwise.
+ */
+function quoteOfTab(tab) {
+  if (el) {
+    if (tab !== store.currentQuoteTab()) return "Le chiffrage affiché est celui d'un autre onglet : revenez à l'onglet de la pièce, puis réessayez.";
+  } else {
+    store.setQuoteTab(tab);
+    base = store.loadBase();
+    indices = store.loadIndices();
+    layers = store.loadSettingsLayers(base);
+    settings = layers.effective;
+    q = store.loadQuote(base, indices);
+  }
+  return base ? null : "Aucun classeur de chiffrage importé : importez-le dans la page Chiffrage.";
+}
+
+/**
+ * Values proposed by the AI for one piece (task "Chiffrage" of the IA page,
+ * ai-apply.js readProposals and checkProposals), applied once a person accepts
+ * them: written as the inputs of that piece ("saisie"), only where they differ
+ * from its values now, each kept with what was there before
+ * (q.pieces[key].valeursIA, undoAIValues; traced "proposition IA appliquée").
+ * A value of the casting route (cycle, cavities, mise au mille, mode) imposes
+ * the island it was proposed for, as the casting card does; another island
+ * proposed resets them. Never a price, a rate, a setting nor a value of the
+ * whole quote: only the keys of PROPOSAL_FIELDS. dryRun: nothing changed,
+ * what would be. The quote is saved; the Chiffrage page shows it recomputed
+ * with a message when it is next shown.
+ *   target: {tab, file (the 3D file of the question; null: none), key (the piece, ui.js piecesOf)}
+ *   proposals: [{cle, valeur, ilot_mode}] (those not refused)
+ *   origin: {date, provider, model, message (id of the answer)}
+ * Returns {piece (its name), applied: [{cle, champ, label, avant, apres, unite}], same, refused: [{cle, label, valeur, refus}], saved}, or {error}.
+ */
+export function applyAIValues(target, proposals, origin = {}, { dryRun = false } = {}) {
+  const error = quoteOfTab(target.tab);
+  if (error) return { error };
+  if ((window.reader3d?.part?.()?.file ?? null) !== (target.file ?? null)) return { error: "Le modèle 3D de l'onglet a changé depuis la réponse : reposez la question." };
+  const [quoteShown, keyShown] = [q, currentKey];
+  if (dryRun) q = structuredClone(q);
+  try {
+    const c = compute({ save: !dryRun });
+    const r = c?.results.find((x) => x.piece.key === target.key);
+    if (!r) return { error: "Cette pièce n'est plus chiffrée : cochez son corps dans la liste de la page Analyse 3D, puis réessayez." };
+    const name = pieceNames(c.results.map((x) => x.piece)).get(r.piece);
+    const i = r.inputs;
+    const code = r.route?.process ?? null;
+    const byKey = new Map(proposals.map((p) => [p.cle, p]));
+    const island = byKey.get("piece.ilot")?.valeur ?? code;
+    const refused = [];
+    const wanted = [];
+    for (const p of proposals) {
+      const spec = PROPOSAL_FIELDS[p.cle];
+      const label = spec?.label ?? p.cle;
+      const refuse = (refus) => refused.push({ cle: p.cle, label, valeur: p.valeur, refus });
+      if (!spec) {
+        refuse("valeur que l'IA ne peut pas proposer");
+        continue;
+      }
+      const v = p.valeur;
+      // The codes, against the workbook and the settings of now.
+      if (spec.type === "ilot" && !(settings.processes[v] && c.rates.has(v))) refuse(`îlot « ${v} » absent du classeur ou de Paramètres`);
+      else if (spec.type === "finition" && !settings.processes[island]?.finitions?.includes(v)) refuse(`finition « ${v} » inconnue de l'îlot ${island ?? "retenu"}`);
+      else if (spec.type === "mode" && !MODES.includes(v)) refuse(`fonctionnement « ${v} » inconnu (${MODES.join(", ")})`);
+      else if (spec.type === "mode" && p.ilot_mode && p.ilot_mode !== island) refuse(`fonctionnement proposé pour ${p.ilot_mode}, l'îlot retenu est ${island ?? "inconnu"}`);
+      else if (spec.type === "tth" && v !== "none" && !settings.tth?.[v]) refuse(`traitement thermique « ${v} » absent de Paramètres`);
+      else if (spec.type === "complexite" && !(v in (settings.tooling?.etude ?? {}))) refuse(`complexité « ${v} » inconnue`);
+      else if (spec.ilot && !island) refuse("aucun îlot retenu pour cette pièce");
+      else wanted.push({ p, spec, label });
+    }
+    // The value of each input now: the one the costing uses (traced), else the one of the inputs or the settings.
+    const tool = r.route?.tooling;
+    const now = {
+      poids: r.trace?.["piece.poids"]?.valeur, toileMini: r.trace?.["piece.toileMini"]?.valeur, epaisseurMax: r.trace?.["piece.epaisseurMax"]?.valeur,
+      moduleMm: r.trace?.["piece.module"]?.valeur, dimMax: r.trace?.["piece.dimMax"]?.valeur,
+      procede: code, finition: r.route?.finition ?? null,
+      miseAuMille: r.trace?.["piece.miseAuMille"]?.valeur, empreintes: r.trace?.["piece.empreintes"]?.valeur, cycle: r.trace?.["piece.cycle"]?.valeur,
+      mode: r.trace?.[`centre.${code}.mode`]?.valeur ?? (r.chosen ? i.mode : null) ?? settings.modes?.[code] ?? null,
+      tth: i.tth, tthMode: i.tthMode, noyaux: !!i.noyaux, tribo: !!i.tribo, redressage: !!i.redressage,
+      outillageTiroirs: tool?.tiroirs ?? i.outillageTiroirs ?? settings.tooling?.tiroirs ?? 0,
+      outillageComplexite: tool?.complexite ?? i.outillageComplexite ?? settings.tooling?.complexite ?? null,
+    };
+    // Another island: its route's values are its own (those of the island before are not kept).
+    const newIsland = byKey.has("piece.ilot") && wanted.some((w) => w.spec.type === "ilot") && !sameValue(island, code);
+    const same = [];
+    const changes = [];
+    for (const { p, spec, label } of wanted) {
+      const before = spec.ilot && newIsland ? null : now[spec.champ] ?? null;
+      if (before !== null && sameValue(p.valeur, before)) same.push({ cle: p.cle, champ: spec.champ, label, valeur: p.valeur, unite: spec.unite ?? "" });
+      else changes.push({ cle: p.cle, champ: spec.champ, label, avant: before, apres: p.valeur, unite: spec.unite ?? "" });
+    }
+    const out = { piece: name, key: r.piece.key, applied: changes, same, refused };
+    if (dryRun || !changes.length) return out;
+
+    // Written: the inputs of the piece, each with what was there before (kept from a first application).
+    const piece = pieceStore(r.piece.key);
+    const record = (piece.valeursIA ??= {});
+    const date = origin.date ?? new Date().toISOString();
+    const write = (champ, valeur, cle) => {
+      const was = record[champ];
+      const avant = was && sameValue(piece[champ] ?? null, was.valeur) ? was.avant : piece[champ] ?? null;
+      record[champ] = { valeur, avant, date, provider: origin.provider ?? null, model: origin.model ?? null, message: origin.message ?? null, cle };
+      piece[champ] = valeur;
+    };
+    const imposing = changes.some((x) => PROPOSAL_FIELDS[x.cle].ilot) && !r.chosen;
+    if (newIsland || imposing) {
+      // The island imposed (as "Retenir" does), its finishing the one proposed or the best one.
+      write("procede", island, "piece.ilot");
+      const finition = changes.find((x) => x.champ === "finition")?.apres ?? (newIsland ? "auto" : r.route.finition);
+      write("finition", finition, "piece.finition");
+      if (newIsland) for (const champ of ["cycle", "empreintes", "miseAuMille", "mode"]) if ((piece[champ] ?? null) !== null) write(champ, null, "piece.ilot");
+    }
+    for (const x of changes) if (!["procede", "finition"].includes(x.champ) || !(newIsland || imposing)) write(x.champ, x.apres, x.cle);
+    // Cores checked: a first core to describe, as the casting card does.
+    if (piece.noyaux && !piece.cores?.length) piece.cores = [{ ...newCore(0, r.part.poids ?? 0), ...(piece.sableKg > 0 ? { masse: piece.sableKg } : {}) }];
+    forgetAdoption(piece);
+    const list = changes.map((x) => `${x.label} : ${valueLabel(x.avant, x.unite)} → ${valueLabel(x.apres, x.unite)}`).join(" ; ");
+    q.analysesIA = [...(q.analysesIA ?? []), { date, provider: origin.provider ?? null, model: origin.model ?? null, question: "Appliquer les valeurs au chiffrage", answer: `Appliqué à « ${name} » : ${list}.`, verified: true, tache: "application_ia" }];
+    out.saved = store.saveQuote(q) !== false;
+    message = { kind: "ok", text: `Valeurs proposées par l'IA appliquées à « ${name} » (page IA / analyse) : ${list}. Elles sont saisies dans le devis ; « Annuler l'application » dans la page IA les retire.` };
+    if (el && !el.chiffrage.hidden) render();
+    return out;
+  } finally {
+    if (dryRun) q = quoteShown;
+    currentKey = keyShown;
+  }
+}
+
+/**
+ * The values applied from the AI to one piece (applyAIValues) taken back:
+ * those of the answer `message` (all of them without one) that are still as
+ * applied come back to what was there before; one changed since by a person
+ * is left. Returns {piece, undone: [{champ, label, avant, apres}], kept: [labels], saved}, or {error}.
+ */
+export function undoAIValues(target, { message: answer = null } = {}) {
+  const error = quoteOfTab(target.tab);
+  if (error) return { error };
+  const piece = q.pieces?.[target.key];
+  const record = piece?.valeursIA;
+  const entries = Object.entries(record ?? {}).filter(([, a]) => !answer || a.message === answer);
+  if (!entries.length) return { error: "Aucune valeur appliquée depuis l'IA à annuler pour cette pièce." };
+  const fieldOf = (champ) => Object.values(PROPOSAL_FIELDS).find((f) => f.champ === champ);
+  const undone = [];
+  const kept = [];
+  for (const [champ, a] of entries) {
+    const label = fieldOf(champ)?.label ?? champ;
+    if (sameValue(piece[champ] ?? null, a.valeur)) {
+      // Nothing there before: the input of the piece by default again (from the 3D model, estimated, "auto").
+      if (a.avant === null) delete piece[champ];
+      else piece[champ] = a.avant;
+      undone.push({ champ, label, avant: a.valeur, apres: a.avant, unite: fieldOf(champ)?.unite ?? "" });
+    } else kept.push(label);
+    delete record[champ];
+  }
+  if (!Object.keys(record).length) delete piece.valeursIA;
+  forgetAdoption(piece);
+  const name = target.name ?? target.key;
+  const list = undone.map((x) => `${x.label} : ${valueLabel(x.avant, x.unite)} → ${valueLabel(x.apres, x.unite)}`).join(" ; ");
+  q.analysesIA = [...(q.analysesIA ?? []), { date: new Date().toISOString(), provider: null, model: null, question: "Annuler l'application des valeurs de l'IA", answer: `Annulé pour « ${name} » : ${list || "aucune valeur (modifiées depuis)"}.`, verified: true, tache: "application_ia" }];
+  const saved = store.saveQuote(q) !== false;
+  message = { kind: "ok", text: `Application des valeurs de l'IA annulée pour « ${name} »${list ? ` : ${list}` : ""}.${kept.length ? ` Modifiées depuis, gardées : ${kept.join(", ")}.` : ""}` };
+  if (el && !el.chiffrage.hidden) render();
+  return { piece: name, undone, kept, saved };
+}
+
+/** The values applied from the AI to a piece (`piece`: its inputs saved) forgotten once a person changed them. */
+function forgetAIValues(piece) {
+  const record = piece.valeursIA;
+  if (!record) return;
+  for (const [champ, a] of Object.entries(record)) if (!sameValue(piece[champ] ?? null, a.valeur)) delete record[champ];
+  if (!Object.keys(record).length) delete piece.valeursIA;
 }
 
 // --------------------------------------------------------------------------- formatting
@@ -265,6 +443,7 @@ function onChange(event) {
       piece.cores = [{ ...newCore(0, poids), ...(piece.sableKg > 0 ? { masse: piece.sableKg } : {}) }];
     }
     forgetAdoption(piece);
+    forgetAIValues(piece);
     store.saveQuote(q);
   } else {
     // Paramètres: only the typed values are kept (store.js); an emptied field
@@ -297,6 +476,7 @@ async function onClick(event) {
     piece.finition = action === "auto" ? "auto" : button.dataset.finition;
     piece.cycle = piece.empreintes = piece.miseAuMille = piece.mode = null;
     forgetAdoption(piece);
+    forgetAIValues(piece);
     store.saveQuote(q);
     render();
   } else if (action === "piece") {
@@ -920,7 +1100,8 @@ function deepFreeze(o) {
  * each piece costed, its three best routes with their reasons, the alerts,
  * and the data files with their dates. A deep-frozen copy, computed on a copy
  * of the quote: nothing is saved and nothing in it leads back to the quote
- * or the settings (the AI explains, it never sets a value). Works without the
+ * or the settings (the AI explains; the values it proposes are applied by
+ * applyAIValues once a person accepts them). Works without the
  * costing page having been opened: the data files, the settings and the quote
  * of the tab `tab` of the 3D page are then read from this browser's storage.
  * null without a costing workbook.
@@ -972,7 +1153,8 @@ export function costingSnapshot({ tab } = {}) {
   const t = layers.tendances;
   return deepFreeze(structuredClone({
     devis: { ensemble: c.selected === "ensemble", trace: c.trace ?? {} },
-    pieces: c.results.map((r) => ({ nom: name.get(r.piece), chiffree: !!r.final, trace: r.trace ?? {}, routes: routes(r) })),
+    // cle: the key of the piece in the quote (never sent: ai-trace.js picks the fields), for the values the AI proposes for it.
+    pieces: c.results.map((r) => ({ nom: name.get(r.piece), cle: r.piece.key, chiffree: !!r.final, trace: r.trace ?? {}, routes: routes(r) })),
     alertes: sum.alertes,
     resume: { valeurs: sum.valeurs, a_valider: sum.aValider, alertes: sum.alertes.length },
     fichiers: {
@@ -1241,6 +1423,9 @@ function castingCard(r) {
   if (i.cycle > 0 && !cycleOptions.some(([v]) => Number(v) === i.cycle)) cycleOptions.push([i.cycle, `${i.cycle} s`]);
   const empreintesOptions = [[" ", `Estimé${e ? ` (${e.parCycle})` : ""}`], ...[1, 2, 3, 4, 5, 6, 8].map((n) => [n, String(n)])];
   const mamOptions = [[" ", `Estimée${e ? ` (${nf(e.miseAuMille, 2)})` : ""}`], ...[1.1, 1.2, 1.25, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 2, 2.2, 2.5].map((n) => [n, nf(n, 2)])];
+  // A value outside the lists (applied from the AI, saved by another version): shown, not replaced by the first option.
+  if (i.empreintes > 0 && !empreintesOptions.some(([v]) => Number(v) === i.empreintes)) empreintesOptions.push([i.empreintes, String(i.empreintes)]);
+  if (i.miseAuMille > 0 && !mamOptions.some(([v]) => Number(v) === i.miseAuMille)) mamOptions.push([i.miseAuMille, nf(i.miseAuMille, 2)]);
   const mam = e?.miseAuMilleDetail;
   const mamDetail = mam
     ? `<details class="small"><summary>Estimation de la mise au mille : ${nf(mam.value, 2)} (rendement ${pct(mam.rendement, 0)})</summary>
@@ -2652,7 +2837,7 @@ async function exportXlsx() {
   const analyses = q.analysesIA ?? [];
   const analysesIA = [
     [H("Analyses IA"), null],
-    ["Statut", "raisonnements et estimations de l'IA gardés pour mémoire : aucune valeur n'a été appliquée au devis ni aux paramètres sans validation ; une estimation du temps de cycle validée est une saisie du devis (onglet Traçabilité, source « estimation IA validée »)"],
+    ["Statut", "raisonnements et estimations de l'IA gardés pour mémoire : aucune valeur n'a été appliquée au devis ni aux paramètres sans validation ; une estimation du temps de cycle validée est une saisie du devis (onglet Traçabilité, source « estimation IA validée »), comme une valeur proposée par l'IA et acceptée (source « proposition IA appliquée »)"],
     [],
     ["Date", "Fournisseur", "Modèle", "Question", "Réponse", "Nombres vérifiés"].map(H),
     ...analyses.map((a) => [dateLabel(a.date), a.provider, a.model, a.question, String(a.answer ?? "").slice(0, 32000), a.verified ? "oui" : a.tache === "cycle_time" ? "non : nombres absents des données envoyées" : "non : nombres absents de la trace"]),

@@ -151,11 +151,11 @@ test("the context is data between delimiters that no text of the CAD file or of 
   assert.equal(second.body.messages.filter((m) => m.role === "system").length, 1);
 });
 
-test("task « Chiffrage »: analyse_chiffrage in strict JSON, never a quote; the costing trace given read only", async () => {
+test("task « Chiffrage »: analyse_chiffrage in strict JSON, never a quote, values of a piece proposed for a person to accept; the costing trace given as it is", async () => {
   const trace = { schema: "3d-reader-costing-trace", lecture_seule: true, pieces: [{ nom: "A", valeurs: { "piece.prix.vente": { valeur: "masqué", unite: "€" } } }] };
   const answer = {
     conclusion: "Prix à valider.", observations: [], inferences: [], recommendations: [], uncertainties: [], needs_human_validation: true,
-    analyse_chiffrage: { explications: ["piece.prix.vente est masqué."], ecarts_signales: [{ cle: "piece.prix.vente", commentaire: "à valider" }], questions: [], hypotheses: [] },
+    analyse_chiffrage: { explications: ["piece.prix.vente est masqué."], ecarts_signales: [{ cle: "piece.prix.vente", commentaire: "à valider" }], questions: [], hypotheses: [], propositions: [] },
   };
   const { status, json, requests } = await call({
     body: { task: "costing", context: { task: "manufacturing_analysis", costing_trace: trace }, messages: [{ role: "user", content: "Pourquoi ce prix ?" }] },
@@ -170,11 +170,18 @@ test("task « Chiffrage »: analyse_chiffrage in strict JSON, never a quote; the
   assert.equal(schema.properties.quote, undefined);
   assert.ok(schema.required.includes("analyse_chiffrage") && !schema.required.includes("quote"));
   const analyse = schema.properties.analyse_chiffrage.anyOf.find((x) => x.type === "object");
-  assert.deepEqual(analyse.required, ["explications", "ecarts_signales", "questions", "hypotheses"]);
+  assert.deepEqual(analyse.required, ["explications", "ecarts_signales", "questions", "hypotheses", "propositions"]);
   assert.deepEqual(analyse.properties.ecarts_signales.items.required, ["cle", "commentaire"]);
+  // The values of a piece proposed: each with its piece, key, value, unit, source and reason.
+  const proposal = analyse.properties.propositions.items;
+  assert.deepEqual(proposal.required, ["piece", "cle", "valeur", "unite", "source", "justification"]);
+  assert.deepEqual(proposal.properties.source.enum, ["question", "trace", "analyse_3d"]);
+  assert.equal(proposal.additionalProperties, false);
   const system = request.body.messages[0].content;
-  assert.match(system, /N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux\. Ne cite que des nombres présents dans costing_trace/);
-  assert.match(system, /Tu ne fixes aucune valeur/);
+  assert.match(system, /N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux\. Dans les explications, ne cite que des nombres présents dans costing_trace/);
+  assert.match(system, /tu ne les modifies pas toi-même/);
+  assert.match(system, /Jamais un prix, un taux, une marge, un paramètre, une valeur du devis entier ni une valeur masquée ; jamais un nombre que tu calcules ou estimes toi-même/);
+  assert.match(system, /Une personne accepte chaque proposition avant qu'elle soit appliquée aux saisies de la pièce/);
   assert.match(system, /Les valeurs masquées \(« masqué »\) sont confidentielles/);
   assert.doesNotMatch(system, /texte simple/);
   // It explains the traced values: no core count proposed, as in the text tasks.

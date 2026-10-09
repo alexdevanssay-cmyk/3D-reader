@@ -63,15 +63,24 @@ const OUTPUT_SCHEMA = {
     recommendations: { type: "array", items: { type: "string" } },
     uncertainties: { type: "array", items: { type: "string" } },
     needs_human_validation: { type: "boolean" },
-    // Task "Chiffrage": reasoning on the traced values of the quote (context.costing_trace), never a value to apply.
+    // Task "Chiffrage": reasoning on the traced values of the quote (context.costing_trace), and values of the
+    // inputs of a piece proposed, applied only once a person accepts them (web/chiffrage/ai-apply.js checks them).
     analyse_chiffrage: { anyOf: [
       { type: "null" },
       { type: "object", properties: {
         explications: { type: "array", items: { type: "string" } },
         ecarts_signales: { type: "array", items: { type: "object", properties: { cle: { type: "string" }, commentaire: { type: "string" } }, required: ["cle","commentaire"], additionalProperties: false } },
         questions: { type: "array", items: { type: "string" } },
-        hypotheses: { type: "array", items: { type: "string" } }
-      }, required: ["explications","ecarts_signales","questions","hypotheses"], additionalProperties: false }
+        hypotheses: { type: "array", items: { type: "string" } },
+        propositions: { type: "array", items: { type: "object", properties: {
+          piece: { type: "string" },
+          cle: { type: "string" },
+          valeur: { anyOf: [{ type: "number" }, { type: "string" }, { type: "boolean" }] },
+          unite: { type: "string" },
+          source: { type: "string", enum: ["question", "trace", "analyse_3d"] },
+          justification: { type: "string" }
+        }, required: ["piece","cle","valeur","unite","source","justification"], additionalProperties: false } }
+      }, required: ["explications","ecarts_signales","questions","hypotheses","propositions"], additionalProperties: false }
     ] }
   },
   required: ["conclusion","observations","inferences","recommendations","uncertainties","needs_human_validation","analyse_chiffrage"],
@@ -108,13 +117,17 @@ Ce contexte EST l'analyse de la pièce par 3D Reader : métrologie, features dé
 Champ "selection" : seuls ces corps de la pièce sont envoyés (le corps sélectionné dans la liste, ou les corps cochés) ; réponds sur eux seulement.
 Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.`;
 
-// Not for the task « Chiffrage », which explains the traced values of the quote and proposes none.
+// Not for the task « Chiffrage », which explains the traced values of the quote and proposes values in its JSON (propositions).
 const TEXT_RULES = `Réponds en texte, jamais en JSON ; la mise en forme Markdown simple est permise (gras, listes, petits tableaux). Pour une conversation ou une question générale (fonderie, procédés, chiffrage, méthode), réponds directement et brièvement. Pour une question sur la pièce, organise la réponse en courtes sections, celles qui sont utiles seulement : « Conclusion », « Mesuré » (valeurs du contexte, avec leurs identifiants), « Déduit », « Recommandations », « À valider ».
 Paramètres de fonderie et de chiffrage (nombre de noyaux, de tiroirs, de chapes, îlot de coulée, coefficient de difficulté…) : quand on te les demande, propose-les en fondeur à partir des features et du criblage fonderie du contexte. Présente chaque valeur comme « Proposition IA — à valider », avec sa justification (identifiants des features) et ta confiance. N'invente jamais de prix, de taux horaires ni de mesures.`;
 
-const COSTING_RULES = `Tâche « Chiffrage » : costing_trace contient les valeurs tracées du devis en cours, en lecture seule. Réponds par un objet JSON (schéma engineering_analysis), toutes ses chaînes en français. Explique ces valeurs dans analyse_chiffrage : explications, ecarts_signales (écarts, alertes et valeurs à valider, chacun avec sa clé de la trace dans cle), questions à l'utilisateur, hypotheses ; cite la clé de chaque valeur dont tu parles (par exemple piece.prix.vente).
-N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux. Ne cite que des nombres présents dans costing_trace, tels quels ou arrondis : une réponse qui contient un autre nombre est marquée « non vérifiée ». Les valeurs masquées (« masqué ») sont confidentielles : ne les devine jamais.
-Tu ne fixes aucune valeur : rien de ce que tu écris n'est appliqué au devis ni aux paramètres. Si costing_trace est null, aucun classeur de chiffrage n'est importé : dis-le dans conclusion, et analyse_chiffrage est null.`;
+// The values of a piece the model may propose (web/chiffrage/ai-apply.js PROPOSAL_FIELDS: the same keys), shared with the local model.
+export const PROPOSAL_RULES = `Propositions (analyse_chiffrage.propositions) : quand l'utilisateur demande de changer une saisie d'une pièce ou en donne la bonne valeur, ou quand costing_trace ou l'analyse de la pièce donnent une valeur plus juste d'une saisie, propose-la : piece (son nom dans costing_trace.pieces), cle (une seule de : piece.poids en kg, piece.toileMini, piece.epaisseurMax, piece.module et piece.dimMax en mm, piece.ilot (code de l'îlot), piece.finition (code de la finition), piece.miseAuMille, piece.empreintes, piece.cycle en s, piece.mode (1*8, 2*8, 3*8 ou Réel), piece.tth (code du traitement ou none), piece.tthMode (scie ou masselotte), piece.noyaux, piece.tribo, piece.redressage (true ou false), piece.outillage.tiroirs, piece.outillage.complexite (Simple, Moyen ou Compliqué(e))), valeur (un nombre dans l'unité de la trace, un code ou true / false), unite, source (question : écrite par l'utilisateur ; trace : lue dans costing_trace ; analyse_3d : lue dans l'analyse de la pièce) et justification (une phrase). Jamais un prix, un taux, une marge, un paramètre, une valeur du devis entier ni une valeur masquée ; jamais un nombre que tu calcules ou estimes toi-même : seulement un nombre écrit par l'utilisateur, dans costing_trace ou dans l'analyse de la pièce. Une personne accepte chaque proposition avant qu'elle soit appliquée aux saisies de la pièce. Aucune proposition : une liste vide.`;
+
+const COSTING_RULES = `Tâche « Chiffrage » : costing_trace contient les valeurs tracées du devis en cours ; tu ne les modifies pas toi-même. Réponds par un objet JSON (schéma engineering_analysis), toutes ses chaînes en français. Explique ces valeurs dans analyse_chiffrage : explications, ecarts_signales (écarts, alertes et valeurs à valider, chacun avec sa clé de la trace dans cle), questions à l'utilisateur, hypotheses ; cite la clé de chaque valeur dont tu parles (par exemple piece.prix.vente).
+N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux. Dans les explications, ne cite que des nombres présents dans costing_trace, tels quels ou arrondis : une réponse qui contient un autre nombre est marquée « non vérifiée ». Les valeurs masquées (« masqué ») sont confidentielles : ne les devine jamais.
+${PROPOSAL_RULES}
+Si costing_trace est null, aucun classeur de chiffrage n'est importé : dis-le dans conclusion, et analyse_chiffrage est null.`;
 
 const CYCLE_RULES = `Tâche « Temps de cycle » : le contexte décrit une pièce coulée et sa coulée dans le devis (îlot, pièces par cycle, mise au mille, poids coulé), le temps de cycle que donne la formule de l'îlot avec ses termes, la tendance quand elle est connue et, s'il y en a, des pièces semblables de l'historique avec leur temps de cycle (source « devis » : temps chiffré dans un devis ; « production » : temps mesuré). Estime le temps de cycle de coulée : la durée d'un cycle de l'îlot, qui coule ensemble toutes les pièces de la grappe.
 Raisonne en fondeur, en coquille par gravité (moule métallique) comme en sable :

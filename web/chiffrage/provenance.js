@@ -46,6 +46,7 @@ export const SOURCES = {
   saisie: { autorite: "hard", niveau: 1, confiance: "haute", label: "saisie du devis", raison: "saisie dans le devis" },
   rfq: { autorite: "hard", niveau: 1, confiance: "haute", label: "demande client", raison: "commande du client (demande importée)" },
   ia_validee: { autorite: "hard", niveau: 1, confiance: "moyenne", label: "estimation IA validée", raison: "estimation d'un modèle de langage validée par une personne : à confirmer par une mesure en production" },
+  ia_appliquee: { autorite: "hard", niveau: 1, confiance: "haute", label: "proposition IA appliquée", raison: "valeur proposée par un modèle de langage, acceptée par une personne : saisie du devis" },
   parametres: { autorite: "hard", niveau: 2, confiance: "haute", label: "saisie Paramètres", raison: "saisie dans Paramètres" },
   classeur: { autorite: "hard", niveau: 2, confiance: "haute", label: "classeur", raison: "classeur de chiffrage" },
   indices: { autorite: "hard", niveau: 2, confiance: "haute", label: "indices", raison: "fichier des indices matière" },
@@ -655,7 +656,13 @@ export function tracePiece(r, ctx, devis) {
   const T = {};
   const i = r.inputs;
   const key = r.piece.key;
-  const input = (field, unite, extra = {}) => traced(i[field], { type: "saisie", unite, ref: `q.pieces["${key}"].${field}`, ...extra });
+  // A value applied from a proposal of the AI (ui.js applyAIValues), still as it was applied: a saisie of its own source.
+  const input = (field, unite, extra = {}) => {
+    const ia = i.valeursIA?.[field];
+    const applied = !!ia && i[field] === ia.valeur;
+    const by = applied ? [`proposée par ${[ia.provider, ia.model].filter(Boolean).join(" · ") || "l'IA"}, acceptée par l'utilisateur`] : [];
+    return traced(i[field], { type: applied ? "ia_appliquee" : "saisie", unite, ref: `q.pieces["${key}"].${field}`, ...extra, ...(applied && ia.date ? { date: ia.date } : {}), hypotheses: [...(extra.hypotheses ?? []), ...by] });
+  };
   const typed = (field) => i[field] !== null && i[field] !== undefined;
   const geo = (valeur, unite, ref, hypotheses = []) => traced(valeur, { type: "geometrie", unite, ref, fichier: ctx.p3dFile ?? undefined, hypotheses });
 

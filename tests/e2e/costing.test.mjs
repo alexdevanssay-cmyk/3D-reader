@@ -641,7 +641,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(trace.pieces[0].valeurs['piece.poids'].valeur, 1.2);
     assert.ok(trace.pieces[0].routes.length >= 1 && trace.pieces[0].routes.some((r) => r.retenue));
     assert.ok(system.length < 20_000, `system prompt of ${system.length} characters`);
-    assert.equal(await reply.locator('.ai-label').textContent(), "Raisonnement IA — aucune valeur n'est appliquée");
+    assert.equal(await reply.locator('.ai-label').textContent(), "Raisonnement IA — rien n'est appliqué sans votre accord");
     assert.equal(await reply.locator('.ai-check').getAttribute('class'), 'ai-check ok');
     assert.match(await reply.locator('.ai-text').textContent(), new RegExp(`est de ${fr(price.valeur).replace(/\s/g, '\\s')} €`));
 
@@ -713,6 +713,111 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     for (const text of ["aucune valeur n'a été appliquée au devis ni aux paramètres", 'Fournisseur', 'Pourquoi ce prix ?', 'Et avec un autre taux ?', 'Et le détail ?', 'qwen3:8b', 'openai/gpt-oss-120b', 'non : nombres absents de la trace']) {
       assert.ok(sheet.includes(text), text);
     }
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('IA page, task « Chiffrage »: a value of the piece proposed, refused without its number in the data, applied with the reply suggested (Tab, Entrée, confirmed), traced, undone', { timeout: 120_000 }, async (t) => {
+    // A stand-in for the AI gateway, its answer proposing what `propositions` holds.
+    const requests = [];
+    let propositions = [];
+    const gateway = createServer((req, res) => {
+      if (req.headers.origin) res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET,POST', 'Access-Control-Allow-Headers': 'Content-Type, Accept' });
+        return res.end();
+      }
+      res.setHeader('Content-Type', 'application/json');
+      if (req.method === 'GET') return res.end(JSON.stringify({ provider: 'Groq', model: 'openai/gpt-oss-120b', models: [], context_chars: 6000, access_code_required: false }));
+      let text = '';
+      req.on('data', (c) => (text += c));
+      req.on('end', () => {
+        requests.push(JSON.parse(text));
+        res.end(JSON.stringify({ output: JSON.stringify({
+          conclusion: 'Poids à corriger.', observations: [], inferences: [], recommendations: [], uncertainties: [], needs_human_validation: true,
+          analyse_chiffrage: { explications: ['Le poids de la pièce est saisi (piece.poids).'], ecarts_signales: [], questions: [], hypotheses: [], propositions },
+        }), provider: 'Groq', model: 'openai/gpt-oss-120b', quota: { requests_remaining_day: 990, requests_limit_day: 1000 } }));
+      });
+    });
+    await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => {
+      gateway.closeAllConnections();
+      gateway.close(resolve);
+    }));
+    const context = await browser.newContext({ locale: 'fr-FR' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    const dialogs = [];
+    page.on('dialog', (d) => {
+      dialogs.push(d.message());
+      d.accept();
+    });
+    // A quote of a piece typed in.
+    await page.goto(`${base}?lang=fr`);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
+    await page.waitForSelector('#page-chiffrage .cmsg.ok');
+    for (const [bind, value] of [['p.poids', 1.2], ['p.toileMini', 5], ['p.epaisseurMax', 10], ['p.moduleMm', 3], ['p.dimMax', 250]]) {
+      await page.fill(`#page-chiffrage [data-bind="${bind}"]`, String(value));
+      await page.dispatchEvent(`#page-chiffrage [data-bind="${bind}"]`, 'change');
+    }
+    await page.waitForSelector('#page-chiffrage .ctable tr.retained');
+    const piece = () => page.evaluate(() => JSON.parse(localStorage.getItem('reader3d.chiffrage.quote.v1')).pieces.manuel);
+    // The IA page, through the gateway.
+    await page.click('.tab[data-page="ia"]');
+    await page.selectOption('#ai-provider', 'openai');
+    await page.fill('#ai-url', `http://127.0.0.1:${gateway.address().port}/api/ai`);
+    const answered = (n) => page.waitForFunction((count) => document.querySelectorAll('#ai-chat .ai-msg').length >= count && /^Réponse en/.test(document.getElementById('ai-status').textContent), n, { timeout: 30_000 });
+    const weight = { piece: 'Pièce', cle: 'piece.poids', valeur: 1.35, unite: 'kg', source: 'question', justification: 'poids réel donné par l\'utilisateur' };
+    // The task clicked: 1,35 kg in none of the data sent nor the question: shown, not applicable, nothing suggested.
+    propositions = [weight];
+    await page.click('.ai-task[data-task="costing"]');
+    await answered(2);
+    assert.match(await page.textContent('#ai-chat .ai-msg:last-child .ai-proposals'), /poids pièce de « Pièce » : 1,35 kg \(votre message\) — poids réel donné par l'utilisateur — non applicable : nombre absent des données envoyées et de vos messages/);
+    assert.equal(await page.isVisible('#ai-suggest'), false);
+    // Written by the user: the reply suggested, beside the box and in it.
+    await page.fill('#ai-input', 'Le poids réel est de 1,35 kg : corrige-le.');
+    await page.press('#ai-input', 'Enter');
+    await answered(4);
+    await page.waitForSelector('#ai-suggest:not([hidden])');
+    assert.match(await page.textContent('#ai-suggest'), /Appliquer les valeurs au chiffrage1 saisie de « Pièce » : Tab dans la zone de saisie, puis Entrée/);
+    assert.equal(await page.getAttribute('#ai-input', 'placeholder'), 'Appliquer les valeurs au chiffrage (Tab pour l\'écrire, puis Entrée)');
+    assert.equal((await piece()).poids, 1.2, 'nothing applied by the answer');
+    // Tab writes it, Entrée applies it after a confirmation: nothing sent to the AI.
+    const sent = requests.length;
+    await page.focus('#ai-input');
+    await page.keyboard.press('Tab');
+    assert.equal(await page.inputValue('#ai-input'), 'Appliquer les valeurs au chiffrage');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => /Valeurs appliquées au chiffrage/.test(document.getElementById('ai-chat').textContent));
+    assert.match(dialogs.at(-1), /^Appliquer ces valeurs au chiffrage de cet onglet \?\n\n« Pièce » :\n {2}poids pièce : 1,2 kg → 1,35 kg\n\nElles deviennent des saisies de la pièce/);
+    assert.equal(requests.length, sent);
+    assert.equal(await page.textContent('#ai-chat .ai-msg:last-child .ai-text'), 'Valeurs appliquées au chiffrage :\n- poids pièce de « Pièce » : 1,2 kg → 1,35 kg');
+    assert.equal(await page.isVisible('#ai-suggest'), false);
+    const applied = await piece();
+    assert.deepEqual([applied.poids, applied.valeursIA.poids.avant, applied.valeursIA.poids.model], [1.35, 1.2, 'openai/gpt-oss-120b']);
+    // The costing: the weight applied, traced as such.
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage [data-bind="p.poids"]');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.poids"]'), '1.35');
+    assert.match(await page.textContent('#page-chiffrage .cmsg.ok'), /Valeurs proposées par l'IA appliquées à « Pièce » \(page IA \/ analyse\) : poids pièce : 1,2 kg → 1,35 kg/);
+    const trace = await page.evaluate(() => window.reader3d?.costing?.());
+    if (trace) assert.equal(trace.pieces[0].trace['piece.poids'].source.type, 'ia_appliquee');
+    // Undone from the conversation: the weight of before.
+    await page.click('.tab[data-page="ia"]');
+    await page.click('#ai-chat .ai-undo-apply');
+    await page.waitForFunction(() => /Application annulée/.test(document.getElementById('ai-chat').textContent));
+    assert.equal(await page.textContent('#ai-chat .ai-msg:last-child .ai-text'), 'Application annulée :\n- poids pièce de « Pièce » : 1,35 kg → 1,2 kg');
+    const back = await piece();
+    assert.deepEqual([back.poids, back.valeursIA], [1.2, undefined]);
+    assert.equal(await page.locator('#ai-chat .ai-undo-apply').count(), 0);
+    // Kept with the conversation after a reload; undone, nothing suggested again (its last message is not an answer).
+    await page.reload();
+    await page.waitForSelector('#ai-chat .ai-proposals');
+    assert.equal(await page.locator('#ai-chat .ai-proposals').count(), 2);
+    assert.equal(await page.locator('#ai-chat .ai-undo-apply').count(), 0);
+    assert.equal(await page.isVisible('#ai-suggest'), false);
     assert.deepEqual(errors, []);
     await context.close();
   });

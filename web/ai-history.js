@@ -61,6 +61,23 @@ function cleanMessage(m, id, date) {
   }
   if (Array.isArray(m.numbers)) out.numbers = m.numbers.filter((x) => typeof x === "string");
   if (Array.isArray(m.names)) out.names = m.names.filter((n) => Array.isArray(n) && n.length === 2 && n.every((x) => typeof x === "string"));
+  // Costing: the values the AI proposed for a piece (chiffrage/ai-apply.js), the piece they are for, their application.
+  const value = (v) => (["number", "string", "boolean"].includes(typeof v) ? v : null);
+  if (Array.isArray(m.proposals)) {
+    out.proposals = m.proposals.filter((p) => p && typeof p === "object" && typeof p.cle === "string").slice(0, 20).map((p) => ({
+      cle: p.cle, valeur: value(p.valeur),
+      ...Object.fromEntries(["piece", "cle_piece", "champ", "unite", "source", "justification", "refus", "ilot_mode"].filter((k) => typeof p[k] === "string").map((k) => [k, p[k]])),
+    }));
+  }
+  const t = m.target;
+  if (t && typeof t === "object" && Number.isInteger(t.tab)) out.target = { tab: t.tab, file: text(t.file) };
+  const a = m.application;
+  if (a && typeof a === "object" && typeof a.message === "string") {
+    out.application = {
+      message: a.message, undone: a.undone === true,
+      changes: (Array.isArray(a.changes) ? a.changes : []).filter((x) => x && typeof x.label === "string").map((x) => ({ label: x.label, avant: value(x.avant), apres: value(x.apres), unite: text(x.unite) ?? "" })),
+    };
+  }
   return out;
 }
 

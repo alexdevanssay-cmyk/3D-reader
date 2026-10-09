@@ -441,7 +441,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.doesNotMatch(costing, /costing_contract|costing_inputs|"quote"/);
     assert.match(costing, /Tâche « Chiffrage »/);
     assert.match(costing, /Ne cite que des nombres présents dans costing_trace/);
-    assert.equal(await page.textContent('#ai-chat .ai-msg:last-child .ai-label'), "Raisonnement IA — aucune valeur n'est appliquée");
+    assert.equal(await page.textContent('#ai-chat .ai-msg:last-child .ai-label'), "Raisonnement IA — rien n'est appliqué sans votre accord");
     // "7,257 cm³" is in no trace: the answer is not verified.
     assert.match(await page.textContent('#ai-chat .ai-msg:last-child .ai-check.bad'), /Réponse non vérifiée : un nombre absent de la trace du chiffrage \(7,257\)/);
     // A new conversation forgets it.

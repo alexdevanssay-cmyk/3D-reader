@@ -379,6 +379,13 @@ table.bodies .open { color: var(--warn); }
 .ai-row .ai-url-field { flex: 1 1 320px; }
 .ai-tasks { gap: 8px; }
 .ai-task[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+/* The values the AI proposes for the costing, under its answer; the reply that applies them, by the box. */
+.ai-proposals { margin-top: 8px; font-size: 13px; }
+.ai-proposals ul { margin: 4px 0 0; padding-left: 18px; }
+.ai-proposals li.refused { color: var(--muted); }
+.ai-undo-apply { margin-top: 8px; }
+.ai-suggest { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.ai-suggest-btn { border-style: dashed; border-color: var(--accent); }
 .ai-chat { display: grid; align-content: start; gap: 10px; flex: 1 1 0; min-height: 0; overflow: auto; }
 .ai-msg { padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); color: var(--text); }
 .ai-msg strong { display: block; margin-bottom: 4px; }

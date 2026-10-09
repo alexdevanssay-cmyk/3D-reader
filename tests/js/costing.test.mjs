@@ -20,6 +20,7 @@ import {
 import { DEMANDE, QUOTE_KEYS, SOURCES, demandeComparee, derive, missing, pieceKeys, resolve, summarize, traced, weakest } from '../../web/chiffrage/provenance.js';
 import { MASQUE, checkNumbers, isInternal, maskNumbers, numbersOf, traceForAI } from '../../web/chiffrage/ai-trace.js';
 import { anonymizer } from '../../web/engine/ai-context.js';
+import { checkProposals, readProposals } from '../../web/chiffrage/ai-apply.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -1653,5 +1654,112 @@ Le modèle 3D, l'alliage AS7G03, la 2e route, le classeur du 08/10/2026 à 12:30
     assert.equal(checkNumbers('15 000', { v: 15600 }).verifiee, false);
     assert.equal(checkNumbers('300 s', { v: 302 }).verifiee, true);
     assert.equal(checkNumbers('10', { v: 14 }).verifiee, false);
+  });
+});
+
+// --------------------------------------------------------------------------- values proposed by the AI, applied by a person
+
+// The task "Chiffrage" of the AI page may propose values of the inputs of a
+// piece (ai-apply.js); a person accepts them, ui.js:applyAIValues writes them
+// as inputs of that piece, undoAIValues takes them back.
+describe('values of a piece proposed by the AI, applied once accepted', () => {
+  before(async () => {
+    globalThis.window ??= { addEventListener() {} };
+    ui ??= await import('../../web/chiffrage/ui.js');
+  });
+
+  const trace = { pieces: [{ nom: 'Pièce', valeurs: { 'piece.poids': { valeur: 1.2, unite: 'kg' }, 'piece.empreintes': { valeur: 2 } } }] };
+  const sent = { costing_trace: trace, bodies: [] };
+
+  test('read and checked: only the inputs of a piece, each number from the data sent or the questions, the piece by its name', () => {
+    const read = readProposals([
+      { piece: 'Pièce', cle: 'piece.poids', valeur: '1,35', unite: 'kg', source: 'question', justification: 'donné par l\'utilisateur' },
+      { piece: 'Pièce', cle: 'piece.prix.vente', valeur: 12, unite: '€', source: 'trace', justification: '' },
+      { piece: 'Pièce', cle: 'piece.cycle', valeur: 137, unite: 's', source: 'trace', justification: 'calculé' },
+      { piece: 'Autre', cle: 'piece.dimMax', valeur: 250, unite: 'mm', source: 'trace', justification: '' },
+      { piece: 'Pièce', cle: 'centre.CG3.mode', valeur: '2*8', unite: '', source: 'question', justification: '' },
+      { piece: 'Pièce', cle: 'piece.noyaux', valeur: 'oui', unite: '', source: 'question', justification: '' },
+      { piece: 'Pièce', cle: 'piece.empreintes', valeur: 2.5, unite: '', source: 'question', justification: '' },
+      'pas un objet',
+    ], trace);
+    assert.deepEqual(read.map((p) => [p.cle, p.champ ?? null, p.valeur, p.index, p.refus === null]), [
+      ['piece.poids', 'poids', 1.35, 0, true],
+      ['piece.prix.vente', null, 12, 0, false],
+      ['piece.cycle', 'cycle', 137, 0, true],
+      ['piece.dimMax', 'dimMax', 250, -1, false],
+      ['piece.mode', 'mode', '2*8', 0, true],
+      ['piece.noyaux', 'noyaux', true, 0, true],
+      ['piece.empreintes', 'empreintes', 2.5, 0, false],
+    ]);
+    assert.equal(read[4].ilot_mode, 'CG3');
+    assert.match(read[1].refus, /prix, taux, paramètre ou valeur du devis entier/);
+    assert.match(read[3].refus, /pièce « Autre » absente/);
+    assert.equal(read[6].refus, 'nombre entier attendu');
+    // Each number from the data: 1,35 kg written by the user; 137 s in none of them (computed by the model).
+    const checked = checkProposals(read, sent, ['Le poids réel est de 1,35 kg.']);
+    assert.equal(checked[0].refus, null);
+    assert.match(checked[2].refus, /nombre absent des données envoyées et de vos messages/);
+    assert.equal(checkProposals(read, sent, [])[0].refus, 'nombre absent des données envoyées et de vos messages');
+    // Read from the trace sent: 2 cavities.
+    assert.equal(checkProposals(readProposals([{ piece: 'Pièce', cle: 'piece.empreintes', valeur: 2 }], trace), sent, [])[0].refus, null);
+    assert.deepEqual(readProposals('rien', trace), []);
+  });
+
+  test('applied: the inputs of the piece that differ, the island imposed for a value of its route, traced; undone: what was there before', () => {
+    const c = computed();
+    const r = c.results[0];
+    const island = r.route.process;
+    const cavities = r.trace['piece.empreintes'].valeur;
+    const proposals = [{ cle: 'piece.poids', valeur: 1.35 }, { cle: 'piece.empreintes', valeur: cavities + 1 }, { cle: 'piece.dimMax', valeur: 250 }];
+    const target = { tab: 1, file: null, key: 'manuel' };
+    // What would change: the weight and the cavities; the largest size is already 250.
+    const dry = ui.applyAIValues(target, proposals, {}, { dryRun: true });
+    assert.deepEqual(dry.applied.map((x) => [x.champ, x.avant, x.apres]), [['poids', 1.2, 1.35], ['empreintes', cavities, cavities + 1]]);
+    assert.deepEqual(dry.same.map((x) => x.champ), ['dimMax']);
+    assert.equal(loadQuote(base, indices).pieces.manuel.poids, 1.2, 'a dry run changes nothing');
+    // Applied: the inputs written, the island of the route imposed with its finishing, each kept with what was there before.
+    const done = ui.applyAIValues(target, proposals, { date: '2026-10-09T10:00:00.000Z', provider: 'Groq', model: 'openai/gpt-oss-120b', message: 'm1' });
+    assert.equal(done.saved, true);
+    const saved = loadQuote(base, indices);
+    const piece = saved.pieces.manuel;
+    assert.deepEqual([piece.poids, piece.empreintes, piece.procede, piece.finition, piece.dimMax], [1.35, cavities + 1, island, r.route.finition, 250]);
+    assert.deepEqual(Object.fromEntries(Object.entries(piece.valeursIA).map(([k, v]) => [k, [v.avant, v.valeur, v.message]])), {
+      procede: [null, island, 'm1'], finition: [null, r.route.finition, 'm1'], poids: [1.2, 1.35, 'm1'], empreintes: [null, cavities + 1, 'm1'],
+    });
+    assert.deepEqual(saved.analysesIA.map((a) => [a.tache, a.question]), [['application_ia', 'Appliquer les valeurs au chiffrage']]);
+    // Traced as a saisie of its own source; the costing uses them.
+    const after = ui.compute().results[0];
+    assert.deepEqual([after.trace['piece.poids'].valeur, after.trace['piece.poids'].source.type, after.trace['piece.poids'].autorite], [1.35, 'ia_appliquee', 'hard']);
+    assert.match(after.trace['piece.poids'].hypotheses.join(), /proposée par Groq · openai\/gpt-oss-120b, acceptée par l'utilisateur/);
+    assert.equal(after.trace['piece.empreintes'].valeur, cavities + 1);
+    assert.equal(after.chosen, true);
+    // Applied again: nothing to change.
+    assert.deepEqual(ui.applyAIValues(target, proposals, {}, { dryRun: true }).applied, []);
+    // Undone: the weight typed before, the cavities and the island estimated again.
+    const undone = ui.undoAIValues({ ...target, name: 'Pièce' }, { message: 'm1' });
+    assert.deepEqual(undone.undone.map((x) => x.champ).sort(), ['empreintes', 'finition', 'poids', 'procede']);
+    const back = loadQuote(base, indices).pieces.manuel;
+    assert.deepEqual([back.poids, back.empreintes, back.procede, back.finition, back.valeursIA], [1.2, undefined, undefined, undefined, undefined]);
+    assert.equal(ui.compute().results[0].chosen, false);
+    assert.match(ui.undoAIValues(target).error, /Aucune valeur appliquée/);
+  });
+
+  test('a value changed since by a person is kept when undone; the codes checked against the settings; another 3D model refused', () => {
+    computed();
+    const target = { tab: 1, file: null, key: 'manuel' };
+    ui.applyAIValues(target, [{ cle: 'piece.poids', valeur: 1.35 }, { cle: 'piece.toileMini', valeur: 4 }], { message: 'm2' });
+    // The weight typed again since in the page.
+    const q = loadQuote(base, indices);
+    saveQuote({ ...q, pieces: { manuel: { ...q.pieces.manuel, poids: 1.5 } } });
+    const undone = ui.undoAIValues(target, { message: 'm2' });
+    assert.deepEqual([undone.undone.map((x) => x.champ), undone.kept], [['toileMini'], ['poids pièce']]);
+    assert.deepEqual([loadQuote(base, indices).pieces.manuel.poids, loadQuote(base, indices).pieces.manuel.toileMini], [1.5, 5]);
+    // Codes unknown: refused, nothing written.
+    const refused = ui.applyAIValues(target, [{ cle: 'piece.ilot', valeur: 'ZZZ' }, { cle: 'piece.mode', valeur: '4*8' }, { cle: 'piece.tth', valeur: 'T99' }], {}, { dryRun: true });
+    assert.deepEqual(refused.refused.map((x) => x.cle), ['piece.ilot', 'piece.mode', 'piece.tth']);
+    assert.deepEqual(refused.applied, []);
+    // The quote of another 3D file: the model of the tab changed since the answer.
+    assert.match(ui.applyAIValues({ ...target, file: 'autre.step' }, [{ cle: 'piece.poids', valeur: 1.35 }]).error, /Le modèle 3D de l'onglet a changé/);
+    assert.match(ui.applyAIValues({ ...target, key: '0:Absente' }, [{ cle: 'piece.poids', valeur: 1.35 }]).error, /n'est plus chiffrée/);
   });
 });
