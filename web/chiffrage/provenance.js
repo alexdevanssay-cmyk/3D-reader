@@ -704,18 +704,20 @@ export function tracePiece(r, ctx, devis) {
 
   // Mise au mille, cavities and cycle: typed in (island chosen), else
   // estimated (routes.js:buildRoute). The estimates of the cavities and of the
-  // cycle use the estimated mise au mille and cavities, not those typed in: an
-  // estimate not retained that another one uses is traced under its own key
-  // (".estimee"). The settings of an estimate are traced when it is used.
+  // cycle use the estimated mise au mille, not the one typed in; the cycle is
+  // that of the cavities retained, and the tool is priced from the estimated
+  // ones: an estimate not retained that another one uses is traced under its
+  // own key (".estimee"). The settings of an estimate are traced when it is used.
   const mamTyped = r.chosen && i.miseAuMille > 0;
   const cavitiesTyped = r.chosen && i.empreintes > 0;
   const cycleTyped = r.chosen && i.cycle > 0;
+  const mouldTyped = i.outillagePrix > 0;
   const shownPct = (v) => `${fr(v * 100, 1)} %`;
   const mamDetail = e.miseAuMilleDetail;
   const mamSettings = mamDetail.estimated
     ? settingsGroup(ctx, ["base", "parDoublement", "petitePiece"].map((k) => `processes.${code}.rendement.${k}`), { label: `rendement de ${code}`, ref: `settings.processes.${code}.rendement` })
     : null;
-  if (mamSettings && !(mamTyped && cavitiesTyped && cycleTyped)) T["parametres.miseAuMille"] = mamSettings;
+  if (mamSettings && !(mamTyped && cavitiesTyped && cycleTyped && mouldTyped)) T["parametres.miseAuMille"] = mamSettings;
   const mamEstimate = mamDetail.estimated
     ? derive(e.miseAuMille, {
       unite: "kg/kg", ref: "routes.js:estimateMiseAuMille (1 / rendement)",
@@ -727,10 +729,10 @@ export function tracePiece(r, ctx, devis) {
   if (ctx.demandePiece) compareDemande(T["piece.miseAuMille"], q.serie, "miseAuMille");
   T["piece.kgCast"] = derive(r.final.kgCast, { unite: "kg", ref: "model.js:quote (poids × mise au mille)", entrees: { "piece.poids": T["piece.poids"], "piece.miseAuMille": T["piece.miseAuMille"] } });
   const mamKey = mamTyped ? "piece.miseAuMille.estimee" : "piece.miseAuMille";
-  if (mamTyped && !(cavitiesTyped && cycleTyped)) T[mamKey] = { ...mamEstimate, hypotheses: [...mamEstimate.hypotheses, "non retenue : sert à estimer les empreintes et le cycle"] };
+  if (mamTyped && !(cavitiesTyped && cycleTyped && mouldTyped)) T[mamKey] = { ...mamEstimate, hypotheses: [...mamEstimate.hypotheses, "non retenue : sert à estimer les empreintes et le cycle"] };
 
   const cavitySettings = settingsGroup(ctx, [`processes.${code}.empreintesMax`, `processes.${code}.grappeMax`], { label: `empreintes et grappe de ${code}`, ref: `settings.processes.${code}` });
-  if (!(cavitiesTyped && cycleTyped)) T["parametres.empreintes"] = cavitySettings;
+  if (!(cavitiesTyped && mouldTyped)) T["parametres.empreintes"] = cavitySettings;
   const cavitiesEstimate = derive(e.parCycle, {
     ref: "routes.js:buildRoute (grappe maxi / kg coulés, au plus les empreintes maxi)",
     entrees: { "piece.poids": T["piece.poids"], [mamKey]: mamEstimate, "parametres.empreintes": cavitySettings },
@@ -738,15 +740,15 @@ export function tracePiece(r, ctx, devis) {
   });
   T["piece.empreintes"] = resolve([cavitiesTyped ? input("empreintes", "") : null, cavitiesEstimate], { seuil, comparer: () => false });
   const cavitiesKey = cavitiesTyped ? "piece.empreintes.estimee" : "piece.empreintes";
-  if (cavitiesTyped && !cycleTyped) T[cavitiesKey] = { ...cavitiesEstimate, hypotheses: [...cavitiesEstimate.hypotheses, "non retenues : servent à estimer le cycle"] };
+  if (cavitiesTyped && !mouldTyped) T[cavitiesKey] = { ...cavitiesEstimate, hypotheses: [...cavitiesEstimate.hypotheses, "non retenues : le prix du moule part d'elles"] };
 
   const cycleSettings = settingsGroup(ctx, ["base", "parKg", "exposant", "parModule2"].map((k) => `processes.${code}.cycle.${k}`), { label: `cycle de ${code}`, ref: `settings.processes.${code}.cycle` });
   if (!cycleTyped) T["parametres.cycle"] = cycleSettings;
   const cycleEstimate = derive(e.cycle, {
     unite: "s", ref: "routes.js:buildRoute (base + coef × (kg coulés par cycle)^exposant + s/mm² × module²)",
-    entrees: { "piece.poids": T["piece.poids"], [mamKey]: mamEstimate, [cavitiesKey]: cavitiesEstimate, "piece.module": T["piece.module"], "parametres.cycle": cycleSettings },
+    entrees: { "piece.poids": T["piece.poids"], [mamKey]: mamEstimate, "piece.empreintes": T["piece.empreintes"], "piece.module": T["piece.module"], "parametres.cycle": cycleSettings },
     plafond: ["moyenne", "estimation à confirmer par les méthodes"],
-    hypotheses: mamTyped || cavitiesTyped ? ["cycle estimé avec les empreintes et la mise au mille estimées, pas celles saisies"] : [],
+    hypotheses: [...(mamTyped ? ["cycle estimé avec la mise au mille estimée, pas celle saisie"] : []), ...(cavitiesTyped ? [`cycle de la grappe des ${plural(i.empreintes, "empreinte")} saisie${i.empreintes > 1 ? "s" : ""}`] : [])],
   });
   // The estimate of the AI adopted by a person ("Utiliser cette valeur"): a value typed in, from its own source.
   const ai = cycleTyped ? adoptedEstimate(i, code) : null;
@@ -820,7 +822,7 @@ export function tracePiece(r, ctx, devis) {
     const band = tl.bandes.indexOf(bandOf(tl.bandes, t.block.kg));
     const toolingSettings = settingsGroup(ctx, [
       "tooling.type", `tooling.types.${tl.types[tl.type] ? tl.type : 0}.prixKg`, "tooling.densite", ...(Array.isArray(tl.coefPoids) ? tl.coefPoids.flatMap((_, k) => [`tooling.coefPoids.${k}.max`, `tooling.coefPoids.${k}.coef`]) : ["tooling.coefPoids"]),
-      "tooling.marges.longueur", "tooling.marges.largeur", "tooling.marges.hauteur", ...(t.cavities > 1 ? ["tooling.marges.entreEmpreintes"] : []),
+      "tooling.marges.longueur", "tooling.marges.largeur", "tooling.marges.hauteur", ...(t.cavities > 1 ? ["tooling.marges.entreEmpreintes"] : []), ...(t.facteurEmpreintes !== 1 ? ["tooling.parEmpreinte"] : []),
       ...["ax3", "ax3auto", "ax5", "ax5auto", "scan", "ajustage", ...(t.tiroirs ? ["tiroir3", "tiroir5"] : [])].map((k) => `tooling.bandes.${band}.${k}`),
       ...Object.keys(tl.taux).map((k) => `tooling.taux.${k}`), `tooling.etude.${t.complexite}`, `tooling.fao.${t.complexite}`, "tooling.sousTraitance", "tooling.marge",
       ...(typed("outillageTiroirs") ? [] : ["tooling.tiroirs"]), ...(i.outillageComplexite ? [] : ["tooling.complexite"]),
@@ -828,12 +830,23 @@ export function tracePiece(r, ctx, devis) {
     if (!(i.outillagePrix > 0)) T["parametres.outillage"] = toolingSettings;
     estimate = derive(route.outillageEstime, {
       unite: "€", ref: "tooling.js:estimateTooling",
-      entrees: { "piece.dimMax": T["piece.dimMax"], "piece.empreintes": T["piece.empreintes"], "parametres.outillage": toolingSettings },
+      entrees: { "piece.dimMax": T["piece.dimMax"], "piece.empreintes": T["piece.empreintes"], "piece.empreintes.estimee": T["piece.empreintes.estimee"], "parametres.outillage": toolingSettings },
       plafond: ["moyenne", "estimation par la méthode du classeur « Outillage fonderie »"],
       hypotheses: [
         `moule ${fr(t.block.L, 0)} × ${fr(t.block.W, 0)} × ${fr(t.block.H, 0)} mm = encombrement ${r.part.bboxSize?.length === 3 ? "du modèle 3D" : "estimé d'après la plus grande dimension"} + marges`,
         `${plural(t.tiroirs, "tiroir")} (${typed("outillageTiroirs") ? "saisi" : "par défaut"}), complexité ${t.complexite} (${i.outillageComplexite ? "saisie" : "par défaut"})`,
+        ...(t.facteurEmpreintes !== 1 ? [`${plural(t.cavities, "empreinte")}, ${t.empreintesEstimees} estimée${t.empreintesEstimees > 1 ? "s" : ""} : heures d'usinage, de scan et d'ajustage × ${fr(t.facteurEmpreintes, 2)}`] : []),
       ],
+    });
+  } else if (route.facteurOutillage !== 1) {
+    // The flat price is for the cavities the island would use: scaled for those typed in.
+    const flatSettings = settingsGroup(ctx, [`processes.${code}.outillage`, "tooling.parEmpreinte"], { label: `forfait d'outillage de ${code} et empreinte en plus ou en moins`, ref: "settings" });
+    if (!mouldTyped) T["parametres.outillage"] = flatSettings;
+    estimate = derive(route.outillageEstime, {
+      unite: "€", ref: "routes.js:buildRoute (forfait de l'îlot × empreintes)",
+      entrees: { "piece.empreintes": T["piece.empreintes"], "piece.empreintes.estimee": T["piece.empreintes.estimee"], "parametres.outillage": flatSettings },
+      plafond: ["faible", "forfait de l'îlot ramené au nombre d'empreintes"],
+      hypotheses: [`prix forfaitaire de l'îlot ${code} × ${fr(route.facteurOutillage, 2)} : ${plural(route.parCycle, "empreinte")} au lieu de ${route.parCycleEstime} estimée${route.parCycleEstime > 1 ? "s" : ""}`],
     });
   } else estimate = fromSetting(ctx, `processes.${code}.outillage`, { unite: "€", hypotheses: [`prix forfaitaire de l'îlot ${code}`] });
   const mould = resolve([i.outillagePrix > 0 ? input("outillagePrix", "€") : null, estimate], { seuil, comparer: () => false });

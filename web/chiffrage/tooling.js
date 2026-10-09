@@ -51,6 +51,12 @@ export const DEFAULT_TOOLING = {
   complexite: "Moyen",
   sousTraitance: 0.1, // share of subcontracting (STT)
   marge: 0, // margin on the die
+  // Cavities other than the island's estimate (chosen in the page): each one
+  // more, or fewer, adds or removes this share of the work of one cavity: the
+  // milling, scan and fitting hours of an in-house die, the flat price of the
+  // other islands' tools. The estimate keeps its price: the method and the
+  // flat prices are taken as those of the cavities the island would use.
+  parEmpreinte: 0.5,
 };
 
 export const COMPLEXITES = ["Simple", "Moyen", "Compliqué(e)"];
@@ -67,9 +73,21 @@ export function coefOf(coefPoids, bareKg) {
 }
 
 /**
+ * Factor of the work of a tool of `n` cavities over that of the tool of the
+ * `estimated` cavities the island would use, each cavity past the first one
+ * counting for `share` of the first: (1 + share (n − 1)) / (1 + share (estimated − 1)).
+ */
+export function cavityFactor(n, estimated = n, share = 0) {
+  const k = Math.max(0, Number(share) || 0);
+  const work = (c) => 1 + k * (Math.max(1, Math.round(c || 1)) - 1);
+  return work(n) / work(estimated);
+}
+
+/**
  * Cost lines of a steel tool of L × l × h mm with the method of the workbook:
  * {total, suivant (next tool: without design and CAM), kg, band, lines}.
- *   o: {L, l, h, prixKg, typeLabel, tiroirs, etudeH, faoH}
+ *   o: {L, l, h, prixKg, typeLabel, tiroirs, etudeH, faoH,
+ *       facteurEmpreintes (milling, scan and fitting hours of the band × it; default 1)}
  *   s: {densite, coefPoids, bandes, taux, sousTraitance, marge}
  */
 export function steelToolCost(o, s) {
@@ -79,15 +97,18 @@ export function steelToolCost(o, s) {
   const band = bandOf(s.bandes, kg);
   const t = s.taux;
   const slides = o.tiroirs || 0;
+  // The hours of the cavities (milling, scan, fitting): those of the band, for more or fewer cavities.
+  const f = o.facteurEmpreintes ?? 1;
+  const h = Object.fromEntries(["ax3", "ax3auto", "ax5", "ax5auto", "scan", "ajustage"].map((k) => [k, band[k] * f]));
   const nf = (v, d = 1) => Number(v).toLocaleString("fr-FR", { maximumFractionDigits: d });
   const lines = [
     { label: `Acier (${o.typeLabel})`, detail: `${nf(o.L, 0)} × ${nf(o.l, 0)} × ${nf(o.h, 0)} mm × ${nf(s.densite)} × ${nf(coef, 2)} = ${nf(kg, 0)} kg × ${nf(o.prixKg, 2)} €/kg`, value: kg * o.prixKg },
-    { label: "Usinage 3 axes", detail: `${nf(band.ax3)} h × ${nf(t.ax3, 0)} € + ${nf(band.ax3auto)} h auto × ${nf(t.ax3auto, 0)} €${slides ? ` + ${nf(band.tiroir3)} h × ${slides} tiroir${slides > 1 ? "s" : ""}` : ""}`, value: band.ax3 * t.ax3 + band.ax3auto * t.ax3auto + band.tiroir3 * t.ax3 * slides },
-    { label: "Usinage 5 axes", detail: `${nf(band.ax5)} h × ${nf(t.ax5, 0)} € + ${nf(band.ax5auto)} h auto × ${nf(t.ax5auto, 0)} €${slides ? ` + ${nf(band.tiroir5)} h × ${slides} tiroir${slides > 1 ? "s" : ""}` : ""}`, value: band.ax5 * t.ax5 + band.ax5auto * t.ax5auto + band.tiroir5 * t.ax5 * slides },
+    { label: "Usinage 3 axes", detail: `${nf(h.ax3)} h × ${nf(t.ax3, 0)} € + ${nf(h.ax3auto)} h auto × ${nf(t.ax3auto, 0)} €${slides ? ` + ${nf(band.tiroir3)} h × ${slides} tiroir${slides > 1 ? "s" : ""}` : ""}`, value: h.ax3 * t.ax3 + h.ax3auto * t.ax3auto + band.tiroir3 * t.ax3 * slides },
+    { label: "Usinage 5 axes", detail: `${nf(h.ax5)} h × ${nf(t.ax5, 0)} € + ${nf(h.ax5auto)} h auto × ${nf(t.ax5auto, 0)} €${slides ? ` + ${nf(band.tiroir5)} h × ${slides} tiroir${slides > 1 ? "s" : ""}` : ""}`, value: h.ax5 * t.ax5 + h.ax5auto * t.ax5auto + band.tiroir5 * t.ax5 * slides },
     { label: "FAO", detail: `${nf(o.faoH)} h × ${nf(t.fao, 0)} €/h`, value: o.faoH * t.fao },
-    { label: "Scan 3D + rapport", detail: `${nf(band.scan)} h × ${nf(t.scan, 0)} €/h`, value: band.scan * t.scan },
+    { label: "Scan 3D + rapport", detail: `${nf(h.scan)} h × ${nf(t.scan, 0)} €/h`, value: h.scan * t.scan },
     { label: "Étude", detail: `${nf(o.etudeH)} h × ${nf(t.etude, 0)} €/h`, value: o.etudeH * t.etude },
-    { label: "Ajustage / montage", detail: `${nf(band.ajustage)} h × ${nf(t.ajustage, 0)} €/h`, value: band.ajustage * t.ajustage },
+    { label: "Ajustage / montage", detail: `${nf(h.ajustage)} h × ${nf(t.ajustage, 0)} €/h`, value: h.ajustage * t.ajustage },
   ];
   const cost = lines.reduce((n, l) => n + l.value, 0);
   const stt = cost / (1 - s.sousTraitance) - cost;
@@ -114,14 +135,19 @@ export function dieSize(part, cavities, t = DEFAULT_TOOLING) {
  *          outillageTiroirs, outillageComplexite (else the defaults of the settings)}
  *   cavities: number of cavities of the die
  *   t: the settings (DEFAULT_TOOLING)
- * Returns {total, suivant, lines: [{label, detail, value}], cavities, block: {L, W, H, kg}, tiroirs, complexite}.
+ *   estimated: the cavities the island would use (routes.js piecesPerCycle);
+ *              other cavities: the hours of the cavities × cavityFactor
+ * Returns {total, suivant, lines: [{label, detail, value}], cavities, block: {L, W, H, kg}, tiroirs, complexite,
+ *          empreintesEstimees, facteurEmpreintes}.
  */
-export function estimateTooling(part, cavities, t = DEFAULT_TOOLING) {
+export function estimateTooling(part, cavities, t = DEFAULT_TOOLING, estimated = cavities) {
   const size = dieSize(part, cavities, t);
   const type = t.types[t.type] ?? t.types[0];
   const tiroirs = part.outillageTiroirs ?? t.tiroirs ?? 0;
   const complexite = part.outillageComplexite || t.complexite || "Moyen";
-  const r = steelToolCost({ L: size.L, l: size.l, h: size.h, prixKg: type.prixKg, typeLabel: type.label, tiroirs, etudeH: t.etude[complexite] ?? 0, faoH: t.fao[complexite] ?? 0 }, t);
+  const n0 = Math.max(1, Math.round(estimated || 1));
+  const facteurEmpreintes = cavityFactor(size.n, n0, t.parEmpreinte);
+  const r = steelToolCost({ L: size.L, l: size.l, h: size.h, prixKg: type.prixKg, typeLabel: type.label, tiroirs, etudeH: t.etude[complexite] ?? 0, faoH: t.fao[complexite] ?? 0, facteurEmpreintes }, t);
   return {
     total: r.total,
     suivant: r.suivant,
@@ -130,6 +156,8 @@ export function estimateTooling(part, cavities, t = DEFAULT_TOOLING) {
     block: { L: size.L, W: size.l, H: size.h, kg: r.kg },
     tiroirs,
     complexite,
+    empreintesEstimees: n0,
+    facteurEmpreintes,
   };
 }
 

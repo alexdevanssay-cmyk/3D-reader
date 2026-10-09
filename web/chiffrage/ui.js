@@ -4,8 +4,7 @@
 
 import { MODES, readCostingWorkbook, readIndicesWorkbook } from "./workbook.js";
 import { centreRates, indexAverage, quote, saleMetalPrice, solveMargin as minimumMargin } from "./model.js";
-import { bestRoutes, buildRoute, rankRoutes } from "./routes.js";
-import { estimateTooling } from "./tooling.js";
+import { bestRoutes, buildRoute, cavityChoices, rankRoutes } from "./routes.js";
 import { coreBoxCost, coresPerPiece, newCore } from "./cores.js";
 import { filledFields, orderValues, programmeFor, programmeOf, readSeriesOrder, sameProgramme } from "./rfq.js";
 import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, demandeComparee, label as traceLabel, pieceNames, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
@@ -297,6 +296,9 @@ async function onClick(event) {
     piece.cycle = piece.empreintes = piece.miseAuMille = piece.mode = null;
     forgetAdoption(piece);
     store.saveQuote(q);
+    render();
+  } else if (action === "cavities" || action === "cavities-auto") {
+    retainCavities(action === "cavities" ? Number(button.dataset.n) : null);
     render();
   } else if (action === "piece") {
     const index = Number(button.dataset.index);
@@ -750,9 +752,14 @@ function traceContext(p3d) {
   return { q, base, indices, layers, settings, seuil, p3dFile: p3d?.file ?? null };
 }
 
-/** Quote of one piece: its features, the routes, the retained route and its costing; and their trace (out.trace). */
-function computePiece(piece, { density, years, volumes, volumeTotal, metal, energy, rates, trace }, ctx) {
-  const inputs = pieceInputs(piece.key);
+/**
+ * Quote of one piece: its features, the routes, the retained route and its
+ * costing; and their trace (out.trace). `override`: inputs of the piece in
+ * place of those saved, with the island and the finishing (a variant compared
+ * in the page, nothing saved).
+ */
+function computePiece(piece, { density, years, volumes, volumeTotal, metal, energy, rates, trace }, ctx, override = null) {
+  const inputs = { ...pieceInputs(piece.key), ...override };
   const auto = {
     poids: piece.volume ? (piece.volume / 1e6) * density : null,
     toileMini: piece.thickness?.min ?? null,
@@ -803,10 +810,11 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
     tthCoef: settings.tth[inputs.tth]?.coef ?? 1,
   };
   const out = { piece, inputs, auto, part, density };
-  const traced = () => ((out.trace = tracePiece(out, ctx, trace)), out);
+  // A variant has its island and finishing given: neither ranked nor traced.
+  const traced = () => (override ? out : ((out.trace = tracePiece(out, ctx, trace)), out));
   if (!(part.poids > 0)) return traced();
 
-  const ranked = rankRoutes(rates, base.lists, part, settings, quoteBase);
+  const ranked = override ? [] : rankRoutes(rates, base.lists, part, settings, quoteBase);
   const best = bestRoutes(ranked, 3);
   out.ranked = ranked;
   out.best = best;
@@ -821,20 +829,15 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
       ? inputs.finition
       : ranked.find((r) => r.process === code && r.feasible)?.finition ?? ranked.find((r) => r.process === code)?.finition ?? process.finitions[0];
   const finalRates = chosen && inputs.mode ? centreRates(base, { modes: { ...settings.modes, [code]: inputs.mode }, energy }) : rates;
-  const route = buildRoute(code, finition, part, settings, finalRates);
-  out.estimated = { cycle: route.cycle, parCycle: route.parCycle, miseAuMille: route.miseAuMille, miseAuMilleDetail: route.miseAuMilleDetail };
+  // The cavities typed in: the cycle estimated for their cluster, the tool priced for them (routes.js).
+  const route = buildRoute(code, finition, part, settings, finalRates, chosen && inputs.empreintes > 0 ? { empreintes: inputs.empreintes } : {});
+  out.estimated = { cycle: route.cycle, parCycle: route.parCycleEstime, miseAuMille: route.miseAuMille, miseAuMilleDetail: route.miseAuMilleDetail };
   if (chosen) {
     const casting = route.operations.find((o) => o.code === code);
     if (inputs.miseAuMille > 0) route.miseAuMille = inputs.miseAuMille;
-    if (inputs.empreintes > 0) casting.parCycle = inputs.empreintes;
     if (inputs.cycle > 0) casting.cycle = inputs.cycle;
   }
-  // The in-house die for the number of cavities retained; or the price typed in.
-  const cavities = route.operations.find((o) => o.code === code)?.parCycle;
-  if (route.tooling && cavities !== route.tooling.cavities) {
-    route.tooling = estimateTooling(part, cavities, settings.tooling);
-    route.outillage = route.tooling.total;
-  }
+  // The tool estimated for the cavities retained; or the price typed in.
   route.outillageEstime = route.outillage;
   if (inputs.outillagePrix > 0) route.outillage = inputs.outillagePrix;
   // Core boxes of the cores of the piece, added to the tooling.
@@ -1142,6 +1145,7 @@ function renderQuote() {
     ${ensemble ? "" : toolingCard(r)}
   </div>
 
+  ${ensemble ? "" : cavitiesCard(c, r)}
   ${ensemble ? "" : cycleCard(r)}
   ${!ensemble && r?.inputs.noyaux ? coresFields(r) : ""}
   ${ensemble ? ensembleCard(c) : solutionsCard(r)}
@@ -1235,7 +1239,8 @@ function castingCard(r) {
   const locked = i.procede === "auto";
   const cycleOptions = [[" ", `Estimé${e ? ` (${nf(e.cycle, 0)} s)` : ""}`], ...[20, 30, 45, 60, 75, 90, 120, 150, 180, 240, 300, 360, 420, 480, 600, 900].map((v) => [v, `${v} s`])];
   if (i.cycle > 0 && !cycleOptions.some(([v]) => Number(v) === i.cycle)) cycleOptions.push([i.cycle, `${i.cycle} s`]);
-  const empreintesOptions = [[" ", `Estimé${e ? ` (${e.parCycle})` : ""}`], ...[1, 2, 3, 4, 5, 6, 8].map((n) => [n, String(n)])];
+  const empreintesOptions = [[" ", `Estimé${e ? ` (${e.parCycle})` : ""}`], ...[...new Set([1, 2, 3, 4, 5, 6, 8, ...(i.empreintes > 0 ? [i.empreintes] : [])])].sort((a, b) => a - b).map((n) => [n, String(n)])];
+  const op = r.route?.operations.find((o) => o.code === routeCode);
   const mamOptions = [[" ", `Estimée${e ? ` (${nf(e.miseAuMille, 2)})` : ""}`], ...[1.1, 1.2, 1.25, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 2, 2.2, 2.5].map((n) => [n, nf(n, 2)])];
   const mam = e?.miseAuMilleDetail;
   const mamDetail = mam
@@ -1249,8 +1254,8 @@ function castingCard(r) {
         ${field("Procédé / îlot", select("p.procede", i.procede, [["auto", "Automatique (meilleure solution)"], ...casting.map((code) => [code, `${code} — ${settings.processes[code].famille}`])]))}
         ${field("Finition", select("p.finition", i.finition, [["auto", "Automatique"], ...(routeCode ? settings.processes[routeCode].finitions.map((f) => [f, `${f} — ${settings.operations[f]?.label ?? f}`]) : [])]))}
         ${field("Fonctionnement", locked ? `<output>${esc(r.finalRates?.get(routeCode)?.mode ?? "—")}</output>` : select("p.mode", i.mode ?? "", [["", `Paramètre (${esc(settings.modes[routeCode] ?? base.centres.find((x) => x.code === routeCode)?.defaultMode ?? "")})`], ...MODES.map((m) => [m, m])], { kind: "nullraw" }), locked ? "choisissez un îlot pour le modifier" : "")}
-        ${field("Temps de cycle", locked ? `<output>${e ? `${nf(e.cycle, 0)} s (estimé)` : "—"}</output>` : select("p.cycle", i.cycle ?? " ", cycleOptions, { kind: "num" }))}
-        ${field("Empreintes / pièces par cycle", locked ? `<output>${e?.parCycle ?? "—"}</output>` : select("p.empreintes", i.empreintes ?? " ", empreintesOptions, { kind: "num" }))}
+        ${field("Temps de cycle", locked ? `<output>${e ? `${nf(e.cycle, 0)} s (estimé)` : "—"}</output>` : select("p.cycle", i.cycle ?? " ", cycleOptions, { kind: "num" }), op?.parCycle > 1 ? `soit ${sec(op.cycle / op.parCycle)} par pièce` : "")}
+        ${field("Empreintes / pièces par cycle", locked ? `<output>${e?.parCycle ?? "—"}</output>` : select("p.empreintes", i.empreintes ?? " ", empreintesOptions, { kind: "num" }), locked && routeCode ? "à comparer dans « Empreintes par coulée »" : "")}
         ${field("Mise au mille (kg coulé / kg pièce)", locked ? `<output>${e ? nf(e.miseAuMille, 2) : "—"}</output>` : select("p.miseAuMille", i.miseAuMille ?? " ", mamOptions, { kind: "num" }))}
         ${field("TRS de l'îlot", `<output>${routeCode ? pct(r.route.operations.find((o) => o.code === routeCode)?.trs, 0) : "—"}</output>`, "modifiable dans Paramètres")}
       </div>
@@ -1268,12 +1273,12 @@ function toolingCard(r) {
   const amortised = r.final && r.part.volumeTotal > 0 ? route.outillage / r.part.volumeTotal : null;
   const rows = t
     ? t.lines.map((l) => `<tr><td>${esc(l.label)}</td><td class="muted small">${esc(l.detail)}</td><td class="num">${total(l.value)}</td></tr>`).join("")
-    : `<tr><td>Outillage ${esc(route.famille)}</td><td class="muted small">prix de l'îlot (Paramètres)</td><td class="num">${total(route.outillageEstime)}</td></tr>`;
+    : `<tr><td>Outillage ${esc(route.famille)}</td><td class="muted small">prix de l'îlot (Paramètres)${route.facteurOutillage !== 1 ? ` × ${nf(route.facteurOutillage, 2)} : ${plural(route.parCycle, "empreinte")} au lieu de ${route.parCycleEstime} estimée${route.parCycleEstime > 1 ? "s" : ""}` : ""}</td><td class="num">${total(route.outillageEstime)}</td></tr>`;
   return `<section class="ccard">
       <h3>Outillage — ${t ? (/^Basse pression/i.test(route.famille) ? "moule basse pression acier réalisé sur place" : "coquille acier réalisée sur place") : esc(route.famille)}</h3>
       <div class="cscroll"><table class="ctable">
         <tbody>${rows}</tbody>
-        <tfoot><tr><td><strong>Total estimé</strong></td><td class="muted small">${t ? `${t.cavities} empreinte${t.cavities > 1 ? "s" : ""}, ${t.tiroirs} tiroir${t.tiroirs > 1 ? "s" : ""}, ${esc(t.complexite)} — outillage suivant ${total(t.suivant)} (sans étude ni FAO)` : ""}</td><td class="num"><strong>${total(route.outillageEstime)}</strong></td></tr></tfoot>
+        <tfoot><tr><td><strong>Total estimé</strong></td><td class="muted small">${t ? `${t.cavities} empreinte${t.cavities > 1 ? "s" : ""}${t.facteurEmpreintes !== 1 ? ` (${t.empreintesEstimees} estimée${t.empreintesEstimees > 1 ? "s" : ""} : heures d'usinage, de scan et d'ajustage × ${nf(t.facteurEmpreintes, 2)})` : ""}, ${t.tiroirs} tiroir${t.tiroirs > 1 ? "s" : ""}, ${esc(t.complexite)} — outillage suivant ${total(t.suivant)} (sans étude ni FAO)` : ""}</td><td class="num"><strong>${total(route.outillageEstime)}</strong></td></tr></tfoot>
       </table></div>
       <div class="cfields">
         ${t ? field("Tiroirs du moule", input("p.outillageTiroirs", r.inputs.outillageTiroirs, { min: 0, step: 1, placeholder: nf(settings.tooling.tiroirs, 0) }), "vide = valeur par défaut") : ""}
@@ -1292,6 +1297,67 @@ function toolingCard(r) {
         <tfoot><tr><td><strong>Total outillage</strong></td><td class="muted small">moule ${total(route.outillageMoule)} + boîtes à noyau ${total(route.outillage - route.outillageMoule)}</td><td class="num"><strong>${total(route.outillage)}</strong></td></tr></tfoot>
       </table></div>` : ""}
     </section>`;
+}
+
+/**
+ * The piece costed with 1, 2... cavities on the island retained: each row is
+ * the quote as "Retenir" makes it (the island imposed, these cavities, the
+ * cycle and the tool estimated for them), the row retained the quote as it is.
+ * `c`: compute(), `r`: one of its results. Nothing is saved.
+ */
+export function cavityRows(c, r) {
+  const route = r.route;
+  return cavityChoices(settings.processes[route.process], route.parCycleEstime, route.parCycle).map((n) => ({
+    n,
+    r: n === route.parCycle ? r : computePiece(r.piece, c, null, { procede: route.process, finition: route.finition, empreintes: n, cycle: null, outillagePrix: null }),
+  }));
+}
+
+/**
+ * Card "Empreintes par coulée": more cavities, a cycle a little longer for
+ * more pieces, so less time per piece, and a bigger die; the price per piece
+ * for each number of cavities, and "Retenir".
+ */
+function cavitiesCard(c, r) {
+  const route = r?.route;
+  if (!route || !r.final) return "";
+  const p = settings.processes[route.process];
+  const k = settings.tooling.parEmpreinte ?? 0;
+  const n0 = route.parCycleEstime;
+  const inclus = q.outillageInclus !== false;
+  const rows = cavityRows(c, r)
+    .map(({ n, r: x }) => {
+      const f = x.final;
+      const casting = x.route?.operations.find((o) => o.code === route.process);
+      if (!f || !casting) return "";
+      const retained = n === route.parCycle;
+      return `<tr class="${retained ? "retained" : ""}" data-empreintes="${n}">
+        <td class="num"><strong>${n}</strong>${n === n0 ? ` <span class="muted small">estimé</span>` : ""}</td>
+        <td class="num">${nf(f.kgCast * n, 2)} kg</td>
+        <td class="num">${sec(casting.cycle)}</td>
+        <td class="num"><strong>${sec(casting.cycle / n)}</strong></td>
+        <td class="num">${eur(x.route.outillageMoule, 0)}</td>
+        <td class="num">${inclus ? eur(f.outillages) : "à part"}</td>
+        <td class="num">${eur(f.pri + f.outillages)}</td>
+        <td class="num">${eur(f.years[0]?.prixVente)}</td>
+        <td class="small">${x.route.alertesEmpreintes.map(esc).join("<br>")}</td>
+        <td>${retained ? "✓ retenu" : `<button type="button" class="small" data-action="cavities" data-n="${n}">Retenir</button>`}</td>
+      </tr>`;
+    })
+    .join("");
+  const typed = [r.chosen && r.inputs.cycle > 0 ? "le temps de cycle saisi" : "", r.inputs.outillagePrix > 0 ? "le prix d'outillage saisi" : ""].filter(Boolean);
+  const mould = route.tooling
+    ? `moule réalisé sur place, méthode « Outillage fonderie » pour sa taille (empreintes côte à côte)${k ? ` ; chaque empreinte de plus que l'estimation ajoute ${pct(k, 0)} des heures d'usinage, de scan et d'ajustage d'une empreinte, chaque empreinte de moins les retire` : ""}`
+    : `forfait de l'îlot (${eur(p.outillage, 0)}) pour ${plural(n0, "empreinte")} estimée${n0 > 1 ? "s" : ""}${k ? ` ; chaque empreinte de plus ajoute ${pct(k, 0)} du prix d'un moule à une empreinte, chaque empreinte de moins les retire` : ""}`;
+  return `<section class="ccard" id="cempreintes">
+    <h3>Empreintes par coulée — ${esc(r.piece.name)}</h3>
+    <p class="small">Îlot <strong>${esc(route.process)}</strong> ${esc(route.famille)} : ${plural(n0, "empreinte")} estimée${n0 > 1 ? "s" : ""} (grappe maxi ${nf(p.grappeMax, 0)} kg, ${plural(p.empreintesMax, "empreinte")} maxi). Plus d'empreintes : un cycle un peu plus long pour plus de pièces, donc moins de temps par pièce, mais un moule plus grand et plus cher.</p>
+    <div class="cscroll"><table class="ctable">
+      <thead><tr><th class="num">Empreintes</th><th class="num">Kg coulés / cycle</th><th class="num">Cycle</th><th class="num">Temps / pièce</th><th class="num">Moule</th><th class="num">Outillage / pièce</th><th class="num">PRI${inclus ? " (outillage compris)" : ""}</th><th class="num">Prix de vente</th><th>Alertes</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    ${r.chosen && r.inputs.empreintes > 0 ? `<p><button type="button" class="small" data-action="cavities-auto">Revenir aux empreintes estimées</button></p>` : ""}
+    <p class="small muted">Cycle : formule de l'îlot pour les kg coulés de toute la grappe ; temps par pièce = cycle / empreintes. Moule : ${mould} (Paramètres, Outillage). ${typed.length ? `La ligne retenue garde ${typed.join(" et ")} ; les autres sont estimées, et « Retenir » remplace ${typed.length > 1 ? "ces saisies" : "cette saisie"} par l'estimation. ` : ""}${r.chosen ? "" : `« Retenir » impose l'îlot ${esc(route.process)} avec ce nombre d'empreintes. `}PRI et prix de vente de la première année${inclus ? ", outillage amorti compris" : " (outillage chiffré à part)"}.</p>
+  </section>`;
 }
 
 function solutionsCard(r) {
@@ -1640,6 +1706,32 @@ function aiChoice() {
   return ai.provider === "ollama"
     ? `Ollama ${esc(ollamaPlace())} (${esc(ai.ollama.model)})`
     : `passerelle en ligne${ai.gateway.url ? "" : " (adresse à renseigner dans la page IA / analyse)"}${ai.anonymize ? ", noms anonymisés" : ""}`;
+}
+
+/**
+ * "Retenir" in the card "Empreintes par coulée": `n` cavities for the piece
+ * shown (null: back to the estimate), on the island of its route, imposed with
+ * them (a number of cavities is that of its island). The cycle and the price
+ * of the tool typed in for other cavities give way to their estimate.
+ */
+function retainCavities(n) {
+  const c = compute();
+  const r = c?.results.find((x) => x.piece.key === c.selected);
+  if (!r?.route) return;
+  const piece = pieceStore(r.piece.key);
+  const imposed = r.inputs.procede !== r.route.process;
+  if (imposed) [piece.procede, piece.finition] = [r.route.process, r.route.finition];
+  const replaced = n === null ? [] : [piece.cycle > 0 ? `temps de cycle saisi (${piece.cycle} s)` : "", piece.outillagePrix > 0 ? `prix d'outillage saisi (${eur(piece.outillagePrix, 0)})` : ""].filter(Boolean);
+  piece.empreintes = n;
+  if (n !== null) piece.cycle = piece.outillagePrix = null;
+  forgetAdoption(piece);
+  store.saveQuote(q);
+  const after = compute()?.results.find((x) => x.piece.key === r.piece.key)?.route;
+  const casting = after?.operations.find((o) => o.code === after.process);
+  message = {
+    kind: "ok",
+    text: `${n === null ? "Empreintes estimées" : plural(n, "empreinte")} sur l'îlot ${r.route.process}${imposed ? ", désormais imposé" : ""}${casting ? ` : cycle de ${sec(casting.cycle)} pour ${plural(casting.parCycle, "pièce")}, soit ${sec(casting.cycle / casting.parCycle)} par pièce, moule ${eur(after.outillageMoule, 0)}` : ""}.${replaced.length ? ` Remplacés par leur estimation : ${replaced.join(", ")}.` : ""}`,
+  };
 }
 
 /** Under the casting parameters: "Estimer le temps de cycle avec l'IA", the box of the similar parts, the AI asked. */
@@ -2458,6 +2550,7 @@ function renderSettings() {
       ${tf("Marge sur la largeur (mm, par côté)", "marges.largeur", tl.marges.largeur, "empreintes côte à côte")}
       ${tf("Marge sur la hauteur (mm, par côté)", "marges.hauteur", tl.marges.hauteur)}
       ${tf("Entre deux empreintes (mm)", "marges.entreEmpreintes", tl.marges.entreEmpreintes)}
+      ${tf("Empreinte en plus ou en moins de l'estimation", "parEmpreinte", tl.parEmpreinte, "part d'une empreinte : heures d'usinage, de scan et d'ajustage des moules estimés, forfait des autres îlots", { kind: "pct" })}
       ${tf("Tiroirs par défaut", "tiroirs", tl.tiroirs, "chaque pièce peut avoir les siens")}
       ${field("Complexité par défaut", select("s.tooling.complexite", tl.complexite, Object.keys(tl.etude)))}
       ${Object.keys(tl.etude).map((k) => tf(`Coquille — heures d'étude : ${k}`, `etude.${k}`, tl.etude[k])).join("")}
@@ -2568,7 +2661,7 @@ async function exportXlsx() {
   for (const r of done) {
     const t = r.route.tooling;
     if (t) for (const l of t.lines) outillage.push([r.piece.name, l.label, l.detail, l.value]);
-    else outillage.push([r.piece.name, `Outillage ${r.route.famille}`, "prix de l'îlot (Paramètres)", r.route.outillageEstime]);
+    else outillage.push([r.piece.name, `Outillage ${r.route.famille}`, `prix de l'îlot (Paramètres)${r.route.facteurOutillage !== 1 ? ` × ${nf(r.route.facteurOutillage, 2)} (${r.route.parCycle} empreintes, ${r.route.parCycleEstime} estimées)` : ""}`, r.route.outillageEstime]);
     if (r.inputs.outillagePrix > 0) outillage.push([r.piece.name, "Prix retenu (saisi)", null, r.inputs.outillagePrix]);
     for (const b of r.route.boxes) {
       outillage.push([r.piece.name, `Boîte à noyau — ${b.core.nom}`, `${nf(b.kg, 0)} kg${b.size.auto ? " (dimensions estimées)" : ""}`, null]);
