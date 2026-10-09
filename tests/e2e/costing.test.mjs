@@ -396,30 +396,37 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.goto(`${base}?lang=fr`);
     await page.click('.tab[data-page="chiffrage"]');
     const text = (selector = '#page-chiffrage') => page.textContent(selector).then((t) => t.replace(/[  ]/g, ' '));
-    const waitText = (re) => page.waitForFunction((source) => new RegExp(source).test(document.getElementById('page-chiffrage').textContent.replace(/[  ]/g, ' ')), re.source);
+    const waitText = (re, id = 'page-chiffrage') => page.waitForFunction(([source, id]) => new RegExp(source).test(document.getElementById(id).textContent.replace(/[  ]/g, ' ')), [re.source, id]);
 
-    // Before the workbook already: the card of the history.
+    // Before the workbook already: the card of the history in Chiffrage; its file in Paramètres, with the other files.
     await page.waitForSelector('#page-chiffrage #chistorique');
     assert.match(await text('#chistorique'), /Historique :\s*aucun/);
-    assert.equal(await page.isDisabled('#chistorique [data-action="export-historique"]'), true);
-    await page.setInputFiles('#page-chiffrage input[data-file="historique"]', join(dir, 'historique.json'));
-    await waitText(/Historique « historique\.json » importé/);
-    assert.match(await text('#page-chiffrage .cmsg.warn'), /^Historique « historique\.json » importé : 2 enregistrements \(2 ajoutés, 0 remplacé : même référence et même source\)\. Enregistrements refusés : H-3 \(temps_cycle_s : nombre > 0 attendu\)\. Champs inconnus, ignorés : atelier\.$/);
+    assert.equal(await page.locator('#page-chiffrage [data-file="historique"], #page-chiffrage [data-drop="historique"]').count(), 0);
+    await page.click('#chistorique [data-action="show-parametres"]');
+    await page.waitForSelector('#page-parametres #chisto-file');
+    assert.match(await text('#chisto-file'), /Historique des temps de cycle :\s*aucun/);
+    assert.equal(await page.isDisabled('#chisto-file [data-action="export-historique"]'), true);
+    await page.setInputFiles('#page-parametres input[data-file="historique"]', join(dir, 'historique.json'));
+    await waitText(/Historique « historique\.json » importé/, 'page-parametres');
+    assert.match(await text('#page-parametres .cmsg.warn'), /^Historique « historique\.json » importé : 2 enregistrements \(2 ajoutés, 0 remplacé : même référence et même source\)\. Enregistrements refusés : H-3 \(temps_cycle_s : nombre > 0 attendu\)\. Champs inconnus, ignorés : atelier\.$/);
+    assert.match(await text('#chisto-file'), /Historique des temps de cycle :\s*2 enregistrements : 2 temps de devis, 0 temps mesuré en production/);
+    // Dropped again on its row: its records replaced, not added twice.
+    const json = readFileSync(join(dir, 'historique.json'), 'utf8');
+    await page.evaluate((content) => {
+      const zone = document.querySelector('#page-parametres [data-drop="historique"]');
+      const data = new DataTransfer();
+      data.items.add(new File([content], 'historique.json', { type: 'application/json' }));
+      zone.dispatchEvent(new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true }));
+    }, json);
+    await waitText(/0 ajouté, 2 remplacés/, 'page-parametres');
+    // The card of Chiffrage counts them.
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage #chistorique');
     assert.match(await text('#chistorique'), /Historique :\s*2 enregistrements : 2 temps de devis, 0 temps mesuré en production/);
     assert.deepEqual(await page.$$eval('#chistorique .chisto-count tbody tr', (trs) => trs.map((tr) => [...tr.cells].map((td) => td.textContent))), [
       ['CG3 Coquille gravité (traditionnel)', '1', '0'], ['SSP Sous pression', '1', '0'],
     ]);
     assert.match(await text('#chistorique'), /Aucun temps mesuré en production/);
-    // Dropped again on its row: its records replaced, not added twice.
-    const json = readFileSync(join(dir, 'historique.json'), 'utf8');
-    await page.evaluate((content) => {
-      const zone = document.querySelector('#page-chiffrage [data-drop="historique"]');
-      const data = new DataTransfer();
-      data.items.add(new File([content], 'historique.json', { type: 'application/json' }));
-      zone.dispatchEvent(new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true }));
-    }, json);
-    await waitText(/0 ajouté, 2 remplacés/);
-    assert.match(await text('#chistorique'), /Historique :\s*2 enregistrements/);
 
     // A part typed in, cast on CG3.
     await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
@@ -481,11 +488,14 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.deepEqual(await page.$$eval('#chistorique .chisto thead th', (ths) => ths.map((th) => th.textContent)), ['Référence', 'Îlot', 'Réel', 'Formule', 'Écart', 'Tendance', 'Écart']);
     assert.match(await text('#chistorique'), /Tendance : la même formule avec les coefficients du fichier de tendances \(CG3 : base\), les autres ceux de Paramètres/);
 
-    // Kept after a reload; exported as a history file, the time measured with the geometry of the part.
+    // Kept after a reload; exported as a history file (from Paramètres), the time measured with the geometry of the part.
     await page.reload();
     await page.waitForSelector('#page-chiffrage #chistorique');
     assert.match(await text('#chistorique'), /Historique :\s*3 enregistrements/);
-    const [download] = await Promise.all([page.waitForEvent('download'), page.click('#chistorique [data-action="export-historique"]')]);
+    await page.click('.tab[data-page="parametres"]');
+    await page.waitForSelector('#page-parametres #chisto-file');
+    assert.match(await text('#chisto-file'), /Historique des temps de cycle :\s*3 enregistrements/);
+    const [download] = await Promise.all([page.waitForEvent('download'), page.click('#chisto-file [data-action="export-historique"]')]);
     assert.equal(download.suggestedFilename(), 'historique_cycles.json');
     const exported = JSON.parse(readFileSync(await download.path(), 'utf8'));
     assert.deepEqual([exported.schema, exported.version, exported.pieces.length], ['reader3d-historique-cycles', 1, 3]);
@@ -498,18 +508,26 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(mam > 1 && !Number.isNaN(Date.parse(date)));
     assert.deepEqual(exported.pieces.filter((r) => r.source === 'devis').map((r) => r.ref), ['H-1', 'H-2']);
 
-    // A phone: the cards of the history within 375 px (their tables scroll inside them).
+    // A phone: the row of the history file and the cards of the history within 375 px (their tables scroll inside them).
     await page.setViewportSize({ width: 375, height: 800 });
+    assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('#chisto-file button')].filter((x) => x.getBoundingClientRect().right > 375).map((x) => x.textContent)), []);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage #chistorique');
     const overflow = await page.evaluate(() => [...document.querySelectorAll('#chistorique, #cfeedback')].flatMap((card) => [card, ...card.querySelectorAll('button, input, .cscroll')])
       .filter((x) => x.offsetParent).map((x) => [x.id || x.textContent.trim().slice(0, 30) || x.className, Math.round(x.getBoundingClientRect().right)]).filter(([, right]) => right > 375));
     assert.deepEqual(overflow, []);
     await page.setViewportSize({ width: 1280, height: 800 });
 
-    // Erased, after a confirmation that says what is lost.
+    // Erased in Paramètres, after a confirmation that says what is lost.
+    await page.click('.tab[data-page="parametres"]');
+    await page.waitForSelector('#page-parametres #chisto-file');
     const dialog = new Promise((resolve) => page.once('dialog', (d) => resolve(d.message()) || d.accept()));
-    await page.click('#chistorique [data-action="clear-historique"]');
+    await page.click('#chisto-file [data-action="clear-historique"]');
     assert.match(await dialog, /Effacer l'historique des temps de cycle \(3 enregistrements, dont 1 temps mesuré en production\)[\s\S]*exportez-le d'abord/);
-    await waitText(/Historique des temps de cycle effacé/);
+    await waitText(/Historique des temps de cycle effacé/, 'page-parametres');
+    assert.match(await text('#chisto-file'), /Historique des temps de cycle :\s*aucun/);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage #chistorique');
     assert.match(await text('#chistorique'), /Historique :\s*aucun/);
     assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.chiffrage.historique.v1')), null);
     assert.deepEqual(errors, []);
@@ -769,8 +787,11 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.click('.tab[data-page="chiffrage"]');
     const text = (selector = '#page-chiffrage') => page.textContent(selector).then((x) => x.replace(/[\u202f\u00a0]/g, ' '));
     const waitText = (re) => page.waitForFunction((source) => new RegExp(source).test(document.getElementById('page-chiffrage').textContent.replace(/[\u202f\u00a0]/g, ' ')), re.source);
-    await page.setInputFiles('#page-chiffrage input[data-file="historique"]', join(dir, 'historique-ia.json'));
-    await waitText(/Historique « historique-ia\.json » importé/);
+    // The history file, imported in Paramètres.
+    await page.click('.tab[data-page="parametres"]');
+    await page.setInputFiles('#page-parametres input[data-file="historique"]', join(dir, 'historique-ia.json'));
+    await page.waitForFunction(() => /Historique « historique-ia\.json » importé/.test(document.getElementById('page-parametres').textContent));
+    await page.click('.tab[data-page="chiffrage"]');
     await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
     await page.waitForSelector('#page-chiffrage .cmsg.ok');
     const typeIn = async (bind, value) => {
@@ -787,7 +808,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // unticked for the gateway until the user ticks it once (remembered).
     assert.match(await text(), /IA de la page IA \/ analyse : passerelle en ligne, noms anonymisés\. Historique : 3 enregistrements, non envoyé\./);
     assert.equal(await page.isChecked('#page-chiffrage [data-pref="cycle-similar"]'), false);
-    assert.match(await text('#chistorique'), /L'historique est gardé dans ce navigateur\. Il n'est envoyé à l'IA que si la case « Envoyer les pièces similaires de l'historique » est cochée/);
+    assert.match(await text('#chistorique'), /gardés dans ce navigateur\. L'historique n'est envoyé à l'IA que si la case « Envoyer les pièces similaires de l'historique » est cochée/);
     await page.check('#page-chiffrage [data-pref="cycle-similar"]');
     await waitText(/Historique : 3 enregistrements, les 3 plus semblables envoyés/);
     assert.deepEqual(await page.evaluate(() => [localStorage.getItem('reader3d.ai.cycleSimilarOnline'), localStorage.getItem('reader3d.ai.cycleSimilar')]), ['1', null]);
@@ -1011,7 +1032,11 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const text = (selector = '#chistorique') => page.textContent(selector).then((x) => x.replace(/[  ]/g, ' '));
     const waitText = (re) => page.waitForFunction((source) => new RegExp(source).test(document.getElementById('chistorique')?.textContent.replace(/[  ]/g, ' ')), re.source);
     const kept = () => page.evaluate(() => Object.keys(JSON.parse(localStorage.getItem('reader3d.chiffrage.banc-essai-ia.v1') ?? '{}').resultats ?? {}).length);
-    await page.setInputFiles('#page-chiffrage input[data-file="historique"]', join(dir, 'historique-banc.json'));
+    // The history file, imported in Paramètres.
+    await page.click('.tab[data-page="parametres"]');
+    await page.setInputFiles('#page-parametres input[data-file="historique"]', join(dir, 'historique-banc.json'));
+    await page.waitForFunction(() => /Historique « historique-banc\.json » importé/.test(document.getElementById('page-parametres').textContent));
+    await page.click('.tab[data-page="chiffrage"]');
     await waitText(/Historique :\s*5 enregistrements/);
     assert.match(await text(), /Pour chaque enregistrement qui a un poids et un module \(4 pièces sur 5\)/);
     assert.match(await text(), /IA de la page IA \/ analyse \(passerelle en ligne, noms anonymisés\)/);

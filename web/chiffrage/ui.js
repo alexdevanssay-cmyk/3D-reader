@@ -281,6 +281,7 @@ async function onClick(event) {
   if (!button) return;
   const action = button.dataset.action;
   if (action === "import-workbook" || action === "import-indices" || action === "import-tendances" || action === "import-rfq" || action === "import-historique") button.parentElement.querySelector("input[data-file]")?.click();
+  else if (action === "show-parametres") document.querySelector('.tab[data-page="parametres"]')?.click();
   else if (action === "thickness") {
     thicknessBusy = true;
     render();
@@ -2260,18 +2261,29 @@ function historyCard() {
   const n = countHistory(pieces);
   return `<section class="ccard" id="chistorique">
     <h3>Historique des temps de cycle</h3>
-    <div class="crow" data-drop="historique" title="Glissez un fichier d'historique (.json) ici pour l'importer"><span>Historique :</span> <strong>${n.total ? `${plural(n.total, "enregistrement")} : ${n.devis} temps de devis, ${n.production} temps mesuré${n.production > 1 ? "s" : ""} en production` : "aucun"}</strong>
-      <button type="button" class="small" data-action="import-historique">Importer l'historique…</button>
-      <input type="file" data-file="historique" accept=".json,application/json" hidden>
-      <button type="button" class="small" data-action="export-historique"${n.total ? "" : " disabled"}>Exporter l'historique</button>
-      <button type="button" class="small" data-action="clear-historique"${n.total ? "" : " disabled"}>Effacer l'historique…</button></div>
+    <div class="crow"><span>Historique :</span> <strong>${historyCount(n)}</strong>
+      <button type="button" class="small" data-action="show-parametres" title="Le fichier d'historique s'importe, s'exporte et s'efface dans Paramètres, avec les autres fichiers">Importer ou exporter dans Paramètres…</button></div>
     ${n.ilots.length ? `<div class="cscroll"><table class="ctable compact chisto-count">
       <thead><tr><th>Îlot</th><th class="num">Devis</th><th class="num">Production</th></tr></thead>
       <tbody>${n.ilots.map((x) => `<tr><td><strong>${esc(x.ilot)}</strong>${settings.processes[x.ilot] ? ` ${esc(settings.processes[x.ilot].famille)}` : ""}</td><td class="num">${x.devis}</td><td class="num">${x.production}</td></tr>`).join("")}</tbody></table></div>` : ""}
     ${comparisonHtml(pieces)}
     ${backtestHtml(pieces)}
-    <p class="small muted">Fichier JSON « reader3d-historique-cycles », version 1 : temps de cycle de devis passés (source « devis ») et temps mesurés en production (source « production »). Un enregistrement de même référence et même source remplace le précédent. L'historique est gardé dans ce navigateur. Il n'est envoyé à l'IA que si la case « Envoyer les pièces similaires de l'historique » est cochée : les ${SIMILAR} enregistrements les plus semblables à la pièce estimée, avec leur temps de cycle, leur poids, leur module, leurs pièces par cycle et leur mise au mille ; pour la passerelle en ligne, la case est décochée par défaut et les références sont anonymisées avec les noms. L'export reprend tout, temps mesurés compris. Données confidentielles : ne pas publier.</p>
+    <p class="small muted">Temps de cycle de devis passés (source « devis ») et temps mesurés en production (source « production »), gardés dans ce navigateur. L'historique n'est envoyé à l'IA que si la case « Envoyer les pièces similaires de l'historique » est cochée : les ${SIMILAR} enregistrements les plus semblables à la pièce estimée, avec leur temps de cycle, leur poids, leur module, leurs pièces par cycle et leur mise au mille ; pour la passerelle en ligne, la case est décochée par défaut et les références sont anonymisées avec les noms. Données confidentielles : ne pas publier.</p>
   </section>`;
+}
+
+/** What the history holds, in a few words. */
+const historyCount = (n) => (n.total ? `${plural(n.total, "enregistrement")} : ${n.devis} temps de devis, ${n.production} temps mesuré${n.production > 1 ? "s" : ""} en production` : "aucun");
+
+/** Paramètres: the row of the history file, with the other files (its import, export and erasing). */
+function historyFileRow() {
+  const n = countHistory(store.loadHistorique());
+  return `<div class="crow" id="chisto-file" data-drop="historique" title="Glissez un fichier d'historique (.json) ici pour l'importer"><span>Historique des temps de cycle :</span> <strong>${historyCount(n)}</strong>
+      <button type="button" class="small" data-action="import-historique">Importer l'historique…</button>
+      <input type="file" data-file="historique" accept=".json,application/json" hidden>
+      <button type="button" class="small" data-action="export-historique"${n.total ? "" : " disabled"}>Exporter l'historique</button>
+      <button type="button" class="small" data-action="clear-historique"${n.total ? "" : " disabled"}>Effacer l'historique…</button></div>
+    <p class="small muted">Historique : fichier JSON « reader3d-historique-cycles », version 1. Il complète celui de ce navigateur : un enregistrement de même référence et même source remplace le précédent. Il sert au chiffrage (carte « Historique des temps de cycle ») et, si la case est cochée, à l'IA. L'export reprend tout, temps mesurés compris. Données confidentielles : ne pas publier.</p>`;
 }
 
 // Where each setting comes from (store.js layers): its label, and its letter in the tables.
@@ -2336,6 +2348,7 @@ function settingsSourcesCard() {
       <button type="button" class="small" data-action="import-tendances">Importer des tendances (fichier de paramètres calés)…</button>
       <input type="file" data-file="tendances" accept=".json,application/json" hidden>${t ? ` <button type="button" class="small" data-action="export-tendances">Exporter les tendances</button>` : ""}</div>
     ${base ? `<div class="crow"><span>Classeur de chiffrage :</span> <strong>${esc(base.source?.fileName)} — importé le ${dateLabel(base.source?.importedAt)}</strong></div>` : ""}
+    ${historyFileRow()}
     ${migrated}
     ${settingsNotApplied()}
     <div class="cfields">${field("Seuil d'alerte : écart à la tendance", sinput("seuilTendance", settings.seuilTendance, { kind: "pct" }), "% — au-delà, le chiffrage signale l'écart (carte Traçabilité)")}</div>
