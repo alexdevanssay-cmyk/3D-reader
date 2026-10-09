@@ -1969,4 +1969,27 @@ describe('values of a piece proposed by the AI, applied once accepted', () => {
     assert.match(ui.applyAIValues({ ...target, file: 'autre.step' }, [{ cle: 'piece.poids', valeur: 1.35 }]).error, /Le modèle 3D de l'onglet a changé/);
     assert.match(ui.applyAIValues({ ...target, key: '0:Absente' }, [{ cle: 'piece.poids', valeur: 1.35 }]).error, /n'est plus chiffrée/);
   });
+
+  test('"Retenir" in the cavities card is a person\'s choice: no longer traced as the AI\'s, kept when the application is undone', () => {
+    const n0 = computed().results[0].trace['piece.empreintes'].valeur;
+    const target = { tab: 1, file: null, key: 'manuel' };
+    ui.applyAIValues(target, [{ cle: 'piece.empreintes', valeur: n0 + 1 }, { cle: 'piece.cycle', valeur: 150 }], { provider: 'Groq', message: 'm3' });
+    assert.deepEqual(Object.keys(loadQuote(base, indices).pieces.manuel.valeursIA).sort(), ['cycle', 'empreintes', 'finition', 'procede']);
+    // Compared, then the AI's number of cavities retained again: the person's; the cycle typed in gave way to its estimate.
+    ui.retainCavities(n0 + 2);
+    ui.retainCavities(n0 + 1);
+    const piece = loadQuote(base, indices).pieces.manuel;
+    assert.deepEqual([piece.empreintes, piece.cycle, Object.keys(piece.valeursIA).sort()], [n0 + 1, null, ['finition', 'procede']]);
+    const T = ui.compute().results[0].trace['piece.empreintes'];
+    assert.deepEqual([T.valeur, T.source.type], [n0 + 1, 'saisie']);
+    // Undone: the island the AI imposed goes back, the cavities the person retained stay.
+    const undone = ui.undoAIValues({ ...target, name: 'Pièce' }, { message: 'm3' });
+    assert.deepEqual(undone.undone.map((x) => x.champ).sort(), ['finition', 'procede']);
+    assert.equal(loadQuote(base, indices).pieces.manuel.empreintes, n0 + 1);
+    // "Revenir aux empreintes estimées" after an application: the AI's cavities forgotten too.
+    computed();
+    ui.applyAIValues(target, [{ cle: 'piece.empreintes', valeur: n0 + 1 }], { message: 'm4' });
+    ui.retainCavities(null);
+    assert.deepEqual(Object.keys(loadQuote(base, indices).pieces.manuel.valeursIA).sort(), ['finition', 'procede']);
+  });
 });

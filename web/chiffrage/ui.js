@@ -1906,8 +1906,9 @@ function aiChoice() {
  * shown (null: back to the estimate), on the island of its route, imposed with
  * them (a number of cavities is that of its island). The cycle and the price
  * of the tool typed in for other cavities give way to their estimate.
+ * Exported for the tests.
  */
-function retainCavities(n) {
+export function retainCavities(n) {
   const c = compute();
   const r = c?.results.find((x) => x.piece.key === c.selected);
   if (!r?.route) return;
@@ -1918,6 +1919,7 @@ function retainCavities(n) {
   piece.empreintes = n;
   if (n !== null) piece.cycle = piece.outillagePrix = null;
   forgetAdoption(piece);
+  forgetAIValues(piece);
   store.saveQuote(q);
   const after = compute()?.results.find((x) => x.piece.key === r.piece.key)?.route;
   const casting = after?.operations.find((o) => o.code === after.process);
