@@ -9,6 +9,7 @@
 import { summarize } from './summary.js';
 import { MESH_EXTENSIONS, needsMainThread } from './meshload.js';
 import { cacheKey, loadResult, saveResult } from './cache.js';
+import { readShared, sharedState, writeShared } from './shared-cache.js';
 import { cancelThickness, thicknessOnAllCores, warmThicknessPool } from './thickpool.js';
 
 export { warmThicknessPool };
@@ -96,6 +97,7 @@ function resetWorker() {
 /** Stop the analyses in progress (the worker is restarted for the next file). */
 export function cancelAll() {
   cancelThickness();
+  for (const read of networkReads) read.abort();
   if (!pending.size) return;
   const err = new Error('Cancelled');
   err.cancelled = true;
@@ -150,11 +152,25 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
   // computed again, and the kept results replaced).
   const isCad = CAD_EXTENSIONS.includes(ext);
   const key = await cacheKey(bytes, isCad ? { ext, quality } : { ext, unit }).catch(() => null);
+  let networkNote = null;
   if (cache && key && !close) {
     const kept = await loadResult(key);
     if (kept?.data) {
-      return { ...kept.data, file: file.name, cacheKey: key, cached: true, cachedThickness: kept.thickness ?? null, elapsed_s: Math.round(performance.now() - start) / 1000 };
+      // Kept before the shared folder was chosen, or when it could not be reached: written there now.
+      const state = await sharedState().catch(() => 'none');
+      if (state === 'granted') share(key, { data: kept.data, thickness: kept.thickness, replace: false });
+      return {
+        ...kept.data, file: file.name, cacheKey: key, cached: true, cachedThickness: kept.thickness ?? null, elapsed_s: Math.round(performance.now() - start) / 1000,
+        networkNote: noteOf({ state }),
+      };
     }
+    // Analysed on another PC: read from the shared network folder (within time limits), else analysed here.
+    const shared = await readFromNetwork(key, onProgress);
+    if (shared.state === 'read') {
+      keep(key, shared, file.name);
+      return { ...shared.data, file: file.name, cacheKey: key, cached: true, cachedFrom: 'network', cachedThickness: shared.thickness, elapsed_s: Math.round(performance.now() - start) / 1000 };
+    }
+    networkNote = noteOf(shared);
   }
 
   let kind, sourceUnit, bodies;
@@ -194,14 +210,77 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
     bodies,
     elapsed_s: Math.round(performance.now() - start) / 1000,
   };
-  // Kept for the next opening of the same file (in the background).
-  saveResult(key, { data }, { file: file.name });
-  return { ...data, cacheKey: key, cached: false, cachedThickness: null };
+  // Kept for the next opening of the same file (in the background), and on the shared network folder for the other PCs.
+  keeping(key, saveResult(key, { data }, { file: file.name }).then((kept) => {
+    if (kept) share(key, { data });
+    return kept;
+  }));
+  return { ...data, cacheKey: key, cached: false, cachedThickness: null, networkNote };
 }
 
-/** Keep the wall thickness of a model with its results (see analyzeInBrowser). */
-export function saveThickness(key, results) {
-  return saveResult(key, { thickness: results });
+/**
+ * Keep the wall thickness of a model with its results (see analyzeInBrowser),
+ * and on the shared network folder with them (`bodies`: those of the model,
+ * whose meshes the thickness is of).
+ */
+export async function saveThickness(key, results, bodies = null) {
+  await saving.get(key);
+  const kept = await saveResult(key, { thickness: results });
+  if (kept && bodies) share(key, { thickness: results, bodies });
+  return kept;
+}
+
+// ------------------------------------------------------------------ the shared network folder
+
+const saving = new Map(); // key -> the analysis being kept in this browser (the thickness waits for it)
+const networkReads = new Set(); // the reads in progress (AbortController), stopped by cancelAll
+const sharedListeners = new Set();
+
+/** The analysis of `key` being kept in this browser (`job`): what is kept next of it waits for it. */
+function keeping(key, job) {
+  saving.set(key, job);
+  job.finally(() => saving.get(key) === job && saving.delete(key)).catch(() => {});
+}
+
+/** Called with {key, note} when a write in the shared folder failed, to be said discreetly (the results of `key` are shown by then). */
+export function onShared(fn) {
+  sharedListeners.add(fn);
+}
+
+/** What to say of a read or a write of the shared folder (shared-cache.js state), or null. */
+function noteOf(result) {
+  if (result.state === 'prompt') return { kind: 'prompt' };
+  if (result.state === 'error') return { kind: 'error', message: result.error };
+  return null;
+}
+
+/** The results of `key` from the shared folder (readShared), stopped by cancelAll (rejects with err.cancelled). */
+async function readFromNetwork(key, onProgress) {
+  const controller = new AbortController();
+  networkReads.add(controller);
+  try {
+    return await readShared(key, { signal: controller.signal, onProgress });
+  } finally {
+    networkReads.delete(controller);
+  }
+}
+
+/** Results read from the shared folder, kept in this browser too (the analysis, then its thickness). */
+function keep(key, shared, name) {
+  keeping(key, saveResult(key, { data: shared.data }, { file: name }).then(async (kept) => {
+    if (kept && shared.thickness) await saveResult(key, { thickness: shared.thickness });
+    return kept;
+  }));
+}
+
+/** Write in the shared folder in the background (writeShared); a failure is said to the page (onShared), never thrown. */
+function share(key, what) {
+  writeShared(key, what).then(
+    (result) => {
+      if (result.state === 'error') sharedListeners.forEach((fn) => fn({ key, note: { kind: 'error', message: result.error, write: true } }));
+    },
+    () => {},
+  );
 }
 
 export { clearCache, cacheInfo } from './cache.js';

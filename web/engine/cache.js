@@ -94,18 +94,20 @@ export async function loadResult(key) {
 /**
  * Keep a part of the results: record {data} (the analysis, first) or
  * {thickness} (added to the analysis already kept). Never throws: the cache
- * is an extra, a full disk or a private window just leave it out.
+ * is an extra, a full disk or a private window just leave it out. Resolves to
+ * whether it was kept (then it may go to the shared network folder, client.js).
  */
 export async function saveResult(key, record, { file = '' } = {}) {
-  if (!key) return;
+  if (!key) return false;
+  let d = null;
   try {
-    const d = await db();
+    d = await db();
     const [part] = Object.keys(record);
     const bytes = sizeOf(record[part]);
-    if (bytes > MAX_BYTES / 2) return; // one model would push out everything else
+    if (bytes > MAX_BYTES / 2) return false; // one model would push out everything else
     const tx = d.transaction(['meta', 'data'], 'readwrite');
     const meta = await request(tx.objectStore('meta').get(key));
-    if (part !== 'data' && !meta) return; // the analysis is no longer kept
+    if (part !== 'data' && !meta) return false; // the analysis is no longer kept
     tx.objectStore('data').put(record[part], partKey(key, part));
     // A new analysis (refreshed, or its open surfaces closed): the thickness kept was of the former one.
     const former = part === 'data' ? {} : meta?.parts;
@@ -113,10 +115,11 @@ export async function saveResult(key, record, { file = '' } = {}) {
     const parts = { ...former, [part]: bytes };
     tx.objectStore('meta').put({ key, file: meta?.file ?? file, savedAt: meta?.savedAt ?? Date.now(), parts, bytes: Object.values(parts).reduce((a, b) => a + b, 0), usedAt: Date.now() });
     await done(tx);
-    await evict(d);
   } catch {
-    // not kept
+    return false; // not kept
   }
+  await evict(d).catch(() => {});
+  return true;
 }
 
 /** Drop the least recently used results above the limits. */

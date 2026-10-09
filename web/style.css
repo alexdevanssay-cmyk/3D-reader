@@ -290,6 +290,8 @@ table.bodies .open { color: var(--warn); }
 .cf small { font-size: 11px; }
 .cf small .cauto { color: var(--text); font-size: 12px; font-weight: 600; }
 .crow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+/* The shared network folder: a long folder name or error wraps within a phone's width. */
+#cnetwork strong, .cnetwork-sync, #cfeedback-net { overflow-wrap: anywhere; }
 /* A data file dragged over its row (or over the settings buttons): dropped, it replaces the one in use. */
 [data-drop] { border: 2px dashed transparent; border-radius: 6px; padding: 2px 6px; margin-left: -8px; transition: border-color 0.1s, background 0.1s; }
 [data-drop].drop-target { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }

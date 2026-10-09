@@ -276,9 +276,19 @@ async function detectServer() {
 function browserClient() {
   engine.browserClient ??= import("./engine/client.js").then((client) => {
     client.onMemory(onEngineMemory);
+    client.onShared(onSharedNote);
     return client;
   });
   return engine.browserClient;
+}
+
+/** A write in the shared network folder that failed: said with the results of that key, in the tabs that show them. */
+function onSharedNote({ key, note }) {
+  for (const tab of tabs) {
+    if (tab.result?.cacheKey !== key) continue;
+    tab.result.networkNote = note;
+    if (tab === activeTab) renderPanel();
+  }
 }
 
 function fmtMB(bytes) {
@@ -302,6 +312,7 @@ const STEP_TEXT = {
   measure: "loading.measure",
   summary: "loading.summary",
   thickness: "loading.thickness",
+  network: "loading.network",
 };
 
 // The engine reports its progress while it works, several times per second
@@ -579,7 +590,10 @@ function renderPanel() {
   const notes = [];
   if (estimated) notes.push(t("method.estimated", { n: estimated }));
   if (s.open_bodies > 0) notes.push(t("method.open", { n: s.open_bodies }));
-  if (r.cached) notes.push(t("method.cached"));
+  if (r.cached) notes.push(t(r.cachedFrom === "network" ? "method.network" : "method.cached"));
+  // The shared network folder (engine/shared-cache.js): its access to grant, or a read or a write that failed, said discreetly.
+  const net = r.networkNote;
+  if (net) notes.push(net.kind === "prompt" ? t("method.networkPrompt") : t(net.write ? "method.networkWrite" : "method.networkRead", { message: net.message }));
   method.textContent = s.volume == null ? t("method.none") : [how, ...notes].join(" ");
 
   $("total-area").textContent = fmtArea(s.area);
@@ -1321,7 +1335,7 @@ async function ensureThickness() {
     try {
       const results = await client.computeThickness(bodies, { onProgress: (p) => showProgress(p, tab) });
       if (tab.result !== result) return null; // another file was opened meanwhile
-      client.saveThickness(result.cacheKey, results);
+      client.saveThickness(result.cacheKey, results, result.bodies);
       if (tab === activeTab) adoptThickness(results);
       else if (tab.view) {
         // Shown when the tab is shown again.

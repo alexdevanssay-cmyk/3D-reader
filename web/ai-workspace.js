@@ -842,6 +842,12 @@ export function mount({ page, reader }) {
   let networkList = [];
   let networkBehind = true; // conversations of this PC may not be in the folder yet (written at the first write that works)
   let historyRead = 0;
+  // The shared folder chosen or forgotten (here or in Paramètres): read again, what this PC has written there anew.
+  document.addEventListener(archives.FOLDER_CHANGED, () => {
+    networkList = [];
+    networkNote = "";
+    networkBehind = true;
+  });
 
   const provider = () => $("ai-provider").value;
   const isLocal = () => provider() === "ollama";
@@ -1862,20 +1868,23 @@ export function mount({ page, reader }) {
       return;
     }
     if (!network) {
-      box.innerHTML = `<p class="ai-hist-note">Aucun dossier réseau choisi. Les discussions des pièces y seront écrites, un fichier par pièce, pour les retrouver depuis les autres postes.</p><div class="ai-hist-actions">${button("choose", "Choisir le dossier…")}</div>${note}`;
+      box.innerHTML = `<p class="ai-hist-note">Aucun dossier réseau choisi. Le dossier réseau partagé de l'entreprise (aussi dans Paramètres) : les discussions des pièces y seront écrites (sous-dossier « historique-ia », un fichier par discussion) pour les retrouver depuis les autres postes, avec les analyses 3D et les retours d'expérience.</p><div class="ai-hist-actions">${button("choose", "Choisir le dossier…")}</div>${note}`;
       $("ai-hist-list-reseau").replaceChildren();
       refocus();
       return;
     }
+    // The shared folder of the company (network-folder.js), else the folder chosen in this page before it.
+    const where = `${network.shared ? "Dossier réseau partagé" : "Dossier"} « ${escapeHtml(network.name)} »`;
     if (!handle) {
-      box.innerHTML = `<p class="ai-hist-note">Dossier « ${escapeHtml(network.name)} » : accès à autoriser (le navigateur le demande après chaque redémarrage).</p><div class="ai-hist-actions">${button("grant", "Autoriser l'accès")}${button("choose", "Changer de dossier…")}</div>${note}`;
+      box.innerHTML = `<p class="ai-hist-note">${where} : ${network.error ? `injoignable (${escapeHtml(network.error)})` : "accès à autoriser (le navigateur le demande après chaque redémarrage)"}.</p><div class="ai-hist-actions">${button("grant", "Autoriser l'accès")}${button("choose", "Changer de dossier…")}</div>${note}`;
       $("ai-hist-list-reseau").replaceChildren();
       refocus();
       return;
     }
     const drawFolder = () => {
       const note = networkNote ? `<p class="ai-hist-error">${escapeHtml(networkNote)}</p>` : "";
-      box.innerHTML = `<p class="ai-hist-note">Dossier « ${escapeHtml(network.name)} » : les discussions des pièces y sont écrites après chaque réponse.</p><div class="ai-hist-actions">${button("refresh", "Actualiser")}${button("choose", "Changer de dossier…")}</div>${note}`;
+      const legacy = network.legacy == null ? "" : `<p class="ai-hist-note">Les discussions du dossier « ${escapeHtml(network.legacy)} », choisi avant dans cette page, sont à recopier ici.</p><div class="ai-hist-actions">${button("move-legacy", "Recopier ces discussions")}</div>`;
+      box.innerHTML = `<p class="ai-hist-note">${where}${network.shared ? ", sous-dossier « historique-ia »" : ""} : les discussions des pièces y sont écrites après chaque réponse.</p><div class="ai-hist-actions">${button("refresh", "Actualiser")}${button("choose", "Changer de dossier…")}</div>${legacy}${note}`;
     };
     drawFolder();
     if (folder || !networkList.length) {
@@ -1984,7 +1993,13 @@ export function mount({ page, reader }) {
         const all = !before || confirm(`Écrire aussi dans ce dossier les ${before} discussion${before > 1 ? "s" : ""} de pièces déjà gardée${before > 1 ? "s" : ""} sur ce PC ?`);
         await sync(handle, { all, force: !same });
       } else if (action === "grant") {
-        if (network && (await archives.grantNetworkFolder(network.handle))) await sync(network.handle);
+        // Granted: the folder of the conversations (in the shared folder: its subfolder), not the one asked.
+        if (network && (await archives.grantNetworkFolder(network.handle)) && (await networkReady())) await sync(network.handle);
+      } else if (action === "move-legacy") {
+        // The conversations of the folder chosen here before the shared folder: copied into it (its access asked again if need be).
+        const moved = await inTurn(async () => archives.moveLegacyFolder(await networkReady(), { ask: true }));
+        networkList = [];
+        networkNote = !moved ? "Ancien dossier non lu : accès refusé, ou dossier partagé inaccessible." : moved.failed ? `${moved.failed} discussion${moved.failed > 1 ? "s" : ""} non recopiée${moved.failed > 1 ? "s" : ""} : réessayez.` : "";
       } else if (action === "refresh" && (await networkReady())) {
         await sync(network.handle);
       }
