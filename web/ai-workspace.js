@@ -40,6 +40,7 @@
 // conversation (onlineMessages): it was given the real names and amounts.
 
 import { anonymizer, buildAIContext, checkContextNumbers, compactAIContext, partNames, summaryAIContext } from "./engine/ai-context.js";
+import * as archives from "./ai-history.js";
 
 const PROVIDERS = [
   ["openai", "En ligne via la passerelle (Groq…)"], // value of earlier versions, kept in this browser's storage
@@ -71,6 +72,7 @@ const KEYS = {
   messages: "reader3d.ai.messages", think: "reader3d.ai.think", amounts: "reader3d.ai.costingAmounts", anonymize: "reader3d.ai.anonymize", fallback: "reader3d.ai.fallback",
   codeRequired: "reader3d.ai.gatewayCodeRequired", // the gateway asked for an access code: its field shown at once
   quota: "reader3d.ai.quota", // what is left of the free quota of the gateway, from its last answer
+  historyTab: "reader3d.ai.historyTab", // the history shown on the right: "local" or "reseau"
 };
 // Sent on window when an answer of the gateway tells what is left of its free quota (the IA page shows it).
 const QUOTA_EVENT = "reader3d-ai-quota";
@@ -104,15 +106,19 @@ const store = {
 // tab's sessionStorage: the first tab's under the key of earlier versions,
 // kept after a reload as its quote (chiffrage/store.js); the others' as long
 // as the page (app.js forgets them when their tab is closed and when the
-// page loads again). A conversation belongs to the part it is about ({file,
-// messages, names}): another file opened in its tab starts a new one, so that
-// a part's conversation is never sent with another part's context. `names`:
-// the names of the quote ({name, label}) known when its questions went to the
-// gateway, replaced in its history even once changed in the quote.
+// page loads again). Each answered one is also kept in the history
+// (ai-history.js: this browser, and the network folder for a part), where
+// the part finds it again when it is opened again. A conversation belongs to
+// the part it is about ({id, part: {id: its file's hash, file}, file,
+// started, updated, messages, names}): another part opened in its tab shows
+// that part's last conversation, or a new one, so that a part's conversation
+// is never sent with another part's context. `names`: the names of the quote
+// and of the part ({name, label}) known when its questions went to the
+// gateway, replaced in its history even once changed.
 const conversationKey = (id) => (id == null || id === 1 ? KEYS.messages : `${KEYS.messages}.${id}`);
 const unsaved = new Map(); // conversations that could not be saved (storage blocked or full): kept for this visit
 
-/** The conversation saved under `key`: {file (null: no part yet), messages}. */
+/** The conversation saved under `key`: {id (null: never answered), part (null: no part yet), file, started, updated, messages, names}. */
 function readConversation(key) {
   let data = null;
   try {
@@ -121,8 +127,13 @@ function readConversation(key) {
     data = null;
   }
   if (Array.isArray(data)) data = { messages: data }; // earlier versions: the messages alone
+  const text = (v) => (typeof v === "string" ? v : null);
   return {
-    file: typeof data?.file === "string" ? data.file : null,
+    id: text(data?.id),
+    part: typeof data?.part?.id === "string" ? { id: data.part.id, file: text(data.part.file) } : null,
+    started: text(data?.started),
+    updated: text(data?.updated),
+    file: text(data?.file),
     messages: Array.isArray(data?.messages) ? data.messages : [],
     names: Array.isArray(data?.names) ? data.names.filter((n) => typeof n?.name === "string" && typeof n?.label === "string") : [],
   };
@@ -144,8 +155,9 @@ export function onlineMessages(messages, { amounts = false, gateway = null } = {
   return messages.filter((m, i) => !(left(m) || (m.role !== "assistant" && left(messages[i + 1]))));
 }
 
+/** Keep the conversation of a tab; an empty one is forgotten, unless it is a new one about a part (not the part's last one). */
 function writeConversation(key, conversation) {
-  const text = conversation.messages.length ? JSON.stringify(conversation) : null;
+  const text = conversation.messages.length || conversation.part ? JSON.stringify(conversation) : null;
   unsaved.delete(key);
   try {
     if (text === null) sessionStorage.removeItem(key);
@@ -636,7 +648,8 @@ export function mount({ page, reader }) {
   if (!page) return { show() {} };
   page.innerHTML = `
     <div class="ai-page">
-      <section class="card">
+      <div class="ai-main">
+      <section class="card ai-settings">
         <div class="card-head">
           <h2>IA / analyse</h2>
           <span id="ai-quota" class="ai-quota" hidden></span>
@@ -668,7 +681,7 @@ export function mount({ page, reader }) {
         <p id="ai-scope" class="ai-scope"></p>
       </section>
 
-      <section class="card">
+      <section class="card ai-convo">
         <div id="ai-chat" class="ai-chat" aria-live="polite"></div>
         <form id="ai-form" class="ai-form">
           <textarea id="ai-input" rows="4" placeholder="Posez une question sur la pièce, les features, la fabrication ou le coût… (Entrée pour envoyer, Maj+Entrée pour aller à la ligne)"></textarea>
@@ -679,6 +692,21 @@ export function mount({ page, reader }) {
           </div>
         </form>
       </section>
+      </div>
+      <aside class="card ai-history" aria-label="Historique des discussions">
+        <div class="ai-hist-tabs" role="tablist" aria-label="Historique">
+          <button type="button" role="tab" id="ai-hist-tab-local" class="ai-hist-tab" data-history="local" aria-controls="ai-hist-local">Historique local</button>
+          <button type="button" role="tab" id="ai-hist-tab-reseau" class="ai-hist-tab" data-history="reseau" aria-controls="ai-hist-reseau">Historique réseau</button>
+        </div>
+        <div id="ai-hist-local" class="ai-hist-panel" role="tabpanel" aria-labelledby="ai-hist-tab-local">
+          <p class="ai-hist-note">Les discussions gardées dans ce navigateur, sur ce PC. Une pièce ouverte à nouveau retrouve sa dernière discussion.</p>
+          <ul id="ai-hist-list-local" class="ai-hist-list"></ul>
+        </div>
+        <div id="ai-hist-reseau" class="ai-hist-panel" role="tabpanel" aria-labelledby="ai-hist-tab-reseau" hidden>
+          <div id="ai-hist-folder" class="ai-hist-folder"></div>
+          <ul id="ai-hist-list-reseau" class="ai-hist-list"></ul>
+        </div>
+      </aside>
     </div>`;
 
   const $ = (id) => page.querySelector("#" + id);
@@ -686,6 +714,13 @@ export function mount({ page, reader }) {
   let busy = null; // AbortController of the question in progress
   let shown = null; // {key, file}: the conversation on screen, the one of the tab shown and of its part
   let pending = null; // the question in progress: {key, nodes (its two messages, shown again with their conversation), dropped}
+  // The history on the right (ai-history.js): the list shown, the network folder ({handle, name, permission}),
+  // what went wrong with it last, the conversations read in it, the latest reading of the lists.
+  let historyTab = store.get(localStorage, KEYS.historyTab) === "reseau" ? "reseau" : "local";
+  let network = null;
+  let networkNote = "";
+  let networkList = [];
+  let historyRead = 0;
 
   const provider = () => $("ai-provider").value;
   const isLocal = () => provider() === "ollama";
@@ -791,8 +826,22 @@ export function mount({ page, reader }) {
     }
     box.append(body);
     $("ai-chat").append(box);
-    $("ai-chat").scrollTop = $("ai-chat").scrollHeight;
+    toEnd(true);
     return body;
+  }
+
+  // As a chat: the conversation shows its last message, unless one scrolled up to read (then it stays there).
+  let pinned = true;
+  $("ai-chat").addEventListener("scroll", () => {
+    const chat = $("ai-chat");
+    pinned = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40;
+  });
+  /** The last message in view (`force`: a question asked, a conversation shown: whatever was read). */
+  function toEnd(force = false) {
+    if (force) pinned = true;
+    if (!pinned) return;
+    const chat = $("ai-chat");
+    chat.scrollTop = chat.scrollHeight;
   }
 
   /** A line of an answer besides its text: before it (`before`), else at the end of its message. */
@@ -832,26 +881,74 @@ export function mount({ page, reader }) {
     decorate(body, m);
   }
 
-  /** The conversation of the tab shown, on screen; a new one when another part was opened in that tab. */
+  /**
+   * The conversation of the tab shown, on screen. Another part opened in that
+   * tab (another file's hash; a conversation of before: another name): that
+   * part's last conversation from the history, else a new one. Questions asked
+   * before the part was known stay, about it from now on.
+   */
   function showConversation() {
-    const tab = reader.tab ?? { id: 1, file: null };
+    const tab = reader.tab ?? { id: 1, file: null, part: null };
     const key = conversationKey(tab.id);
-    if (shown?.key === key && shown.file === tab.file) return;
-    const conversation = readConversation(key);
-    if (tab.file && conversation.file && conversation.file !== tab.file) {
-      // Its question in progress is about the part that was there: dropped.
+    const partId = tab.part?.id ?? null;
+    if (shown?.key === key && shown.file === tab.file && shown.part === partId) return;
+    let conversation = readConversation(key);
+    const other = partId && conversation.part ? conversation.part.id !== partId : !!(tab.file && conversation.file && conversation.file !== tab.file);
+    if (other) {
+      // Its question in progress is about the part that was there: dropped (its conversation is in the history).
       if (pending?.key === key) {
         pending.dropped = true;
         busy?.abort();
       }
-      writeConversation(key, { file: tab.file, messages: [] });
-      conversation.messages = [];
+      conversation = { ...conversation, id: null, part: null, started: null, updated: null, file: tab.file, messages: [], names: [] };
+      writeConversation(key, conversation);
     }
-    shown = { key, file: tab.file };
+    if (partId && !conversation.part) {
+      if (conversation.messages.length) {
+        conversation = { ...conversation, part: tab.part, file: tab.file ?? tab.part.file };
+        writeConversation(key, conversation);
+        if (conversation.id) archive(conversation);
+      } else {
+        loadLatest(key, tab.part);
+      }
+    }
+    shown = { key, file: tab.file, part: partId };
     $("ai-chat").replaceChildren();
     for (const m of conversation.messages) showMessage(m);
     if (pending?.key === key) $("ai-chat").append(...pending.nodes);
-    $("ai-chat").scrollTop = $("ai-chat").scrollHeight;
+    toEnd(true);
+    showHistory();
+  }
+
+  let loading = 0; // the history read for the part of a tab: only the latest read is used
+
+  /** The last conversation of the history about `part`, shown in the tab of `key` if nothing was asked there since. */
+  async function loadLatest(key, part) {
+    const token = ++loading;
+    const found = await latestOf(part).catch(() => null);
+    if (token !== loading || !found) return;
+    const now = readConversation(key);
+    // A question asked meanwhile, a new conversation, another part: left as they are.
+    if (now.messages.length || now.part || pending?.key === key) return;
+    const { synced, ...conversation } = found;
+    writeConversation(key, { ...conversation, part, file: part.file ?? conversation.file });
+    if (shown?.key === key) {
+      shown = null;
+      showConversation();
+    }
+  }
+
+  /** The last conversation about `part`: of this browser, or of the network folder (when it is reachable), one merged with the other. */
+  async function latestOf(part) {
+    const local = await archives.localFor(part.id).catch(() => []);
+    let best = local[0] ?? null;
+    const folder = await networkReady();
+    if (folder && archives.partHash(part)) {
+      const remote = (await archives.readPartFile(folder, part).catch(() => [])).sort((a, b) => Date.parse(b.updated) - Date.parse(a.updated));
+      if (remote[0] && (!best || Date.parse(remote[0].updated) > Date.parse(best.updated))) best = remote[0];
+      if (best) best = archives.mergeConversation(best, [...local, ...remote].find((c) => c.id === best.id && c !== best));
+    }
+    return best;
   }
   showConversation();
   // Another tab shown, or another part in the tab shown.
@@ -1084,6 +1181,8 @@ export function mount({ page, reader }) {
     showConversation();
     const conv = shown;
     const tabId = reader.tab?.id;
+    const tabPart = reader.tab?.part ?? null;
+    const askedAt = new Date().toISOString(); // the date of the question and of its answer in the history
     const part = readPart();
     const snapshot = costing ? (async () => reader.costing?.())() : null;
     snapshot?.catch(() => {}); // read below
@@ -1136,7 +1235,7 @@ export function mount({ page, reader }) {
       foldThought();
       answerBox.classList.remove("ai-thinking");
       answerBox.textContent = visible;
-      $("ai-chat").scrollTop = $("ai-chat").scrollHeight;
+      toEnd();
     };
     busy = new AbortController();
     const { signal } = busy;
@@ -1242,20 +1341,28 @@ export function mount({ page, reader }) {
       const legend = names ? names.legend(formatAnswer(output)) : [];
       // An answer of the local model is marked: it never goes online with the conversation (onlineMessages);
       // one of the gateway given the internal amounts of the costing too, with the gateway: not without the box ticked.
+      const source = answer ? { provider: answer.provider, model: answer.model } : { provider: "Ollama", model: localModel };
       const message = {
-        role: "assistant", content: withoutThinking(output), ...(localModel ? { local: true } : {}), ...(amountsSent !== null && !localModel ? { amounts: true, gateway: amountsSent } : {}),
+        id: archives.newId(), role: "assistant", content: withoutThinking(output), date: askedAt, answered: new Date().toISOString(),
+        ...(source.provider ? { provider: source.provider } : {}), ...(source.model ? { model: source.model } : {}),
+        ...(localModel ? { local: true } : {}), ...(amountsSent !== null && !localModel ? { amounts: true, gateway: amountsSent } : {}),
         ...(check ? { costing: check } : {}), ...(numbers.length ? { numbers } : {}), ...(notice ? { notice } : {}), ...(legend.length ? { names: legend } : {}),
       };
       signal.throwIfAborted();
       decorate(answerBox, message);
       // Only answered questions are kept: a failed one is not sent again with the next. Not in a
-      // conversation started since about another part of the tab.
+      // conversation started since (another part of the tab, a new conversation, one of the history).
       const kept = readConversation(conv.key);
-      if (!(kept.file && conv.file && kept.file !== conv.file)) {
+      if (kept.id === conversation.id && !(kept.file && conv.file && kept.file !== conv.file)) {
         const known = unionNames(quoteNames ? unionNames(kept.names, quoteNames) : kept.names, ofPart);
-        writeConversation(conv.key, { file: kept.file ?? conv.file, messages: [...kept.messages, { role: "user", content: question }, message], names: known });
+        const record = {
+          ...kept, id: kept.id ?? archives.newId(), part: kept.part ?? tabPart, file: kept.file ?? conv.file ?? tabPart?.file ?? null,
+          started: kept.started ?? askedAt, updated: new Date().toISOString(),
+          messages: [...kept.messages, { id: archives.newId(), role: "user", content: question, date: askedAt }, message], names: known,
+        };
+        writeConversation(conv.key, record);
+        archive(record);
       }
-      const source = answer ? { provider: answer.provider, model: answer.model } : { provider: "Ollama", model: localModel };
       // Costing: the answer kept with the quote of the tab, for the record (nothing in it is applied).
       if (costing && sent.costing_trace) {
         const { addAIAnalysis } = await import("./chiffrage/ui.js");
@@ -1357,9 +1464,213 @@ export function mount({ page, reader }) {
       pending.dropped = true;
       busy?.abort();
     }
-    writeConversation(shown.key, { file: null, messages: [] });
+    // About a part: a new one of its conversations (the one before stays in the history, not shown again).
+    const part = reader.tab?.part ?? null;
+    writeConversation(shown.key, part ? { id: null, part, file: reader.tab.file ?? part.file, messages: [], names: [] } : { file: null, messages: [] });
     $("ai-chat").replaceChildren();
     setStatus("Nouvelle conversation");
+    showHistory();
+  });
+
+  // ------------------------------------------------------------------ history (ai-history.js), on the right
+
+
+  /** The network folder when it may be written (its access granted), else null. */
+  async function networkReady() {
+    if (!archives.folderSupported()) return null;
+    network = await archives.networkFolder().catch(() => null);
+    return network?.permission === "granted" ? network.handle : null;
+  }
+
+  /** Keep a conversation in the history: this browser, and the network folder for a part (when its access is granted). */
+  async function archive(conversation) {
+    if (!conversation.messages.length) return;
+    let record = null;
+    try {
+      record = await archives.saveLocal(conversation);
+    } catch (err) {
+      networkNote = `Historique de ce PC indisponible : ${err?.message || err}`;
+    }
+    const folder = archives.partHash(conversation.part) ? await networkReady() : null;
+    if (folder) {
+      try {
+        await archives.writePartFile(folder, conversation);
+        if (record) await archives.saveLocal(conversation, { synced: conversation.updated });
+        networkNote = "";
+      } catch (err) {
+        networkNote = `Écriture dans le dossier réseau impossible : ${err?.message || err}`;
+      }
+    }
+    showHistory();
+  }
+
+  const dateLabel = (iso) => {
+    const d = new Date(iso);
+    const options = { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" };
+    if (d.getFullYear() !== new Date().getFullYear()) options.year = "numeric";
+    return Number.isFinite(d.getTime()) ? d.toLocaleString("fr-FR", options) : "";
+  };
+
+  /** A list of the history: each conversation, its part, its date, its first question; the one shown and its part's marked. */
+  function historyItems(list, conversations, source) {
+    const tab = reader.tab;
+    const current = readConversation(conversationKey(tab?.id ?? 1)).id;
+    if (!conversations.length) {
+      const empty = document.createElement("li");
+      empty.className = "ai-hist-empty";
+      empty.textContent = source === "local" ? "Aucune discussion gardée sur ce PC." : "Aucune discussion dans ce dossier.";
+      list.replaceChildren(empty);
+      return;
+    }
+    list.replaceChildren(...conversations.map((c) => {
+      const li = document.createElement("li");
+      li.className = "ai-hist-item";
+      li.classList.toggle("current", c.id === current);
+      li.classList.toggle("this-part", !!c.part && c.part.id === tab?.part?.id);
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "ai-hist-open";
+      open.dataset.id = c.id;
+      open.dataset.source = source;
+      const { question, count } = archives.conversationSummary(c);
+      const name = c.part?.file ?? c.file;
+      open.title = `${name ?? "Sans pièce"} — ouvrir cette discussion dans un nouvel onglet${c.part ? " (le modèle 3D n'est pas ouvert)" : ""}`;
+      const part = document.createElement("span");
+      part.className = "ai-hist-part";
+      part.textContent = name ? name.replace(/\.[^.]+$/, "") : "Sans pièce";
+      const meta = document.createElement("span");
+      meta.className = "ai-hist-meta";
+      meta.textContent = `${dateLabel(c.updated)} · ${count} message${count > 1 ? "s" : ""}`;
+      const first = document.createElement("span");
+      first.className = "ai-hist-q";
+      first.textContent = question ? `« ${question} »` : "";
+      open.append(part, meta, first);
+      li.append(open);
+      if (source === "local") {
+        const del = document.createElement("button");
+        del.type = "button";
+        del.className = "ai-hist-del";
+        del.dataset.id = c.id;
+        del.textContent = "×";
+        del.title = "Supprimer cette discussion de l'historique de ce PC";
+        del.setAttribute("aria-label", `Supprimer la discussion ${name ?? "sans pièce"} du ${dateLabel(c.updated)}`);
+        li.append(del);
+      }
+      return li;
+    }));
+  }
+
+  /** The history on the right, as kept now (`folder`: read the network folder again). */
+  async function showHistory({ folder = false } = {}) {
+    const token = ++historyRead;
+    for (const tabEl of page.querySelectorAll(".ai-hist-tab")) {
+      const on = tabEl.dataset.history === historyTab;
+      tabEl.setAttribute("aria-selected", String(on));
+      tabEl.tabIndex = on ? 0 : -1;
+    }
+    $("ai-hist-local").hidden = historyTab !== "local";
+    $("ai-hist-reseau").hidden = historyTab !== "reseau";
+    if (historyTab === "local") {
+      const local = await archives.listLocal().catch(() => null);
+      if (token !== historyRead) return;
+      if (local) historyItems($("ai-hist-list-local"), local, "local");
+      else $("ai-hist-list-local").replaceChildren(Object.assign(document.createElement("li"), { className: "ai-hist-empty", textContent: "Historique indisponible dans ce navigateur (navigation privée ?)." }));
+      return;
+    }
+    const box = $("ai-hist-folder");
+    const handle = await networkReady();
+    if (token !== historyRead) return;
+    const button = (action, label) => `<button type="button" class="btn small" data-hist-action="${action}">${label}</button>`;
+    const note = networkNote ? `<p class="ai-hist-error">${escapeHtml(networkNote)}</p>` : "";
+    if (!archives.folderSupported()) {
+      box.innerHTML = '<p class="ai-hist-note">Ce navigateur ne peut pas ouvrir de dossier : l\'historique réseau demande Chrome ou Edge.</p>';
+      $("ai-hist-list-reseau").replaceChildren();
+      return;
+    }
+    if (!network) {
+      box.innerHTML = `<p class="ai-hist-note">Aucun dossier réseau choisi. Les discussions des pièces y seront écrites, un fichier par pièce, pour les retrouver depuis les autres postes.</p><div class="ai-hist-actions">${button("choose", "Choisir le dossier…")}</div>${note}`;
+      $("ai-hist-list-reseau").replaceChildren();
+      return;
+    }
+    if (!handle) {
+      box.innerHTML = `<p class="ai-hist-note">Dossier « ${escapeHtml(network.name)} » : accès à autoriser (le navigateur le demande après chaque redémarrage).</p><div class="ai-hist-actions">${button("grant", "Autoriser l'accès")}${button("choose", "Changer de dossier…")}</div>${note}`;
+      $("ai-hist-list-reseau").replaceChildren();
+      return;
+    }
+    box.innerHTML = `<p class="ai-hist-note">Dossier « ${escapeHtml(network.name)} » : les discussions des pièces y sont écrites après chaque réponse.</p><div class="ai-hist-actions">${button("refresh", "Actualiser")}${button("choose", "Changer de dossier…")}</div>${note}`;
+    if (folder || !networkList.length) {
+      $("ai-hist-list-reseau").replaceChildren(Object.assign(document.createElement("li"), { className: "ai-hist-empty", textContent: "Lecture du dossier…" }));
+      try {
+        networkList = await archives.listFolder(handle);
+      } catch (err) {
+        networkList = [];
+        networkNote = `Lecture du dossier réseau impossible : ${err?.message || err}`;
+      }
+      if (token !== historyRead) return;
+    }
+    historyItems($("ai-hist-list-reseau"), networkList, "reseau");
+  }
+
+  /** Open a conversation of the history: the tab that shows it, else a new tab of its part (its model not opened). */
+  async function openArchive(id, source) {
+    const found = source === "local" ? await archives.getLocal(id).catch(() => null) : networkList.find((c) => c.id === id);
+    if (!found) return;
+    const there = (reader.tabs ?? []).find((t) => readConversation(conversationKey(t.id)).id === id);
+    if (there) {
+      reader.showTab?.(there.id);
+      return;
+    }
+    let conversation = found;
+    // The same conversation on this PC and in the folder: the messages of both.
+    const local = source === "local" ? null : await archives.getLocal(id).catch(() => null);
+    if (local) conversation = archives.mergeConversation(found, local);
+    const { synced, ...kept } = conversation;
+    if (!reader.openPartTab) return;
+    reader.openPartTab(kept.part ?? { id: null, file: null }, (tabId) => writeConversation(conversationKey(tabId), { ...kept, file: kept.part?.file ?? kept.file }));
+    setStatus(kept.part ? "Discussion ouverte dans un nouvel onglet : ouvrez le fichier de la pièce pour la voir en 3D" : "Discussion ouverte dans un nouvel onglet");
+  }
+
+  page.querySelector(".ai-hist-tabs").addEventListener("click", (event) => {
+    const tabEl = event.target.closest(".ai-hist-tab");
+    if (!tabEl) return;
+    historyTab = tabEl.dataset.history;
+    store.set(localStorage, KEYS.historyTab, historyTab === "reseau" ? "reseau" : null);
+    showHistory({ folder: historyTab === "reseau" });
+  });
+  page.querySelector(".ai-hist-tabs").addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+    historyTab = historyTab === "local" ? "reseau" : "local";
+    store.set(localStorage, KEYS.historyTab, historyTab === "reseau" ? "reseau" : null);
+    showHistory({ folder: historyTab === "reseau" });
+    page.querySelector(`.ai-hist-tab[data-history="${historyTab}"]`).focus();
+  });
+  page.querySelector(".ai-history").addEventListener("click", async (event) => {
+    const open = event.target.closest(".ai-hist-open");
+    if (open) return openArchive(open.dataset.id, open.dataset.source);
+    const del = event.target.closest(".ai-hist-del");
+    if (del) {
+      if (!confirm("Supprimer cette discussion de l'historique de ce PC ? (Une copie écrite dans le dossier réseau y reste.)")) return;
+      await archives.deleteLocal(del.dataset.id).catch(() => {});
+      return showHistory();
+    }
+    const action = event.target.closest("[data-hist-action]")?.dataset.histAction;
+    if (!action) return;
+    try {
+      if (action === "choose") {
+        const handle = await archives.chooseNetworkFolder();
+        networkList = [];
+        networkNote = "";
+        // The conversations of before kept on this PC: written there too, if wanted.
+        const before = (await archives.listLocal()).filter((c) => archives.partHash(c.part) && !(c.synced && Date.parse(c.synced) >= Date.parse(c.updated))).length;
+        const all = !before || confirm(`Écrire aussi dans ce dossier les ${before} discussion${before > 1 ? "s" : ""} de pièces déjà gardée${before > 1 ? "s" : ""} sur ce PC ?`);
+        await archives.syncFolder(handle, { all });
+      } else if (action === "grant") {
+        if (network && (await archives.grantNetworkFolder(network.handle))) await archives.syncFolder(network.handle);
+      }
+    } catch (err) {
+      if (err?.name !== "AbortError") networkNote = `Dossier réseau : ${err?.message || err}`;
+    }
+    showHistory({ folder: true });
   });
 
   $("ai-input").addEventListener("keydown", (event) => {
@@ -1402,6 +1713,7 @@ export function mount({ page, reader }) {
       $("ai-input")?.focus();
       showScope();
       showReady();
+      showHistory();
     },
     /** The tab `id` of the 3D page was closed (app.js): its conversation is forgotten, its question dropped. */
     forgetTab(id) {

@@ -91,6 +91,14 @@ function resize() {
 new ResizeObserver(resize).observe(viewport);
 resize();
 
+// The pages fill the window under the top bar, whatever its height (it wraps on a narrow window): --topbar-h of style.css.
+{
+  const topbar = document.querySelector(".topbar");
+  const measure = () => document.documentElement.style.setProperty("--topbar-h", `${topbar.offsetHeight}px`);
+  new ResizeObserver(measure).observe(topbar);
+  measure();
+}
+
 renderer.setAnimationLoop(() => {
   controls.update();
   renderer.render(scene, camera);
@@ -451,6 +459,7 @@ async function openFile(file, { refresh = false, handle = null, close = false, t
     tab.handle = handle ?? (file === tab.file ? tab.handle : null);
     tab.file = file;
     tab.result = data;
+    identifyPart(tab, file, data);
     if (!shown()) {
       // Opened in a tab not shown: its model is built when the tab is shown.
       if (tab.view) disposeObjects(tab.view.meshes);
@@ -1804,6 +1813,26 @@ function cancelTab(tab) {
   renderTabs();
 }
 
+/**
+ * The part a tab shows, for the history of the IA page (ai-history.js): {id:
+ * "sha256:<hex>" of its file, file: its name}. The hash the browser's analysis
+ * read the file by (its result's cacheKey), else computed (server engine, a
+ * page without crypto.subtle): the IA page is told when it is known.
+ */
+function identifyPart(tab, file, data) {
+  const hash = /^\d+\|([0-9a-f]{64})\|/.exec(data?.cacheKey ?? "")?.[1];
+  tab.part = { id: hash ? `sha256:${hash}` : null, file: file.name };
+  if (hash) return;
+  import("./ai-history.js")
+    .then(({ partIdOf }) => partIdOf(file))
+    .then((id) => {
+      if (tab.file !== file) return; // another file opened since
+      tab.part = { id, file: file.name };
+      if (tab === activeTab) document.dispatchEvent(new CustomEvent("reader3d-part"));
+    })
+    .catch(() => {});
+}
+
 /** Close a tab: its model and its quote are forgotten. */
 function closeTab(tab) {
   const i = tabs.indexOf(tab);
@@ -1811,7 +1840,7 @@ function closeTab(tab) {
   cancelTab(tab);
   if (tab === activeTab) clearModel();
   else if (tab.view) disposeObjects(tab.view.meshes);
-  tab.view = tab.result = tab.file = null;
+  tab.view = tab.result = tab.file = tab.part = null;
   tabs.splice(i, 1);
   forgetQuote(tab.id);
   forgetConversation(tab.id);
@@ -1858,15 +1887,18 @@ function resetTabs() {
 function renderTabs() {
   const strip = $("doc-tabs");
   const items = tabs.map((tab) => {
-    const name = tab.loading?.file ?? tab.file?.name ?? null;
+    // A conversation of the history opened in its own tab: its part's name, its model not open.
+    const chatOnly = !tab.loading && !tab.file && !!tab.part?.file;
+    const name = tab.loading?.file ?? tab.file?.name ?? tab.part?.file ?? null;
     const el = document.createElement("div");
     el.className = "doc-tab";
     el.classList.toggle("active", tab === activeTab);
     el.classList.toggle("busy", !!tab.loading);
+    el.classList.toggle("chat-only", chatOnly);
     el.dataset.tab = tab.id;
     el.setAttribute("role", "tab");
     el.setAttribute("aria-selected", String(tab === activeTab));
-    el.title = name ?? t("tabs.new");
+    el.title = chatOnly ? t("tabs.chatOnly", { name }) : name ?? t("tabs.new");
     el.innerHTML = '<span class="doc-tab-spin" aria-hidden="true"></span><span class="doc-tab-name"></span><button type="button" class="doc-tab-close">×</button>';
     // The part, without the extension of its file (the whole name as a tip).
     el.querySelector(".doc-tab-name").textContent = name ? name.replace(/\.[^.]+$/, "") : t("tabs.new");
@@ -2052,6 +2084,11 @@ setInterval(() => document.visibilityState === "visible" && !$("memory-card").hi
 // The results are also in <script id="reader3d-result" type="application/json">,
 // <body data-status="analysing|done|error"> and window.reader3d.
 const params = new URLSearchParams(location.search);
+
+/** A tab as window.reader3d gives it: {id, file (its name), part ({id, file}: the part it shows or its conversation is about, once known)}. */
+function tabInfo(tab) {
+  return { id: tab.id, file: tab.file?.name ?? null, part: tab.part?.id ? { id: tab.part.id, file: tab.part.file ?? null } : null };
+}
 
 function setStatus(status, message = "") {
   const changed = document.body.dataset.status !== status;
@@ -2253,7 +2290,28 @@ window.reader3d = {
   },
   /** The tab shown: its id and the name of the file of its part (null: none). The IA page keeps a conversation per tab. */
   get tab() {
-    return activeTab ? { id: activeTab.id, file: activeTab.file?.name ?? null } : null;
+    return activeTab ? tabInfo(activeTab) : null;
+  },
+  /** Every tab of the 3D page: [{id, file, part}]. */
+  get tabs() {
+    return tabs.map(tabInfo);
+  },
+  /** Show the tab `id` of the 3D page (the page shown stays). */
+  showTab(id) {
+    const tab = tabs.find((x) => x.id === id);
+    if (tab && tab !== activeTab) showTab(tab);
+  },
+  /**
+   * A new tab for a conversation of the history of the IA page: its part
+   * ({id, file}) known, its model not open. `before(id)` is called with the
+   * tab's id before it is shown (its conversation written). Returns that id.
+   */
+  openPartTab(part, before) {
+    const tab = createTab();
+    tab.part = { id: part?.id ?? null, file: part?.file ?? null };
+    before?.(tab.id);
+    showTab(tab);
+    return tab.id;
   },
   /** Material of the part (alloy name and density g/cm³), e.g. from a customer request. */
   setMaterial(label, density) {
