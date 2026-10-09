@@ -1428,8 +1428,7 @@ function castingCard(r) {
   const empreintesOptions = [[" ", `Estimé${e ? ` (${e.parCycle})` : ""}`], ...[...new Set([1, 2, 3, 4, 5, 6, 8, ...(i.empreintes > 0 ? [i.empreintes] : [])])].sort((a, b) => a - b).map((n) => [n, String(n)])];
   const op = r.route?.operations.find((o) => o.code === routeCode);
   const mamOptions = [[" ", `Estimée${e ? ` (${nf(e.miseAuMille, 2)})` : ""}`], ...[1.1, 1.2, 1.25, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 2, 2.2, 2.5].map((n) => [n, nf(n, 2)])];
-  // A value outside the lists (applied from the AI, saved by another version): shown, not replaced by the first option.
-  if (i.empreintes > 0 && !empreintesOptions.some(([v]) => Number(v) === i.empreintes)) empreintesOptions.push([i.empreintes, String(i.empreintes)]);
+  // A value outside the list (applied from the AI, saved by another version): shown, not replaced by the first option.
   if (i.miseAuMille > 0 && !mamOptions.some(([v]) => Number(v) === i.miseAuMille)) mamOptions.push([i.miseAuMille, nf(i.miseAuMille, 2)]);
   const mam = e?.miseAuMilleDetail;
   const mamDetail = mam

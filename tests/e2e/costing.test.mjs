@@ -857,7 +857,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.waitForFunction(() => /Valeurs appliquées au chiffrage/.test(document.getElementById('ai-chat').textContent));
     assert.match(dialogs.at(-1), /^Appliquer ces valeurs au chiffrage de cet onglet \?\n\n« Pièce » :\n {2}poids pièce : 1,2 kg → 1,35 kg\n\nElles deviennent des saisies de la pièce/);
     assert.equal(requests.length, sent);
-    assert.equal(await page.textContent('#ai-chat .ai-msg:last-child .ai-text'), 'Valeurs appliquées au chiffrage :\n- poids pièce de « Pièce » : 1,2 kg → 1,35 kg');
+    assert.match(await page.textContent('#ai-chat .ai-msg:last-child .ai-text'), /^Valeurs appliquées au chiffrage :\n- poids pièce de « Pièce » : 1,2 kg → 1,35 kgAnnuler l'application$/);
     assert.equal(await page.isVisible('#ai-suggest'), false);
     const applied = await piece();
     assert.deepEqual([applied.poids, applied.valeursIA.poids.avant, applied.valeursIA.poids.model], [1.35, 1.2, 'openai/gpt-oss-120b']);
