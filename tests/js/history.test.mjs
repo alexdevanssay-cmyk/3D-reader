@@ -99,6 +99,29 @@ describe('history file: format, validation, merge, export', () => {
     assert.deepEqual(twice.pieces.map((r) => r.temps_cycle_s), [222]);
   });
 
+  test('the records of the shared network folder: one of the same reference and source replaces the one kept only when it is newer', () => {
+    const at = (date, over = {}) => checkRecord(record({ source: 'production', date, ...over })).record;
+    const kept = [at('2026-06-01T10:00:00.000Z', { temps_cycle_s: 230 }), record({ ref: 'REF-B' }), at(undefined, { ref: 'SANS-DATE' })];
+    // Read back as written (this PC's own), an older one, a newer one, a new part, a dated one for a record without a date.
+    const merged = mergeHistory(kept, [
+      at('2026-06-01T10:00:00.000Z', { temps_cycle_s: 230 }),
+      at('2026-05-01T10:00:00.000Z', { temps_cycle_s: 999 }),
+      at('2026-07-01T10:00:00.000Z', { temps_cycle_s: 240 }),
+      at('2026-06-15T10:00:00.000Z', { ref: 'AUTRE-PC', temps_cycle_s: 300 }),
+      at('2026-01-01T00:00:00.000Z', { ref: 'SANS-DATE', temps_cycle_s: 111 }),
+    ], { newer: true });
+    assert.deepEqual([merged.added, merged.replaced, merged.unchanged], [1, 2, 2]);
+    assert.deepEqual(merged.pieces.map((r) => [r.ref, r.source, r.temps_cycle_s]), [['REF-A', 'production', 240], ['REF-B', 'devis', 200], ['SANS-DATE', 'production', 111], ['AUTRE-PC', 'production', 300]]);
+    // In any order: the newest wins; read again, nothing changes.
+    const reversed = mergeHistory(kept, [at('2026-07-01T10:00:00.000Z', { temps_cycle_s: 240 }), at('2026-05-01T10:00:00.000Z', { temps_cycle_s: 999 })], { newer: true });
+    assert.equal(reversed.pieces[0].temps_cycle_s, 240);
+    const again = mergeHistory(merged.pieces, merged.pieces, { newer: true });
+    assert.deepEqual([again.added, again.replaced, again.unchanged], [0, 0, 4]);
+    // Neither dated: the one kept stays; a file imported by hand still replaces it.
+    assert.equal(mergeHistory([record()], [record({ temps_cycle_s: 1 })], { newer: true }).pieces[0].temps_cycle_s, 200);
+    assert.equal(mergeHistory([record()], [record({ temps_cycle_s: 1 })]).pieces[0].temps_cycle_s, 1);
+  });
+
   test('export: the format of the import, read back the same', () => {
     const pieces = importHistory([], file([record(), record({ ref: 'P', source: 'production', date: '2026-06-01T10:00:00.000Z' })])).pieces;
     const out = JSON.parse(JSON.stringify(exportHistory(pieces)));

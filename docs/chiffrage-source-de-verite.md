@@ -458,6 +458,7 @@ Déplacer chaque constante métier dans Paramètres, ou la lire dans le classeur
   - la géométrie : poids, module, épaisseurs, encombrement, volume, surface, noyaux et sable ;
   - l'îlot retenu, les pièces par cycle, le TRS, la mise au mille et la taille de série du chiffrage.
   Il ne change pas le devis.
+- **Dossier réseau partagé.** Choisi une fois par poste dans Paramètres (`network-folder.js`, Chrome ou Edge). Chaque temps mesuré enregistré y est aussi écrit, dans le sous-dossier « retours-experience », un fichier par enregistrement au format de l'historique, jamais par-dessus un autre (`chiffrage/feedback.js`) ; s'il ne peut pas l'être (accès à autoriser, réseau absent), il attend dans ce navigateur. Les fichiers du dossier sont lus à l'ouverture de Chiffrage et de Paramètres (et avec « Actualiser ») et fusionnés dans l'historique : un enregistrement de même référence et même source ne remplace celui gardé que s'il est plus récent (sa date). Un import de fichier, lui, remplace toujours. Rien ne part ailleurs que dans ce dossier du réseau de l'entreprise.
 - **Comparaison.** Pour chaque temps mesuré, trois estimations, chacune avec son écart relatif (estimation − réel) / réel :
   - la formule de `routes.js`, recalculée avec les coefficients actuels de Paramètres (`history.js:formulaCycle`), avec les pièces par cycle et la mise au mille de l'enregistrement ;
   - la même formule avec les coefficients du fichier de tendances, pour les îlots dont il donne le cycle ;
