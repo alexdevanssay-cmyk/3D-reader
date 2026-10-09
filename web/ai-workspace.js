@@ -906,6 +906,7 @@ export function mount({ page, reader }) {
     if (partId && !conversation.part) {
       if (conversation.messages.length) {
         conversation = { ...conversation, part: tab.part, file: tab.file ?? tab.part.file };
+        if (conversation.id) conversation = archives.normalizeConversation(conversation);
         writeConversation(key, conversation);
         if (conversation.id) archive(conversation);
       } else {
@@ -1355,11 +1356,12 @@ export function mount({ page, reader }) {
       const kept = readConversation(conv.key);
       if (kept.id === conversation.id && !(kept.file && conv.file && kept.file !== conv.file)) {
         const known = unionNames(quoteNames ? unionNames(kept.names, quoteNames) : kept.names, ofPart);
-        const record = {
+        // Ids and dates given once (the messages of an earlier version have none): the history merges by them.
+        const record = archives.normalizeConversation({
           ...kept, id: kept.id ?? archives.newId(), part: kept.part ?? tabPart, file: kept.file ?? conv.file ?? tabPart?.file ?? null,
           started: kept.started ?? askedAt, updated: new Date().toISOString(),
           messages: [...kept.messages, { id: archives.newId(), role: "user", content: question, date: askedAt }, message], names: known,
-        };
+        });
         writeConversation(conv.key, record);
         archive(record);
       }

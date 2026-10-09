@@ -134,7 +134,7 @@ async function store(name, mode = "readonly") {
 /** Keep a conversation in this browser (`synced`: when it was last written in the network folder). */
 export async function saveLocal(conversation, { synced } = {}) {
   const kept = await getLocal(conversation.id).catch(() => null);
-  const record = { ...conversation, part_id: conversation.part?.id ?? "", synced: synced ?? kept?.synced ?? null };
+  const record = { ...normalizeConversation(conversation), part_id: conversation.part?.id ?? "", synced: synced ?? kept?.synced ?? null };
   await request((await store(CONVERSATIONS, "readwrite")).put(record));
   return record;
 }
