@@ -558,5 +558,19 @@ export function anonymizer(context, names = []) {
   };
 }
 
+/**
+ * The names of the part open, for the anonymizer, whatever its context holds:
+ * every body of the file (`bodies`: their names, by their index in it), with
+ * the label of the context ("Corps 1"...), and the file. A body not sent, or
+ * the file when no body is, may still be named in a question or the history.
+ */
+export function partNames({ bodies = [], file = null } = {}) {
+  const ext = /\.[^./\\]+$/.exec(file ?? "")?.[0] ?? "";
+  return [
+    ...bodies.map((name, i) => ({ name, label: bodyLabel({ id: `body-${i}` }, i) })),
+    ...(file ? [{ name: file, label: `Pièce${ext}` }, { name: file.slice(0, file.length - ext.length), label: "Pièce" }] : []),
+  ];
+}
+
 export const AI_CONTEXT_VERSION = "1.0";
 export const AI_CONTEXT_TASKS = [...TASKS];

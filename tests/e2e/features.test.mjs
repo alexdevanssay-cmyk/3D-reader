@@ -486,18 +486,20 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.selectOption('#ai-provider', 'openai');
     await page.fill('#ai-url', `http://127.0.0.1:${gateway.address().port}/api/ai`);
     await page.dispatchEvent('#ai-url', 'change');
-    const ask = async () => {
-      await page.fill('#ai-input', 'Combien de noyaux ?');
+    const ask = async (question = 'Combien de noyaux ?') => {
+      await page.fill('#ai-input', question);
       await page.press('#ai-input', 'Enter');
       await page.waitForFunction(() => /^Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
       return contextOf(completions.at(-1));
     };
     await page.click('.tab[data-page="viewer"]');
     await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
+    // The IA page shown while the part is analysed: told when it is done, without leaving the page.
+    await page.click('.tab[data-page="ia"]');
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    assert.equal(await page.textContent('#ai-status'), 'Modèle analysé : posez votre question');
 
     // The whole part: both bodies, said so.
-    await page.click('.tab[data-page="ia"]');
     assert.equal(await page.textContent('#ai-scope'), "Envoyé à l'IA : toute la pièce « named_assembly.step » (2 corps).");
     let sent = await ask();
     assert.deepEqual([sent.bodies.length, sent.selection.mode, sent.selection.bodies_sent, sent.selection.bodies_in_file], [2, 'all', 2, 2]);
@@ -512,6 +514,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // A body selected in the list: that body only, its name never sent.
     await page.click('.tab[data-page="viewer"]');
     const name = (await page.textContent('#bodies tr[data-index="1"] td.name')).trim();
+    const other = (await page.textContent('#bodies tr[data-index="0"] td.name')).trim();
     await page.click('#bodies tr[data-index="1"] td.name');
     await page.click('.tab[data-page="ia"]');
     assert.match(await page.textContent('#ai-scope'), /^Envoyé à l'IA : le corps sélectionné « .+ » seulement \(1 sur 2\)\./);
@@ -519,6 +522,10 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.deepEqual([sent.bodies.length, sent.model.body_count, sent.selection.mode, sent.selection.bodies_sent], [1, 1, 'selected', 1]);
     assert.match(sent.selection.note, /Seul le corps sélectionné/);
     assert.ok(!JSON.stringify(completions.at(-1)).includes(name), 'the real name stays in the browser');
+    // The other body, not sent, named in the question (then in the history): replaced all the same.
+    await ask(`Et ${other} ?`);
+    const online = JSON.stringify(completions.at(-1).messages);
+    assert.ok(!online.includes(other) && online.includes('Et Corps 1 ?'), 'a body not sent, named in the question, stays in the browser');
 
     // Unselected, one body unchecked: the body checked only.
     await page.click('.tab[data-page="viewer"]');

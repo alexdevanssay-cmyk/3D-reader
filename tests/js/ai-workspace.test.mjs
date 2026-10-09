@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { addressSpace, answerText, costingText, defaultGateway, formatAnswer, gatewayLabel, isMarkdown, markdownToHtml, numbersLabel, quotaLabel, selectionOf, onlineMessages } from "../../web/ai-workspace.js";
-import { anonymizer, checkContextNumbers } from "../../web/engine/ai-context.js";
+import { anonymizer, checkContextNumbers, partNames } from "../../web/engine/ai-context.js";
 
 test("Ollama's address declares the address space the browser checks it against", () => {
   // This computer.
@@ -129,6 +129,21 @@ test("the names sent online: neutral labels in place of the file, the bodies, th
   assert.equal(none.text("Bonjour"), "Bonjour");
 });
 
+test("the names of the part not sent are replaced too: a body not selected, the file when no body is sent", () => {
+  const all = partNames({ bodies: ["CARTER-4711-A", "COUVERCLE-9022"], file: "Projet X.step" });
+  assert.deepEqual(all, [
+    { name: "CARTER-4711-A", label: "Corps 1" }, { name: "COUVERCLE-9022", label: "Corps 2" },
+    { name: "Projet X.step", label: "Pièce.step" }, { name: "Projet X", label: "Pièce" },
+  ]);
+  // Only the carter selected: its context holds it alone, the cover named in the question is replaced all the same.
+  const names = anonymizer({ source: { file: "Projet X.step" }, bodies: [{ id: "body-0", name: "CARTER-4711-A" }] }, all);
+  assert.equal(names.text("Compare CARTER-4711-A et COUVERCLE-9022 de Projet X"), "Compare Corps 1 et Corps 2 de Pièce");
+  assert.deepEqual(names.legend("Corps 2 est plus léger."), [["Corps 2", "COUVERCLE-9022"]]);
+  // No body checked: the context has no part, the file name is replaced.
+  assert.equal(anonymizer({ no_model_loaded: true, bodies: [] }, all).text("Que sais-tu de Projet X.step ?"), "Que sais-tu de Pièce.step ?");
+  assert.deepEqual(partNames(), []);
+});
+
 test("the numbers of an answer checked against the data sent: rounded, in another unit, from the question; the others counted", () => {
   const context = {
     schema_version: "1.0",
@@ -195,9 +210,31 @@ test("an answer in Markdown is laid out, and nothing of it becomes a tag of its 
   assert.match(html, /<p class="ai-h">Analyse<\/p>/);
   assert.match(html, /<strong>Conclusion<\/strong> : 2 noyaux, <code>body-0<\/code>\./);
   assert.match(html, /<table class="ai-table"><thead><tr><th>Élément<\/th><th>Valeur<\/th><\/tr><\/thead><tbody><tr><td>Noyaux<\/td><td>2 &lt;img src=x onerror=alert\(1\)&gt;<\/td><\/tr><\/tbody><\/table>/);
-  assert.match(html, /<ul><li>tiroir <em>proposé<\/em><\/li><li class="ai-sub">sous-point<\/li><\/ul><ol><li>premier<\/li><\/ol>/);
+  assert.match(html, /<ul><li>tiroir <em>proposé<\/em><ul><li>sous-point<\/li><\/ul><\/li><\/ul><ol><li>premier<\/li><\/ol>/);
   assert.doesNotMatch(html, /<img/);
   assert.match(markdownToHtml("```\n<b>x</b>\n```"), /<pre><code>&lt;b&gt;x&lt;\/b&gt;<\/code><\/pre>/);
+});
+
+test("numbered lists keep their numbers: items under an item in a list of its own, a loose list one list", () => {
+  // The bullets under step 1 are not counted: step 2 stays 2.
+  assert.equal(markdownToHtml("1. Ouvrir\n   - a\n   - b\n2. Fermer"), "<ol><li>Ouvrir<ul><li>a</li><li>b</li></ul></li><li>Fermer</li></ol>");
+  // Items between blank lines: one list, not "1. 1. 1.".
+  assert.equal(markdownToHtml("1. A\n\n2. B\n\n3. C\n\nFin."), "<ol><li>A</li><li>B</li><li>C</li></ol><p>Fin.</p>");
+  // A list that does not start at 1 keeps its first number; a line indented under an item is in it.
+  assert.equal(markdownToHtml("3. Poser les noyaux\n   au robot\n4. Couler"), '<ol start="3"><li>Poser les noyaux<br>au robot</li><li>Couler</li></ol>');
+  // A list of another kind after a blank line is a list of its own; text after a list, a paragraph.
+  assert.equal(markdownToHtml("- a\n\n1. b\nTexte"), "<ul><li>a</li></ul><ol><li>b</li></ol><p>Texte</p>");
+  // A list indented as a whole is a list.
+  assert.equal(markdownToHtml("  - a\n  - b"), "<ul><li>a</li><li>b</li></ul>");
+});
+
+test("pipe lines that are no table (separator rows only) are shown as text, the answer kept", () => {
+  for (const answer of ["Voici:\n|---|---|\nfin", "Élément | Valeur\n|---|---|\nNoyaux | 2", "a\n|||\nb", "**x**\n| - |"]) {
+    assert.equal(isMarkdown(answer), true);
+    const html = markdownToHtml(answer);
+    assert.doesNotMatch(html, /<table/);
+    assert.match(html, /<p>[^<]*\|/, answer);
+  }
 });
 
 test("the bodies sent are told to the model, without their names", () => {

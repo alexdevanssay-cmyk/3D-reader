@@ -39,7 +39,7 @@
 // local"). What the local model answered never goes online with the
 // conversation (onlineMessages): it was given the real names and amounts.
 
-import { anonymizer, buildAIContext, checkContextNumbers, compactAIContext, summaryAIContext } from "./engine/ai-context.js";
+import { anonymizer, buildAIContext, checkContextNumbers, compactAIContext, partNames, summaryAIContext } from "./engine/ai-context.js";
 
 const PROVIDERS = [
   ["openai", "En ligne via la passerelle (Groq…)"], // value of earlier versions, kept in this browser's storage
@@ -325,6 +325,7 @@ export function isMarkdown(text) {
  * attribute of the answer reaches the page, only the ones written here.
  */
 export function markdownToHtml(text) {
+  const ITEM = /^(\s*)([-*•]|(\d+)[.)])\s+(.*)$/; // a list item: its indent, its mark, its number, its text
   const inline = (line) => escapeHtml(line)
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
@@ -351,19 +352,45 @@ export function markdownToHtml(text) {
       i--;
       const body = rows.filter((r) => !/^\s*\|[\s:|-]+\|\s*$/.test(r)).map(cells);
       const [head, ...rest] = body;
-      out.push(`<table class="ai-table"><thead><tr>${head.map((c) => `<th>${inline(c)}</th>`).join("")}</tr></thead><tbody>${rest.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
-    } else if (/^\s*([-*•]|\d+[.)])\s+/.test(line)) {
+      // Only rows of dashes or pipes (a header line without its leading pipe above): text, not a table.
+      if (!head) out.push(`<p>${rows.map(inline).join("<br>")}</p>`);
+      else out.push(`<table class="ai-table"><thead><tr>${head.map((c) => `<th>${inline(c)}</th>`).join("")}</tr></thead><tbody>${rest.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
+    } else if (ITEM.test(line)) {
       flush();
-      const ordered = /^\s*\d+[.)]\s+/.test(line);
-      const items = [];
-      // One list per kind: a numbered list after bullets starts a list of its own (indented items stay in).
-      const sameList = (l) => /^\s*([-*•]|\d+[.)])\s+/.test(l) && (/^\s{2,}/.test(l) || /^\s*\d+[.)]\s+/.test(l) === ordered);
-      for (; i < lines.length && sameList(lines[i]); i++) {
-        const depth = /^\s{2,}/.test(lines[i]) ? " class=\"ai-sub\"" : "";
-        items.push(`<li${depth}>${inline(lines[i].replace(/^\s*([-*•]|\d+[.)])\s+/, ""))}</li>`);
+      // One list per kind: a numbered list after bullets starts a list of its own. The items indented
+      // under an item are a list in it; blank lines between items (a loose list) and lines indented
+      // under an item keep the list open.
+      const indent = (l) => /^\s*/.exec(l)[0].length;
+      const base = indent(line);
+      const ordered = !!ITEM.exec(line)[3];
+      const items = []; // {lines, sub: {ordered, start, items: [lines]}}
+      for (; i < lines.length; i++) {
+        const l = lines[i];
+        if (!l.trim()) {
+          let j = i + 1;
+          while (j < lines.length && !lines[j].trim()) j++;
+          const next = ITEM.exec(lines[j] ?? "");
+          if (next && (indent(lines[j]) >= base + 2 || !!next[3] === ordered)) {
+            i = j - 1;
+            continue;
+          }
+          break;
+        }
+        const m = ITEM.exec(l);
+        const last = items[items.length - 1];
+        if (m && indent(l) >= base + 2 && last) {
+          (last.sub ??= { ordered: !!m[3], start: Number(m[3] ?? 1), items: [] }).items.push([m[4]]);
+        } else if (m && indent(l) < base + 2 && !!m[3] === ordered) {
+          items.push({ lines: [m[4]], sub: null, start: Number(m[3] ?? 1) });
+        } else if (!m && indent(l) >= base + 2 && last) {
+          if (last.sub) last.sub.items[last.sub.items.length - 1].push(l.trim());
+          else last.lines.push(l.trim());
+        } else break;
       }
       i--;
-      out.push(`<${ordered ? "ol" : "ul"}>${items.join("")}</${ordered ? "ol" : "ul"}>`);
+      const list = (isOrdered, start, lis) => (isOrdered ? `<ol${start !== 1 ? ` start="${start}"` : ""}>${lis}</ol>` : `<ul>${lis}</ul>`);
+      const li = (texts, sub = null) => `<li>${texts.map(inline).join("<br>")}${sub ? list(sub.ordered, sub.start, sub.items.map((t) => li(t)).join("")) : ""}</li>`;
+      out.push(list(ordered, items[0].start, items.map((it) => li(it.lines, it.sub)).join("")));
     } else if (/^#{1,4} /.test(line)) {
       flush();
       out.push(`<p class="ai-h">${inline(line.replace(/^#{1,4} /, ""))}</p>`);
@@ -379,13 +406,15 @@ export function markdownToHtml(text) {
 
 /** An answer in its bubble: laid out when written in Markdown, else as plain text (line breaks kept). */
 function setAnswer(el, text) {
-  if (isMarkdown(text)) {
-    el.classList.add("ai-md");
-    el.innerHTML = markdownToHtml(text);
-  } else {
-    el.classList.remove("ai-md");
-    el.textContent = text;
+  let html = null;
+  try {
+    html = isMarkdown(text) ? markdownToHtml(text) : null;
+  } catch (err) {
+    console.warn("Answer not laid out", err); // shown as it was written: never lost
   }
+  el.classList.toggle("ai-md", html != null);
+  if (html != null) el.innerHTML = html;
+  else el.textContent = text;
 }
 
 /** Where an answer of the gateway comes from: "Groq · openai/gpt-oss-120b". */
@@ -463,17 +492,21 @@ Explique les valeurs et leurs sources, signale les écarts et les valeurs à val
 N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux. Ne cite que des nombres présents dans costing_trace, tels quels ou arrondis, sans en calculer de nouveaux : une réponse qui contient un autre nombre est marquée « non vérifiée ».
 Si costing_trace est null, aucun classeur de chiffrage n'est importé : dis-le et propose de l'importer dans la page Chiffrage.`;
 
+// As the gateway's text tasks (api/ai.js TEXT_RULES): not in the task « Chiffrage », which proposes nothing.
+const PROPOSALS = "Paramètres de fonderie et de chiffrage (nombre de noyaux, de tiroirs, de chapes, îlot de coulée, coefficient de difficulté…) : quand on te les demande, propose-les en fondeur à partir des features et du criblage fonderie du contexte. Présente chaque valeur comme « Proposition IA — à valider », avec sa justification (identifiants des features) et ta confiance. N'invente jamais de prix, de taux horaires ni de mesures.";
+
 /** Instructions of the local model: plain French text, laid out only when the question is about the part. */
 function systemPrompt(model, where = "sur ce PC", costing = false) {
   return `Tu es l'assistant d'ingénierie de 3D Reader, pour une fonderie d'aluminium. Tu es un modèle de langage (${model}) qui tourne en local ${where} avec Ollama : aucune donnée n'est envoyée sur Internet.
 Réponds en français, en texte (jamais de JSON ; gras, listes et petits tableaux Markdown permis), de façon claire et concise.
 Pour une conversation ou une question générale (fonderie, procédés, chiffrage, méthode), réponds directement et brièvement.
 Pour une question sur la pièce, organise la réponse en courtes sections, celles qui sont utiles seulement : « Conclusion », « Mesuré » (valeurs du contexte, avec leurs identifiants), « Déduit », « Recommandations », « À valider ».
-N'utilise que le contexte fourni (analyse géométrique et sémantique de la pièce, connaissances fonderie). N'invente jamais de dimensions, de paramètres de procédé, de propriétés matière, de prix, de taux, de temps de cycle, de nombre de noyaux, de probabilités de défaut, d'attaques, de masselottes ni de résultats de simulation.
+N'utilise que le contexte fourni (analyse géométrique et sémantique de la pièce, connaissances fonderie). N'invente jamais de dimensions, de paramètres de procédé, de propriétés matière, de prix, de taux, de temps de cycle, ${costing ? "de nombre de noyaux, " : ""}de probabilités de défaut, d'attaques, de masselottes ni de résultats de simulation.
 Pour la fonderie, cite les identifiants de sources fournis et dis clairement quand une conclusion demande une simulation de remplissage/solidification ou une validation fonderie.
 Ce contexte est l'analyse de la pièce par 3D Reader (features détectées avec leurs identifiants, criblage fonderie, pistes de fabrication) : ne renvoie jamais vers un module ou un outil de 3D Reader que tu supposes. S'il manque du détail (champ "summary_only" ou "compaction"), dis-le et indique l'analyse à choisir dans la page IA : « Features », « Fabrication », « DFM » ou « Chiffrage ».
 Champ "selection" : seuls ces corps de la pièce sont envoyés ; réponds sur eux seulement.
-Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.${costing ? `\n${COSTING_RULES}` : ""}`;
+Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.
+${costing ? COSTING_RULES : PROPOSALS}`;
 }
 
 /** The answer without a model's hidden reasoning (<think>…</think>, written by older Ollama versions). */
@@ -1173,7 +1206,9 @@ export function mount({ page, reader }) {
         if ($("ai-anon").checked) {
           // Before the compaction: the labels count in the budget. With the names this conversation
           // replaced before: one changed since in the quote may be in its history.
-          names = anonymizer(whole, unionNames(quoteNames, conversation.names));
+          // The names of the part too, sent or not: a body not sent may be named in the question or the history.
+          const ofPart = part?.scope ? partNames({ bodies: part.scope.all_names, file: part.scope.file }) : [];
+          names = anonymizer(whole, [...ofPart, ...unionNames(quoteNames, conversation.names)]);
           whole = names.context(whole);
           online = { question: names.text(online.question), history: online.history.map((m) => ({ ...m, content: names.text(m.content) })) };
         }
@@ -1354,12 +1389,22 @@ export function mount({ page, reader }) {
     showScope();
   });
 
+  /** The status line when no question is asked: is there a part, is it still analysed. */
+  function showReady() {
+    if (!busy) setStatus(reader.status === "analysing" ? "Analyse de la pièce en cours" : readPart({ withSemantic: false }) ? "Modèle analysé : posez votre question" : "Aucun modèle 3D chargé : questions générales possibles");
+  }
+  // The analysis ended (or failed, or another tab is shown): said without leaving the page.
+  document.addEventListener("reader3d-status", () => {
+    showScope();
+    showReady();
+  });
+
   return {
     show() {
       showConversation();
       $("ai-input")?.focus();
       showScope();
-      if (!busy) setStatus(reader.status === "analysing" ? "Analyse de la pièce en cours" : readPart({ withSemantic: false }) ? "Modèle analysé : posez votre question" : "Aucun modèle 3D chargé : questions générales possibles");
+      showReady();
     },
     /** The tab `id` of the 3D page was closed (app.js): its conversation is forgotten, its question dropped. */
     forgetTab(id) {

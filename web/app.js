@@ -2050,9 +2050,12 @@ setInterval(() => document.visibilityState === "visible" && !$("memory-card").hi
 const params = new URLSearchParams(location.search);
 
 function setStatus(status, message = "") {
+  const changed = document.body.dataset.status !== status;
   document.body.dataset.status = status;
   if (message) document.body.dataset.error = message;
   else delete document.body.dataset.error;
+  // The IA page says when the part is still analysed: told when it is no longer.
+  if (changed) document.dispatchEvent(new CustomEvent("reader3d-status"));
 }
 
 function plainReport(data) {
@@ -2150,6 +2153,8 @@ function aiPart({ withSemantic = true } = {}) {
       bodies_sent: indices.length,
       bodies_in_file: r.bodies.length,
       names: indices.map((i) => r.bodies[i].name),
+      // Every body, sent or not, for the anonymizer of the IA page only: a question may name one not sent.
+      all_names: r.bodies.map((b) => b.name),
       file: r.file ?? null,
     },
   };

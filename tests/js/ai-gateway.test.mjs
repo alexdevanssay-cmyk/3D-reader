@@ -164,6 +164,8 @@ test("task « Chiffrage »: analyse_chiffrage in strict JSON, never a quote; the
   assert.match(system, /Tu ne fixes aucune valeur/);
   assert.match(system, /Les valeurs masquées \(« masqué »\) sont confidentielles/);
   assert.doesNotMatch(system, /texte simple/);
+  // It explains the traced values: no core count proposed, as in the text tasks.
+  assert.doesNotMatch(system, /Proposition IA — à valider/);
   assert.equal(request.body.tools, undefined);
   // The trace as it was sent, nothing else.
   assert.deepEqual(contextOf(request).costing_trace, trace);
