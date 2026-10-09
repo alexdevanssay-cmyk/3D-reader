@@ -133,6 +133,16 @@ export function estimateMiseAuMille(p, part) {
   return { value: 1 / rendement, rendement, terms, estimated: true };
 }
 
+/** Pieces per cycle of island `p` for `kgCast` kg cast per piece: as many as its cluster takes, within its cavities. */
+export function piecesPerCycle(p, kgCast) {
+  return Math.max(1, Math.min(p.empreintesMax, Math.floor(p.grappeMax / Math.max(kgCast, 1e-9))));
+}
+
+/** Casting cycle (s) of island `p`: `parCycle` pieces of `kgCast` kg cast each, a modulus of `moduleMm` (unknown: 0). */
+export function castingCycle(p, kgCast, parCycle, moduleMm) {
+  return p.cycle.base + p.cycle.parKg * (kgCast * parCycle) ** (p.cycle.exposant ?? 1) + (p.cycle.parModule2 || 0) * (moduleMm || 0) ** 2;
+}
+
 /**
  * Operations and parameters of one route.
  *   part: {poids, moduleMm (volume / area), toileMini, epaisseurMax, dimMax,
@@ -175,8 +185,8 @@ export function buildRoute(code, finition, part, settings, rates) {
   const mam = estimateMiseAuMille(p, part);
   const miseAuMille = mam.value;
   const kgCast = part.poids * miseAuMille;
-  const parCycle = Math.max(1, Math.min(p.empreintesMax, Math.floor(p.grappeMax / Math.max(kgCast, 1e-9))));
-  const cycle = p.cycle.base + p.cycle.parKg * (kgCast * parCycle) ** (p.cycle.exposant ?? 1) + (p.cycle.parModule2 || 0) * (part.moduleMm || 0) ** 2;
+  const parCycle = piecesPerCycle(p, kgCast);
+  const cycle = castingCycle(p, kgCast, parCycle, part.moduleMm);
   const simple = (c) => ({ code: c, cycle: ops[c].base + ops[c].parKg * part.poids ** (ops[c].exposant ?? 1), parCycle: ops[c].parCycle || 1, trs: trs(c) });
   const batch = (c) => {
     const o = ops[c];

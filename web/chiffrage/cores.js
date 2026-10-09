@@ -6,7 +6,7 @@
 // CAM by complexity, subcontracting. The hourly rates, the hours of the weight
 // bands and the weight coefficients are those of the dies (one table in the
 // workbook): the tooling settings. Neutral starting values: the foundry's own
-// are imported as a settings file.
+// are imported as a trends file (Paramètres → Importer des tendances).
 
 import { DEFAULT_TOOLING, steelToolCost } from "./tooling.js";
 

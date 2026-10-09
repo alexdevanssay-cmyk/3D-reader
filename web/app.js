@@ -762,13 +762,17 @@ function exportableResult(r) {
 
 /**
  * Wall thickness of bodies of the result shown, for the exports:
- * {thickness: {method, min, median, max}} (mm), or {} when not computed.
+ * {thickness: {method, min, median, max, sphere, wall}} (mm), or {} when not
+ * computed. sphere and wall: {min, median, max} of those methods, whichever
+ * method the view shows (the foundry screen of the AI context reads them).
  */
 function thicknessExport(r, indices) {
   if (r !== state.result || !thick.results) return {};
   const stats = thickStats(indices);
   // The thinnest wall always by the "wall" method (see thickness.js).
   const wall = thickStats(indices, "wall");
+  const sphere = thickMethod() === "sphere" ? stats : thickStats(indices, "sphere");
+  const minMedianMax = (s) => ({ min: s.min, median: s.median, max: s.max });
   return {
     thickness: {
       method: thickMethod(),
@@ -777,6 +781,8 @@ function thicknessExport(r, indices) {
       max: stats.max,
       floor: thick.floor,
       details: wall.details,
+      sphere: minMedianMax(sphere),
+      wall: minMedianMax(wall),
     },
   };
 }
@@ -1090,7 +1096,9 @@ window.addEventListener("drop", (e) => {
     showPage("viewer");
   } else {
     // On the costing pages, files go to the rows of their data files (chiffrage/ui.js), not to the 3D view.
-    if ($("page-viewer").hidden) return;
+    if (!$("page-chiffrage").hidden || !$("page-parametres").hidden) return;
+    // From the IA page: analysed in the 3D view, where its progress shows.
+    if (!$("page-ia").hidden) showPage("viewer");
     tab = freeTab();
   }
   const item = [...(e.dataTransfer.items ?? [])].find((i) => i.kind === "file");
@@ -1767,6 +1775,7 @@ function showTab(tab) {
   if (tab.result) updatePublished(tab.result);
   else {
     $("reader3d-result").textContent = "null";
+    publishSemantic();
     document.dispatchEvent(new CustomEvent("reader3d-part"));
   }
   costingPages?.then((ui) => ui.setTab(tab.id));
@@ -1794,6 +1803,7 @@ function closeTab(tab) {
   tab.view = tab.result = tab.file = null;
   tabs.splice(i, 1);
   forgetQuote(tab.id);
+  forgetConversation(tab.id);
   if (!tabs.length) nextTabId = 1;
   if (tab === activeTab) {
     activeTab = null;
@@ -1810,6 +1820,20 @@ function forgetQuote(id) {
       // no storage
     }
   }
+}
+
+// The conversation of the IA page of a tab (ai-workspace.js: one per tab, in
+// sessionStorage, the first tab's under the key of earlier versions).
+const conversationKey = (id) => (id === 1 ? "reader3d.ai.messages" : `reader3d.ai.messages.${id}`);
+
+/** Forget the conversation of the IA page of the tab `id` (closed). */
+function forgetConversation(id) {
+  try {
+    sessionStorage.removeItem(conversationKey(id));
+  } catch {
+    // no storage
+  }
+  aiWorkspace?.then((ui) => ui.forgetTab?.(id)).catch(() => {});
 }
 
 /** "3D Reader": start again with one empty tab (the settings, the costing workbook and the metal prices are kept). */
@@ -2058,10 +2082,10 @@ function publishResult(r) {
 
 /** The machine-readable result in the page (and the text report), kept up to date. */
 function updatePublished(r) {
+  // First: a listener of the event that asks for the contract gets the new one.
+  publishSemantic();
   document.dispatchEvent(new CustomEvent("reader3d-part"));
   const data = exportableResult(r);
-  const semantic = buildSemantic3D(data);
-  $("reader3d-semantic-result").textContent = JSON.stringify(semantic).replace(/</g, "\\u003c");
   // "<" escaped so that a part name cannot close the script element.
   $("reader3d-result").textContent = JSON.stringify(data).replace(/</g, "\\u003c");
   if (params.get("report")) {
@@ -2074,6 +2098,51 @@ function updatePublished(r) {
     }
     pre.textContent = plainReport(data);
   }
+}
+
+// The semantic contract (engine/semantic.js) of the result shown, for the IA
+// page and for scripts. It takes seconds on a part with thousands of faces: it
+// is built when asked for, kept until the published result changes, and
+// written into #reader3d-semantic-result when the page is idle, so that it
+// never holds up or breaks the result itself.
+let semanticKept = null; // {result, density, method, semantic}
+let semanticPending = null; // idle callback writing #reader3d-semantic-result
+
+/** The semantic contract of the result shown (null without one). */
+function currentSemantic() {
+  const r = state.result;
+  if (!r) return null;
+  const density = $("density").value;
+  // The thickness method changes the statistics exported without republishing.
+  const method = thickMethod();
+  if (semanticKept?.result !== r || semanticKept.density !== density || semanticKept.method !== method) {
+    // The bodies checked, each with its index in r.bodies (what setSelection takes).
+    const data = exportableResult(r);
+    const indices = includedIndices();
+    data.bodies = data.bodies.map((b, k) => ({ ...b, source_index: indices[k] }));
+    semanticKept = { result: r, density, method, semantic: buildSemantic3D(data) };
+  }
+  return semanticKept.semantic;
+}
+
+/** #reader3d-semantic-result: "null" at once (never that of another state), the new contract when the page is idle. */
+function publishSemantic() {
+  semanticKept = null;
+  $("reader3d-semantic-result").textContent = "null";
+  if (semanticPending != null) (window.cancelIdleCallback ?? clearTimeout)(semanticPending);
+  semanticPending = null;
+  if (!state.result) return;
+  const write = () => {
+    semanticPending = null;
+    let text = "null";
+    try {
+      text = JSON.stringify(currentSemantic()).replace(/</g, "\\u003c");
+    } catch (err) {
+      console.warn("Semantic contract not built", err);
+    }
+    $("reader3d-semantic-result").textContent = text;
+  };
+  semanticPending = window.requestIdleCallback ? requestIdleCallback(write, { timeout: 2000 }) : setTimeout(write);
 }
 
 async function openUrl(url) {
@@ -2099,10 +2168,10 @@ window.reader3d = {
   aiContextVersion: AI_CONTEXT_VERSION,
   aiContext(options = {}) {
     if (!state.result) return null;
-    return buildAIContext(buildSemantic3D(exportableResult(state.result)), options);
+    return buildAIContext(currentSemantic(), options);
   },
   get semantic() {
-    return state.result ? buildSemantic3D(exportableResult(state.result)) : null;
+    return currentSemantic();
   },
   get result() {
     return state.result ? exportableResult(state.result) : null;
@@ -2128,6 +2197,20 @@ window.reader3d = {
   setSelection(indices) {
     if (state.result) setIncluded(indices.filter((i) => i >= 0 && i < state.result.bodies.length));
     return partFeatures();
+  },
+  /**
+   * The costing of the tab shown, read only (chiffrage/ui.js costingSnapshot):
+   * its traced values, best routes, alerts and data files; null without a
+   * costing workbook. Also when the costing page was never opened.
+   */
+  async costing() {
+    const tab = activeTab?.id; // the tab shown when asked
+    const ui = await import("./chiffrage/ui.js");
+    return ui.costingSnapshot({ tab });
+  },
+  /** The tab shown: its id and the name of the file of its part (null: none). The IA page keeps a conversation per tab. */
+  get tab() {
+    return activeTab ? { id: activeTab.id, file: activeTab.file?.name ?? null } : null;
   },
   /** Material of the part (alloy name and density g/cm³), e.g. from a customer request. */
   setMaterial(label, density) {
@@ -2198,6 +2281,13 @@ for (const [param, id] of [["unit", "unit"], ["quality", "quality"]]) {
   if (value && [...$(id).options].some((o) => o.value === value)) $(id).value = value;
 }
 defaultMaterial = { value: $("material").value, alloy: null, density: $("density").value };
+// The tabs start again: the conversations of the IA page of the tabs of the
+// page before a reload are forgotten, but the first tab's (as its quote).
+try {
+  for (const key of Object.keys(sessionStorage)) if (key.startsWith(`${conversationKey(1)}.`)) sessionStorage.removeItem(key);
+} catch {
+  // no storage
+}
 showTab(createTab());
 applyLanguage();
 setStatus("idle");

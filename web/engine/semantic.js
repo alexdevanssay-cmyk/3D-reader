@@ -5,50 +5,38 @@
 // existing Reader result. CAD surface classes are supplied by cad.js when available.
 //
 // Contract version: 1.0
-import { buildManufacturingPlan } from "./manufacturing-plan.js";
+import { buildManufacturingPlan, operationDependencyGraph, precedence } from "./manufacturing-plan.js";
 import { buildFoundryAnalysis, FOUNDRY_SCHEMA_VERSION, FOUNDRY_KNOWLEDGE_VERSION } from "./foundry-knowledge.js";
+import { meshTopology } from "./meshanalysis.js";
 
 export const SEMANTIC_VERSION = "1.0";
 
 const EPS = 1e-9;
-const FEATURE_SCHEMA_VERSION = "9.0";
+const FEATURE_SCHEMA_VERSION = "10.0";
 const MANUFACTURING_PLANNING_SCHEMA_VERSION = "1.0";
 const MANUFACTURING_SCHEMA_VERSION = "1.0";
 const FOUNDRY_PROFILE = "unspecified";
 
-function finite(v) { return typeof v === "number" && Number.isFinite(v); }
-function dist(a, b) { const x=a[0]-b[0], y=a[1]-b[1], z=a[2]-b[2]; return Math.hypot(x,y,z); }
+// Coaxial faces are related pairwise up to this many on one axis line (a
+// counterbored hole, a split bore, a small turned part); beyond it, as on a
+// long shaft, each face only to its neighbours along the axis, so that
+// relations grow linearly.
+const COAXIAL_PAIRWISE_LIMIT = 16;
 
+function finite(v) { return typeof v === "number" && Number.isFinite(v); }
+function dot(a, b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+
+/**
+ * Edge topology of a body's mesh (see meshanalysis.js meshTopology), or null
+ * without one. The in-browser engine gives it with each body (body.topology),
+ * which the page keeps when it leaves the mesh out.
+ */
 function topology(body) {
-  const p = body.mesh?.positions;
-  const f = body.mesh?.indices;
-  if (!p || !f) return null;
-  const nv = Math.floor(p.length / 3);
-  const nf = Math.floor(f.length / 3);
-  const edges = new Map();
-  let degenerate = 0;
-  for (let i=0;i<nf;i++) {
-    const a=f[3*i], b=f[3*i+1], c=f[3*i+2];
-    if (a===b || b===c || a===c) degenerate++;
-    for (const [u,v] of [[a,b],[b,c],[c,a]]) {
-      const lo=Math.min(u,v), hi=Math.max(u,v), k=lo+","+hi;
-      edges.set(k,(edges.get(k)||0)+1);
-    }
-  }
-  let boundary=0, nonManifold=0;
-  for (const n of edges.values()) {
-    if (n===1) boundary++;
-    else if (n!==2) nonManifold++;
-  }
-  return {
-    vertices: nv,
-    triangles: nf,
-    unique_edges: edges.size,
-    boundary_edges: boundary,
-    non_manifold_edges: nonManifold,
-    degenerate_triangles: degenerate,
-    watertight: boundary===0 && nonManifold===0,
-  };
+  const m = body.mesh;
+  if (!m?.positions || !m?.indices) return null;
+  // Far from the origin, float32 does not even resolve the body: its
+  // double-precision vertices when kept.
+  return meshTopology(ArrayBuffer.isView(m.positions64) ? m.positions64 : m.positions, m.indices);
 }
 
 function principalAxes(body) {
@@ -69,6 +57,105 @@ function normalizeAxis(v) {
   if (n <= EPS) return null;
   const a = v.map(x => x / n);
   return a;
+}
+
+/** Rounded direction of an axis, the same for both senses (first non-zero component positive); null if invalid. */
+function directionKey(axis) {
+  const a=normalizeAxis(axis);
+  if (!a) return null;
+  const d=a.map(v=>Math.round(v*1e4));
+  const sense=Math.sign(d.find(v=>v!==0));
+  return d.map(v=>v*sense).join(",");
+}
+
+/**
+ * Bucket keys of the line through `point` along `axis`: its direction and the
+ * foot of the perpendicular from the origin, rounded (the foot to 0.01 mm).
+ * Coaxial faces get the same key whichever point of the axis each was given;
+ * the exact coaxiality test (axisDistance) is still made on the pairs related.
+ * A foot coordinate on a rounding boundary (9.525 mm = 3/8", give or take a
+ * few bits) gives the keys of both sides, so that coaxial faces share one.
+ */
+function axisLineKeys(axis, point) {
+  const a=normalizeAxis(axis);
+  if (!a || !Array.isArray(point) || point.length!==3 || !point.every(finite)) return [];
+  const t=dot(point,a);
+  let keys=[directionKey(a)+"|"];
+  for (let i=0;i<3;i++) {
+    const v=(point[i]-t*a[i])*1e2;
+    const rounded=Math.abs(v-Math.floor(v)-0.5)<=1e-4 ? [Math.floor(v),Math.ceil(v)] : [Math.round(v)];
+    keys=keys.flatMap(k=>rounded.map(r=>k+(i ? "," : "")+r));
+  }
+  return keys;
+}
+
+function groupBy(items, key) {
+  const groups=new Map();
+  for (const item of items) {
+    const k=key(item);
+    if (k==null) continue;
+    const group=groups.get(k);
+    if (group) group.push(item);
+    else groups.set(k,[item]);
+  }
+  return groups;
+}
+
+/** Position of a face along `axis`: the middle of its B-Rep edge end points, else its axis point. */
+function axialPosition(face, axis) {
+  let lo=Infinity, hi=-Infinity;
+  for (const e of face.edge_signatures ?? []) {
+    if (!Array.isArray(e) || e.length!==6 || !e.every(finite)) continue;
+    const t0=e[0]*axis[0]+e[1]*axis[1]+e[2]*axis[2], t1=e[3]*axis[0]+e[4]*axis[1]+e[5]*axis[2];
+    lo=Math.min(lo,t0,t1);
+    hi=Math.max(hi,t0,t1);
+  }
+  return lo<=hi ? (lo+hi)/2 : dot(face.center_mm,axis);
+}
+
+/**
+ * Coaxial faces to relate: face -> the later faces (in `faces` order) on its
+ * axis line. Pairwise on a short line, neighbours along the axis on a long one
+ * (see COAXIAL_PAIRWISE_LIMIT). Pairs are never all tested nor stored.
+ */
+function coaxialPartners(faces) {
+  const order=new Map(faces.map((f,i)=>[f,i]));
+  const partners=new Map();
+  // A pair may come twice: its two faces on two keys of one line, or neighbours in both chains below.
+  const linked=new Set();
+  const link=(a,b)=>{
+    const [first,second]=order.get(a)<order.get(b) ? [a,b] : [b,a];
+    const key=order.get(first)+":"+order.get(second);
+    if (linked.has(key)) return;
+    linked.add(key);
+    const list=partners.get(first) ?? [];
+    list.push(second);
+    partners.set(first,list);
+  };
+  const lines=new Map();
+  for (const f of faces) {
+    for (const key of axisLineKeys(f.axis,f.center_mm)) {
+      const line=lines.get(key);
+      if (line) line.push(f);
+      else lines.set(key,[f]);
+    }
+  }
+  for (const group of lines.values()) {
+    if (group.length<=COAXIAL_PAIRWISE_LIMIT) {
+      for (let i=0;i<group.length;i++) for (let j=i+1;j<group.length;j++) link(group[i],group[j]);
+      continue;
+    }
+    const axis=normalizeAxis(group[0].axis);
+    const position=new Map(group.map(f=>[f,axialPosition(f,axis)]));
+    const along=[...group].sort((a,b)=>position.get(a)-position.get(b) || order.get(a)-order.get(b));
+    for (let i=1;i<along.length;i++) link(along[i-1],along[i]);
+    // The cylinders on their own too: a shoulder is a step between two
+    // diameters even with a chamfer (a cone) between them.
+    const cylinders=along.filter(f=>f.type==="cylinder");
+    for (let i=1;i<cylinders.length;i++) link(cylinders[i-1],cylinders[i]);
+  }
+  for (const list of partners.values()) list.sort((a,b)=>order.get(a)-order.get(b));
+  return partners;
 }
 
 /** Distance between two parallel axis lines (direction + point on it); Infinity if not parallel. */
@@ -117,20 +204,27 @@ function faceAdjacency(surfaces) {
   });
 }
 
-function cylindricalRelations(cylinders, cones, surfaces) {
-  const relations=[];
-  const adjacency=faceAdjacency(surfaces);
+/** Faces by index and their B-Rep neighbours (face index -> [{face, shared_edges}]), built once per body. */
+function faceGraph(surfaces) {
+  const byIndex=new Map(surfaces.map(s=>[s.index,s]));
   const neighbors=new Map();
-  for(const rel of adjacency){
-    for(const [a,b] of [[rel.faces[0],rel.faces[1]],[rel.faces[1],rel.faces[0]]]){
-      const list=neighbors.get(a)??[];
+  for (const rel of faceAdjacency(surfaces)) {
+    for (const [a,b] of [[rel.faces[0],rel.faces[1]],[rel.faces[1],rel.faces[0]]]) {
+      const list=neighbors.get(a) ?? [];
       list.push({face:b,shared_edges:rel.shared_edges});
       neighbors.set(a,list);
     }
   }
-  for (let i=0;i<cylinders.length;i++) {
-    for (let j=i+1;j<cylinders.length;j++) {
-      const a=cylinders[i], b=cylinders[j];
+  return {byIndex, neighbors};
+}
+
+function cylindricalRelations(cylinders, cones, graph) {
+  const relations=[];
+  const {byIndex, neighbors}=graph;
+  const partners=coaxialPartners([...cylinders, ...cones]);
+  for (const a of cylinders) {
+    for (const b of partners.get(a) ?? []) {
+      if (b.type!=="cylinder") continue;
       if (axisDistance(a.axis,a.center_mm,b.axis,b.center_mm)>Math.max(1e-4,Math.min(a.radius_mm,b.radius_mm)*1e-3)) continue;
       const radiiEqual=Math.abs(a.radius_mm-b.radius_mm)<=Math.max(1e-5,Math.min(a.radius_mm,b.radius_mm)*1e-4);
       relations.push({
@@ -143,17 +237,19 @@ function cylindricalRelations(cylinders, cones, surfaces) {
     }
   }
   for (const c of cylinders) {
-    for (const cone of cones) {
+    // Cones come after the cylinders in the partner lists, in their own order.
+    for (const cone of partners.get(c) ?? []) {
+      if (cone.type!=="cone") continue;
       if (axisDistance(c.axis,c.center_mm,cone.axis,cone.center_mm)>Math.max(1e-4,c.radius_mm*1e-3)) continue;
       relations.push({
         type:"coaxial_cylinder_cone",
         surfaces:[c.index,cone.index],
-        diameter_mm:c.diameter_mm,
+        diameter_mm:2*c.radius_mm,
         cone_ref_radius_mm:cone.ref_radius_mm ?? null,
         confidence:0.9,
       });
     }
-    const adjacent_planes=(neighbors.get(c.index)??[]).map(x=>surfaces.find(f=>f.index===x.face)).filter(f=>f?.type==="plane");
+    const adjacent_planes=(neighbors.get(c.index)??[]).map(x=>byIndex.get(x.face)).filter(f=>f?.type==="plane");
     if(adjacent_planes.length){
       relations.push({
         type:"cylindrical_boundary_planes",
@@ -175,22 +271,30 @@ function parallelAxes(a,b,tol=1e-5) {
   return Math.abs(Math.abs(aa[0]*bb[0]+aa[1]*bb[1]+aa[2]*bb[2])-1) <= tol;
 }
 
-function centerDistance(a,b) {
-  return Array.isArray(a) && Array.isArray(b) ? dist(a,b) : Infinity;
-}
-
+/**
+ * Repeated cylinders: groups of parallel cylinders of the same radius, each
+ * member's axis more than a diameter away from another one's in its group
+ * (not a split face of the same hole, nor a section of the same shaft).
+ * Groups of three or more, in face order.
+ */
 function repeatedCylinders(cylinders) {
+  const order=new Map(cylinders.map((c,i)=>[c,i]));
   const groups=[];
-  for (let i=0;i<cylinders.length;i++) {
-    for (let j=i+1;j<cylinders.length;j++) {
-      const a=cylinders[i], b=cylinders[j];
-      if (!parallelAxes(a.axis,b.axis)) continue;
-      const sameRadius=Math.abs(a.radius_mm-b.radius_mm) <= Math.max(1e-5,Math.min(a.radius_mm,b.radius_mm)*1e-4);
-      if (!sameRadius || centerDistance(a.center_mm,b.center_mm) <= Math.max(a.radius_mm*2,1e-3)) continue;
-      groups.push([a,b]);
+  for (const parallel of groupBy(cylinders, c=>directionKey(c.axis)).values()) {
+    // The same radius within the tolerance of the coaxial relations, from the
+    // smallest one of each group, rather than a rounded key: two radii a few
+    // bits apart (7/32" = 2.778125 mm) could round on either side of it.
+    let group=null;
+    for (const c of [...parallel].sort((a,b)=>a.radius_mm-b.radius_mm)) {
+      if (!group || c.radius_mm-group[0].radius_mm>Math.max(1e-5,group[0].radius_mm*1e-4)) groups.push(group=[]);
+      group.push(c);
     }
   }
-  return groups;
+  return groups
+    .map(group=>group.sort((a,b)=>order.get(a)-order.get(b)))
+    .sort((a,b)=>order.get(a[0])-order.get(b[0]))
+    .map(group=>group.filter(a=>group.some(b=>b!==a && axisDistance(a.axis,a.center_mm,b.axis,b.center_mm)>Math.max(a.radius_mm*2,1e-3))))
+    .filter(members=>members.length>=3);
 }
 
 function collinearCenters(cylinders) {
@@ -238,19 +342,58 @@ function circularCenters(cylinders) {
   return Math.max(...axialSpread)-Math.min(...axialSpread) <= 1e-4*Math.max(1,r);
 }
 
-function surfaceRelations(surfaces) {
+function surfaceRelations(surfaces, graph, bodyId) {
   const cylinders=surfaces.filter(x=>x.type==="cylinder" && finite(x.radius_mm));
   const cones=surfaces.filter(x=>x.type==="cone" && Array.isArray(x.axis) && Array.isArray(x.center_mm));
-  const analytic=cylindricalRelations(cylinders,cones,surfaces);
+  const analytic=cylindricalRelations(cylinders,cones,graph);
   return analytic.map((r, i) => ({
     ...r,
-    relation_id:"relation-"+i,
+    // Scoped by body: surface indices, hence relations, restart in every body.
+    relation_id:bodyId+"/relation-"+i,
     evidence:"analytic_surface_geometry",
     confirmed_by_shared_brep_edges: r.type==="cylindrical_boundary_planes"
   }));
 }
 
-function featureCandidates(body, topo, stableRelations) {
+/**
+ * A cylindrical face that turns less than a full revolution (no seam edge in
+ * its B-Rep edges) and meets a plane parallel to its axis tangentially: a
+ * rounded edge or corner, not a hole or a boss. Needs the edges and plane
+ * normals given by cad.js; false without them.
+ */
+function cylindricalBlend(cylinder, graph) {
+  const axis=normalizeAxis(cylinder.axis);
+  if (!axis || !Array.isArray(cylinder.center_mm)) return false;
+  const tangentPlane=(graph.neighbors.get(cylinder.index) ?? []).some(({face}) => {
+    const plane=graph.byIndex.get(face);
+    const n=plane?.type==="plane" ? normalizeAxis(plane.normal) : null;
+    if (!n || !Array.isArray(plane.center_mm) || Math.abs(dot(n,axis))>1e-6) return false;
+    const distance=Math.abs(dot(n,cylinder.center_mm)-dot(n,plane.center_mm));
+    return Math.abs(distance-cylinder.radius_mm)<=Math.max(1e-4,cylinder.radius_mm*1e-3);
+  });
+  if (!tangentPlane) return false;
+  // A full revolution has a seam: one edge met twice around the face.
+  const keys=(cylinder.edge_signatures ?? []).map(edgeKey).filter(Boolean);
+  return new Set(keys).size===keys.length;
+}
+
+/** Whether a plane bounds the body's box, the whole body on one side of it: an outer face. False without a normal. */
+function envelopePlane(plane, bbox) {
+  const n=normalizeAxis(plane.normal);
+  const min=bbox?.min, max=bbox?.max;
+  if (!n || !Array.isArray(plane.center_mm) || !Array.isArray(min) || !Array.isArray(max)) return false;
+  // Extent of the box along n: the lowest and highest projections of its corners.
+  let lo=0, hi=0;
+  for (let i=0;i<3;i++) {
+    lo+=Math.min(n[i]*min[i],n[i]*max[i]);
+    hi+=Math.max(n[i]*min[i],n[i]*max[i]);
+  }
+  const d=dot(n,plane.center_mm);
+  const tol=Math.max(1e-4,(hi-lo)*1e-6);
+  return Math.abs(d-lo)<=tol || Math.abs(d-hi)<=tol;
+}
+
+function featureCandidates(body, topo, relations, graph) {
   const out=[];
   const s=body.bbox?.size ?? [0,0,0];
   const volume=body.volume;
@@ -273,12 +416,20 @@ function featureCandidates(body, topo, stableRelations) {
   const surfaces=body.geometric_surfaces ?? [];
   const cylinders=surfaces.filter(x=>x.type==="cylinder" && finite(x.radius_mm));
   const cones=surfaces.filter(x=>x.type==="cone" && Array.isArray(x.axis) && Array.isArray(x.center_mm));
-  const relations=stableRelations ?? surfaceRelations(surfaces);
+  const {byIndex, neighbors:adjacencyByFace}=graph;
+  // Rounded edges are reported as fillets below, never as holes, bores or bosses.
+  const blends=new Set(cylinders.filter(c=>cylindricalBlend(c,graph)).map(c=>c.index));
+  const boundaryRelations=relations.filter(r=>r.type==="cylindrical_boundary_planes");
 
   for (const c of cylinders) {
+    if (blends.has(c.index)) continue;
     const axial = Math.max(...s);
     const likelyThrough = c.radius_mm > 0 && axial > 0 && axial / (2*c.radius_mm) > 1.5;
-    const boundaryEvidence = c.edge_count === 2 || c.wire_count === 2;
+    // Two boundary circles close a pin or a boss as well as a hole: only a face
+    // with the material outside it (reversed; any other orientation is unknown)
+    // can be a hole. They do not tell a through hole from a blind one either,
+    // hence the confirmation still needed.
+    const boundaryEvidence = c.orientation === "reversed" && (c.edge_count === 2 || c.wire_count === 2);
     out.push({
       type:"cylindrical_feature_candidate",
       subtype:boundaryEvidence && likelyThrough ? "possible_through_hole" : likelyThrough ? "possible_bore" : "cylindrical_surface",
@@ -290,17 +441,16 @@ function featureCandidates(body, topo, stableRelations) {
       axis:c.axis ?? null,
       center_mm:c.center_mm ?? null,
       boundary_evidence:{wire_count:c.wire_count ?? null,edge_count:c.edge_count ?? null},
-      needs_topology_confirmation:!(boundaryEvidence && likelyThrough)
+      needs_topology_confirmation:true
     });
   }
 
   // A cylindrical face bounded by two planar faces is a strong geometric
   // signature of a cylindrical passage, but it is still not enough to prove
   // design intent: an external boss can have the same topology.
-  for (const r of relations) {
-    if (r.type !== "cylindrical_boundary_planes") continue;
-    const cylinder = cylinders.find(c => c.index === r.surface);
-    if (!cylinder) continue;
+  for (const r of boundaryRelations) {
+    const cylinder = byIndex.get(r.surface);
+    if (!cylinder || blends.has(cylinder.index)) continue;
     const planeCount = r.planes.length;
     const subtype = planeCount >= 2 ? "possible_through_hole_or_bore" :
       planeCount === 1 ? "possible_blind_hole_or_bore" : "cylindrical_cut_candidate";
@@ -324,8 +474,8 @@ function featureCandidates(body, topo, stableRelations) {
   // supports a machining-like transition. Keep the result explicitly provisional.
   for (const r of relations) {
     if (r.type === "coaxial_cylinder_cone") {
-      const cylinder = cylinders.find(c => c.index === r.surfaces[0]);
-      const cone = cones.find(c => c.index === r.surfaces[1]);
+      const cylinder = byIndex.get(r.surfaces[0]);
+      const cone = byIndex.get(r.surfaces[1]);
       if (!cylinder || !cone) continue;
       const coneAngle = Math.abs(cone.semi_angle_rad ?? 0);
       out.push({
@@ -345,16 +495,11 @@ function featureCandidates(body, topo, stableRelations) {
     }
   }
 
-  // Promote repeated, parallel, equal-radius cylinders to a conservative
-  // pattern candidate. Do not infer linear/circular intent until the centers
-  // support a stronger pattern classification.
-  const repeated = repeatedCylinders(cylinders);
-  const repeatedMembers = new Map();
-  for (const pair of repeated) {
-    for (const cylinder of pair) repeatedMembers.set(cylinder.index, cylinder);
-  }
-  if (repeatedMembers.size >= 3) {
-    const members=[...repeatedMembers.values()];
+  // Promote repeated, parallel, equal-radius cylinders (rounded edges aside)
+  // to a conservative pattern candidate, one per direction and radius. Do not
+  // infer linear/circular intent until the centers support a stronger pattern
+  // classification.
+  for (const members of repeatedCylinders(cylinders.filter(c=>!blends.has(c.index)))) {
     const subtype = collinearCenters(members)
       ? "possible_linear_cylindrical_pattern"
       : circularCenters(members)
@@ -375,18 +520,9 @@ function featureCandidates(body, topo, stableRelations) {
 
   // Toroidal faces adjacent to analytic faces are strong evidence of a blend,
   // but the semantic layer does not assume that every torus is a fillet.
-  const adjacencyForFeatures=faceAdjacency(surfaces);
-  const neighborMap=new Map();
-  for (const rel of adjacencyForFeatures) {
-    for (const [a,b] of [[rel.faces[0],rel.faces[1]],[rel.faces[1],rel.faces[0]]]) {
-      const list=neighborMap.get(a) ?? [];
-      list.push({index:b,shared_edges:rel.shared_edges});
-      neighborMap.set(a,list);
-    }
-  }
   for (const torus of surfaces.filter(x=>x.type==="torus" && finite(x.minor_radius_mm))) {
-    const neighbors=(neighborMap.get(torus.index) ?? [])
-      .map(x=>surfaces.find(f=>f.index===x.index))
+    const neighbors=(adjacencyByFace.get(torus.index) ?? [])
+      .map(x=>byIndex.get(x.face))
       .filter(Boolean)
       .filter(x=>["plane","cylinder","cone","bspline","bezier"].includes(x.type));
     if (neighbors.length < 2) continue;
@@ -402,11 +538,32 @@ function featureCandidates(body, topo, stableRelations) {
     });
   }
 
+  // A partial cylinder tangent to a plane parallel to its axis rounds an edge
+  // or a corner (cylindricalBlend): a fillet, whatever its length.
+  for (const c of cylinders) {
+    if (!blends.has(c.index)) continue;
+    const neighbors=(adjacencyByFace.get(c.index) ?? [])
+      .map(x=>byIndex.get(x.face))
+      .filter(Boolean)
+      .filter(x=>["plane","cylinder","cone","bspline","bezier"].includes(x.type));
+    out.push({
+      type:"fillet_feature_candidate",
+      subtype:"possible_cylindrical_fillet_or_blend",
+      surface_index:c.index,
+      radius_mm:c.radius_mm,
+      axis:c.axis ?? null,
+      adjacent_surfaces:neighbors.map(x=>x.index),
+      confidence:0.8,
+      method:"partial_cylindrical_face_tangent_to_shared_brep_planes",
+      needs_topology_confirmation:true
+    });
+  }
+
   // A conical face adjacent to machining-like analytic faces is a possible
   // chamfer/taper. Angle and adjacency are evidence, not proof of intent.
   for (const cone of cones) {
-    const neighbors=(neighborMap.get(cone.index) ?? [])
-      .map(x=>surfaces.find(f=>f.index===x.index))
+    const neighbors=(adjacencyByFace.get(cone.index) ?? [])
+      .map(x=>byIndex.get(x.face))
       .filter(Boolean)
       .filter(x=>["plane","cylinder"].includes(x.type));
     if (neighbors.length < 2) continue;
@@ -425,27 +582,25 @@ function featureCandidates(body, topo, stableRelations) {
 
   // A planar face with several shared B-Rep edges to neighboring faces is a
   // conservative recess/pocket signal. Concavity is intentionally not inferred
-  // from face orientation alone.
-  const adjacency=faceAdjacency(surfaces);
-  const adjacencyByFace=new Map();
-  for (const rel of adjacency) {
-    for (const face of rel.faces) {
-      const other=rel.faces[0]===face ? rel.faces[1] : rel.faces[0];
-      const list=adjacencyByFace.get(face) ?? [];
-      list.push({face:other,shared_edges:rel.shared_edges});
-      adjacencyByFace.set(face,list);
+  // from face orientation alone, but a face on the body's envelope (every face
+  // of a plain box) has the whole body on one side: it is no recess floor.
+  const relationIdsByPlane=new Map();
+  for (const r of boundaryRelations) {
+    for (const plane of r.planes ?? []) {
+      const list=relationIdsByPlane.get(plane) ?? [];
+      list.push(r.relation_id);
+      relationIdsByPlane.set(plane,list);
     }
   }
   for (const floor of surfaces.filter(x=>x.type==="plane")) {
+    if (envelopePlane(floor, body.bbox)) continue;
     const neighbors=adjacencyByFace.get(floor.index) ?? [];
     const wallSurfaces=neighbors
-      .map(x=>surfaces.find(s=>s.index===x.face))
+      .map(x=>byIndex.get(x.face))
       .filter(Boolean)
       .filter(x=>x.type==="plane" || x.type==="cylinder" || x.type==="cone" || x.type==="bspline" || x.type==="bezier");
     if (wallSurfaces.length < 3) continue;
-    const relationIds=relations
-      .filter(r=>r.type==="cylindrical_boundary_planes" && (r.planes ?? []).includes(floor.index))
-      .map(r=>r.relation_id);
+    const relationIds=relationIdsByPlane.get(floor.index) ?? [];
     out.push({
       type:"pocket_feature_candidate",
       subtype:"possible_pocket_or_recess",
@@ -462,13 +617,15 @@ function featureCandidates(body, topo, stableRelations) {
   // A cylindrical face attached to planar faces may represent an external boss
   // or an internal bore. Without a reliable inside/outside test, keep both
   // interpretations explicit rather than misclassifying the feature.
+  const boundaryRelationBySurface=new Map(boundaryRelations.map(r=>[r.surface,r]));
   for (const c of cylinders) {
+    if (blends.has(c.index)) continue;
     const neighbors=adjacencyByFace.get(c.index) ?? [];
     const planes=neighbors
-      .map(x=>surfaces.find(s=>s.index===x.face))
+      .map(x=>byIndex.get(x.face))
       .filter(x=>x?.type==="plane");
     if (!planes.length) continue;
-    const boundaryRelation=relations.find(r=>r.type==="cylindrical_boundary_planes" && r.surface===c.index);
+    const boundaryRelation=boundaryRelationBySurface.get(c.index);
     out.push({
       type:"boss_feature_candidate",
       subtype:"possible_cylindrical_boss_or_bore",
@@ -489,9 +646,8 @@ function featureCandidates(body, topo, stableRelations) {
   // different diameters are useful for counterbore/step candidates.
   const coaxial = relations.filter(r => r.type === "coaxial_cylinders" || r.type === "coaxial_cylinder_step");
   for (const r of coaxial) {
-    const surfacesByIndex = new Map(surfaces.map(x => [x.index, x]));
-    const a = surfacesByIndex.get(r.surfaces[0]);
-    const b = surfacesByIndex.get(r.surfaces[1]);
+    const a = byIndex.get(r.surfaces[0]);
+    const b = byIndex.get(r.surfaces[1]);
     if (!a || !b) continue;
     const subtype = r.type === "coaxial_cylinders"
       ? "possible_coaxial_repeat_or_continuous_bore"
@@ -525,27 +681,34 @@ function featureCandidates(body, topo, stableRelations) {
       out.push({
         type:"stepped_cylindrical_feature_candidate",
         subtype:"possible_countersink_or_taper_transition",
-        relation:r,
+        surfaces:r.surfaces,
+        diameter_mm:r.diameter_mm,
+        cone_ref_radius_mm:r.cone_ref_radius_mm,
         confidence:0.78,
         method:"coaxial_analytic_surfaces",
+        evidence:[{source:"relation", relation_id:r.relation_id}],
         needs_topology_confirmation:true
       });
     } else if (r.type==="coaxial_cylinder_step") {
       out.push({
         type:"stepped_cylindrical_feature_candidate",
         subtype:"possible_counterbore_or_coaxial_step",
-        relation:r,
+        surfaces:r.surfaces,
+        radii_mm:r.radii_mm,
         confidence:0.79,
         method:"coaxial_analytic_surfaces_with_different_radii",
+        evidence:[{source:"relation", relation_id:r.relation_id}],
         needs_topology_confirmation:true
       });
     } else if (r.type==="coaxial_cylinders") {
       out.push({
         type:"coaxial_cylindrical_relation",
         subtype:"same_diameter_coaxial_surfaces",
-        relation:r,
+        surfaces:r.surfaces,
+        radius_mm:r.radius_mm,
         confidence:0.94,
         method:"coaxial_analytic_surfaces",
+        evidence:[{source:"relation", relation_id:r.relation_id}],
         needs_topology_confirmation:true
       });
     }
@@ -554,7 +717,13 @@ function featureCandidates(body, topo, stableRelations) {
   return out;
 }
 
-function stableFeatureId(feature, occurrence) {
+/**
+ * Id of a feature, scoped by its body (surface indices restart in every body):
+ * `body-0/feature-1a2b3c4d`. A hash of 32 bits can collide in a body of tens
+ * of thousands of features: the next free value is then taken (`taken`: the
+ * ids given so far in the body).
+ */
+function stableFeatureId(feature, occurrence, bodyId, taken) {
   const identity = [
     feature.type ?? "feature",
     feature.subtype ?? "",
@@ -569,11 +738,15 @@ function stableFeatureId(feature, occurrence) {
     hash ^= identity.charCodeAt(i);
     hash = Math.imul(hash, 16777619);
   }
-  return "feature-" + (hash >>> 0).toString(16).padStart(8, "0");
+  const id = (h) => bodyId + "/feature-" + (h >>> 0).toString(16).padStart(8, "0");
+  while (taken.has(id(hash))) hash = (hash + 1) | 0;
+  taken.add(id(hash));
+  return id(hash);
 }
 
-function normalizeFeatureEvidence(features) {
+function normalizeFeatureEvidence(features, bodyId) {
   const occurrences = new Map();
+  const taken = new Set();
   return features.map((feature) => {
     const key = [
       feature.type ?? "feature",
@@ -597,7 +770,7 @@ function normalizeFeatureEvidence(features) {
     const confidence = finite(feature.confidence) ? Math.max(0, Math.min(1, feature.confidence)) : 0;
     return {
       ...feature,
-      feature_id: feature.feature_id ?? stableFeatureId(feature, occurrence),
+      feature_id: feature.feature_id ?? stableFeatureId(feature, occurrence, bodyId, taken),
       status: needsConfirmation ? "provisional" : "evidenced",
       confidence,
       evidence: normalizedEvidence,
@@ -669,60 +842,85 @@ function manufacturingAccessibility(feature) {
   };
 }
 
-function manufacturingForBody(body, features, principal) {
+/** The faces a feature machines, as a key ("" when it names none). */
+function featureSurfacesKey(feature) {
+  if (feature.surface_index != null) return String(feature.surface_index);
+  if (feature.floor_surface != null) return String(feature.floor_surface);
+  return Array.isArray(feature.surfaces) ? [...feature.surfaces].sort((a,b)=>a-b).join(",") : "";
+}
+
+/** Surfaces an operation works on: those of its feature, and the faces a chamfer or blend meets. */
+function featureSurfaces(feature) {
+  const list=[feature.surface_index, feature.floor_surface, ...(feature.surfaces ?? []), ...(feature.relation?.surfaces ?? []), ...(feature.adjacent_surfaces ?? [])];
+  return [...new Set(list.filter(i=>i!=null))];
+}
+
+function manufacturingForBody(body, features, principal, topo) {
+  // One operation per operation kind and machined faces: the features that
+  // read the same faces the same way share it. The analytic cylinder of a
+  // hole candidate is the same hole: it takes the hole's operation.
+  const holeOperations=new Map(features
+    .filter(f=>f.type==="hole_feature_candidate")
+    .map(f=>[f.surface_index, manufacturingOperation(f)]));
   const operations=[];
+  const byTarget=new Map();
   for (const feature of features) {
-    const operation=manufacturingOperation(feature);
+    const operation=(feature.type==="cylindrical_feature_candidate" && holeOperations.get(feature.surface_index)) || manufacturingOperation(feature);
     if (!operation) continue;
-    operations.push({
+    const surfaces=featureSurfacesKey(feature);
+    const shared=surfaces ? byTarget.get(operation+"|"+surfaces) : null;
+    if (shared) {
+      shared.feature_ids.push(feature.feature_id);
+      shared.confidence=Math.max(shared.confidence, feature.confidence);
+      continue;
+    }
+    const entry={
       operation_id:"op-"+feature.feature_id,
       feature_ids:[feature.feature_id],
+      surfaces:featureSurfaces(feature),
       operation,
       confidence:feature.confidence,
       status:"candidate",
       accessibility:manufacturingAccessibility(feature),
       rationale:feature.method,
-    });
+    };
+    operations.push(entry);
+    if (surfaces) byTarget.set(operation+"|"+surfaces, entry);
   }
 
-  const precedence={
-    "pocket_milling":20,
-    "boss_milling_or_bore":25,
-    "drilling":30,
-    "drilling_blind":30,
-    "drilling_or_boring":30,
-    "counterboring_or_boring":35,
-    "boring_or_coaxial_feature_machining":35,
-    "patterned_feature_machining":40,
-    "chamfering_or_countersinking":50,
-    "fillet_or_blend_finishing":60,
-    "feature_machining":40,
-  };
-  operations.sort((a,b)=>(precedence[a.operation]??45)-(precedence[b.operation]??45) || a.operation_id.localeCompare(b.operation_id));
+  // Same precedence and dependencies as the V6 plan (manufacturing-plan.js).
+  operations.sort((a,b)=>precedence(a.operation)-precedence(b.operation) || a.operation_id.localeCompare(b.operation_id));
+  const dependsOn=new Map();
+  for (const edge of operationDependencyGraph(operations)) {
+    const list=dependsOn.get(edge.to) ?? [];
+    if (!list.includes(edge.from)) list.push(edge.from);
+    dependsOn.set(edge.to,list);
+  }
   const sequence=operations.map((op,i)=>({
     sequence:i+1,
     operation_id:op.operation_id,
     feature_ids:op.feature_ids,
-    depends_on:i ? [operations[i-1].operation_id] : [],
+    depends_on:dependsOn.get(op.operation_id) ?? [],
   }));
 
-  const minThickness=finite(body.min_thickness_mm) ? body.min_thickness_mm
-    : finite(body.thickness_mm) ? body.thickness_mm
-    : null;
+  // The thinnest wall measured by the Reader: thickness.min is always the
+  // "wall" method, whichever method the 3D view shows (app.js thicknessExport).
+  const minThickness=finite(body.thickness?.min) ? body.thickness.min : null;
   const functionalThickness={
     minimum_wall_thickness_mm:minThickness,
-    source:minThickness!=null ? "reader_body_metric" : "not_available",
+    source:minThickness!=null ? "reader_wall_thickness" : "not_available",
     status:minThickness!=null ? "measured" : "undetermined",
     warning:minThickness!=null && minThickness < 2 ? "thin_wall_candidate" : null,
   };
 
   const dfm=[];
   if (!body.closed) dfm.push({code:"open_body",severity:"high",recommendation:"repair_or_close_body_before_manufacturing_analysis"});
-  if (body.mesh && topology(body)?.non_manifold_edges>0) dfm.push({code:"non_manifold_geometry",severity:"high",recommendation:"repair_non_manifold_topology"});
+  if (topo?.non_manifold_edges>0) dfm.push({code:"non_manifold_geometry",severity:"high",recommendation:"repair_non_manifold_topology"});
   if (minThickness!=null && minThickness < 2) dfm.push({code:"thin_wall",severity:"medium",recommendation:"verify_process_capability_and_clamping"});
   if (features.some(f=>f.status==="provisional")) dfm.push({code:"provisional_feature_intent",severity:"info",recommendation:"confirm_feature_intent_before_generating_toolpaths"});
   if (features.some(f=>f.type==="pattern_feature_candidate")) dfm.push({code:"repeated_features",severity:"info",recommendation:"consider a common setup/tool strategy for repeated features"});
-  if (!features.length) dfm.push({code:"no_machining_feature_detected",severity:"info",recommendation:"do_not_assume_a_specific_manufacturing_process_from_geometry_alone"});
+  // Machining candidates only: a closed solid or planar faces say nothing of the process.
+  if (!operations.length) dfm.push({code:"no_machining_feature_detected",severity:"info",recommendation:"do_not_assume_a_specific_manufacturing_process_from_geometry_alone"});
 
   return {
     schema_version:MANUFACTURING_SCHEMA_VERSION,
@@ -738,15 +936,20 @@ function manufacturingForBody(body, features, principal) {
 }
 
 function semanticBody(body, index) {
-  const topo=topology(body);
+  // Given with the body when it has no mesh (from the page), with the index of
+  // each body in its result when only some of them are given (app.js).
+  const topo=body.topology ?? topology(body);
+  const sourceIndex=body.source_index ?? index;
   const size=body.bbox?.size ?? [0,0,0];
   const volume=body.volume;
   const envelopeVolume=size.reduce((a,b)=>a*b,1);
-  const relations=surfaceRelations(body.geometric_surfaces ?? []);
-  const features=normalizeFeatureEvidence(featureCandidates(body,topo,relations));
+  const id="body-"+sourceIndex;
+  const graph=faceGraph(body.geometric_surfaces ?? []);
+  const relations=surfaceRelations(body.geometric_surfaces ?? [], graph, id);
+  const features=normalizeFeatureEvidence(featureCandidates(body,topo,relations,graph), id);
   const semantic = {
-    id: "body-"+index,
-    source_index:index,
+    id,
+    source_index:sourceIndex,
     name:body.name ?? "Body",
     role:"solid_body",
     metrics:{
@@ -771,8 +974,9 @@ function semanticBody(body, index) {
       evidence:semanticEvidenceQuality(relations, features),
       notes:Array.isArray(body.notes)?body.notes:[],
     },
-    manufacturing:manufacturingForBody(body, features, principalAxes(body)),
-    foundry: buildFoundryAnalysis(body, features, principalAxes(body), FOUNDRY_PROFILE),
+    manufacturing:manufacturingForBody(body, features, principalAxes(body), topo),
+    // The Reader body has no topology of its own: the one computed here.
+    foundry: buildFoundryAnalysis({...body, topology:topo}, features, principalAxes(body), FOUNDRY_PROFILE),
   };
   semantic.manufacturing_plan = buildManufacturingPlan(semantic);
   return semantic;

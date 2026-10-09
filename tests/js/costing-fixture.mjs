@@ -187,8 +187,13 @@ export function costingWorkbookSheets() {
 export const costingWorkbook = () => writeWorkbook(costingWorkbookSheets());
 export const indicesWorkbook = (offset = 100) => writeWorkbook({ Notes: { A1: 'cours' }, 'Suivi indice': indicesSheet(offset) });
 
-/** A made-up customer request (RFQ / GO NO GO workbook): volumes 2027-2030, three MOQ, target price. */
-export function seriesOrderWorkbook() {
+/**
+ * A made-up customer request (RFQ / GO NO GO workbook): volumes 2027-2030,
+ * three MOQ, target price, weights, mise au mille and machining scrap rate.
+ * go, foundry: cells added to (or replacing those of) the sheets
+ * "1- Données GO NO GO" and "5- Chiffrage Fonderie".
+ */
+export function seriesOrderWorkbook({ go: extraGo = {}, foundry: extraFoundry = {} } = {}) {
   const go = {
     H7: 'Année', H8: 'Volume série', H9: 'Volume proto',
     A69: 'Proto', B69: 'Non',
@@ -203,6 +208,7 @@ export function seriesOrderWorkbook() {
     A58: 'Nombre total de référence à chiffrer dans RFQ *', B58: 1,
     A60: 'Fonderie', B60: 'CG',
     A73: 'Plan 2D', B73: 'Brut', C73: 'AB-123 ind A',
+    A62: 'Poids Brut vendu (en kg)', B62: 1.25,
   };
   const vols = { 2026: 0, 2027: 1000, 2028: 1500, 2029: 1500, 2030: 800, 2031: 0 };
   Object.keys(vols).forEach((y, i) => {
@@ -211,6 +217,7 @@ export function seriesOrderWorkbook() {
     go[`${c}8`] = vols[y];
     go[`${c}9`] = y === '2026' ? 20 : 0; // prototypes the year before the series
   });
+  Object.assign(go, extraGo);
   return writeWorkbook({
     'Mode opératoire': { A1: 'Template Go No Go' },
     '1- Données GO NO GO': go,
@@ -221,6 +228,9 @@ export function seriesOrderWorkbook() {
       C21: 'Date de référence', D21: 46082, C22: 'Valeur de référence achat', D22: 2800, C23: 'Valeur de référence vente', D23: 2810,
       C24: 'P1020 achat', D24: 400, C25: 'P1020 vente', D25: 410, C26: 'Premium achat', D26: 330, C27: 'Premium vente', D27: 640,
       C28: 'PAF PRI', D28: 0.05, C29: 'PAF vendue', D29: 0.07,
+      // Part of the foundry quote: compared with the costing, not applied.
+      C30: 'Poids vendu (kg / pc)', D30: 1.1, C31: 'Mise au mille', D31: 1.6, C32: 'Taux de rebuts usinage', D32: 0.03,
+      ...extraFoundry,
     },
   });
 }

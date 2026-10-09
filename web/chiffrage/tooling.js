@@ -13,7 +13,7 @@
 // The size of the die (L × l × h) is not in the 3D model: it is the size of
 // the part plus margins. The values below are neutral starting values: the
 // foundry's own (prices, rates, hours, margins calibrated on its dies) are
-// imported as a settings file (Paramètres → Importer des paramètres), never
+// imported as a trends file (Paramètres → Importer des tendances), never
 // written in this public code.
 
 export const DEFAULT_TOOLING = {

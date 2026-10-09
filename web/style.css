@@ -260,6 +260,8 @@ table.bodies .open { color: var(--warn); }
 .tabs { display: flex; gap: 2px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
 .tab { border: none; background: transparent; padding: 4px 12px; border-radius: 6px; }
 .tab.active { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+/* A phone: the four pages within its width. */
+@media (max-width: 420px) { .tab { padding: 4px 7px; } }
 .page { height: calc(100% - 53px); overflow-y: auto; padding: 16px; }
 @media (max-width: 900px) { .page { height: auto; } }
 
@@ -294,19 +296,55 @@ table.bodies .open { color: var(--warn); }
 .cmsg.ok { background: color-mix(in srgb, var(--ok) 14%, transparent); }
 .cmsg.error { background: var(--error-bg); color: var(--error-text); }
 .cmsg.warn { background: color-mix(in srgb, var(--warn) 16%, transparent); }
+.cmsg.lines { white-space: pre-line; } /* a message of several lines (the checklist of an unreachable Ollama) */
 .cactions { display: flex; gap: 8px; flex-wrap: wrap; }
+/* Paramètres: where each value comes from (saisie, classeur, tendance, défaut), and the trend beside a value that differs. */
+.cval { display: inline-flex; align-items: center; gap: 4px; }
+.cf > .cval { display: flex; }
+.cf > .cval > input { flex: 1; min-width: 0; font-size: 14px; color: var(--text); }
+.csrc { flex: none; font-size: 10px; line-height: 15px; padding: 0 5px; border-radius: 8px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; cursor: help; }
+.csrc.saisie { border-color: var(--accent); color: var(--accent); }
+.csrc.classeur { border-color: var(--ok); color: var(--ok); }
+.csrc.tendance { border-color: var(--warn); color: var(--warn); }
+.csrc.defaut { border-style: dashed; }
+.ctrend { display: block; margin-top: 2px; color: var(--warn); font-size: 11px; white-space: normal; }
 @media (max-width: 700px) { .cgrid { grid-template-columns: 1fr; } }
 .ctable td.bad { color: var(--error-text); }
+/* Chiffrage: traced values (provenance.js), the banner "N valeurs à valider / N alertes" and the card "Traçabilité". */
+.ctrace-banner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ctrace-banner.clean { background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.ctrace details > summary { cursor: pointer; font-size: 13px; margin: 8px 0; }
+.ctrace .ctable td { vertical-align: top; }
+.ctable tr.calert td:first-child { box-shadow: inset 3px 0 var(--warn); }
+.calerts { margin: 6px 0; padding-left: 18px; }
+.calerts li { margin: 2px 0; }
+.cnote { display: block; margin-top: 2px; font-size: 11px; white-space: normal; }
+.cconf { font-size: 11px; line-height: 16px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--border); white-space: nowrap; }
+.cconf.haute { border-color: var(--ok); color: var(--ok); }
+.cconf.moyenne { border-color: var(--accent); color: var(--accent); }
+.cconf.faible { border-color: var(--warn); color: var(--warn); }
+.cconf.nulle { border-color: var(--error-text); color: var(--error-text); }
+/* Chiffrage: the estimate of the cycle time by the AI (ai-cycle.js), a proposal until it is used. */
+.ccycle-value { margin: 6px 0; font-size: 14px; }
+.ccycle-compare { margin: 4px 0; padding-left: 18px; }
+.ccycle-compare li, .ccycle-ia ul li { margin: 2px 0; }
+.ccycle-ia ul { padding-left: 18px; }
+/* Chiffrage: the backtest of the AI on the history of cycle times (backtest.js). */
+.cbacktest-reading { margin: 8px 0; font-size: 13px; }
+.cbacktest-error { color: var(--error-text); }
 /* "Fermer le corps" under an open body of the bodies table. */
 .close-row td { padding-top: 0; border-top: 0; }
 .close-row .close-body { font-size: 12px; color: var(--accent); }
 
 /* "IA / analyse" page (ai-workspace.js). */
-.ai-page { max-width: 1100px; margin: 0 auto; padding: 24px 16px; display: grid; gap: 16px; }
+.ai-page { max-width: 1100px; margin: 0 auto; padding: 24px 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .ai-page h2 { margin: 0; font-size: 18px; }
+.ai-page .card-head { flex-wrap: wrap; gap: 4px 12px; }
 .ai-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-top: 12px; }
-.ai-row .field { flex-direction: column; align-items: stretch; gap: 4px; }
-.ai-row #ai-url { min-width: 320px; }
+/* Fields as wide as the room they have, never wider than the page (a phone: one per row). */
+.ai-row .field { flex-direction: column; align-items: stretch; gap: 4px; min-width: 0; max-width: 100%; }
+.ai-row .field > input, .ai-row .field > select { min-width: 0; max-width: 100%; }
+.ai-row .ai-url-field { flex: 1 1 320px; }
 .ai-tasks { gap: 8px; }
 .ai-task[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 .ai-chat { display: grid; gap: 10px; max-height: 55vh; overflow: auto; }
@@ -316,6 +354,21 @@ table.bodies .open { color: var(--warn); }
 .ai-assistant { background: var(--panel); }
 .ai-error { background: var(--error-bg); color: var(--error-text); border-color: transparent; }
 .ai-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.ai-thinking { font-style: italic; color: var(--muted); }
+/* Task "Chiffrage": the answer is reasoning only; whether its numbers are in the costing trace. */
+.ai-label { margin-bottom: 4px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.ai-check { margin-bottom: 6px; font-size: 12px; }
+.ai-check.ok { color: var(--ok); }
+.ai-check.bad { color: var(--warn); font-weight: 600; }
+/* The local model answering in place of the gateway; the numbers of an answer that come from none of
+   the data sent; the real names of the labels the gateway was sent. */
+.ai-notice { margin-bottom: 6px; font-size: 12px; font-weight: 600; color: var(--warn); }
+.ai-numbers, .ai-names { margin-top: 6px; font-size: 12px; color: var(--muted); }
+/* The reasoning of the model while it is written: one line, its latest words; then folded. */
+.ai-thought { display: flex; justify-content: flex-end; overflow: hidden; white-space: nowrap; margin-top: 6px; font-size: 12px; font-style: italic; color: var(--muted); }
+.ai-thought-details { margin-top: 6px; font-size: 12px; color: var(--muted); }
+.ai-thought-details summary { cursor: pointer; }
 .ai-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-top: 12px; }
-.ai-form textarea { flex: 1; min-width: 260px; font: inherit; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); resize: vertical; }
+.ai-form textarea { flex: 1 1 260px; min-width: 0; font: inherit; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); resize: vertical; }
 .ai-actions { display: flex; flex-direction: column; gap: 6px; }
+@media (max-width: 600px) { .ai-page { padding: 8px 0; } }

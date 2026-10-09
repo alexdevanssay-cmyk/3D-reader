@@ -1,19 +1,43 @@
 // What the costing pages keep in this browser (localStorage): the data read
 // from the costing workbook and from the metal prices file, the settings
-// (TRS, islands, methods...) and the inputs of the current quote. Saved at
-// every change, so they are back when the page is opened again. Nothing is
-// sent anywhere.
+// (TRS, islands, methods...), the inputs of the current quote and the history
+// of cycle times (history.js) and the results of the backtest of the AI on it
+// (backtest.js). Saved at every change, so they are back when the page is
+// opened again. Nothing is sent from here: the estimate of the cycle time by
+// the AI (ai-cycle.js, ui.js) gives it the records of the history most like
+// the piece only when the box "Envoyer les pièces similaires de l'historique"
+// is ticked (for the online gateway, unticked unless the user ticks it).
+//
+// The settings are layers, resolved value by value at each loading (so a
+// re-imported workbook or a new trends file is taken into account):
+//   1. saisie    the values typed in the Paramètres page, and only those, each
+//                with its provenance {source: "saisie", date};
+//   2. classeur  the values the costing workbook holds (margin, minimum rate,
+//                safety coefficient, changeover hours, yearly increases,
+//                energy prices, working modes): current rules of the company;
+//   3. tendance  the calibrated settings file imported in Paramètres (trends of
+//                past quotes): a soft prior, never above a current value;
+//   4. défaut    the neutral values of the code (DEFAULT_*).
+// An empty field is "not set" (the next layer), never 0.
 
 import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, DEFAULT_TTH } from "./routes.js";
 import { DEFAULT_TOOLING } from "./tooling.js";
 import { DEFAULT_CORES } from "./cores.js";
 import { indexAverage } from "./model.js";
+import { MODES } from "./workbook.js";
 
 const KEYS = {
   base: "reader3d.chiffrage.base.v1",
   indices: "reader3d.chiffrage.indices.v1",
+  // Earlier versions: the whole settings object, defaults, imported file and
+  // inputs mixed. Migrated once to `saisies`, then left as it is (a backup)
+  // until the typed values are erased.
   settings: "reader3d.chiffrage.settings.v1",
+  saisies: "reader3d.chiffrage.settings.v2", // {values: {path: {value, source: "saisie", date}}, migratedAt?}
+  tendances: "reader3d.chiffrage.tendances.v1", // {fileName, importedAt, values, completed: [path]}
   quote: "reader3d.chiffrage.quote.v1",
+  historique: "reader3d.chiffrage.historique.v1", // {pieces: [record]}: cycle times of past quotes and of production (history.js)
+  bancEssai: "reader3d.chiffrage.banc-essai-ia.v1", // {resultats: {key: result}, prochaine, arret, enCours}: backtest of the AI (backtest.js)
 };
 
 // Densities of the alloys (g/cm³), to get the weight of the part from its volume.
@@ -21,10 +45,17 @@ export const DEFAULT_DENSITIES = {
   AS7G03: 2.68, AS7G06: 2.68, AS7U3: 2.75, AS8U3: 2.75, AS9G: 2.65, AS9GU: 2.7, AS9U3: 2.76,
   AS10G: 2.65, AS12: 2.65, AS12U: 2.7, AS12UNG: 2.68, AS13: 2.65, AZ10: 2.85, AZ5: 2.8,
 };
+// Density of an alloy that has none in the settings (an alert in the trace of the quote).
+export const GENERIC_DENSITY = 2.7;
 
 const clone = (x) => JSON.parse(JSON.stringify(x));
 
+// Values that could not be saved (private window, storage full or blocked):
+// kept for this visit, in place of the older ones of the storage.
+const unsaved = new Map();
+
 function read(key) {
+  if (unsaved.has(key)) return JSON.parse(unsaved.get(key));
   try {
     const text = localStorage.getItem(key);
     return text ? JSON.parse(text) : null;
@@ -37,8 +68,10 @@ function write(key, value) {
   try {
     if (value === null) localStorage.removeItem(key);
     else localStorage.setItem(key, JSON.stringify(value));
+    unsaved.delete(key);
     return true;
   } catch {
+    unsaved.set(key, JSON.stringify(value));
     return false; // private window, storage full or blocked: works for this visit only
   }
 }
@@ -48,9 +81,34 @@ export const saveBase = (base) => write(KEYS.base, base);
 export const loadIndices = () => read(KEYS.indices);
 export const saveIndices = (indices) => write(KEYS.indices, indices);
 
-/** Settings with their defaults; the workbook's values where it has some. */
-export function defaultSettings(base) {
-  const d = base?.defaults ?? {};
+/** The records of the history of cycle times (history.js), [] when there is none. */
+export function loadHistorique() {
+  const h = read(KEYS.historique);
+  return Array.isArray(h?.pieces) ? h.pieces : [];
+}
+/** The history of cycle times replaced by the records `pieces` (none: erased); false when kept for this visit only. */
+export const saveHistorique = (pieces) => write(KEYS.historique, pieces?.length ? { pieces } : null);
+
+/**
+ * The backtest of the AI on the history (backtest.js, ui.js): {resultats: {key:
+ * result}, prochaine (ms: the earliest next request), arret (why the last run
+ * stopped) | null, enCours (a run started and not ended: the page was closed)}.
+ */
+export function loadBancEssai() {
+  const b = read(KEYS.bancEssai);
+  return { resultats: b?.resultats && typeof b.resultats === "object" ? b.resultats : {}, prochaine: Number.isFinite(b?.prochaine) ? b.prochaine : 0, arret: b?.arret ?? null, enCours: !!b?.enCours };
+}
+/** The backtest replaced by `banc` (null: erased); false when kept for this visit only. */
+export const saveBancEssai = (banc) => write(KEYS.bancEssai, banc);
+
+// --------------------------------------------------------------------------- settings: the layers
+
+const isPlain = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const at = (o, keys) => keys.reduce((x, k) => (x === null || x === undefined ? undefined : x[k]), o);
+const byDepth = (entries) => entries.sort(([a], [b]) => a.split(".").length - b.split(".").length);
+
+/** The neutral settings of the code. */
+function codeSettings() {
   return {
     trs: { ...DEFAULT_TRS },
     modes: {},
@@ -60,46 +118,41 @@ export function defaultSettings(base) {
     tooling: clone(DEFAULT_TOOLING), // in-house gravity dies (tooling.js)
     tth: clone(DEFAULT_TTH), // heat treatments: cost relative to T6
     cores: clone(DEFAULT_CORES), // sand cores and core boxes (cores.js)
-    inflation: {
-      salaires: d.evolutionSalaires ?? 0.015,
-      conso: d.evolutionConso ?? 0.02,
-      elec: d.evolutionElec ?? 0,
-      gaz: d.evolutionGaz ?? 0,
-      autresEnergies: d.evolutionAutresEnergies ?? 0.03,
-    },
+    inflation: { salaires: 0.015, conso: 0.02, elec: 0, gaz: 0, autresEnergies: 0.03 },
     energy: null, // null: the workbook's prices
-    marge: d.marge ?? 0.12,
-    tauxMini: d.tauxMini ?? 0.1,
-    coefSecurite: d.coefSecurite ?? 0.1,
-    heuresChangementCoulee: d.changeover?.[0]?.heures ?? 8,
-    heuresChangementFinition: d.changeover?.[1]?.heures ?? 1,
+    marge: 0.12,
+    tauxMini: 0.1,
+    coefSecurite: 0.1,
+    heuresChangementCoulee: 8,
+    heuresChangementFinition: 1,
+    seuilTendance: 0.15, // deviation from the trend above which the trace of the quote raises an alert (provenance.js)
   };
 }
 
-/** Merge saved settings over the defaults (new settings of later versions get their default). */
-export function loadSettings(base) {
-  const defaults = defaultSettings(base);
-  const saved = read(KEYS.settings);
-  if (!saved) return defaults;
-  const merged = { ...defaults, ...saved };
-  for (const key of ["trs", "modes", "densities", "inflation"]) merged[key] = { ...defaults[key], ...saved[key] };
-  merged.cores = { ...defaults.cores, ...saved.cores };
-  for (const k of ["etude", "fao"]) merged.cores[k] = { ...defaults.cores[k], ...saved.cores?.[k] };
-  merged.tth = { ...defaults.tth };
-  for (const [code, value] of Object.entries(saved.tth ?? {})) merged.tth[code] = { ...defaults.tth[code], ...value };
-  merged.tooling = { ...defaults.tooling, ...saved.tooling };
-  for (const [k, v] of Object.entries(defaults.tooling)) {
-    if (v && typeof v === "object" && !Array.isArray(v)) merged.tooling[k] = { ...v, ...saved.tooling?.[k] };
-    else if (Array.isArray(v) && !Array.isArray(saved.tooling?.[k])) merged.tooling[k] = v;
-  }
-  for (const key of ["processes", "operations"]) {
-    merged[key] = { ...defaults[key] };
-    for (const [code, value] of Object.entries(saved[key] ?? {})) merged[key][code] = { ...defaults[key][code], ...value, cycle: { ...defaults[key][code]?.cycle, ...value.cycle }, rendement: { ...defaults[key][code]?.rendement, ...value.rendement } };
-  }
-  return merged;
+/** The settings the costing workbook holds (only those it has a value for). */
+function workbookSettings(base) {
+  if (!base) return {};
+  const d = base.defaults ?? {};
+  const known = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined));
+  const out = known({
+    marge: d.marge,
+    tauxMini: d.tauxMini,
+    coefSecurite: d.coefSecurite,
+    heuresChangementCoulee: d.changeover?.[0]?.heures,
+    heuresChangementFinition: d.changeover?.[1]?.heures,
+  });
+  const inflation = known({ salaires: d.evolutionSalaires, conso: d.evolutionConso, elec: d.evolutionElec, gaz: d.evolutionGaz, autresEnergies: d.evolutionAutresEnergies });
+  // Energy prices and working modes: what the costing already took from the workbook when the settings had none.
+  const energy = Object.fromEntries(Object.entries(base.energy ?? {}).filter(([, v]) => Number.isFinite(v)));
+  const modes = Object.fromEntries((base.centres ?? []).filter((c) => c.defaultMode).map((c) => [c.code, c.defaultMode]));
+  for (const [k, v] of Object.entries({ inflation, energy, modes })) if (Object.keys(v).length) out[k] = v;
+  return out;
 }
 
-const isPlain = (v) => v && typeof v === "object" && !Array.isArray(v);
+/** Settings with their defaults; the workbook's values where it has some. */
+export function defaultSettings(base) {
+  return mergeSettings(codeSettings(), workbookSettings(base));
+}
 
 /** Settings `extra` (a whole or partial settings file) merged into `settings`; arrays are replaced. */
 export function mergeSettings(settings, extra) {
@@ -109,8 +162,427 @@ export function mergeSettings(settings, extra) {
   return out;
 }
 
-export const saveSettings = (settings) => write(KEYS.settings, settings);
-export const resetSettings = () => write(KEYS.settings, null);
+/**
+ * Put `value` at `keys` of the settings `root`; not where the place does not
+ * exist (row of a shorter table, value instead of a group): false then.
+ */
+function place(root, keys, value) {
+  let o = root;
+  for (const k of keys.slice(0, -1)) {
+    if (Array.isArray(o) && !(Number(k) < o.length)) return false;
+    if (o[k] === null || o[k] === undefined) o[k] = {};
+    else if (typeof o[k] !== "object") return false;
+    o = o[k];
+  }
+  const last = keys.at(-1);
+  if (Array.isArray(o) && !(Number(last) < o.length)) return false;
+  // A table saved whole over another one: its rows completed by those below.
+  const below = o[last];
+  if (Array.isArray(value) && Array.isArray(below) && isPlain(below[0])) value = value.map((x, i) => (isPlain(x) ? { ...(below[i] ?? below.at(-1)), ...x } : x));
+  o[last] = value;
+  return true;
+}
+
+/** The keys of the table of rows (bands of hours, weight coefficients, steel types) a row of which `keys` addresses in the settings `s`; else null. */
+function tableOf(s, keys) {
+  for (let n = 1; n < keys.length; n++) {
+    const t = at(s, keys.slice(0, n));
+    if (Array.isArray(t)) return isPlain(t[0]) && /^\d+$/.test(keys[n]) ? keys.slice(0, n) : null;
+    if (t === null || typeof t !== "object") return null;
+  }
+  return null;
+}
+
+/**
+ * The effective settings: at each place, the value typed in (saisies: {path:
+ * {value}}), else the workbook's, else the trend's, else the code's. A trend
+ * never takes the place of a current value (typed, or of the workbook).
+ *
+ * A value typed in a row of a table applies to a table of the length it was
+ * typed in (`rows`; saved before: the code's): row i of a table of other
+ * bands is another band. Where the trends give that table with another
+ * length than the code's one a row of which is typed in, the table of the
+ * code is used there, the trend's is ignored (report.ignored: the paths of
+ * those tables). A typed value with no place (its row is not in the table
+ * used, or the table is not the one it was typed in; a value in place of a
+ * group) is not applied (report.unapplied: its path).
+ */
+export function resolveSettings({ code = codeSettings(), workbook = {}, tendances = null, saisies = {} } = {}, report = {}) {
+  const current = mergeSettings(code, workbook); // the settings without the trends
+  const s = clone(mergeSettings(mergeSettings(code, tendances), workbook));
+  const entries = byDepth(Object.entries(saisies)).filter(([, e]) => e?.value !== null && e?.value !== undefined);
+  // [the keys of its table, the length of the table it was typed in] of a value typed in a row; else [].
+  const rowOf = (path, e) => {
+    const table = tableOf(current, path.split("."));
+    return table ? [table, Number.isInteger(e.rows) ? e.rows : at(current, table).length] : [];
+  };
+  report.ignored = [];
+  for (const [path, e] of entries) {
+    const [table, rows] = rowOf(path, e);
+    if (!table || at(s, table).length === rows || at(current, table).length !== rows || !Array.isArray(at(tendances, table))) continue;
+    at(s, table.slice(0, -1))[table.at(-1)] = clone(at(current, table));
+    report.ignored.push(table.join("."));
+  }
+  report.unapplied = [];
+  for (const [path, e] of entries) {
+    const [table, rows] = rowOf(path, e);
+    const elsewhere = table && Number.isInteger(e.rows) && at(s, table).length !== rows; // typed in another table (saved before: placed as it was)
+    if (elsewhere || !place(s, path.split("."), clone(e.value))) report.unapplied.push(path);
+  }
+  return s;
+}
+
+/**
+ * Migration of the settings of earlier versions. They were saved as one whole
+ * object at the first change (defaults of the code and of the workbook, the
+ * imported calibrated file and the inputs mixed). Each of its values becomes a
+ * typed value, except:
+ *   - those equal to the default of the code, or of the workbook, at the same
+ *     place: they were defaults, not choices (a re-imported workbook now
+ *     applies to them);
+ *   - the empty ones (null: a field emptied, now "not set").
+ * Tables of the same length as the default one are taken row by row, value by
+ * value; others whole. The values of an imported calibrated file cannot be
+ * told apart from the inputs: they are typed values too (Paramètres says so).
+ */
+export function migrateSettings(saved, base) {
+  const refs = [defaultSettings(base), codeSettings()];
+  const date = new Date().toISOString();
+  const values = {};
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  (function walk(v, keys) {
+    const ref = refs.map((r) => at(r, keys)).find((x) => x !== undefined);
+    if (isPlain(v)) for (const [k, x] of Object.entries(v)) walk(x, [...keys, k]);
+    else if (Array.isArray(v) && Array.isArray(ref) && v.length === ref.length && v.every(isPlain)) v.forEach((x, i) => walk(x, [...keys, String(i)]));
+    else if (v !== null && v !== undefined && keys.length && !refs.some((r) => same(at(r, keys), v))) values[keys.join(".")] = { value: v, source: "saisie", date, migrated: true };
+  })(saved, []);
+  return values;
+}
+
+function loadSaisies(base) {
+  const saved = read(KEYS.saisies);
+  if (isPlain(saved?.values)) return saved;
+  const old = read(KEYS.settings);
+  if (!isPlain(old)) return { values: {} };
+  const saisies = { values: migrateSettings(old, base), migratedAt: new Date().toISOString() };
+  write(KEYS.saisies, saisies);
+  return saisies;
+}
+
+function loadTendances() {
+  const t = read(KEYS.tendances);
+  if (!isPlain(t?.values)) return null;
+  // The threshold of the alerts on the deviation from the trend is not the trends' to set (saved before it was refused).
+  if (!Object.hasOwn(t.values, "seuilTendance")) return t;
+  const { seuilTendance, ...values } = t.values;
+  return Object.keys(values).length ? { ...t, values } : null;
+}
+
+/** The typed value at `keys`, or the value saved whole that holds it (earlier versions). */
+function typedAt(values, keys) {
+  for (let n = keys.length; n > 0; n--) {
+    const e = values[keys.slice(0, n).join(".")];
+    if (e && (n === keys.length || at(e.value, keys.slice(n)) !== undefined)) return e;
+  }
+  return null;
+}
+
+/**
+ * The settings and their layers: {effective, saisies, tendances, ignored
+ * (tables of the trends not used: a row of them typed in, resolveSettings),
+ * unapplied (paths of typed values not applied), provenance(path)}.
+ * provenance("trs.CG3") = {source: "saisie" | "classeur" | "tendance" |
+ * "defaut", value, date?, fileName?, migrated?, from? ("tendance": a trend
+ * adopted over the workbook), trend (the trend's value at that place, if
+ * any), classeur (the workbook's), trendIgnored? (in a table of the trends
+ * not used), unapplied? (the value typed there is not applied)}.
+ */
+export function loadSettingsLayers(base) {
+  const code = codeSettings();
+  const workbook = workbookSettings(base);
+  const tendances = loadTendances();
+  const saisies = loadSaisies(base);
+  const report = {};
+  const effective = resolveSettings({ code, workbook, tendances: tendances?.values, saisies: saisies.values }, report);
+  const completed = new Set(tendances?.completed ?? []); // values the trends file did not have
+  return {
+    effective,
+    saisies,
+    tendances,
+    ignored: report.ignored,
+    unapplied: report.unapplied,
+    provenance(path) {
+      const keys = path.split(".");
+      const value = at(effective, keys);
+      const ignored = report.ignored.some((t) => path.startsWith(`${t}.`));
+      const trend = tendances && !completed.has(path) && !ignored ? at(tendances.values, keys) : undefined;
+      const classeur = at(workbook, keys);
+      const typed = typedAt(saisies.values, keys);
+      const notes = { ...(ignored ? { trendIgnored: true } : {}), ...(report.unapplied.includes(path) ? { unapplied: true } : {}) };
+      if (typed && !notes.unapplied) {
+        return { source: "saisie", value, date: typed.date, migrated: !!typed.migrated, ...(typed.from ? { from: typed.from, fileName: typed.fileName } : {}), trend, classeur, ...notes };
+      }
+      if (classeur !== undefined) return { source: "classeur", value, fileName: base?.source?.fileName, trend, classeur, ...notes };
+      if (trend !== undefined) return { source: "tendance", value, fileName: tendances.fileName, date: tendances.importedAt, trend, ...notes };
+      return { source: "defaut", value, ...notes };
+    },
+  };
+}
+
+/** The effective settings (see loadSettingsLayers). */
+export const loadSettings = (base) => loadSettingsLayers(base).effective;
+
+// Values without meaning at 0 or out of their range: refused when typed in,
+// left out of a trends file. modes: the working modes of the workbook.
+const RULES = [
+  { re: /^trs\.[^.]+$/, test: (v) => v > 0 && v <= 1, message: "TRS entre 0 et 100 %" },
+  { re: /^densities\.[^.]+$/, test: (v) => v > 0, message: "densité supérieure à 0" },
+  { re: /^operations\.[^.]+\.chargeKg$/, test: (v) => v > 0, message: "charge supérieure à 0 kg" },
+  { re: /^processes\.[^.]+\.miseAuMille$/, test: (v) => v > 0, message: "mise au mille supérieure à 0" },
+  { re: /^modes\.[^.]+$/, test: (v) => MODES.includes(v), message: `fonctionnement ${MODES.join(", ")}` },
+  { re: /^seuilTendance$/, test: (v) => v >= 0, message: "seuil positif ou nul" },
+];
+const ruleOf = (path) => RULES.find((r) => r.re.test(path));
+
+/**
+ * A value typed in Paramètres at `path` ("trs.CG3"), saved with its date.
+ * Empty (null, ""): not set, the value of the next layer comes back. Returns
+ * the reason of a value refused (TRS at 0...), else null.
+ */
+export function setSetting(path, value, base = null) {
+  if (value === null || value === undefined || value === "") {
+    clearSetting(path, base);
+    return null;
+  }
+  const rule = ruleOf(path);
+  if (rule && !rule.test(value)) return rule.message;
+  // A row of a table: the length of the table it is typed in (resolveSettings).
+  const table = tableOf(codeSettings(), path.split("."));
+  const rows = table ? at(loadSettingsLayers(base).effective, table)?.length : undefined;
+  const saisies = loadSaisies(base);
+  saisies.values[path] = { value, source: "saisie", date: new Date().toISOString(), ...(Number.isInteger(rows) ? { rows } : {}) };
+  write(KEYS.saisies, saisies);
+  return null;
+}
+
+/** The typed value at `path` removed: the next layer applies there. */
+export function clearSetting(path, base = null) {
+  const saisies = loadSaisies(base);
+  const keys = path.split(".");
+  delete saisies.values[path];
+  // Inside a group or a table saved whole (earlier versions): removed from it (a table row gets the value below).
+  for (let n = keys.length - 1; n > 0; n--) {
+    const parent = at(saisies.values[keys.slice(0, n).join(".")]?.value, keys.slice(n, -1));
+    if (parent && typeof parent === "object") delete parent[keys.at(-1)];
+  }
+  write(KEYS.saisies, saisies);
+}
+
+/**
+ * "Adopter la tendance": the typed value at `path` gives way to the trend.
+ * Where the workbook has a value (above the trends), the trend is typed in,
+ * marked as an adopted trend (from, fileName: provenance, traced to validate).
+ */
+export function adoptTendance(path, base = null) {
+  const keys = path.split(".");
+  const t = loadTendances();
+  const trend = at(t?.values, keys);
+  if (trend === undefined) return;
+  clearSetting(path, base);
+  if (at(workbookSettings(base), keys) !== undefined) {
+    const saisies = loadSaisies(base);
+    saisies.values[path] = { value: trend, source: "saisie", date: new Date().toISOString(), from: "tendance", fileName: t.fileName };
+    write(KEYS.saisies, saisies);
+  }
+}
+
+/** Erase the typed values (and the settings of earlier versions); the trends are kept. */
+export function clearSaisies() {
+  write(KEYS.saisies, { values: {} });
+  write(KEYS.settings, null);
+}
+
+/** Erase the trends; the typed values are kept. */
+export const clearTendances = () => write(KEYS.tendances, null);
+
+/** The typed values as a settings file (groups of values; table rows by their number). */
+export function exportSaisies(base = null) {
+  const out = {};
+  for (const [path, e] of byDepth(Object.entries(loadSaisies(base).values))) {
+    const keys = path.split(".");
+    let o = out;
+    for (const k of keys.slice(0, -1)) o = isPlain(o[k]) || Array.isArray(o[k]) ? o[k] : (o[k] = {});
+    o[keys.at(-1)] = e.value;
+  }
+  return out;
+}
+
+/** The trends imported: {fileName, importedAt, values}, or null. */
+export const exportTendances = loadTendances;
+
+// --------------------------------------------------------------------------- settings: trends file
+
+/** Number of values of a settings file (a list of finishing methods counts as one). */
+export function countValues(o) {
+  if (Array.isArray(o)) return o.some((x) => x !== null && typeof x === "object") ? o.reduce((n, x) => n + countValues(x), 0) : 1;
+  if (isPlain(o)) return Object.values(o).reduce((n, x) => n + countValues(x), 0);
+  return o === null || o === undefined ? 0 : 1;
+}
+
+// Groups open to new entries (a centre, an alloy, a heat treatment): the
+// shape of an entry; a new heat treatment needs its cost coefficient.
+const OPEN = {
+  trs: { template: 0 },
+  modes: { template: "" },
+  densities: { template: 0 },
+  tth: { template: { label: "", coef: 0, cycle: "" }, required: ["coef"], complete: (code, t) => ({ label: code, cycle: "", ...t }) },
+};
+const TYPES = { number: "nombre attendu", string: "texte attendu", boolean: "vrai / faux attendu" };
+
+/** The known key nearest to a misspelled one (at most 2 letters apart), or null. */
+function nearest(key, known) {
+  const distance = (a, b) => {
+    let row = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= a.length; i++) {
+      const next = [i];
+      for (let j = 1; j <= b.length; j++) next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      row = next;
+    }
+    return row[b.length];
+  };
+  let best = null;
+  let min = 3;
+  for (const k of known) {
+    const d = distance(key.toLowerCase(), k.toLowerCase());
+    if (d < min) [best, min] = [k, d];
+  }
+  return best;
+}
+
+/** Value `v` of a trends file checked against `ref`, the code's value at the same place `keys`; undefined: left out. */
+function clean(v, ref, keys, report) {
+  const path = keys.join(".");
+  const refuse = (reason) => void report.invalid.push({ path, reason });
+  if (v === null || v === undefined) return refuse("vide");
+  if (Array.isArray(ref)) return cleanTable(v, ref, keys, report);
+  if (isPlain(ref)) {
+    if (!isPlain(v)) return refuse("groupe de valeurs attendu");
+    const out = {};
+    for (const [k, x] of Object.entries(v)) {
+      if (k.startsWith("_")) continue; // comments of the file
+      const sub = [...keys, k];
+      let c;
+      if (Object.hasOwn(ref, k)) c = clean(x, ref[k], sub, report);
+      else if (OPEN[path]) {
+        const open = OPEN[path];
+        c = clean(x, open.template, sub, report);
+        const missing = c === undefined ? [] : (open.required ?? []).filter((r) => !Object.hasOwn(c, r));
+        if (missing.length) {
+          report.invalid.push({ path: sub.join("."), reason: `incomplet (${missing.join(", ")})` });
+          c = undefined;
+        } else if (c !== undefined && open.complete) c = open.complete(k, c);
+      } else report.unknown.push({ path: sub.join("."), suggestion: nearest(k, Object.keys(ref)) });
+      if (c !== undefined) out[k] = c;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+  if (typeof v !== typeof ref || (typeof v === "number" && !Number.isFinite(v))) return refuse(TYPES[typeof ref] ?? "valeur attendue");
+  const rule = ruleOf(path);
+  if (rule && !rule.test(v)) return refuse(rule.message);
+  return v;
+}
+
+/**
+ * A table of a trends file (bands of hours, weight coefficients, steel types,
+ * finishing methods of an island). Rows missing a value get the default one
+ * (reported in `completed`): a partial table never gives NaN.
+ */
+function cleanTable(v, ref, keys, report) {
+  const path = keys.join(".");
+  const complete = (c, template, row) => {
+    for (const k of Object.keys(template)) if (!Object.hasOwn(c, k)) report.completed.push(`${path}.${row}.${k}`);
+    return { ...template, ...c };
+  };
+  // Numbered rows ({"3": {...}}, as the typed values are exported): those rows of the default table.
+  if (isPlain(v) && Object.keys(v).length && Object.keys(v).every((k) => /^\d+$/.test(k))) {
+    const out = clone(ref);
+    const given = new Set();
+    for (const [i, x] of Object.entries(v)) {
+      if (!(Number(i) < ref.length)) report.unknown.push({ path: `${path}.${i}`, suggestion: null });
+      else {
+        const c = clean(x, ref[i], [...keys, i], report);
+        if (c !== undefined) {
+          out[i] = isPlain(c) ? complete(c, ref[i], i) : c;
+          given.add(Number(i));
+        }
+      }
+    }
+    // The rows the file does not give: the default ones, not trends.
+    ref.forEach((row, i) => {
+      if (!given.has(i) && isPlain(row)) for (const k of Object.keys(row)) report.completed.push(`${path}.${i}.${k}`);
+    });
+    return out;
+  }
+  if (!Array.isArray(v)) return void report.invalid.push({ path, reason: "tableau attendu" });
+  if (isPlain(ref[0])) {
+    const out = [];
+    v.forEach((x, i) => {
+      const template = ref[i] ?? ref.at(-1);
+      const c = clean(x, template, [...keys, String(i)], report);
+      if (c !== undefined) out.push(complete(c, template, out.length));
+    });
+    return out.length ? out : undefined;
+  }
+  // A list of names: the finishing methods of an island are known operations.
+  const out = v.filter((x) => {
+    const ok = typeof x === typeof ref[0] && (!path.endsWith(".finitions") || Object.hasOwn(DEFAULT_OPERATIONS, x));
+    if (!ok) report.invalid.push({ path, reason: `« ${x} » inconnu` });
+    return ok;
+  });
+  return out.length ? out : undefined;
+}
+
+/**
+ * A trends file (calibrated settings, whole or partial) checked against the
+ * settings of the code: unknown or misspelled keys and invalid values are
+ * reported and left out. Returns {values (null: nothing usable), completed,
+ * report: {count (the values of the file, not those completed), unknown:
+ * [{path, suggestion}], invalid: [{path, reason}], completed: [path]}}.
+ * Not the threshold of the alerts on the deviation from the trend
+ * (seuilTendance): a trend does not decide when it is far from a value.
+ */
+export function validateTendances(json) {
+  const report = { count: 0, unknown: [], invalid: [], completed: [] };
+  const { seuilTendance, ...code } = codeSettings();
+  const schema = { ...code, energy: { elecAncien: 0, elecNouveau: 0, gazAncien: 0, gazNouveau: 0 } };
+  const values = isPlain(json) ? clean(json, schema, [], report) ?? null : (report.invalid.push({ path: "", reason: "fichier de paramètres (objet JSON) attendu" }), null);
+  report.count = countValues(values) - report.completed.length;
+  return { values, completed: report.completed, report };
+}
+
+/**
+ * Import of a trends file: it replaces the trends imported before, and only
+ * them (the typed values stay above). Returns the report of validateTendances;
+ * throws when the file has no usable value.
+ */
+export function importTendances(json, fileName) {
+  const { values, completed, report } = validateTendances(json);
+  const unknown = report.unknown.length ? ` (clés inconnues : ${report.unknown.slice(0, 8).map((u) => u.path).join(", ")})` : "";
+  if (!values) throw new Error(`aucune valeur de paramètre reconnue dans ce fichier${unknown}`);
+  // A table of another length than the one rows of which are typed in: not used there (resolveSettings), said now.
+  const code = codeSettings();
+  report.warnings = [];
+  for (const [path, e] of Object.entries(read(KEYS.saisies)?.values ?? {})) {
+    const table = tableOf(code, path.split("."));
+    const rows = table && (Number.isInteger(e?.rows) ? e.rows : at(code, table).length);
+    const trend = table && at(values, table);
+    if (!Array.isArray(trend) || trend.length === rows || report.warnings.some((x) => x.path === table.join("."))) continue;
+    const kept = rows === at(code, table).length ? "le tableau par défaut est gardé là où des lignes sont saisies dans Paramètres" : "les lignes saisies dans Paramètres ne sont plus appliquées";
+    report.warnings.push({ path: table.join("."), reason: `${trend.length} lignes au lieu de ${rows} : ${kept}` });
+  }
+  write(KEYS.tendances, { fileName, importedAt: new Date().toISOString(), values, completed });
+  return report;
+}
 
 export function defaultQuote(base, indices) {
   const d = base?.defaults ?? {};
@@ -172,12 +644,16 @@ export function defaultQuote(base, indices) {
     marge: null, // null: the setting
     composants: [],
     serie: null, // series order of the customer request (rfq.js)
+    serieAvant: null, // {field: value} the fields of the quote before a request filled them (back with "Retirer")
+    serieValeurs: null, // {field: value} what an earlier request wrote that the current one does not, still in the fields
+    serieRetiree: null, // {fileName, fields: {field: value}, avant}: request removed, fields still holding its values
     moqs: [], // order quantities, largest first
     prixCible: null,
     serieEnergie: true, // energy prices of the request in place of the settings
     prototype: false, // prototypes: prototype volumes of the request, no target price
     outillageInclus: true, // tooling amortised in the piece price; false: sold apart
     margeOutillage: 0, // margin on the tooling sold apart
+    analysesIA: [], // answers of the AI page on this quote, a record: {date, provider, model, question, answer, verified}; none applied
   };
 }
 
@@ -189,6 +665,33 @@ let quoteTab = 1;
 /** The quote read and saved from now on: the one of the tab `id` of the 3D page. */
 export function setQuoteTab(id) {
   quoteTab = id;
+}
+
+/** The tab of the 3D page whose quote is read and saved. */
+export const currentQuoteTab = () => quoteTab;
+
+/** `entry` added to the list `field` of the quote of the tab `id` as it is saved (not the one in a page). */
+export function appendToQuote(id, field, entry) {
+  const shown = quoteTab;
+  quoteTab = id;
+  try {
+    const saved = readQuote() ?? {};
+    saved[field] = [...(Array.isArray(saved[field]) ? saved[field] : []), entry];
+    return saveQuote(saved);
+  } finally {
+    quoteTab = shown;
+  }
+}
+
+/** The quote of the tab `id` as it is saved (not the one in a page); null when it has none. */
+export function savedQuote(id) {
+  const shown = quoteTab;
+  quoteTab = id;
+  try {
+    return readQuote();
+  } finally {
+    quoteTab = shown;
+  }
 }
 
 function readQuote() {
