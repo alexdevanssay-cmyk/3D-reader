@@ -8,6 +8,7 @@
 import { buildManufacturingPlan, operationDependencyGraph, precedence } from "./manufacturing-plan.js";
 import { buildFoundryAnalysis, FOUNDRY_SCHEMA_VERSION, FOUNDRY_KNOWLEDGE_VERSION } from "./foundry-knowledge.js";
 import { meshTopology } from "./meshanalysis.js";
+import { ANALYSIS_HINTS } from "./analysis-hints.js";
 
 export const SEMANTIC_VERSION = "1.0";
 
@@ -967,6 +968,8 @@ function semanticBody(body, index) {
       analytic_surfaces:body.geometric_surfaces ?? [],
       principal_axes:principalAxes(body),
     },
+    // Draw direction and parting line (parting.js), proposed or defined by hand, when computed.
+    ...(body.parting ? {parting:body.parting} : {}),
     features,
     relations,
     quality:{
@@ -1012,16 +1015,7 @@ export function buildSemantic3D(result) {
       },
     },
     bodies:(result.bodies ?? []).map(semanticBody),
-    analysis_hints:[
-      "features are geometric candidates, not guaranteed design intent",
-      "manufacturing operations, setups, dependencies and DFM notes are candidates, not executable toolpaths",
-      "V6 planning groups candidate operations by compatible tool axis and exposes unresolved access constraints",
-      "functional thickness is reported only when an existing Reader metric is available",
-      "raw tessellation is intentionally excluded from this AI payload",
-      "use source_index to map semantic bodies back to Reader bodies",
-      "foundry analysis is a conservative geometry screen; filling, solidification, risering and gating are not simulated",
-      "numeric foundry limits are process/alloy specific and must be validated against the selected foundry process",
-    ],
+    analysis_hints:[...ANALYSIS_HINTS],
     manufacturing_schema_version:MANUFACTURING_SCHEMA_VERSION,
     manufacturing_planning_schema_version:MANUFACTURING_PLANNING_SCHEMA_VERSION,
     foundry_schema_version: FOUNDRY_SCHEMA_VERSION,

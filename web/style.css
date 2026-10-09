@@ -261,6 +261,29 @@ table.bodies .open { color: var(--warn); }
 .thick-min button { margin-left: auto; }
 .thick-min strong.overridden { color: var(--muted); font-weight: 400; }
 .thick-min-used label { color: var(--text); font-weight: 600; }
+/* Parting line */
+.parting-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.parting-head > span:first-child { color: var(--muted); }
+.parting-head strong { font-size: 20px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.parting-origin { font-size: 12px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; color: var(--muted); }
+.parting-origin.manual { color: var(--warn); border-color: var(--warn); }
+#parting-stats { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+table.parting-candidates { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+table.parting-candidates th { text-align: left; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); padding: 3px 4px; }
+table.parting-candidates td { padding: 3px 4px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+table.parting-candidates tr { cursor: pointer; }
+table.parting-candidates .num { text-align: right; white-space: nowrap; }
+table.parting-candidates tr.proposed td:nth-child(2) { font-weight: 600; }
+table.parting-candidates input { margin: 0; }
+.parting-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.parting-vector { display: inline-flex; gap: 6px; align-items: center; }
+.parting-vector input { width: 110px; }
+#parting-target { min-width: 0; max-width: 100%; }
+#parting-reset { margin-top: 8px; }
+#parting-hint { margin: 6px 0 0; color: var(--accent); }
+#parting-status, #parting-body { margin: 2px 0 6px; }
+.parting-legend { margin: 8px 0 0; line-height: 1.9; }
+.parting-legend .swatch { margin-left: 4px; margin-right: 3px; }
 .linklike { background: none; border: 0; padding: 0; color: inherit; font: inherit; text-decoration: underline dotted; cursor: pointer; }
 .linklike:hover { color: var(--accent, #4f8cff); }
 
@@ -274,8 +297,12 @@ table.bodies .open { color: var(--warn); }
 @media (max-width: 900px) { .page { height: auto; } }
 
 /* Costing pages */
-.cpage { max-width: 1400px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
-.cgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 14px; }
+.cpage { margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+/* The cards side by side over the whole width: all on one row when there is room (5 from about 1 900 px), else
+   wrapped, those of the last row stretched. */
+.cgrid { display: flex; flex-wrap: wrap; gap: 14px; }
+.cgrid > .ccard { flex: 1 1 360px; }
+.cgrid .cfields { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
 .ccard { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; min-width: 0; }
 .ccard h3 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .ccard h4 { margin: 14px 0 6px; font-size: 13px; }
@@ -284,7 +311,10 @@ table.bodies .open { color: var(--warn); }
 .cf > input, .cf > select, .cf > output { font-size: 14px; color: var(--text); }
 .cf > output { padding: 5px 0; font-weight: 600; font-variant-numeric: tabular-nums; }
 .cf small { font-size: 11px; }
+.cf small .cauto { color: var(--text); font-size: 12px; font-weight: 600; }
 .crow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+/* The shared network folder: a long folder name or error wraps within a phone's width. */
+#cnetwork strong, .cnetwork-sync, #cfeedback-net { overflow-wrap: anywhere; }
 /* A data file dragged over its row (or over the settings buttons): dropped, it replaces the one in use. */
 [data-drop] { border: 2px dashed transparent; border-radius: 6px; padding: 2px 6px; margin-left: -8px; transition: border-color 0.1s, background 0.1s; }
 [data-drop].drop-target { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
@@ -316,7 +346,7 @@ table.bodies .open { color: var(--warn); }
 .csrc.tendance { border-color: var(--warn); color: var(--warn); }
 .csrc.defaut { border-style: dashed; }
 .ctrend { display: block; margin-top: 2px; color: var(--warn); font-size: 11px; white-space: normal; }
-@media (max-width: 700px) { .cgrid { grid-template-columns: 1fr; } }
+@media (max-width: 700px) { .cgrid > .ccard { flex-basis: 100%; } }
 .ctable td.bad { color: var(--error-text); }
 /* Chiffrage: traced values (provenance.js), the banner "N valeurs à valider / N alertes" and the card "Traçabilité". */
 .ctrace-banner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -374,6 +404,13 @@ table.bodies .open { color: var(--warn); }
 .ai-row .ai-url-field { flex: 1 1 320px; }
 .ai-tasks { gap: 8px; }
 .ai-task[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+/* The values the AI proposes for the costing, under its answer; the reply that applies them, by the box. */
+.ai-proposals { margin-top: 8px; font-size: 13px; }
+.ai-proposals ul { margin: 4px 0 0; padding-left: 18px; }
+.ai-proposals li.refused { color: var(--muted); }
+.ai-undo-apply { margin-top: 8px; }
+.ai-suggest { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.ai-suggest-btn { border-style: dashed; border-color: var(--accent); }
 .ai-chat { display: grid; align-content: start; gap: 10px; flex: 1 1 0; min-height: 0; overflow: auto; }
 .ai-msg { padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); color: var(--text); }
 .ai-msg strong { display: block; margin-bottom: 4px; }

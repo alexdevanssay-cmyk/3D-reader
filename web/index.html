@@ -114,7 +114,7 @@
           <h2 data-i18n="drop.title">Drop a 3D file here</h2>
           <p>STEP · IGES · BREP · STL · OBJ · PLY · OFF · GLB/glTF · 3MF · DAE</p>
           <p class="muted" data-i18n="drop.real">The real (material) volume is computed, not only the bounding envelope.</p>
-          <p class="muted small" id="privacy-note" hidden data-i18n="drop.privacy">Your file never leaves your computer: everything is computed in this browser tab.</p>
+          <p class="muted small" id="privacy-note" hidden data-i18n="drop.privacy">Your file never leaves your computer: everything is computed in this browser tab (its results are also kept in the shared folder of your company network, when one is chosen in Settings).</p>
           <p class="muted small" data-i18n-html="drop.ai">For AI assistants and scripts: see <a href="ai.html">ai.html</a>.</p>
         </div>
       </div>
@@ -249,6 +249,48 @@
           <tbody id="bodies"></tbody>
         </table>
         <div id="body-detail" class="body-detail" hidden></div>
+      </section>
+
+      <!-- Draw direction and parting line of the body selected (else the largest closed one). -->
+      <section class="card" id="parting-card" hidden>
+        <div class="card-head">
+          <h3 data-i18n="parting.title">Parting line</h3>
+          <label class="check" data-i18n-title="parting.show.title" title="Show on the 3D view: the two halves of the mould, the undercuts in red, the parting line and the draw direction"><input type="checkbox" id="parting-show"> <span data-i18n="parting.show">Show</span></label>
+        </div>
+        <p class="small muted" id="parting-body" hidden></p>
+        <p class="small" id="parting-status" hidden></p>
+        <button id="parting-retry" class="small" type="button" hidden data-i18n="parting.retry">Retry</button>
+        <div id="parting-main" hidden>
+          <div class="parting-head">
+            <span data-i18n="parting.direction">Draw direction</span>
+            <strong id="parting-axis">—</strong>
+            <span id="parting-origin" class="parting-origin"></span>
+          </div>
+          <dl class="stats" id="parting-stats"></dl>
+          <p class="muted small" id="parting-sampled" hidden></p>
+          <table class="parting-candidates" id="parting-candidates">
+            <thead><tr><th></th><th data-i18n="parting.col.axis">Axis</th><th class="num" data-i18n="parting.col.undercut">Undercuts</th><th class="num" data-i18n="parting.col.zeroDraft">No draft</th><th data-i18n="parting.col.line">Line</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div class="parting-controls">
+            <button id="parting-pick" class="small toggle" type="button" data-i18n="parting.pick" data-i18n-title="parting.pick.title" title="Click a face on the 3D view: the draw direction becomes its normal (that face upwards)">Pick a face</button>
+            <span class="parting-vector">
+              <input id="parting-vector" type="text" placeholder="x y z" autocomplete="off" data-i18n-title="parting.vector.title" title="Draw direction: three components (e.g. 0 0 1) or an axis (X, -Z…)">
+              <button id="parting-apply" class="small" type="button" data-i18n="parting.apply">Apply</button>
+            </span>
+          </div>
+          <div class="parting-controls">
+            <button id="parting-assign" class="small toggle" type="button" data-i18n="parting.assign" data-i18n-title="parting.assign.title" title="Click faces on the 3D view to move them to a half of the mould: the parting line follows the boundary between the halves">Reassign faces</button>
+            <select id="parting-target">
+              <option value="1" data-i18n="parting.target.upper">to the upper half</option>
+              <option value="2" selected data-i18n="parting.target.lower">to the lower half</option>
+            </select>
+          </div>
+          <p class="small" id="parting-hint" hidden></p>
+          <button id="parting-reset" class="small" type="button" data-i18n="parting.reset">Back to the proposal</button>
+          <p class="parting-legend small" id="parting-legend"></p>
+          <p class="muted small" data-i18n="parting.note">Proposed from the geometry (lines of sight along the draw direction): an aid, not a die design. A definition made by hand is kept in this browser for this part.</p>
+        </div>
       </section>
 
       <section class="card" id="memory-card" hidden>

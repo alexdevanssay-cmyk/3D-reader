@@ -341,6 +341,7 @@ const RULES = [
   { re: /^processes\.[^.]+\.miseAuMille$/, test: (v) => v > 0, message: "mise au mille supérieure à 0" },
   { re: /^modes\.[^.]+$/, test: (v) => MODES.includes(v), message: `fonctionnement ${MODES.join(", ")}` },
   { re: /^seuilTendance$/, test: (v) => v >= 0, message: "seuil positif ou nul" },
+  { re: /^tooling\.parEmpreinte$/, test: (v) => v >= 0, message: "part d'une empreinte positive ou nulle" },
 ];
 const ruleOf = (path) => RULES.find((r) => r.re.test(path));
 

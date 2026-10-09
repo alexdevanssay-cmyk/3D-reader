@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { buildSemantic3D } from "../../web/engine/semantic.js";
 import { buildAIContext, compactAIContext } from "../../web/engine/ai-context.js";
+import { ANALYSIS_HINTS } from "../../web/engine/analysis-hints.js";
 
 function body(overrides = {}) {
   return {
@@ -607,9 +608,11 @@ test("a rounded edge is a fillet, not a hole, a bore or a boss", () => {
 
   // Features grouped by type (a compacted AI context): the fillet is R5, no Ø10.
   const context = buildAIContext(roundedSemantic, { task: "feature_analysis" });
-  const compact = compactAIContext(context, { maxChars: JSON.stringify(compactAIContext(context, { maxChars: Infinity })).length - 1 });
-  assert.equal(compact.compaction.level, 2);
-  const fillets = compact.bodies[0].feature_groups.find(g => g.type === "fillet_feature_candidate");
+  const grouped = (c) => c.bodies[0].provisional_feature_groups ?? c.bodies[0].feature_groups;
+  let compact = null;
+  for (let budget = JSON.stringify(context).length; budget > 0 && !(compact && grouped(compact)); budget -= 20) compact = compactAIContext(context, { maxChars: budget });
+  assert.ok(compact.compaction.level >= 5, `level ${compact.compaction.level}`);
+  const fillets = grouped(compact).find(g => g.type === "fillet_feature_candidate");
   assert.deepEqual(fillets.radii_mm, [5]);
   assert.equal("diameters_mm" in fillets, false);
 
@@ -1023,12 +1026,51 @@ test("the compacted AI context of a large assembly fits the budget of a local mo
   const context = buildAIContext(semantic, { task: "manufacturing_analysis" });
   const compact = compactAIContext(context, { maxChars: 12000 });
   assert.ok(JSON.stringify(compact).length <= 12000, `${JSON.stringify(compact).length} characters`);
-  assert.equal(compact.compaction.level, 5);
+  assert.equal(compact.compaction.level, 9);
   assert.equal(compact.compaction.original_body_count, count);
   // The largest bodies are listed, the others counted.
   assert.equal(compact.bodies.length + compact.other_bodies.count, count);
   assert.equal(compact.bodies[0].metrics.volume_mm3, 1000 + count - 1);
   assert.ok(compact.warnings.length <= 5);
+});
+
+test("the compaction gives up what repeats first, then the machining plan, then the process detail, the geometry last", () => {
+  // One body of a dozen cylinders, with the plan and the foundry screen of the task "Planification".
+  const surfaces = Array.from({ length: 12 }, (_, i) => ({ index: i, type: "cylinder", radius_mm: 3 + i, diameter_mm: 6 + 2 * i, axis: [0,0,1], center_mm: [20 * i, 0, 0], wire_count: 2, edge_count: 2, edge_signatures: [] }));
+  const semantic = buildSemantic3D({
+    file: "part.step", kind: "cad", engine: "browser", source_unit: "mm",
+    summary: { volume: 50000, area: 20000, bodies: 1, solids: 1 },
+    bodies: [body({ geometric_surfaces: surfaces })],
+  });
+  const context = buildAIContext(semantic, { task: "planning" });
+  const levels = new Map();
+  for (let budget = JSON.stringify(context).length; budget > 500; budget -= 25) {
+    const c = compactAIContext(context, { maxChars: budget });
+    levels.set(c.compaction.level, c); // the smallest of each level
+  }
+  const at = (level) => levels.get(level);
+  // 2: the notes of every analysis and the reasoning rules out, the features repeating the body counted; every hole still listed.
+  assert.ok(at(2) && !("reasoning_contract" in at(2)));
+  assert.deepEqual(at(2).warnings.filter((w) => ANALYSIS_HINTS.includes(w)), []);
+  assert.ok(at(2).bodies[0].repeated_features.cylindrical_geometry >= 1);
+  assert.ok(!at(2).bodies[0].features.some((f) => f.type === "cylindrical_geometry"));
+  assert.equal(at(2).bodies[0].features.filter((f) => f.type === "cylindrical_feature_candidate").length, 12);
+  assert.ok(!("sources" in (at(2).bodies[0].foundry ?? {})) && !("topology" in (at(2).bodies[0].foundry.evidence ?? {})));
+  // 3: the machining plan summarized, the operations and the foundry risks still whole.
+  assert.ok(Array.isArray(at(3).bodies[0].manufacturing_plan.planned_order) && !("setups" in at(3).bodies[0].manufacturing_plan));
+  assert.ok(Array.isArray(at(3).bodies[0].manufacturing.operations) && Array.isArray(at(3).bodies[0].foundry.risks));
+  // 4: the operations counted by kind, the foundry screen to its risks and checks; the features still listed.
+  assert.ok(!Array.isArray(at(4).bodies[0].manufacturing.operations) && "required_checks" in at(4).bodies[0].foundry);
+  assert.equal(at(4).bodies[0].features.length, 12);
+  // 5 then 6: the geometry last, the provisional features grouped first.
+  const reached = [...levels.keys()];
+  assert.ok(reached.indexOf(5) > reached.indexOf(4) && (!levels.has(6) || reached.indexOf(6) > reached.indexOf(5)), reached.join());
+  // At the smallest of level 5, every cylinder grouped with its diameter; bigger, some listed as they fit.
+  const cylinders = at(5).bodies[0].provisional_feature_groups.filter((g) => g.type === "cylindrical_feature_candidate");
+  assert.deepEqual([cylinders.reduce((n, g) => n + g.count, 0), cylinders.flatMap((g) => g.diameters_mm).length], [12, 12]);
+  const roomier = compactAIContext(context, { maxChars: JSON.stringify(at(5)).length + 400 });
+  assert.equal(roomier.compaction.level, 5);
+  assert.ok(roomier.bodies[0].features.length >= 2 && JSON.stringify(roomier).length <= JSON.stringify(at(5)).length + 400);
 });
 
 test("a small budget: past the last resort, fewer warnings, their count kept", () => {

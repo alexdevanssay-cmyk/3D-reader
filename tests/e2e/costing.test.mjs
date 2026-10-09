@@ -352,6 +352,70 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await context.close();
   });
 
+  test('cavities per casting: the quote for 1 to 4 cavities and more, "Retenir" imposes the island, kept after a reload, back to the estimate', { timeout: 90_000 }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage .ccard');
+    await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
+    await page.waitForSelector('#page-chiffrage .cmsg.ok');
+    for (const [bind, value] of [['p.poids', 1.2], ['p.toileMini', 5], ['p.epaisseurMax', 10], ['p.moduleMm', 3], ['p.dimMax', 250]]) {
+      await page.fill(`#page-chiffrage [data-bind="${bind}"]`, String(value));
+      await page.dispatchEvent(`#page-chiffrage [data-bind="${bind}"]`, 'change');
+    }
+    const card = '#page-chiffrage #cempreintes';
+    await page.waitForSelector(`${card} tr.retained`);
+    assert.match(await page.textContent(card), /Empreintes par coulée — Pièce/);
+    // Automatic choice: the island of the best route, with its estimated cavities; the list of the casting card says where to change them.
+    const island = (await page.textContent(`${card} p strong`)).trim();
+    const estimated = Number(await page.getAttribute(`${card} tr.retained`, 'data-empreintes'));
+    assert.match(await page.textContent(`${card} tr.retained`), /estimé/);
+    assert.ok(await page.locator(`${card} tbody tr`).count() >= 4);
+    assert.match(await page.textContent('#page-chiffrage'), /à comparer dans « Empreintes par coulée »/);
+    const cells = (n) => page.$$eval(`${card} tr[data-empreintes="${n}"] td`, (tds) => tds.map((td) => td.textContent.trim()));
+    const num = (text) => Number(text.replace(/[^\d,]/g, '').replace(',', '.'));
+    // More cavities: a longer cycle, less time per piece, a dearer die.
+    const [one, two] = [await cells(1), await cells(2)];
+    assert.ok(num(two[2]) > num(one[2]), `cycle ${two[2]} > ${one[2]}`);
+    assert.ok(num(two[3]) < num(one[3]), `per piece ${two[3]} < ${one[3]}`);
+    assert.ok(num(two[4]) > num(one[4]), `die ${two[4]} > ${one[4]}`);
+    // "Retenir" a row of more cavities: the quote is that row, the island imposed with it.
+    const offered = await page.$$eval(`${card} [data-action="cavities"]`, (buttons) => buttons.map((b) => Number(b.dataset.n)));
+    const n = offered.find((x) => x > estimated) ?? offered[0];
+    const row = await cells(n);
+    await page.click(`${card} [data-action="cavities"][data-n="${n}"]`);
+    await page.waitForFunction((k) => document.querySelector('#page-chiffrage #cempreintes tr.retained')?.dataset.empreintes === String(k), n);
+    assert.match((await page.textContent('#page-chiffrage .cmsg.ok')).replace(/\u202f/g, ' '), new RegExp(`^${n} empreintes sur l'îlot ${island}, désormais imposé : cycle de [\\d,]+ s pour ${n} pièces, soit [\\d,]+ s par pièce, moule [\\d ]+ €\\.$`));
+    assert.deepEqual((await cells(n)).slice(0, 8), row.slice(0, 8));
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.procede"]'), island);
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.empreintes"]'), String(n));
+    assert.match(await page.textContent('#page-chiffrage'), /soit [\d,]+ s par pièce/);
+    assert.match(await page.textContent('#page-chiffrage'), new RegExp(`${n} empreintes`));
+    // Kept after a reload.
+    await page.reload();
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector(`${card} tr.retained`);
+    assert.equal(await page.getAttribute(`${card} tr.retained`, 'data-empreintes'), String(n));
+    // A phone: the card within 375 px, its table scrolling inside it, the page not sideways.
+    await page.setViewportSize({ width: 375, height: 800 });
+    const overflow = await page.evaluate(() => [...document.querySelectorAll('#cempreintes')].flatMap((c) => [c, ...c.querySelectorAll('button, .cscroll, p')])
+      .filter((x) => x.offsetParent && !x.parentElement.closest('.cscroll')).map((x) => [x.textContent.trim().slice(0, 30) || x.className, Math.round(x.getBoundingClientRect().right)]).filter(([, right]) => right > 375));
+    assert.deepEqual(overflow, []);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), true, 'no sideways scroll of the page');
+    await page.setViewportSize({ width: 1280, height: 800 });
+    // Back to the estimate: the island stays imposed.
+    await page.click(`${card} [data-action="cavities-auto"]`);
+    await page.waitForFunction((k) => document.querySelector('#page-chiffrage #cempreintes tr.retained')?.dataset.empreintes === String(k), estimated);
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.empreintes"]'), ' ');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.procede"]'), island);
+    assert.equal(await page.locator(`${card} [data-action="cavities-auto"]`).count(), 0);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
   test('settings of an earlier version: taken over as values typed in, said; those equal to the trends imported since, offered to erase', { timeout: 60_000 }, async () => {
     const context = await browser.newContext({ locale: 'fr-FR' });
     const page = await context.newPage();
@@ -396,30 +460,37 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.goto(`${base}?lang=fr`);
     await page.click('.tab[data-page="chiffrage"]');
     const text = (selector = '#page-chiffrage') => page.textContent(selector).then((t) => t.replace(/[  ]/g, ' '));
-    const waitText = (re) => page.waitForFunction((source) => new RegExp(source).test(document.getElementById('page-chiffrage').textContent.replace(/[  ]/g, ' ')), re.source);
+    const waitText = (re, id = 'page-chiffrage') => page.waitForFunction(([source, id]) => new RegExp(source).test(document.getElementById(id).textContent.replace(/[  ]/g, ' ')), [re.source, id]);
 
-    // Before the workbook already: the card of the history.
+    // Before the workbook already: the card of the history in Chiffrage; its file in Paramètres, with the other files.
     await page.waitForSelector('#page-chiffrage #chistorique');
     assert.match(await text('#chistorique'), /Historique :\s*aucun/);
-    assert.equal(await page.isDisabled('#chistorique [data-action="export-historique"]'), true);
-    await page.setInputFiles('#page-chiffrage input[data-file="historique"]', join(dir, 'historique.json'));
-    await waitText(/Historique « historique\.json » importé/);
-    assert.match(await text('#page-chiffrage .cmsg.warn'), /^Historique « historique\.json » importé : 2 enregistrements \(2 ajoutés, 0 remplacé : même référence et même source\)\. Enregistrements refusés : H-3 \(temps_cycle_s : nombre > 0 attendu\)\. Champs inconnus, ignorés : atelier\.$/);
+    assert.equal(await page.locator('#page-chiffrage [data-file="historique"], #page-chiffrage [data-drop="historique"]').count(), 0);
+    await page.click('#chistorique [data-action="show-parametres"]');
+    await page.waitForSelector('#page-parametres #chisto-file');
+    assert.match(await text('#chisto-file'), /Historique des temps de cycle :\s*aucun/);
+    assert.equal(await page.isDisabled('#chisto-file [data-action="export-historique"]'), true);
+    await page.setInputFiles('#page-parametres input[data-file="historique"]', join(dir, 'historique.json'));
+    await waitText(/Historique « historique\.json » importé/, 'page-parametres');
+    assert.match(await text('#page-parametres .cmsg.warn'), /^Historique « historique\.json » importé : 2 enregistrements \(2 ajoutés, 0 remplacé : même référence et même source\)\. Enregistrements refusés : H-3 \(temps_cycle_s : nombre > 0 attendu\)\. Champs inconnus, ignorés : atelier\.$/);
+    assert.match(await text('#chisto-file'), /Historique des temps de cycle :\s*2 enregistrements : 2 temps de devis, 0 temps mesuré en production/);
+    // Dropped again on its row: its records replaced, not added twice.
+    const json = readFileSync(join(dir, 'historique.json'), 'utf8');
+    await page.evaluate((content) => {
+      const zone = document.querySelector('#page-parametres [data-drop="historique"]');
+      const data = new DataTransfer();
+      data.items.add(new File([content], 'historique.json', { type: 'application/json' }));
+      zone.dispatchEvent(new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true }));
+    }, json);
+    await waitText(/0 ajouté, 2 remplacés/, 'page-parametres');
+    // The card of Chiffrage counts them.
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage #chistorique');
     assert.match(await text('#chistorique'), /Historique :\s*2 enregistrements : 2 temps de devis, 0 temps mesuré en production/);
     assert.deepEqual(await page.$$eval('#chistorique .chisto-count tbody tr', (trs) => trs.map((tr) => [...tr.cells].map((td) => td.textContent))), [
       ['CG3 Coquille gravité (traditionnel)', '1', '0'], ['SSP Sous pression', '1', '0'],
     ]);
     assert.match(await text('#chistorique'), /Aucun temps mesuré en production/);
-    // Dropped again on its row: its records replaced, not added twice.
-    const json = readFileSync(join(dir, 'historique.json'), 'utf8');
-    await page.evaluate((content) => {
-      const zone = document.querySelector('#page-chiffrage [data-drop="historique"]');
-      const data = new DataTransfer();
-      data.items.add(new File([content], 'historique.json', { type: 'application/json' }));
-      zone.dispatchEvent(new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true }));
-    }, json);
-    await waitText(/0 ajouté, 2 remplacés/);
-    assert.match(await text('#chistorique'), /Historique :\s*2 enregistrements/);
 
     // A part typed in, cast on CG3.
     await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
@@ -481,11 +552,14 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.deepEqual(await page.$$eval('#chistorique .chisto thead th', (ths) => ths.map((th) => th.textContent)), ['Référence', 'Îlot', 'Réel', 'Formule', 'Écart', 'Tendance', 'Écart']);
     assert.match(await text('#chistorique'), /Tendance : la même formule avec les coefficients du fichier de tendances \(CG3 : base\), les autres ceux de Paramètres/);
 
-    // Kept after a reload; exported as a history file, the time measured with the geometry of the part.
+    // Kept after a reload; exported as a history file (from Paramètres), the time measured with the geometry of the part.
     await page.reload();
     await page.waitForSelector('#page-chiffrage #chistorique');
     assert.match(await text('#chistorique'), /Historique :\s*3 enregistrements/);
-    const [download] = await Promise.all([page.waitForEvent('download'), page.click('#chistorique [data-action="export-historique"]')]);
+    await page.click('.tab[data-page="parametres"]');
+    await page.waitForSelector('#page-parametres #chisto-file');
+    assert.match(await text('#chisto-file'), /Historique des temps de cycle :\s*3 enregistrements/);
+    const [download] = await Promise.all([page.waitForEvent('download'), page.click('#chisto-file [data-action="export-historique"]')]);
     assert.equal(download.suggestedFilename(), 'historique_cycles.json');
     const exported = JSON.parse(readFileSync(await download.path(), 'utf8'));
     assert.deepEqual([exported.schema, exported.version, exported.pieces.length], ['reader3d-historique-cycles', 1, 3]);
@@ -498,18 +572,26 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(mam > 1 && !Number.isNaN(Date.parse(date)));
     assert.deepEqual(exported.pieces.filter((r) => r.source === 'devis').map((r) => r.ref), ['H-1', 'H-2']);
 
-    // A phone: the cards of the history within 375 px (their tables scroll inside them).
+    // A phone: the row of the history file and the cards of the history within 375 px (their tables scroll inside them).
     await page.setViewportSize({ width: 375, height: 800 });
+    assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('#chisto-file button')].filter((x) => x.getBoundingClientRect().right > 375).map((x) => x.textContent)), []);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage #chistorique');
     const overflow = await page.evaluate(() => [...document.querySelectorAll('#chistorique, #cfeedback')].flatMap((card) => [card, ...card.querySelectorAll('button, input, .cscroll')])
       .filter((x) => x.offsetParent).map((x) => [x.id || x.textContent.trim().slice(0, 30) || x.className, Math.round(x.getBoundingClientRect().right)]).filter(([, right]) => right > 375));
     assert.deepEqual(overflow, []);
     await page.setViewportSize({ width: 1280, height: 800 });
 
-    // Erased, after a confirmation that says what is lost.
+    // Erased in Paramètres, after a confirmation that says what is lost.
+    await page.click('.tab[data-page="parametres"]');
+    await page.waitForSelector('#page-parametres #chisto-file');
     const dialog = new Promise((resolve) => page.once('dialog', (d) => resolve(d.message()) || d.accept()));
-    await page.click('#chistorique [data-action="clear-historique"]');
+    await page.click('#chisto-file [data-action="clear-historique"]');
     assert.match(await dialog, /Effacer l'historique des temps de cycle \(3 enregistrements, dont 1 temps mesuré en production\)[\s\S]*exportez-le d'abord/);
-    await waitText(/Historique des temps de cycle effacé/);
+    await waitText(/Historique des temps de cycle effacé/, 'page-parametres');
+    assert.match(await text('#chisto-file'), /Historique des temps de cycle :\s*aucun/);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage #chistorique');
     assert.match(await text('#chistorique'), /Historique :\s*aucun/);
     assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.chiffrage.historique.v1')), null);
     assert.deepEqual(errors, []);
@@ -592,13 +674,15 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const stored = await costingStorage();
     await page.selectOption('#ai-provider', 'ollama');
     await page.fill('#ai-url', `http://127.0.0.1:${ollama.address().port}`);
-    await page.click('.ai-task[data-task="costing"]');
-    assert.equal(await page.isVisible('#ai-amounts-field'), false, 'the local model gets the whole trace');
     const fr = (v) => v.toLocaleString('fr-FR', { maximumFractionDigits: 2 });
+    // Without a question: the task "Chiffrage" clicked, its own question asked.
+    const costingQuestion = 'Explique le chiffrage de cette pièce : les postes principaux, les écarts signalés et les valeurs à valider.';
     const ask = async (question) => {
       const n = await page.locator('#ai-chat .ai-check').count();
-      await page.fill('#ai-input', question);
-      await page.press('#ai-input', 'Enter');
+      if (question) {
+        await page.fill('#ai-input', question);
+        await page.press('#ai-input', 'Enter');
+      } else await page.click('.ai-task[data-task="costing"]');
       await page.waitForFunction((count) => document.querySelectorAll('#ai-chat .ai-check').length > count, n, { timeout: 30_000 });
       // The answer is shown before it is kept with the quote: the status tells when the question is over.
       await page.waitForFunction(() => /^Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
@@ -606,7 +690,9 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     };
     // The stand-in cites the sale price of the trace it was given.
     answer = (trace) => `Le prix de vente (piece.prix.vente) est de ${typeof trace.pieces[0].valeurs['piece.prix.vente'].valeur === 'number' ? `${fr(trace.pieces[0].valeurs['piece.prix.vente'].valeur)} €` : 'masqué'}.`;
-    let reply = await ask('Pourquoi ce prix ?');
+    let reply = await ask();
+    assert.equal(await page.isVisible('#ai-amounts-field'), false, 'the local model gets the whole trace');
+    assert.equal(chats[0].messages.at(-1).content, costingQuestion);
     const system = chats[0].messages[0].content;
     assert.doesNotMatch(system, /costing_contract|costing_inputs|"quote"/);
     assert.match(system, /N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux\. Ne cite que des nombres présents dans costing_trace/);
@@ -619,7 +705,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(trace.pieces[0].valeurs['piece.poids'].valeur, 1.2);
     assert.ok(trace.pieces[0].routes.length >= 1 && trace.pieces[0].routes.some((r) => r.retenue));
     assert.ok(system.length < 20_000, `system prompt of ${system.length} characters`);
-    assert.equal(await reply.locator('.ai-label').textContent(), "Raisonnement IA — aucune valeur n'est appliquée");
+    assert.equal(await reply.locator('.ai-label').textContent(), "Raisonnement IA — rien n'est appliqué sans votre accord");
     assert.equal(await reply.locator('.ai-check').getAttribute('class'), 'ai-check ok');
     assert.match(await reply.locator('.ai-text').textContent(), new RegExp(`est de ${fr(price.valeur).replace(/\s/g, '\\s')} €`));
 
@@ -630,7 +716,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // The AI wrote nothing: the costing data of this browser are unchanged. Its answers are kept with the quote, for the record.
     assert.equal(await costingStorage(), stored);
     const kept = await analyses();
-    assert.deepEqual(kept.map((a) => [a.provider, a.model, a.question, a.verified]), [['Ollama', 'qwen3:8b', 'Pourquoi ce prix ?', true], ['Ollama', 'qwen3:8b', 'Et avec un autre taux ?', false]]);
+    assert.deepEqual(kept.map((a) => [a.provider, a.model, a.question, a.verified]), [['Ollama', 'qwen3:8b', costingQuestion, true], ['Ollama', 'qwen3:8b', 'Et avec un autre taux ?', false]]);
     assert.match(kept[1].answer, /Avec un taux de 85 €\/h/);
     assert.ok(kept.every((a) => !Number.isNaN(Date.parse(a.date))));
 
@@ -691,6 +777,111 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     for (const text of ["aucune valeur n'a été appliquée au devis ni aux paramètres", 'Fournisseur', 'Pourquoi ce prix ?', 'Et avec un autre taux ?', 'Et le détail ?', 'qwen3:8b', 'openai/gpt-oss-120b', 'non : nombres absents de la trace']) {
       assert.ok(sheet.includes(text), text);
     }
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('IA page, task « Chiffrage »: a value of the piece proposed, refused without its number in the data, applied with the reply suggested (Tab, Entrée, confirmed), traced, undone', { timeout: 120_000 }, async (t) => {
+    // A stand-in for the AI gateway, its answer proposing what `propositions` holds.
+    const requests = [];
+    let propositions = [];
+    const gateway = createServer((req, res) => {
+      if (req.headers.origin) res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET,POST', 'Access-Control-Allow-Headers': 'Content-Type, Accept' });
+        return res.end();
+      }
+      res.setHeader('Content-Type', 'application/json');
+      if (req.method === 'GET') return res.end(JSON.stringify({ provider: 'Groq', model: 'openai/gpt-oss-120b', models: [], context_chars: 6000, access_code_required: false }));
+      let text = '';
+      req.on('data', (c) => (text += c));
+      req.on('end', () => {
+        requests.push(JSON.parse(text));
+        res.end(JSON.stringify({ output: JSON.stringify({
+          conclusion: 'Poids à corriger.', observations: [], inferences: [], recommendations: [], uncertainties: [], needs_human_validation: true,
+          analyse_chiffrage: { explications: ['Le poids de la pièce est saisi (piece.poids).'], ecarts_signales: [], questions: [], hypotheses: [], propositions },
+        }), provider: 'Groq', model: 'openai/gpt-oss-120b', quota: { requests_remaining_day: 990, requests_limit_day: 1000 } }));
+      });
+    });
+    await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => {
+      gateway.closeAllConnections();
+      gateway.close(resolve);
+    }));
+    const context = await browser.newContext({ locale: 'fr-FR' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    const dialogs = [];
+    page.on('dialog', (d) => {
+      dialogs.push(d.message());
+      d.accept();
+    });
+    // A quote of a piece typed in.
+    await page.goto(`${base}?lang=fr`);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
+    await page.waitForSelector('#page-chiffrage .cmsg.ok');
+    for (const [bind, value] of [['p.poids', 1.2], ['p.toileMini', 5], ['p.epaisseurMax', 10], ['p.moduleMm', 3], ['p.dimMax', 250]]) {
+      await page.fill(`#page-chiffrage [data-bind="${bind}"]`, String(value));
+      await page.dispatchEvent(`#page-chiffrage [data-bind="${bind}"]`, 'change');
+    }
+    await page.waitForSelector('#page-chiffrage .ctable tr.retained');
+    const piece = () => page.evaluate(() => JSON.parse(localStorage.getItem('reader3d.chiffrage.quote.v1')).pieces.manuel);
+    // The IA page, through the gateway.
+    await page.click('.tab[data-page="ia"]');
+    await page.selectOption('#ai-provider', 'openai');
+    await page.fill('#ai-url', `http://127.0.0.1:${gateway.address().port}/api/ai`);
+    const answered = (n) => page.waitForFunction((count) => document.querySelectorAll('#ai-chat .ai-msg').length >= count && /^Réponse en/.test(document.getElementById('ai-status').textContent), n, { timeout: 30_000 });
+    const weight = { piece: 'Pièce', cle: 'piece.poids', valeur: 1.35, unite: 'kg', source: 'question', justification: 'poids réel donné par l\'utilisateur' };
+    // The task clicked: 1,35 kg said to come from the user's message, in none of them: shown, not applicable, nothing suggested.
+    propositions = [weight];
+    await page.click('.ai-task[data-task="costing"]');
+    await answered(2);
+    assert.match(await page.textContent('#ai-chat .ai-msg:last-child .ai-proposals'), /poids pièce de « Pièce » : 1,35 kg \(votre message\) — poids réel donné par l'utilisateur — non applicable : nombre absent de vos messages/);
+    assert.equal(await page.isVisible('#ai-suggest'), false);
+    // Written by the user: the reply suggested, beside the box and in it.
+    await page.fill('#ai-input', 'Le poids réel est de 1,35 kg : corrige-le.');
+    await page.press('#ai-input', 'Enter');
+    await answered(4);
+    await page.waitForSelector('#ai-suggest:not([hidden])');
+    assert.match(await page.textContent('#ai-suggest'), /Appliquer les valeurs au chiffrage1 saisie de « Pièce » : Tab dans la zone de saisie, puis Entrée/);
+    assert.equal(await page.getAttribute('#ai-input', 'placeholder'), 'Appliquer les valeurs au chiffrage (Tab pour l\'écrire, puis Entrée)');
+    assert.equal((await piece()).poids, 1.2, 'nothing applied by the answer');
+    // Tab writes it, Entrée applies it after a confirmation: nothing sent to the AI.
+    const sent = requests.length;
+    await page.focus('#ai-input');
+    await page.keyboard.press('Tab');
+    assert.equal(await page.inputValue('#ai-input'), 'Appliquer les valeurs au chiffrage');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => /Valeurs appliquées au chiffrage/.test(document.getElementById('ai-chat').textContent));
+    assert.match(dialogs.at(-1), /^Appliquer ces valeurs au chiffrage de cet onglet \?\n\n« Pièce » :\n {2}poids pièce : 1,2 kg → 1,35 kg\n\nElles deviennent des saisies de la pièce/);
+    assert.equal(requests.length, sent);
+    assert.match(await page.textContent('#ai-chat .ai-msg:last-child .ai-text'), /^Valeurs appliquées au chiffrage :\n- poids pièce de « Pièce » : 1,2 kg → 1,35 kgAnnuler l'application$/);
+    assert.equal(await page.isVisible('#ai-suggest'), false);
+    const applied = await piece();
+    assert.deepEqual([applied.poids, applied.valeursIA.poids.avant, applied.valeursIA.poids.model], [1.35, 1.2, 'openai/gpt-oss-120b']);
+    // The costing: the weight applied, traced as such.
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage [data-bind="p.poids"]');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.poids"]'), '1.35');
+    assert.match(await page.textContent('#page-chiffrage .cmsg.ok'), /Valeurs proposées par l'IA appliquées à « Pièce » \(page IA \/ analyse\) : poids pièce : 1,2 kg → 1,35 kg/);
+    const trace = await page.evaluate(() => window.reader3d?.costing?.());
+    if (trace) assert.equal(trace.pieces[0].trace['piece.poids'].source.type, 'ia_appliquee');
+    // Undone from the conversation: the weight of before.
+    await page.click('.tab[data-page="ia"]');
+    await page.click('#ai-chat .ai-undo-apply');
+    await page.waitForFunction(() => /Application annulée/.test(document.getElementById('ai-chat').textContent));
+    assert.equal(await page.textContent('#ai-chat .ai-msg:last-child .ai-text'), 'Application annulée :\n- poids pièce de « Pièce » : 1,35 kg → 1,2 kg');
+    const back = await piece();
+    assert.deepEqual([back.poids, back.valeursIA], [1.2, undefined]);
+    assert.equal(await page.locator('#ai-chat .ai-undo-apply').count(), 0);
+    // Kept with the conversation after a reload; undone, nothing suggested again (its last message is not an answer).
+    await page.reload();
+    await page.waitForSelector('#ai-chat .ai-proposals');
+    assert.equal(await page.locator('#ai-chat .ai-proposals').count(), 2);
+    assert.equal(await page.locator('#ai-chat .ai-undo-apply').count(), 0);
+    assert.equal(await page.isVisible('#ai-suggest'), false);
     assert.deepEqual(errors, []);
     await context.close();
   });
@@ -765,8 +956,11 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.click('.tab[data-page="chiffrage"]');
     const text = (selector = '#page-chiffrage') => page.textContent(selector).then((x) => x.replace(/[\u202f\u00a0]/g, ' '));
     const waitText = (re) => page.waitForFunction((source) => new RegExp(source).test(document.getElementById('page-chiffrage').textContent.replace(/[\u202f\u00a0]/g, ' ')), re.source);
-    await page.setInputFiles('#page-chiffrage input[data-file="historique"]', join(dir, 'historique-ia.json'));
-    await waitText(/Historique « historique-ia\.json » importé/);
+    // The history file, imported in Paramètres.
+    await page.click('.tab[data-page="parametres"]');
+    await page.setInputFiles('#page-parametres input[data-file="historique"]', join(dir, 'historique-ia.json'));
+    await page.waitForFunction(() => /Historique « historique-ia\.json » importé/.test(document.getElementById('page-parametres').textContent));
+    await page.click('.tab[data-page="chiffrage"]');
     await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
     await page.waitForSelector('#page-chiffrage .cmsg.ok');
     const typeIn = async (bind, value) => {
@@ -783,7 +977,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // unticked for the gateway until the user ticks it once (remembered).
     assert.match(await text(), /IA de la page IA \/ analyse : passerelle en ligne, noms anonymisés\. Historique : 3 enregistrements, non envoyé\./);
     assert.equal(await page.isChecked('#page-chiffrage [data-pref="cycle-similar"]'), false);
-    assert.match(await text('#chistorique'), /L'historique est gardé dans ce navigateur\. Il n'est envoyé à l'IA que si la case « Envoyer les pièces similaires de l'historique » est cochée/);
+    assert.match(await text('#chistorique'), /gardés dans ce navigateur\. L'historique n'est envoyé à l'IA que si la case « Envoyer les pièces similaires de l'historique » est cochée/);
     await page.check('#page-chiffrage [data-pref="cycle-similar"]');
     await waitText(/Historique : 3 enregistrements, les 3 plus semblables envoyés/);
     assert.deepEqual(await page.evaluate(() => [localStorage.getItem('reader3d.ai.cycleSimilarOnline'), localStorage.getItem('reader3d.ai.cycleSimilar')]), ['1', null]);
@@ -1007,7 +1201,11 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const text = (selector = '#chistorique') => page.textContent(selector).then((x) => x.replace(/[  ]/g, ' '));
     const waitText = (re) => page.waitForFunction((source) => new RegExp(source).test(document.getElementById('chistorique')?.textContent.replace(/[  ]/g, ' ')), re.source);
     const kept = () => page.evaluate(() => Object.keys(JSON.parse(localStorage.getItem('reader3d.chiffrage.banc-essai-ia.v1') ?? '{}').resultats ?? {}).length);
-    await page.setInputFiles('#page-chiffrage input[data-file="historique"]', join(dir, 'historique-banc.json'));
+    // The history file, imported in Paramètres.
+    await page.click('.tab[data-page="parametres"]');
+    await page.setInputFiles('#page-parametres input[data-file="historique"]', join(dir, 'historique-banc.json'));
+    await page.waitForFunction(() => /Historique « historique-banc\.json » importé/.test(document.getElementById('page-parametres').textContent));
+    await page.click('.tab[data-page="chiffrage"]');
     await waitText(/Historique :\s*5 enregistrements/);
     assert.match(await text(), /Pour chaque enregistrement qui a un poids et un module \(4 pièces sur 5\)/);
     assert.match(await text(), /IA de la page IA \/ analyse \(passerelle en ligne, noms anonymisés\)/);

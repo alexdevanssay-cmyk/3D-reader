@@ -88,7 +88,7 @@ export function withQueries({ query, ...data }) {
  * vertex e to vertex e + 1): -1 on a free edge, -2 on an edge shared by more
  * than two triangles. Found with an open-addressing hash of the edges.
  */
-function edgeNeighbours(nv, indices, alloc) {
+export function edgeNeighbours(nv, indices, alloc = (Type, n) => new Type(n)) {
   const nt = indices.length / 3;
   const out = alloc(Int32Array, 3 * nt).fill(-1);
   let size = 16;
@@ -846,7 +846,7 @@ export function engravingMask(positions, indices, values, { floor = 0, maxDepth 
 }
 
 /** Vertex indices merged by position (the faces of a CAD model have their own vertices). */
-function weld(positions, indices) {
+export function weld(positions, indices) {
   const n = positions.length / 3;
   let lo = Infinity, hi = -Infinity;
   for (let i = 0; i < positions.length; i++) {

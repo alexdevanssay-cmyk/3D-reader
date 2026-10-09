@@ -15,12 +15,24 @@
 // Nothing here goes online: the conversations hold the real names of the
 // parts and of the quote (the names are replaced only in what is sent to the
 // gateway). They stay on this PC, and in the folder chosen on the network.
+//
+// The folder on the network: the subfolder "historique-ia" of the shared
+// folder of the company (network-folder.js, chosen in Paramètres or in this
+// page), once one is chosen. A folder chosen in this page before the shared
+// folder existed is still used while there is no shared folder; when one is
+// chosen, the conversations of this PC are written in the new place, and those
+// of the folder of before are copied there (moveLegacyFolder), then that
+// folder is forgotten.
+
+import { SUBFOLDERS, TRIES, chooseSharedFolder, fileNames, notFound, pause, readText, sharedDir, sharedFolder, writeFile } from "./network-folder.js";
+
+export { CHANGED as FOLDER_CHANGED, folderSupported } from "./network-folder.js";
 
 export const HISTORY_SCHEMA = "reader3d-historique-ia";
 export const HISTORY_VERSION = 1;
 const DB_NAME = "reader3d-ai";
 const CONVERSATIONS = "conversations"; // key: id; index "part" on part_id ("" without a part)
-const SETTINGS = "settings"; // key: "network" -> the folder's handle
+const SETTINGS = "settings"; // key: "network" -> the folder chosen in this page before the shared folder
 
 /** A new id for a conversation or a message. */
 export function newId() {
@@ -61,6 +73,23 @@ function cleanMessage(m, id, date) {
   }
   if (Array.isArray(m.numbers)) out.numbers = m.numbers.filter((x) => typeof x === "string");
   if (Array.isArray(m.names)) out.names = m.names.filter((n) => Array.isArray(n) && n.length === 2 && n.every((x) => typeof x === "string"));
+  // Costing: the values the AI proposed for a piece (chiffrage/ai-apply.js), the piece they are for, their application.
+  const value = (v) => (["number", "string", "boolean"].includes(typeof v) ? v : null);
+  if (Array.isArray(m.proposals)) {
+    out.proposals = m.proposals.filter((p) => p && typeof p === "object" && typeof p.cle === "string").slice(0, 20).map((p) => ({
+      cle: p.cle, valeur: value(p.valeur),
+      ...Object.fromEntries(["piece", "cle_piece", "champ", "unite", "source", "justification", "refus", "ilot_mode"].filter((k) => typeof p[k] === "string").map((k) => [k, p[k]])),
+    }));
+  }
+  const t = m.target;
+  if (t && typeof t === "object" && Number.isInteger(t.tab)) out.target = { tab: t.tab, file: text(t.file) };
+  const a = m.application;
+  if (a && typeof a === "object" && typeof a.message === "string") {
+    out.application = {
+      message: a.message, undone: a.undone === true,
+      changes: (Array.isArray(a.changes) ? a.changes : []).filter((x) => x && typeof x.label === "string").map((x) => ({ label: x.label, avant: value(x.avant), apres: value(x.apres), unite: text(x.unite) ?? "" })),
+    };
+  }
   return out;
 }
 
@@ -286,23 +315,6 @@ export function mergePartFile(existing, conversation) {
   };
 }
 
-// A file being written (by this PC or another one): missing or unreadable for a moment.
-const busyFile = (err) => ["NotFoundError", "NotReadableError", "InvalidStateError"].includes(err?.name);
-const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const TRIES = 4;
-
-/** The text of the file `handle`, read again a moment later while it is being written. */
-async function readText(handle) {
-  for (let i = 1; ; i++) {
-    try {
-      return await (await handle.getFile()).text();
-    } catch (err) {
-      if (i >= TRIES || !busyFile(err)) throw err;
-    }
-    await pause(100 * i);
-  }
-}
-
 /**
  * The files of the part `part` in the folder `dir` (of its conversations, and
  * the one of the first version), under any of its names; Chrome's .crswap
@@ -311,12 +323,9 @@ async function readText(handle) {
  */
 async function partFiles(dir, part) {
   const hash = `__${partHash(part).slice(0, 16)}`;
-  const names = [];
-  for await (const entry of dir.values()) {
-    if (entry.kind === "file" && entry.name.endsWith(".json") && (entry.name.endsWith(`${hash}.json`) || entry.name.includes(`${hash}__`))) names.push(entry.name);
-  }
+  const names = await fileNames(dir, (n) => n.endsWith(".json") && (n.endsWith(`${hash}.json`) || n.includes(`${hash}__`)));
   const out = [];
-  for (const n of names.sort()) {
+  for (const n of names) {
     try {
       out.push(await dir.getFileHandle(n));
     } catch (err) {
@@ -325,8 +334,6 @@ async function partFiles(dir, part) {
   }
   return out;
 }
-
-const notFound = (err) => err?.name === "NotFoundError" || err?.name === "TypeMismatchError";
 
 /**
  * A file of the folder read: parsePartFile, or null when empty (created, not
@@ -384,10 +391,10 @@ export async function writePartFile(dir, conversation) {
     const mine = handles.find((h) => h.name.endsWith(suffix)) ?? null;
     const { conversations } = await readPart(dir, conversation.part, mine?.name ?? null);
     const copies = conversations.filter((c) => c.id === conversation.id);
-    const target = mine ?? (await dir.getFileHandle(partFileName(conversation.part, conversation.id), { create: true }));
-    const writable = await target.createWritable();
-    await writable.write(JSON.stringify(mergePartFile(copies.length ? { part: conversation.part, conversations: copies } : null, conversation), null, 1));
-    await writable.close();
+    const name = mine?.name ?? partFileName(conversation.part, conversation.id);
+    // Read back below, tried again here with what the folder holds then: another PC's write meanwhile is merged, never written over.
+    await writeFile(dir, name, JSON.stringify(mergePartFile(copies.length ? { part: conversation.part, conversations: copies } : null, conversation), null, 1), { verify: false, tries: 1 });
+    const target = await dir.getFileHandle(name);
     const back = (await readFile(target, false).catch(() => null))?.conversations.find((c) => c.id === conversation.id);
     if (back && conversation.messages.every((m) => back.messages.some((k) => k.id === m.id))) return true;
     if (attempt >= TRIES) throw new Error("la discussion est écrite en même temps par un autre poste : réessayé plus tard");
@@ -398,9 +405,7 @@ export async function writePartFile(dir, conversation) {
 /** Every conversation of the folder `dir`, the latest first ({...conversation, part}); the files that are not of this history are left. */
 export async function listFolder(dir) {
   const out = [];
-  const names = [];
-  for await (const entry of dir.values()) if (entry.kind === "file" && entry.name.endsWith(".json")) names.push(entry.name);
-  for (const name of names) {
+  for (const name of await fileNames(dir, (n) => n.endsWith(".json"))) {
     try {
       const parsed = parsePartFile(await readText(await dir.getFileHandle(name)));
       if (parsed) out.push(...parsed.conversations);
@@ -411,27 +416,52 @@ export async function listFolder(dir) {
   return mergeAll(out).sort(latestFirst);
 }
 
-/** Whether this browser can open a folder (Chrome, Edge). */
-export const folderSupported = () => typeof globalThis.showDirectoryPicker === "function";
-
-/** The network folder chosen: {handle, name, permission ("granted", "prompt", "denied")}, or null. */
+/**
+ * The folder of the history on the network, or null when none is chosen:
+ * {handle, name, permission ("granted", "prompt", "denied"), shared, legacy, error}.
+ *   shared     -- true: the shared folder of the company (`name`), the
+ *                 conversations in its subfolder "historique-ia"; false: the
+ *                 folder chosen in this page before the shared folder
+ *   handle     -- the access granted: the folder of the conversations; else
+ *                 the folder to ask the access of (grantNetworkFolder)
+ *   legacy     -- with the shared folder: the name of the folder chosen in
+ *                 this page before, its conversations still to copy (moveLegacyFolder)
+ *   error      -- the shared folder granted but not reachable (permission "prompt" then)
+ */
 export async function networkFolder() {
-  const handle = await setting("network").catch(() => null);
-  if (!handle) return null;
+  const legacy = await setting("network").catch(() => null);
+  const shared = await sharedFolder();
+  if (shared) {
+    const out = { handle: shared.handle, name: shared.name, permission: shared.permission, shared: true, legacy: legacy?.name ?? null, error: null };
+    if (shared.permission !== "granted") return out;
+    try {
+      const dir = await sharedDir(SUBFOLDERS.ia);
+      return dir ? { ...out, handle: dir } : { ...out, permission: "prompt" };
+    } catch (err) {
+      return { ...out, permission: "prompt", error: err?.message || String(err) };
+    }
+  }
+  if (!legacy) return null;
   let permission = "prompt";
   try {
-    permission = await handle.queryPermission({ mode: "readwrite" });
+    permission = await legacy.queryPermission({ mode: "readwrite" });
   } catch {
     // an older handle: asked again
   }
-  return { handle, name: handle.name, permission };
+  return { handle: legacy, name: legacy.name, permission, shared: false, legacy: null, error: null };
 }
 
-/** Ask the folder (a click of the user): the network folder from now on. */
+/**
+ * Ask the folder (a click of the user): the shared folder of the company from
+ * now on (network-folder.js), also chosen in Paramètres. Resolves to the folder
+ * of the conversations in it, those of the folder of before copied there.
+ */
 export async function chooseNetworkFolder() {
-  const handle = await globalThis.showDirectoryPicker({ id: "reader3d-historique-ia", mode: "readwrite" });
-  await setSetting("network", handle);
-  return handle;
+  await chooseSharedFolder();
+  const dir = await sharedDir(SUBFOLDERS.ia);
+  if (!dir) throw new Error("accès au dossier refusé");
+  await moveLegacyFolder(dir).catch(() => null);
+  return dir;
 }
 
 /** Ask again for the folder kept (a click of the user: the browser asks after a restart). */
@@ -441,6 +471,52 @@ export async function grantNetworkFolder(handle) {
 
 export async function forgetNetworkFolder() {
   await setSetting("network", null);
+}
+
+/**
+ * The conversations of the folder chosen in this page before the shared
+ * folder, copied into `dir` (the subfolder "historique-ia" of the shared
+ * folder), each one merged with its copy there; then that folder forgotten.
+ * Done when its access is granted (`ask`: asked for, on a click), else left
+ * for later. Resolves to {copied, failed}, or null (none, or not readable now).
+ */
+export async function moveLegacyFolder(dir, { ask = false } = {}) {
+  const legacy = await setting("network").catch(() => null);
+  if (!legacy || !dir) return null;
+  let permission = await legacy.queryPermission({ mode: "readwrite" }).catch(() => "prompt");
+  if (permission !== "granted" && ask) permission = await legacy.requestPermission({ mode: "readwrite" }).catch(() => "denied");
+  if (permission !== "granted") return null;
+  let copied = 0;
+  let failed = 0;
+  if (!(await legacy.isSameEntry(dir).catch(() => false))) {
+    for (const conversation of await listFolder(legacy)) {
+      try {
+        if (await writePartFile(dir, conversation)) copied++;
+      } catch {
+        failed++;
+      }
+    }
+  }
+  if (!failed) await setSetting("network", null);
+  return { copied, failed };
+}
+
+/**
+ * The shared folder just chosen in Paramètres: the conversations of this PC
+ * about a part written in its subfolder "historique-ia" — all of them when a
+ * folder was used before (they were on the network already), else those of
+ * before only when `ask(count)` says so, as when the folder is chosen in the
+ * IA page — and those of the folder of before copied there. Resolves to
+ * {written, failed, moved}, or null without the access to the folder.
+ */
+export async function adoptSharedFolder({ ask = () => true } = {}) {
+  const dir = await sharedDir(SUBFOLDERS.ia);
+  if (!dir) return null;
+  const legacy = await setting("network").catch(() => null);
+  const moved = await moveLegacyFolder(dir).catch(() => null);
+  const before = legacy ? 0 : (await listLocal()).filter((c) => partHash(c.part)).length;
+  const all = !before || ask(before);
+  return { ...(await syncFolder(dir, { all, force: true })), moved };
 }
 
 /**

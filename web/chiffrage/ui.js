@@ -4,8 +4,7 @@
 
 import { MODES, readCostingWorkbook, readIndicesWorkbook } from "./workbook.js";
 import { centreRates, indexAverage, quote, saleMetalPrice, solveMargin as minimumMargin } from "./model.js";
-import { bestRoutes, buildRoute, rankRoutes } from "./routes.js";
-import { estimateTooling } from "./tooling.js";
+import { bestRoutes, buildRoute, cavityChoices, rankRoutes } from "./routes.js";
 import { coreBoxCost, coresPerPiece, newCore } from "./cores.js";
 import { filledFields, orderValues, programmeFor, programmeOf, readSeriesOrder, sameProgramme } from "./rfq.js";
 import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, demandeComparee, label as traceLabel, pieceNames, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
@@ -16,6 +15,9 @@ import {
 import { DEFAULT_INTERVAL_S, backtestCsv, backtestItems, backtestReading, backtestRows, fingerprint, leaveOneOut, resultOf, runBacktest, summarizeBacktest } from "./backtest.js";
 import { addressSpace, askJSON, numbersLabel, savedAI } from "../ai-workspace.js";
 import * as store from "./store.js";
+import { PROPOSAL_FIELDS, sameValue, valueLabel } from "./ai-apply.js";
+import * as network from "../network-folder.js";
+import { forgetRead, pendingCount, syncFeedback, writeFeedback } from "./feedback.js";
 
 let el = null;
 let page = "chiffrage";
@@ -64,6 +66,10 @@ export function mount(targets) {
   document.addEventListener("reader3d-part", () => {
     if (!el.chiffrage.hidden) render();
   });
+  // The shared folder chosen or granted in the IA page: checked again, its retours d'expérience read.
+  document.addEventListener(network.CHANGED, () => {
+    if (!el.chiffrage.hidden || !el.parametres.hidden) refreshNetwork();
+  });
   return { show, setTab, forgetTab };
 }
 
@@ -98,6 +104,7 @@ export function reload() {
 export function show(name) {
   page = name;
   render();
+  refreshNetwork(); // the retours d'expérience of the other PCs, in the background
 }
 
 /** The tab `id` of the 3D page is shown: its own quote (the settings and the workbooks are shared). */
@@ -123,6 +130,236 @@ export function addAIAnalysis(entry, { tab = store.currentQuoteTab() } = {}) {
     q.analysesIA = [...(q.analysesIA ?? []), entry];
     store.saveQuote(q);
   } else store.appendToQuote(tab, "analysesIA", entry);
+}
+
+/**
+ * The quote of the tab `tab` of the 3D page, for a change asked by the IA
+ * page: the one of the Chiffrage page when it shows that tab (in memory),
+ * else read again from this browser's storage with the data files and the
+ * settings (as costingSnapshot: the storage may have changed since, an
+ * answer of the AI kept there). An error (French) otherwise.
+ */
+function quoteOfTab(tab) {
+  if (el) {
+    if (tab !== store.currentQuoteTab()) return "Le chiffrage affiché est celui d'un autre onglet : revenez à l'onglet de la pièce, puis réessayez.";
+  } else {
+    store.setQuoteTab(tab);
+    base = store.loadBase();
+    indices = store.loadIndices();
+    layers = store.loadSettingsLayers(base);
+    settings = layers.effective;
+    q = store.loadQuote(base, indices);
+  }
+  return base ? null : "Aucun classeur de chiffrage importé : importez-le dans la page Chiffrage.";
+}
+
+// The inputs of the casting route of a piece: they are for its island (the island select resets them).
+const ROUTE_FIELDS = ["cycle", "empreintes", "miseAuMille", "mode"];
+const changeText = (x) => `${x.label} : ${valueLabel(x.avant, x.unite)} → ${valueLabel(x.apres, x.unite)}`;
+
+/**
+ * Values proposed by the AI for one piece (task "Chiffrage" of the IA page,
+ * ai-apply.js readProposals and checkProposals), applied once a person accepts
+ * them: written as the inputs of that piece ("saisie"), only where they differ
+ * from its values now, each kept with what was there before
+ * (q.pieces[key].valeursIA, undoAIValues; traced "proposition IA appliquée").
+ * A value of the casting route (cycle, cavities, mise au mille, mode) is for
+ * its island: it imposes the island of the route, as the casting card does;
+ * another island proposed (and accepted) resets the route's values typed for
+ * the island before. Values proposed with an island refused are refused with
+ * it. Never a price, a rate, a setting nor a value of the whole quote: only the
+ * keys of PROPOSAL_FIELDS. dryRun: nothing changed, what would be. The quote
+ * is saved; the Chiffrage page shows it recomputed with a message when it is
+ * next shown.
+ *   target: {tab, file (the 3D file of the question; null: none), key (the piece, ui.js piecesOf)}
+ *   proposals: [{cle, valeur, ilot_mode}] (those not refused)
+ *   origin: {date, provider, model, message (id of the answer)}
+ * Returns {piece (its name), applied: [{cle, champ, label, avant, apres, unite}],
+ * consequences (the island imposed, the values reset, in the same form), same,
+ * refused: [{cle, label, valeur, refus}], saved}, or {error}.
+ */
+export function applyAIValues(target, proposals, origin = {}, { dryRun = false } = {}) {
+  const error = quoteOfTab(target.tab);
+  if (error) return { error };
+  if ((window.reader3d?.part?.()?.file ?? null) !== (target.file ?? null)) return { error: "Le modèle 3D de l'onglet a changé depuis la réponse : reposez la question." };
+  const [quoteShown, keyShown] = [q, currentKey];
+  if (dryRun) q = structuredClone(q);
+  try {
+    const c = compute({ save: !dryRun });
+    const r = c?.results.find((x) => x.piece.key === target.key);
+    if (!r) return { error: "Cette pièce n'est plus chiffrée : cochez son corps dans la liste de la page Analyse 3D, puis réessayez." };
+    const name = pieceNames(c.results.map((x) => x.piece)).get(r.piece);
+    const i = r.inputs;
+    const code = r.route?.process ?? null;
+    const refused = [];
+    const refuse = (p, refus) => refused.push({ cle: p.cle, label: PROPOSAL_FIELDS[p.cle]?.label ?? p.cle, valeur: p.valeur, refus });
+    // The island first: the one proposed when the workbook and the settings have it, else the one of the route.
+    const ilot = proposals.find((p) => p.cle === "piece.ilot");
+    const ilotOk = !!ilot && Object.hasOwn(settings.processes, ilot.valeur) && c.rates.has(ilot.valeur);
+    if (ilot && !ilotOk) refuse(ilot, `îlot « ${ilot.valeur} » absent du classeur ou de Paramètres`);
+    const island = ilotOk ? ilot.valeur : code;
+    const newIsland = ilotOk && island !== code;
+    const wanted = [];
+    for (const p of proposals) {
+      if (p === ilot) {
+        if (ilotOk) wanted.push({ p, spec: PROPOSAL_FIELDS[p.cle] });
+        continue;
+      }
+      const spec = PROPOSAL_FIELDS[p.cle];
+      const v = p.valeur;
+      // The codes, against the workbook and the settings of now; the values of a route, for the island accepted.
+      if (!spec) refuse(p, "valeur que l'IA ne peut pas proposer");
+      else if (ilot && !ilotOk && (spec.ilot || spec.type === "finition")) refuse(p, "proposée avec un îlot refusé");
+      else if (spec.type === "finition" && !settings.processes[island]?.finitions?.includes(v)) refuse(p, `finition « ${v} » inconnue de l'îlot ${island ?? "retenu"}`);
+      else if (spec.type === "mode" && !MODES.includes(v)) refuse(p, `fonctionnement « ${v} » inconnu (${MODES.join(", ")})`);
+      else if (spec.type === "mode" && p.ilot_mode && p.ilot_mode !== island) refuse(p, `fonctionnement proposé pour ${p.ilot_mode}, l'îlot retenu est ${island ?? "inconnu"}`);
+      else if (spec.type === "tth" && v !== "none" && !Object.hasOwn(settings.tth ?? {}, v)) refuse(p, `traitement thermique « ${v} » absent de Paramètres`);
+      else if (spec.type === "complexite" && !Object.hasOwn(settings.tooling?.etude ?? {}, v)) refuse(p, `complexité « ${v} » inconnue`);
+      else if (spec.ilot && !island) refuse(p, "aucun îlot retenu pour cette pièce");
+      else wanted.push({ p, spec });
+    }
+    // The value of each input now: the one the costing uses (traced), else the one of the inputs or the settings.
+    const tool = r.route?.tooling;
+    const now = {
+      poids: r.trace?.["piece.poids"]?.valeur, toileMini: r.trace?.["piece.toileMini"]?.valeur, epaisseurMax: r.trace?.["piece.epaisseurMax"]?.valeur,
+      moduleMm: r.trace?.["piece.module"]?.valeur, dimMax: r.trace?.["piece.dimMax"]?.valeur,
+      procede: code, finition: r.route?.finition ?? null,
+      miseAuMille: r.trace?.["piece.miseAuMille"]?.valeur, empreintes: r.trace?.["piece.empreintes"]?.valeur, cycle: r.trace?.["piece.cycle"]?.valeur,
+      mode: r.trace?.[`centre.${code}.mode`]?.valeur ?? (r.chosen ? i.mode : null) ?? settings.modes?.[code] ?? null,
+      tth: i.tth, tthMode: i.tthMode, noyaux: !!i.noyaux, tribo: !!i.tribo, redressage: !!i.redressage,
+      outillageTiroirs: tool?.tiroirs ?? i.outillageTiroirs ?? settings.tooling?.tiroirs ?? 0,
+      outillageComplexite: tool?.complexite ?? i.outillageComplexite ?? settings.tooling?.complexite ?? null,
+    };
+    const same = [];
+    const changes = [];
+    for (const { p, spec } of wanted) {
+      // On another island, the values of its route (its finishing too) are new: compared with nothing.
+      const before = newIsland && (spec.ilot || spec.type === "finition") ? null : now[spec.champ] ?? null;
+      const x = { cle: p.cle, champ: spec.champ, label: spec.label, unite: spec.unite ?? "" };
+      if (before !== null && sameValue(p.valeur, before)) same.push({ ...x, valeur: p.valeur });
+      else changes.push({ ...x, avant: before, apres: p.valeur });
+    }
+    // What the changes bring with them: the island imposed for a value of its route (as "Retenir" does), its
+    // finishing; the values of the route typed before, for another island or unused while it was automatic, reset.
+    const imposing = !newIsland && !r.chosen && changes.some((x) => PROPOSAL_FIELDS[x.cle].ilot);
+    const islandSet = newIsland || imposing;
+    const proposed = new Set(changes.map((x) => x.champ));
+    const finitionProposed = wanted.find((w) => w.spec.type === "finition")?.p.valeur ?? null;
+    const consequences = [];
+    if (imposing) consequences.push({ cle: "piece.ilot", champ: "procede", label: "procédé / îlot", avant: "automatique", apres: `${island} imposé`, unite: "" });
+    if (islandSet && finitionProposed === null) consequences.push({ cle: "piece.finition", champ: "finition", label: "finition", avant: now.finition, apres: newIsland ? "automatique" : `${r.route.finition} imposée`, unite: "" });
+    if (islandSet) for (const champ of ROUTE_FIELDS) if ((i[champ] ?? null) !== null && !proposed.has(champ)) consequences.push({ cle: "piece.ilot", champ, label: Object.values(PROPOSAL_FIELDS).find((f) => f.champ === champ).label, avant: i[champ], apres: null, unite: Object.values(PROPOSAL_FIELDS).find((f) => f.champ === champ).unite ?? "" });
+    const out = { piece: name, key: r.piece.key, applied: changes, consequences, same, refused };
+    if (dryRun || !changes.length) return out;
+
+    // Written: the inputs of the piece, each with what was there before; a second application keeps what was there
+    // before the first, for a value of a route only on the same island.
+    const piece = pieceStore(r.piece.key);
+    const record = (piece.valeursIA ??= {});
+    const date = origin.date ?? new Date().toISOString();
+    const procede = islandSet ? island : piece.procede ?? "auto";
+    const write = (champ, valeur, cle, extra = {}) => {
+      const was = record[champ];
+      // Not from a value reset by another island: what was there before was for that one.
+      const keep = was && sameValue(piece[champ] ?? null, was.valeur) && (!["procede", "finition", ...ROUTE_FIELDS].includes(champ) || (was.procede === procede && was.cle !== "piece.ilot"));
+      record[champ] = { valeur, avant: keep ? was.avant : piece[champ] ?? null, procede, date, provider: origin.provider ?? null, model: origin.model ?? null, message: origin.message ?? null, cle, ...extra };
+      piece[champ] = valeur;
+    };
+    if (islandSet) {
+      write("procede", island, "piece.ilot");
+      write("finition", finitionProposed ?? (newIsland ? "auto" : r.route.finition), "piece.finition");
+      for (const champ of ROUTE_FIELDS) if ((piece[champ] ?? null) !== null && !proposed.has(champ)) write(champ, null, "piece.ilot");
+    }
+    for (const x of changes) {
+      if (islandSet && ["procede", "finition"].includes(x.champ)) continue;
+      // An adopted estimate of the cycle replaced: kept with the record, back with an undo.
+      write(x.champ, x.apres, x.cle, x.champ === "cycle" && piece.cycleIA ? { cycleIA: piece.cycleIA } : {});
+    }
+    // Cores checked by this application: a first core to describe, as the casting card does (taken back with an undo).
+    if (changes.some((x) => x.champ === "noyaux" && x.apres === true) && !piece.cores?.length) {
+      piece.cores = [{ ...newCore(0, r.part.poids ?? 0), ...(piece.sableKg > 0 ? { masse: piece.sableKg } : {}) }];
+      record.noyaux.cores = structuredClone(piece.cores);
+    }
+    forgetAdoption(piece);
+    const list = [...changes, ...consequences].map(changeText).join(" ; ");
+    q.analysesIA = [...(q.analysesIA ?? []), { date, provider: origin.provider ?? null, model: origin.model ?? null, question: "Appliquer les valeurs au chiffrage", answer: `Appliqué à « ${name} » : ${list}.`, verified: true, tache: "application_ia" }];
+    out.saved = store.saveQuote(q) !== false;
+    message = { kind: "ok", text: `Valeurs proposées par l'IA appliquées à « ${name} » (page IA / analyse) : ${list}. Elles sont saisies dans le devis ; « Annuler l'application » dans la page IA les retire.` };
+    if (el && !el.chiffrage.hidden) render();
+    return out;
+  } finally {
+    if (dryRun) q = quoteShown;
+    currentKey = keyShown;
+  }
+}
+
+/**
+ * The values applied from the AI to one piece (applyAIValues) taken back:
+ * those of the answer `message` (all of them without one) that are still as
+ * applied come back to what was there before; one changed since by a person
+ * is left. The island comes back only with the values of its route: when one
+ * of them changed since (typed, an estimate adopted), the island and its
+ * route stay as they are. Returns {piece, undone: [{champ, label, avant, apres}], kept: [labels], saved}, or {error}.
+ */
+export function undoAIValues(target, { message: answer = null } = {}) {
+  const error = quoteOfTab(target.tab);
+  if (error) return { error };
+  const piece = q.pieces?.[target.key];
+  const record = piece?.valeursIA;
+  const entries = Object.entries(record ?? {}).filter(([, a]) => !answer || a.message === answer);
+  if (!entries.length) return { error: "Aucune valeur appliquée depuis l'IA à annuler pour cette pièce." };
+  const fieldOf = (champ) => Object.values(PROPOSAL_FIELDS).find((f) => f.champ === champ);
+  const json = (v) => JSON.stringify(v ?? null);
+  const islandBack = entries.some(([champ]) => champ === "procede");
+  const routeChanged = islandBack && (ROUTE_FIELDS.some((c) => (record[c] ? !sameValue(piece[c] ?? null, record[c].valeur) : (piece[c] ?? null) !== null))
+    || (!!piece.cycleIA && json(piece.cycleIA) !== json(record.cycle?.cycleIA)));
+  const procede = piece.procede ?? "auto";
+  const undone = [];
+  const kept = [];
+  for (const [champ, a] of entries) {
+    const label = fieldOf(champ)?.label ?? champ;
+    delete record[champ];
+    // A value of a route applied for an island the piece is no longer on (another island chosen since): left.
+    const moved = ["finition", ...ROUTE_FIELDS].includes(champ) && a.procede !== undefined && procede !== a.procede;
+    if (moved || (routeChanged && ["procede", "finition", ...ROUTE_FIELDS].includes(champ))) {
+      kept.push(label);
+      continue;
+    }
+    if (!sameValue(piece[champ] ?? null, a.valeur)) {
+      kept.push(label);
+      continue;
+    }
+    // Nothing there before: the input of the piece by default again (from the 3D model, estimated, "auto").
+    if (a.avant === null) delete piece[champ];
+    else piece[champ] = a.avant;
+    if (champ === "cycle" && a.cycleIA) piece.cycleIA = a.cycleIA;
+    if (champ === "noyaux" && a.cores && json(piece.cores) === json(a.cores)) delete piece.cores;
+    undone.push({ champ, label, avant: a.valeur, apres: a.avant, unite: fieldOf(champ)?.unite ?? "" });
+  }
+  if (!Object.keys(record).length) delete piece.valeursIA;
+  forgetAdoption(piece);
+  const name = target.name ?? target.key;
+  const list = undone.map(changeText).join(" ; ");
+  q.analysesIA = [...(q.analysesIA ?? []), { date: new Date().toISOString(), provider: null, model: null, question: "Annuler l'application des valeurs de l'IA", answer: `Annulé pour « ${name} » : ${list || "aucune valeur (modifiées depuis)"}.`, verified: true, tache: "application_ia" }];
+  const saved = store.saveQuote(q) !== false;
+  message = { kind: "ok", text: `Application des valeurs de l'IA annulée pour « ${name} »${list ? ` : ${list}` : ""}.${kept.length ? ` Modifiées depuis, gardées : ${kept.join(", ")}.` : ""}` };
+  if (el && !el.chiffrage.hidden) render();
+  return { piece: name, undone, kept, saved };
+}
+
+/**
+ * The values applied from the AI to a piece (`piece`: its inputs saved)
+ * forgotten once a person changed them; those of a casting route also once
+ * the piece is on another island than the one they were applied for.
+ */
+function forgetAIValues(piece) {
+  const record = piece.valeursIA;
+  if (!record) return;
+  for (const [champ, a] of Object.entries(record)) {
+    const moved = ["finition", ...ROUTE_FIELDS].includes(champ) && a.procede !== undefined && (piece.procede ?? "auto") !== a.procede;
+    if (moved || !sameValue(piece[champ] ?? null, a.valeur)) delete record[champ];
+  }
+  if (!Object.keys(record).length) delete piece.valeursIA;
 }
 
 // --------------------------------------------------------------------------- formatting
@@ -265,6 +502,7 @@ function onChange(event) {
       piece.cores = [{ ...newCore(0, poids), ...(piece.sableKg > 0 ? { masse: piece.sableKg } : {}) }];
     }
     forgetAdoption(piece);
+    forgetAIValues(piece);
     store.saveQuote(q);
   } else {
     // Paramètres: only the typed values are kept (store.js); an emptied field
@@ -281,6 +519,8 @@ async function onClick(event) {
   if (!button) return;
   const action = button.dataset.action;
   if (action === "import-workbook" || action === "import-indices" || action === "import-tendances" || action === "import-rfq" || action === "import-historique") button.parentElement.querySelector("input[data-file]")?.click();
+  else if (action === "show-parametres") document.querySelector('.tab[data-page="parametres"]')?.click();
+  else if (action.startsWith("network-")) networkAction(action);
   else if (action === "thickness") {
     thicknessBusy = true;
     render();
@@ -296,7 +536,11 @@ async function onClick(event) {
     piece.finition = action === "auto" ? "auto" : button.dataset.finition;
     piece.cycle = piece.empreintes = piece.miseAuMille = piece.mode = null;
     forgetAdoption(piece);
+    forgetAIValues(piece);
     store.saveQuote(q);
+    render();
+  } else if (action === "cavities" || action === "cavities-auto") {
+    retainCavities(action === "cavities" ? Number(button.dataset.n) : null);
     render();
   } else if (action === "piece") {
     const index = Number(button.dataset.index);
@@ -436,8 +680,10 @@ async function onClick(event) {
     download("historique_cycles.json", new Blob([JSON.stringify(exportHistory(store.loadHistorique()), null, 2)], { type: "application/json" }));
   } else if (action === "clear-historique") {
     const n = countHistory(store.loadHistorique());
-    if (!n.total || !confirm(`Effacer l'historique des temps de cycle (${plural(n.total, "enregistrement")}, dont ${n.production} temps mesuré${n.production > 1 ? "s" : ""} en production) ?\n\nIl n'est gardé que dans ce navigateur : exportez-le d'abord pour le conserver. Le chiffrage et les paramètres ne changent pas.`)) return;
+    const shared = netFolder && !["none", "unsupported"].includes(netFolder.state) ? " Les retours d'expérience du dossier réseau partagé y restent : ils reviennent à sa prochaine lecture." : "";
+    if (!n.total || !confirm(`Effacer l'historique des temps de cycle (${plural(n.total, "enregistrement")}, dont ${n.production} temps mesuré${n.production > 1 ? "s" : ""} en production) ?\n\nIl n'est gardé que dans ce navigateur : exportez-le d'abord pour le conserver. Le chiffrage et les paramètres ne changent pas.${shared}`)) return;
     store.saveHistorique([]);
+    forgetRead();
     message = { kind: "ok", text: "Historique des temps de cycle effacé." };
     render();
   } else if (action === "export-xlsx") {
@@ -750,9 +996,14 @@ function traceContext(p3d) {
   return { q, base, indices, layers, settings, seuil, p3dFile: p3d?.file ?? null };
 }
 
-/** Quote of one piece: its features, the routes, the retained route and its costing; and their trace (out.trace). */
-function computePiece(piece, { density, years, volumes, volumeTotal, metal, energy, rates, trace }, ctx) {
-  const inputs = pieceInputs(piece.key);
+/**
+ * Quote of one piece: its features, the routes, the retained route and its
+ * costing; and their trace (out.trace). `override`: inputs of the piece in
+ * place of those saved, with the island and the finishing (a variant compared
+ * in the page, nothing saved).
+ */
+function computePiece(piece, { density, years, volumes, volumeTotal, metal, energy, rates, trace }, ctx, override = null) {
+  const inputs = { ...pieceInputs(piece.key), ...override };
   const auto = {
     poids: piece.volume ? (piece.volume / 1e6) * density : null,
     toileMini: piece.thickness?.min ?? null,
@@ -803,10 +1054,11 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
     tthCoef: settings.tth[inputs.tth]?.coef ?? 1,
   };
   const out = { piece, inputs, auto, part, density };
-  const traced = () => ((out.trace = tracePiece(out, ctx, trace)), out);
+  // A variant has its island and finishing given: neither ranked nor traced.
+  const traced = () => (override ? out : ((out.trace = tracePiece(out, ctx, trace)), out));
   if (!(part.poids > 0)) return traced();
 
-  const ranked = rankRoutes(rates, base.lists, part, settings, quoteBase);
+  const ranked = override ? [] : rankRoutes(rates, base.lists, part, settings, quoteBase);
   const best = bestRoutes(ranked, 3);
   out.ranked = ranked;
   out.best = best;
@@ -821,20 +1073,15 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
       ? inputs.finition
       : ranked.find((r) => r.process === code && r.feasible)?.finition ?? ranked.find((r) => r.process === code)?.finition ?? process.finitions[0];
   const finalRates = chosen && inputs.mode ? centreRates(base, { modes: { ...settings.modes, [code]: inputs.mode }, energy }) : rates;
-  const route = buildRoute(code, finition, part, settings, finalRates);
-  out.estimated = { cycle: route.cycle, parCycle: route.parCycle, miseAuMille: route.miseAuMille, miseAuMilleDetail: route.miseAuMilleDetail };
+  // The cavities typed in: the cycle estimated for their cluster, the tool priced for them (routes.js).
+  const route = buildRoute(code, finition, part, settings, finalRates, chosen && inputs.empreintes > 0 ? { empreintes: inputs.empreintes } : {});
+  out.estimated = { cycle: route.cycle, parCycle: route.parCycleEstime, miseAuMille: route.miseAuMille, miseAuMilleDetail: route.miseAuMilleDetail };
   if (chosen) {
     const casting = route.operations.find((o) => o.code === code);
     if (inputs.miseAuMille > 0) route.miseAuMille = inputs.miseAuMille;
-    if (inputs.empreintes > 0) casting.parCycle = inputs.empreintes;
     if (inputs.cycle > 0) casting.cycle = inputs.cycle;
   }
-  // The in-house die for the number of cavities retained; or the price typed in.
-  const cavities = route.operations.find((o) => o.code === code)?.parCycle;
-  if (route.tooling && cavities !== route.tooling.cavities) {
-    route.tooling = estimateTooling(part, cavities, settings.tooling);
-    route.outillage = route.tooling.total;
-  }
+  // The tool estimated for the cavities retained; or the price typed in.
   route.outillageEstime = route.outillage;
   if (inputs.outillagePrix > 0) route.outillage = inputs.outillagePrix;
   // Core boxes of the cores of the piece, added to the tooling.
@@ -919,7 +1166,8 @@ function deepFreeze(o) {
  * each piece costed, its three best routes with their reasons, the alerts,
  * and the data files with their dates. A deep-frozen copy, computed on a copy
  * of the quote: nothing is saved and nothing in it leads back to the quote
- * or the settings (the AI explains, it never sets a value). Works without the
+ * or the settings (the AI explains; the values it proposes are applied by
+ * applyAIValues once a person accepts them). Works without the
  * costing page having been opened: the data files, the settings and the quote
  * of the tab `tab` of the 3D page are then read from this browser's storage.
  * null without a costing workbook.
@@ -971,7 +1219,8 @@ export function costingSnapshot({ tab } = {}) {
   const t = layers.tendances;
   return deepFreeze(structuredClone({
     devis: { ensemble: c.selected === "ensemble", trace: c.trace ?? {} },
-    pieces: c.results.map((r) => ({ nom: name.get(r.piece), chiffree: !!r.final, trace: r.trace ?? {}, routes: routes(r) })),
+    // cle: the key of the piece in the quote (never sent: ai-trace.js picks the fields), for the values the AI proposes for it.
+    pieces: c.results.map((r) => ({ nom: name.get(r.piece), cle: r.piece.key, chiffree: !!r.final, trace: r.trace ?? {}, routes: routes(r) })),
     alertes: sum.alertes,
     resume: { valeurs: sum.valeurs, a_valider: sum.aValider, alertes: sum.alertes.length },
     fichiers: {
@@ -1142,6 +1391,7 @@ function renderQuote() {
     ${ensemble ? "" : toolingCard(r)}
   </div>
 
+  ${ensemble ? "" : cavitiesCard(c, r)}
   ${ensemble ? "" : cycleCard(r)}
   ${!ensemble && r?.inputs.noyaux ? coresFields(r) : ""}
   ${ensemble ? ensembleCard(c) : solutionsCard(r)}
@@ -1227,6 +1477,9 @@ function coresFields(r) {
     <p class="small muted">Par pièce : ${nf(per.sable, 3)} kg de sable, noyautage ${nf(per.cycle, 0)} s (centre ASN). Boîte vide = estimée d'après la masse du noyau (sable ${nf(sc.sableDensite, 2)} kg/dm³ + ${nf(sc.paroi, 0)} mm de paroi). Prix des boîtes : méthode de l'onglet « 4- Outillage » (BAN) de la demande client, ajoutés à l'outillage (taux et heures dans Paramètres).</p></section>`;
 }
 
+// Under a menu left on "Automatique": the solution it gives, in the colour of the values.
+const auto = (text) => `<span class="cauto">${esc(text)}</span>`;
+
 function castingCard(r) {
   const casting = Object.keys(settings.processes).filter((code) => base.centres.some((x) => x.code === code));
   const i = r.inputs;
@@ -1235,8 +1488,11 @@ function castingCard(r) {
   const locked = i.procede === "auto";
   const cycleOptions = [[" ", `Estimé${e ? ` (${nf(e.cycle, 0)} s)` : ""}`], ...[20, 30, 45, 60, 75, 90, 120, 150, 180, 240, 300, 360, 420, 480, 600, 900].map((v) => [v, `${v} s`])];
   if (i.cycle > 0 && !cycleOptions.some(([v]) => Number(v) === i.cycle)) cycleOptions.push([i.cycle, `${i.cycle} s`]);
-  const empreintesOptions = [[" ", `Estimé${e ? ` (${e.parCycle})` : ""}`], ...[1, 2, 3, 4, 5, 6, 8].map((n) => [n, String(n)])];
+  const empreintesOptions = [[" ", `Estimé${e ? ` (${e.parCycle})` : ""}`], ...[...new Set([1, 2, 3, 4, 5, 6, 8, ...(i.empreintes > 0 ? [i.empreintes] : [])])].sort((a, b) => a - b).map((n) => [n, String(n)])];
+  const op = r.route?.operations.find((o) => o.code === routeCode);
   const mamOptions = [[" ", `Estimée${e ? ` (${nf(e.miseAuMille, 2)})` : ""}`], ...[1.1, 1.2, 1.25, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 2, 2.2, 2.5].map((n) => [n, nf(n, 2)])];
+  // A value outside the list (applied from the AI, saved by another version): shown, not replaced by the first option.
+  if (i.miseAuMille > 0 && !mamOptions.some(([v]) => Number(v) === i.miseAuMille)) mamOptions.push([i.miseAuMille, nf(i.miseAuMille, 2)]);
   const mam = e?.miseAuMilleDetail;
   const mamDetail = mam
     ? `<details class="small"><summary>Estimation de la mise au mille : ${nf(mam.value, 2)} (rendement ${pct(mam.rendement, 0)})</summary>
@@ -1246,11 +1502,11 @@ function castingCard(r) {
   return `<section class="ccard">
       <h3>Paramètres de coulée — ${esc(r.piece.name)}</h3>
       <div class="cfields">
-        ${field("Procédé / îlot", select("p.procede", i.procede, [["auto", "Automatique (meilleure solution)"], ...casting.map((code) => [code, `${code} — ${settings.processes[code].famille}`])]))}
-        ${field("Finition", select("p.finition", i.finition, [["auto", "Automatique"], ...(routeCode ? settings.processes[routeCode].finitions.map((f) => [f, `${f} — ${settings.operations[f]?.label ?? f}`]) : [])]))}
+        ${field("Procédé / îlot", select("p.procede", i.procede, [["auto", "Automatique (meilleure solution)"], ...casting.map((code) => [code, `${code} — ${settings.processes[code].famille}`])]), locked ? auto(routeCode ? `${routeCode} — ${settings.processes[routeCode]?.famille ?? ""}` : "aucun îlot faisable") : "")}
+        ${field("Finition", select("p.finition", i.finition, [["auto", "Automatique"], ...(routeCode ? settings.processes[routeCode].finitions.map((f) => [f, `${f} — ${settings.operations[f]?.label ?? f}`]) : [])]), i.finition === "auto" && r.route?.finition ? auto(`${r.route.finition} — ${settings.operations[r.route.finition]?.label ?? r.route.finition}`) : "")}
         ${field("Fonctionnement", locked ? `<output>${esc(r.finalRates?.get(routeCode)?.mode ?? "—")}</output>` : select("p.mode", i.mode ?? "", [["", `Paramètre (${esc(settings.modes[routeCode] ?? base.centres.find((x) => x.code === routeCode)?.defaultMode ?? "")})`], ...MODES.map((m) => [m, m])], { kind: "nullraw" }), locked ? "choisissez un îlot pour le modifier" : "")}
-        ${field("Temps de cycle", locked ? `<output>${e ? `${nf(e.cycle, 0)} s (estimé)` : "—"}</output>` : select("p.cycle", i.cycle ?? " ", cycleOptions, { kind: "num" }))}
-        ${field("Empreintes / pièces par cycle", locked ? `<output>${e?.parCycle ?? "—"}</output>` : select("p.empreintes", i.empreintes ?? " ", empreintesOptions, { kind: "num" }))}
+        ${field("Temps de cycle", locked ? `<output>${e ? `${nf(e.cycle, 0)} s (estimé)` : "—"}</output>` : select("p.cycle", i.cycle ?? " ", cycleOptions, { kind: "num" }), op?.parCycle > 1 ? `soit ${sec(op.cycle / op.parCycle)} par pièce` : "")}
+        ${field("Empreintes / pièces par cycle", locked ? `<output>${e?.parCycle ?? "—"}</output>` : select("p.empreintes", i.empreintes ?? " ", empreintesOptions, { kind: "num" }), locked && routeCode ? "à comparer dans « Empreintes par coulée »" : "")}
         ${field("Mise au mille (kg coulé / kg pièce)", locked ? `<output>${e ? nf(e.miseAuMille, 2) : "—"}</output>` : select("p.miseAuMille", i.miseAuMille ?? " ", mamOptions, { kind: "num" }))}
         ${field("TRS de l'îlot", `<output>${routeCode ? pct(r.route.operations.find((o) => o.code === routeCode)?.trs, 0) : "—"}</output>`, "modifiable dans Paramètres")}
       </div>
@@ -1268,12 +1524,12 @@ function toolingCard(r) {
   const amortised = r.final && r.part.volumeTotal > 0 ? route.outillage / r.part.volumeTotal : null;
   const rows = t
     ? t.lines.map((l) => `<tr><td>${esc(l.label)}</td><td class="muted small">${esc(l.detail)}</td><td class="num">${total(l.value)}</td></tr>`).join("")
-    : `<tr><td>Outillage ${esc(route.famille)}</td><td class="muted small">prix de l'îlot (Paramètres)</td><td class="num">${total(route.outillageEstime)}</td></tr>`;
+    : `<tr><td>Outillage ${esc(route.famille)}</td><td class="muted small">prix de l'îlot (Paramètres)${route.facteurOutillage !== 1 ? ` × ${nf(route.facteurOutillage, 2)} : ${plural(route.parCycle, "empreinte")} au lieu de ${route.parCycleEstime} estimée${route.parCycleEstime > 1 ? "s" : ""}` : ""}</td><td class="num">${total(route.outillageEstime)}</td></tr>`;
   return `<section class="ccard">
       <h3>Outillage — ${t ? (/^Basse pression/i.test(route.famille) ? "moule basse pression acier réalisé sur place" : "coquille acier réalisée sur place") : esc(route.famille)}</h3>
       <div class="cscroll"><table class="ctable">
         <tbody>${rows}</tbody>
-        <tfoot><tr><td><strong>Total estimé</strong></td><td class="muted small">${t ? `${t.cavities} empreinte${t.cavities > 1 ? "s" : ""}, ${t.tiroirs} tiroir${t.tiroirs > 1 ? "s" : ""}, ${esc(t.complexite)} — outillage suivant ${total(t.suivant)} (sans étude ni FAO)` : ""}</td><td class="num"><strong>${total(route.outillageEstime)}</strong></td></tr></tfoot>
+        <tfoot><tr><td><strong>Total estimé</strong></td><td class="muted small">${t ? `${t.cavities} empreinte${t.cavities > 1 ? "s" : ""}${t.facteurEmpreintes !== 1 ? ` (${t.empreintesEstimees} estimée${t.empreintesEstimees > 1 ? "s" : ""} : heures d'usinage, de scan et d'ajustage × ${nf(t.facteurEmpreintes, 2)})` : ""}, ${t.tiroirs} tiroir${t.tiroirs > 1 ? "s" : ""}, ${esc(t.complexite)} — outillage suivant ${total(t.suivant)} (sans étude ni FAO)` : ""}</td><td class="num"><strong>${total(route.outillageEstime)}</strong></td></tr></tfoot>
       </table></div>
       <div class="cfields">
         ${t ? field("Tiroirs du moule", input("p.outillageTiroirs", r.inputs.outillageTiroirs, { min: 0, step: 1, placeholder: nf(settings.tooling.tiroirs, 0) }), "vide = valeur par défaut") : ""}
@@ -1292,6 +1548,67 @@ function toolingCard(r) {
         <tfoot><tr><td><strong>Total outillage</strong></td><td class="muted small">moule ${total(route.outillageMoule)} + boîtes à noyau ${total(route.outillage - route.outillageMoule)}</td><td class="num"><strong>${total(route.outillage)}</strong></td></tr></tfoot>
       </table></div>` : ""}
     </section>`;
+}
+
+/**
+ * The piece costed with 1, 2... cavities on the island retained: each row is
+ * the quote as "Retenir" makes it (the island imposed, these cavities, the
+ * cycle and the tool estimated for them), the row retained the quote as it is.
+ * `c`: compute(), `r`: one of its results. Nothing is saved.
+ */
+export function cavityRows(c, r) {
+  const route = r.route;
+  return cavityChoices(settings.processes[route.process], route.parCycleEstime, route.parCycle).map((n) => ({
+    n,
+    r: n === route.parCycle ? r : computePiece(r.piece, c, null, { procede: route.process, finition: route.finition, empreintes: n, cycle: null, outillagePrix: null }),
+  }));
+}
+
+/**
+ * Card "Empreintes par coulée": more cavities, a cycle a little longer for
+ * more pieces, so less time per piece, and a bigger die; the price per piece
+ * for each number of cavities, and "Retenir".
+ */
+function cavitiesCard(c, r) {
+  const route = r?.route;
+  if (!route || !r.final) return "";
+  const p = settings.processes[route.process];
+  const k = settings.tooling.parEmpreinte ?? 0;
+  const n0 = route.parCycleEstime;
+  const inclus = q.outillageInclus !== false;
+  const rows = cavityRows(c, r)
+    .map(({ n, r: x }) => {
+      const f = x.final;
+      const casting = x.route?.operations.find((o) => o.code === route.process);
+      if (!f || !casting) return "";
+      const retained = n === route.parCycle;
+      return `<tr class="${retained ? "retained" : ""}" data-empreintes="${n}">
+        <td class="num"><strong>${n}</strong>${n === n0 ? ` <span class="muted small">estimé</span>` : ""}</td>
+        <td class="num">${nf(f.kgCast * n, 2)} kg</td>
+        <td class="num">${sec(casting.cycle)}</td>
+        <td class="num"><strong>${sec(casting.cycle / n)}</strong></td>
+        <td class="num">${eur(x.route.outillageMoule, 0)}</td>
+        <td class="num">${inclus ? eur(f.outillages) : "à part"}</td>
+        <td class="num">${eur(f.pri + f.outillages)}</td>
+        <td class="num">${eur(f.years[0]?.prixVente)}</td>
+        <td class="small">${x.route.alertesEmpreintes.map(esc).join("<br>")}</td>
+        <td>${retained ? "✓ retenu" : `<button type="button" class="small" data-action="cavities" data-n="${n}">Retenir</button>`}</td>
+      </tr>`;
+    })
+    .join("");
+  const typed = [r.chosen && r.inputs.cycle > 0 ? "le temps de cycle saisi" : "", r.inputs.outillagePrix > 0 ? "le prix d'outillage saisi" : ""].filter(Boolean);
+  const mould = route.tooling
+    ? `moule réalisé sur place, méthode « Outillage fonderie » pour sa taille (empreintes côte à côte)${k ? ` ; chaque empreinte de plus que l'estimation ajoute ${pct(k, 0)} des heures d'usinage, de scan et d'ajustage d'une empreinte, chaque empreinte de moins les retire` : ""}`
+    : `forfait de l'îlot (${eur(p.outillage, 0)}) pour ${plural(n0, "empreinte")} estimée${n0 > 1 ? "s" : ""}${k ? ` ; chaque empreinte de plus ajoute ${pct(k, 0)} du prix d'un moule à une empreinte, chaque empreinte de moins les retire` : ""}`;
+  return `<section class="ccard" id="cempreintes">
+    <h3>Empreintes par coulée — ${esc(r.piece.name)}</h3>
+    <p class="small">Îlot <strong>${esc(route.process)}</strong> ${esc(route.famille)} : ${plural(n0, "empreinte")} estimée${n0 > 1 ? "s" : ""} (grappe maxi ${nf(p.grappeMax, 0)} kg, ${plural(p.empreintesMax, "empreinte")} maxi). Plus d'empreintes : un cycle un peu plus long pour plus de pièces, donc moins de temps par pièce, mais un moule plus grand et plus cher.</p>
+    <div class="cscroll"><table class="ctable">
+      <thead><tr><th class="num">Empreintes</th><th class="num">Kg coulés / cycle</th><th class="num">Cycle</th><th class="num">Temps / pièce</th><th class="num">Moule</th><th class="num">Outillage / pièce</th><th class="num">PRI${inclus ? " (outillage compris)" : ""}</th><th class="num">Prix de vente</th><th>Alertes</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    ${r.chosen && r.inputs.empreintes > 0 ? `<p><button type="button" class="small" data-action="cavities-auto">Revenir aux empreintes estimées</button></p>` : ""}
+    <p class="small muted">Cycle : formule de l'îlot pour les kg coulés de toute la grappe ; temps par pièce = cycle / empreintes. Moule : ${mould} (Paramètres, Outillage). ${typed.length ? `La ligne retenue garde ${typed.join(" et ")} ; les autres sont estimées, et « Retenir » remplace ${typed.length > 1 ? "ces saisies" : "cette saisie"} par l'estimation. ` : ""}${r.chosen ? "" : `« Retenir » impose l'îlot ${esc(route.process)} avec ce nombre d'empreintes. `}PRI et prix de vente de la première année${inclus ? ", outillage amorti compris" : " (outillage chiffré à part)"}.</p>
+  </section>`;
 }
 
 function solutionsCard(r) {
@@ -1642,6 +1959,32 @@ function aiChoice() {
     : `passerelle en ligne${ai.gateway.url ? "" : " (adresse à renseigner dans la page IA / analyse)"}${ai.anonymize ? ", noms anonymisés" : ""}`;
 }
 
+/**
+ * "Retenir" in the card "Empreintes par coulée": `n` cavities for the piece
+ * shown (null: back to the estimate), on the island of its route, imposed with
+ * them (a number of cavities is that of its island). The cycle and the price
+ * of the tool typed in for other cavities give way to their estimate.
+ */
+function retainCavities(n) {
+  const c = compute();
+  const r = c?.results.find((x) => x.piece.key === c.selected);
+  if (!r?.route) return;
+  const piece = pieceStore(r.piece.key);
+  const imposed = r.inputs.procede !== r.route.process;
+  if (imposed) [piece.procede, piece.finition] = [r.route.process, r.route.finition];
+  const replaced = n === null ? [] : [piece.cycle > 0 ? `temps de cycle saisi (${piece.cycle} s)` : "", piece.outillagePrix > 0 ? `prix d'outillage saisi (${eur(piece.outillagePrix, 0)})` : ""].filter(Boolean);
+  piece.empreintes = n;
+  if (n !== null) piece.cycle = piece.outillagePrix = null;
+  forgetAdoption(piece);
+  store.saveQuote(q);
+  const after = compute()?.results.find((x) => x.piece.key === r.piece.key)?.route;
+  const casting = after?.operations.find((o) => o.code === after.process);
+  message = {
+    kind: "ok",
+    text: `${n === null ? "Empreintes estimées" : plural(n, "empreinte")} sur l'îlot ${r.route.process}${imposed ? ", désormais imposé" : ""}${casting ? ` : cycle de ${sec(casting.cycle)} pour ${plural(casting.parCycle, "pièce")}, soit ${sec(casting.cycle / casting.parCycle)} par pièce, moule ${eur(after.outillageMoule, 0)}` : ""}.${replaced.length ? ` Remplacés par leur estimation : ${replaced.join(", ")}.` : ""}`,
+  };
+}
+
 /** Under the casting parameters: "Estimer le temps de cycle avec l'IA", the box of the similar parts, the AI asked. */
 function cycleButton(r) {
   const busy = cycleJob?.key === r.piece.key;
@@ -1960,6 +2303,7 @@ function saveFeedback() {
   const record = productionRecord(r, { ref, tempsCycle: r.inputs.cycleReel, fichier: c.p3d?.file ?? null, serie: q.tailleSerie || null, estimation });
   const before = store.loadHistorique().find((x) => x.source === "production" && x.ref === ref);
   const saved = store.saveHistorique(mergeHistory(store.loadHistorique(), [record]).pieces);
+  shareFeedback(record);
   pieceStore(currentKey).cycleReel = null;
   store.saveQuote(q);
   message = {
@@ -1985,7 +2329,8 @@ function feedbackCard(c, r) {
     </div>
     <p><button type="button" class="small" data-action="save-feedback"${missing ? " disabled" : ""}>Enregistrer dans le retour d'expérience</button>${missing ? ` <small class="muted">${missing}</small>` : ""}</p>
     ${saved ? `<p class="small">Déjà enregistré pour « ${esc(ref)} » : ${sec(saved.temps_cycle_s)} sur ${esc(saved.ilot)}${saved.date ? ` le ${dateLabel(saved.date)}` : ""}. Un nouvel enregistrement le remplace.</p>` : ""}
-    <p class="small muted">Gardé dans l'historique des temps de cycle de ce navigateur (source « production »)${ref ? ` sous la référence « ${esc(ref)} »` : ""}, avec la géométrie de la pièce (poids, module, épaisseurs, encombrement, volume, surface, noyaux) et l'îlot, les pièces par cycle, le TRS et la mise au mille du chiffrage. L'enregistrement n'envoie rien ; comme tout l'historique, il peut partir ensuite à l'IA parmi les pièces semblables (case « Envoyer les pièces similaires de l'historique »). Le temps mesuré ne change ni le chiffrage ni les paramètres.</p>
+    ${feedbackNetHtml()}
+    <p class="small muted">Gardé dans l'historique des temps de cycle de ce navigateur (source « production »)${ref ? ` sous la référence « ${esc(ref)} »` : ""}, avec la géométrie de la pièce (poids, module, épaisseurs, encombrement, volume, surface, noyaux) et l'îlot, les pièces par cycle, le TRS et la mise au mille du chiffrage, et écrit aussi dans le dossier réseau partagé de l'entreprise quand il est choisi (Paramètres), pour les autres postes. L'enregistrement n'envoie rien sur Internet ; comme tout l'historique, il peut partir ensuite à l'IA parmi les pièces semblables (case « Envoyer les pièces similaires de l'historique »). Le temps mesuré ne change ni le chiffrage ni les paramètres.</p>
   </section>`;
 }
 
@@ -2260,18 +2605,184 @@ function historyCard() {
   const n = countHistory(pieces);
   return `<section class="ccard" id="chistorique">
     <h3>Historique des temps de cycle</h3>
-    <div class="crow" data-drop="historique" title="Glissez un fichier d'historique (.json) ici pour l'importer"><span>Historique :</span> <strong>${n.total ? `${plural(n.total, "enregistrement")} : ${n.devis} temps de devis, ${n.production} temps mesuré${n.production > 1 ? "s" : ""} en production` : "aucun"}</strong>
-      <button type="button" class="small" data-action="import-historique">Importer l'historique…</button>
-      <input type="file" data-file="historique" accept=".json,application/json" hidden>
-      <button type="button" class="small" data-action="export-historique"${n.total ? "" : " disabled"}>Exporter l'historique</button>
-      <button type="button" class="small" data-action="clear-historique"${n.total ? "" : " disabled"}>Effacer l'historique…</button></div>
+    <div class="crow"><span>Historique :</span> <strong>${historyCount(n)}</strong>
+      <button type="button" class="small" data-action="show-parametres" title="Le fichier d'historique s'importe, s'exporte et s'efface dans Paramètres, avec les autres fichiers">Importer ou exporter dans Paramètres…</button></div>
+    ${netSyncHtml()}
     ${n.ilots.length ? `<div class="cscroll"><table class="ctable compact chisto-count">
       <thead><tr><th>Îlot</th><th class="num">Devis</th><th class="num">Production</th></tr></thead>
       <tbody>${n.ilots.map((x) => `<tr><td><strong>${esc(x.ilot)}</strong>${settings.processes[x.ilot] ? ` ${esc(settings.processes[x.ilot].famille)}` : ""}</td><td class="num">${x.devis}</td><td class="num">${x.production}</td></tr>`).join("")}</tbody></table></div>` : ""}
     ${comparisonHtml(pieces)}
     ${backtestHtml(pieces)}
-    <p class="small muted">Fichier JSON « reader3d-historique-cycles », version 1 : temps de cycle de devis passés (source « devis ») et temps mesurés en production (source « production »). Un enregistrement de même référence et même source remplace le précédent. L'historique est gardé dans ce navigateur. Il n'est envoyé à l'IA que si la case « Envoyer les pièces similaires de l'historique » est cochée : les ${SIMILAR} enregistrements les plus semblables à la pièce estimée, avec leur temps de cycle, leur poids, leur module, leurs pièces par cycle et leur mise au mille ; pour la passerelle en ligne, la case est décochée par défaut et les références sont anonymisées avec les noms. L'export reprend tout, temps mesurés compris. Données confidentielles : ne pas publier.</p>
+    <p class="small muted">Temps de cycle de devis passés (source « devis ») et temps mesurés en production (source « production »), gardés dans ce navigateur. L'historique n'est envoyé à l'IA que si la case « Envoyer les pièces similaires de l'historique » est cochée : les ${SIMILAR} enregistrements les plus semblables à la pièce estimée, avec leur temps de cycle, leur poids, leur module, leurs pièces par cycle et leur mise au mille ; pour la passerelle en ligne, la case est décochée par défaut et les références sont anonymisées avec les noms. Données confidentielles : ne pas publier.</p>
   </section>`;
+}
+
+/** What the history holds, in a few words. */
+const historyCount = (n) => (n.total ? `${plural(n.total, "enregistrement")} : ${n.devis} temps de devis, ${n.production} temps mesuré${n.production > 1 ? "s" : ""} en production` : "aucun");
+
+/** Paramètres: the row of the history file, with the other files (its import, export and erasing). */
+function historyFileRow() {
+  const n = countHistory(store.loadHistorique());
+  return `<div class="crow" id="chisto-file" data-drop="historique" title="Glissez un fichier d'historique (.json) ici pour l'importer"><span>Historique des temps de cycle :</span> <strong>${historyCount(n)}</strong>
+      <button type="button" class="small" data-action="import-historique">Importer l'historique…</button>
+      <input type="file" data-file="historique" accept=".json,application/json" hidden>
+      <button type="button" class="small" data-action="export-historique"${n.total ? "" : " disabled"}>Exporter l'historique</button>
+      <button type="button" class="small" data-action="clear-historique"${n.total ? "" : " disabled"}>Effacer l'historique…</button></div>
+    <p class="small muted">Historique : fichier JSON « reader3d-historique-cycles », version 1. Il complète celui de ce navigateur : un enregistrement de même référence et même source remplace le précédent. Il sert au chiffrage (carte « Historique des temps de cycle ») et, si la case est cochée, à l'IA. L'export reprend tout, temps mesurés compris. Données confidentielles : ne pas publier.</p>`;
+}
+
+// --------------------------------------------------------------------------- the shared network folder
+
+// The shared folder of the company network (network-folder.js) as last checked, what the readings of its
+// retours d'expérience brought during this visit (feedback.js), and where the last real time saved went.
+let netFolder = null; // {state, name, error} (checkSharedFolder); null: being checked
+let netSync = null; // the last reading (syncFeedback), with the records it brought since the page was opened: {..., total: {added, replaced}}
+let netFeedback = null; // {ref, state: "writing" | "written" | "pending", name, error}
+let netChecking = null;
+
+/** The folder checked again, its retours d'expérience read and merged when it is accessible; the rows that show them drawn again. */
+function refreshNetwork() {
+  netChecking ??= (async () => {
+    netFolder = await network.checkSharedFolder().catch((err) => ({ state: "unreadable", name: null, error: err?.message || String(err) }));
+    // Its access to grant: the real times of this PC waiting for it said.
+    if (["prompt", "denied"].includes(netFolder.state)) netSync = { state: "prompt", total: netSync?.total ?? { added: 0, replaced: 0 } };
+    drawNetwork();
+    if (netFolder.state !== "accessible") return;
+    // A network that stops answering midway: said, read again at the next showing of the page.
+    const report = await network.withTimeout(syncFeedback({ load: store.loadHistorique, save: store.saveHistorique }), 120_000, "le dossier réseau ne répond plus")
+      .catch((err) => ({ state: "error", error: err?.message || String(err) }));
+    const total = { added: (netSync?.total.added ?? 0) + (report.added ?? 0), replaced: (netSync?.total.replaced ?? 0) + (report.replaced ?? 0) };
+    netSync = { ...report, total };
+    // A real time that was waiting for the folder: written with the others.
+    if (netFeedback?.state === "pending" && report.state === "done" && !report.waiting) netFeedback = { ...netFeedback, state: "written", name: null };
+    drawNetwork();
+  })().finally(() => {
+    netChecking = null;
+  });
+  return netChecking;
+}
+
+const fragment = (html) => {
+  const t = document.createElement("template");
+  t.innerHTML = html.trim();
+  return t.content.firstElementChild;
+};
+
+/** The rows of the shared folder, of the history and of the real time saved drawn again alone: what is being typed in the page is kept. */
+function drawNetwork() {
+  if (!el) return;
+  if (pointerDown) {
+    pending = true;
+    return;
+  }
+  if (page === "parametres") {
+    el.parametres.querySelector("#cnetwork")?.replaceWith(fragment(networkRow()));
+    // The row of the history file: its count only (its file input may be open in the file picker).
+    const row = el.parametres.querySelector("#chisto-file");
+    if (row) {
+      const n = countHistory(store.loadHistorique());
+      row.querySelector("strong").textContent = historyCount(n);
+      for (const b of row.querySelectorAll('[data-action="export-historique"], [data-action="clear-historique"]')) b.disabled = !n.total;
+    }
+  } else {
+    refreshHistory();
+    el.chiffrage.querySelector("#cfeedback-net")?.replaceWith(fragment(feedbackNetHtml()));
+  }
+}
+
+const NET_STATES = {
+  unsupported: "indisponible dans ce navigateur (il faut Chrome ou Edge)",
+  none: "aucun",
+  prompt: "accès à autoriser (le navigateur le demande après chaque redémarrage)",
+  denied: "accès refusé",
+  unreadable: "illisible",
+  accessible: "accessible",
+};
+
+/** Paramètres: the row of the shared network folder, with the files: its state, its choice, what it brought. */
+function networkRow() {
+  const f = netFolder;
+  const button = (action, label) => ` <button type="button" class="small" data-action="network-${action}">${label}</button>`;
+  const named = f && !["none", "unsupported"].includes(f.state);
+  const state = !f ? "vérification…" : named ? `« ${esc(f.name)} » — ${NET_STATES[f.state]}${f.error ? ` (${esc(f.error)})` : ""}` : NET_STATES[f.state];
+  const buttons = !f || f.state === "unsupported" ? "" : [
+    named ? "" : button("choose", "Choisir le dossier…"),
+    ["prompt", "denied"].includes(f.state) ? button("grant", "Autoriser l'accès") : "",
+    ["accessible", "unreadable"].includes(f.state) ? button("refresh", "Actualiser") : "",
+    named ? button("choose", "Changer de dossier…") : "",
+    named ? button("forget", "Ne plus utiliser") : "",
+  ].join("");
+  return `<div id="cnetwork">
+    <div class="crow"><span>Dossier réseau partagé :</span> <strong>${state}</strong>${buttons}</div>
+    ${netSyncHtml()}
+    <p class="small muted">Un dossier du réseau de l'entreprise, choisi une fois sur chaque poste, où chacun profite du travail des autres : les analyses 3D des pièces (sous-dossier « analyses-3d » : une pièce analysée sur un poste s'ouvre aussitôt sur les autres), les retours d'expérience (« retours-experience » : les temps de cycle mesurés en production, lus à chaque ouverture de Chiffrage ou de Paramètres) et l'historique IA (« historique-ia »). Il reste sur le réseau de l'entreprise : rien n'est envoyé sur Internet.</p>
+  </div>`;
+}
+
+/** What the readings of the retours d'expérience of the folder brought during this visit, in a line (empty before any). */
+function netSyncHtml() {
+  const s = netSync;
+  if (!s || s.state === "none") return "";
+  const waiting = pendingCount();
+  if (s.state === "prompt") return waiting ? `<p class="small cnetwork-sync">${plural(waiting, "retour")} d'expérience de ce poste à écrire dans le dossier réseau partagé dès que son accès est autorisé.</p>` : "";
+  if (s.state === "error") return `<p class="small cnetwork-sync">Dossier réseau partagé non lu : ${esc(s.error)}.</p>`;
+  const time = new Date(s.at).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+  const { added, replaced } = s.total;
+  const brought = added || replaced ? `${plural(added, "temps mesuré")} ajouté${added > 1 ? "s" : ""} à l'historique, ${replaced} mis à jour depuis l'ouverture de la page` : "aucun temps mesuré nouveau depuis l'ouverture de la page";
+  const more = [
+    s.written ? `${plural(s.written, "retour")} de ce poste écrit${s.written > 1 ? "s" : ""}` : "",
+    s.waiting ? `${s.waiting} encore à écrire` : "",
+    s.unreadable?.length ? `fichier${s.unreadable.length > 1 ? "s" : ""} illisible${s.unreadable.length > 1 ? "s" : ""} : ${esc(list(s.unreadable, (x) => x))}` : "",
+  ].filter(Boolean);
+  return `<p class="small cnetwork-sync">Retours d'expérience du dossier réseau partagé, lu à ${time} : ${brought}${more.length ? ` ; ${more.join(" ; ")}` : ""}.</p>`;
+}
+
+/** The real time saved last, written in the shared folder too (in the background). */
+function shareFeedback(record) {
+  netFeedback = { ref: record.ref, state: "writing" };
+  writeFeedback(record)
+    .catch((err) => ({ state: "pending", error: err?.message || String(err) }))
+    .then((result) => {
+      netFeedback = result.state === "none" ? null : { ref: record.ref, ...result };
+      drawNetwork();
+    });
+}
+
+/** The card Retour d'expérience: where the real time saved last went on the network. */
+function feedbackNetHtml() {
+  const f = netFeedback;
+  const ref = esc(f?.ref ?? "");
+  const text = !f ? ""
+    : f.state === "writing" ? `Retour « ${ref} » : écriture dans le dossier réseau partagé…`
+    : f.state === "written" ? `Retour « ${ref} » écrit aussi dans le dossier réseau partagé${f.name ? ` (retours-experience/${esc(f.name)})` : ""} : les autres postes le lisent.`
+    : `Retour « ${ref} » pas encore écrit dans le dossier réseau partagé (${esc(f.error)}) : il le sera à la prochaine lecture du dossier, son accès autorisé ou le réseau revenu.`;
+  return `<p class="small" id="cfeedback-net"${text ? "" : " hidden"}>${text}</p>`;
+}
+
+/** The buttons of the row of the shared folder (Paramètres). */
+async function networkAction(action) {
+  try {
+    if (action === "network-choose") {
+      const handle = await network.chooseSharedFolder();
+      message = { kind: "ok", text: `Dossier réseau partagé « ${handle.name} » choisi : les analyses 3D, les retours d'expérience et l'historique IA de ce poste y sont écrits, ceux des autres postes y sont lus.` };
+      // The conversations of the IA page go to its subfolder (ai-history.js): those kept before on this PC when the user says so.
+      import("../ai-history.js")
+        .then((h) => h.adoptSharedFolder({ ask: (n) => confirm(`Écrire aussi dans le dossier réseau partagé les ${plural(n, "discussion")} IA de pièces déjà gardée${n > 1 ? "s" : ""} sur ce PC ?`) }))
+        .catch(() => {});
+    } else if (action === "network-grant") {
+      if (!(await network.grantSharedFolder())) message = { kind: "warn", text: "Accès au dossier réseau partagé non autorisé." };
+    } else if (action === "network-forget") {
+      if (!confirm(`Ne plus utiliser le dossier réseau partagé « ${netFolder?.name ?? ""} » sur ce poste ?\n\nSes fichiers y restent, pour les autres postes ; ce poste n'y écrit et n'y lit plus les analyses 3D, les retours d'expérience ni l'historique IA.`)) return;
+      await network.forgetSharedFolder();
+      netSync = null;
+      message = { kind: "ok", text: "Dossier réseau partagé : plus utilisé sur ce poste." };
+    }
+  } catch (err) {
+    if (err?.name !== "AbortError") message = { kind: "error", text: `Dossier réseau partagé : ${err?.message || err}` };
+  }
+  netFolder = null;
+  render();
+  refreshNetwork();
 }
 
 // Where each setting comes from (store.js layers): its label, and its letter in the tables.
@@ -2336,6 +2847,8 @@ function settingsSourcesCard() {
       <button type="button" class="small" data-action="import-tendances">Importer des tendances (fichier de paramètres calés)…</button>
       <input type="file" data-file="tendances" accept=".json,application/json" hidden>${t ? ` <button type="button" class="small" data-action="export-tendances">Exporter les tendances</button>` : ""}</div>
     ${base ? `<div class="crow"><span>Classeur de chiffrage :</span> <strong>${esc(base.source?.fileName)} — importé le ${dateLabel(base.source?.importedAt)}</strong></div>` : ""}
+    ${historyFileRow()}
+    ${networkRow()}
     ${migrated}
     ${settingsNotApplied()}
     <div class="cfields">${field("Seuil d'alerte : écart à la tendance", sinput("seuilTendance", settings.seuilTendance, { kind: "pct" }), "% — au-delà, le chiffrage signale l'écart (carte Traçabilité)")}</div>
@@ -2458,6 +2971,7 @@ function renderSettings() {
       ${tf("Marge sur la largeur (mm, par côté)", "marges.largeur", tl.marges.largeur, "empreintes côte à côte")}
       ${tf("Marge sur la hauteur (mm, par côté)", "marges.hauteur", tl.marges.hauteur)}
       ${tf("Entre deux empreintes (mm)", "marges.entreEmpreintes", tl.marges.entreEmpreintes)}
+      ${tf("Empreinte en plus ou en moins de l'estimation", "parEmpreinte", tl.parEmpreinte, "part d'une empreinte : heures d'usinage, de scan et d'ajustage des moules estimés, forfait des autres îlots", { kind: "pct" })}
       ${tf("Tiroirs par défaut", "tiroirs", tl.tiroirs, "chaque pièce peut avoir les siens")}
       ${field("Complexité par défaut", select("s.tooling.complexite", tl.complexite, Object.keys(tl.etude)))}
       ${Object.keys(tl.etude).map((k) => tf(`Coquille — heures d'étude : ${k}`, `etude.${k}`, tl.etude[k])).join("")}
@@ -2568,7 +3082,7 @@ async function exportXlsx() {
   for (const r of done) {
     const t = r.route.tooling;
     if (t) for (const l of t.lines) outillage.push([r.piece.name, l.label, l.detail, l.value]);
-    else outillage.push([r.piece.name, `Outillage ${r.route.famille}`, "prix de l'îlot (Paramètres)", r.route.outillageEstime]);
+    else outillage.push([r.piece.name, `Outillage ${r.route.famille}`, `prix de l'îlot (Paramètres)${r.route.facteurOutillage !== 1 ? ` × ${nf(r.route.facteurOutillage, 2)} (${r.route.parCycle} empreintes, ${r.route.parCycleEstime} estimées)` : ""}`, r.route.outillageEstime]);
     if (r.inputs.outillagePrix > 0) outillage.push([r.piece.name, "Prix retenu (saisi)", null, r.inputs.outillagePrix]);
     for (const b of r.route.boxes) {
       outillage.push([r.piece.name, `Boîte à noyau — ${b.core.nom}`, `${nf(b.kg, 0)} kg${b.size.auto ? " (dimensions estimées)" : ""}`, null]);
@@ -2636,7 +3150,7 @@ async function exportXlsx() {
   const analyses = q.analysesIA ?? [];
   const analysesIA = [
     [H("Analyses IA"), null],
-    ["Statut", "raisonnements et estimations de l'IA gardés pour mémoire : aucune valeur n'a été appliquée au devis ni aux paramètres sans validation ; une estimation du temps de cycle validée est une saisie du devis (onglet Traçabilité, source « estimation IA validée »)"],
+    ["Statut", "raisonnements et estimations de l'IA gardés pour mémoire : aucune valeur n'a été appliquée au devis ni aux paramètres sans validation ; une estimation du temps de cycle validée est une saisie du devis (onglet Traçabilité, source « estimation IA validée »), comme une valeur proposée par l'IA et acceptée (source « proposition IA appliquée »)"],
     [],
     ["Date", "Fournisseur", "Modèle", "Question", "Réponse", "Nombres vérifiés"].map(H),
     ...analyses.map((a) => [dateLabel(a.date), a.provider, a.model, a.question, String(a.answer ?? "").slice(0, 32000), a.verified ? "oui" : a.tache === "cycle_time" ? "non : nombres absents des données envoyées" : "non : nombres absents de la trace"]),

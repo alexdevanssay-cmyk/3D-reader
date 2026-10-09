@@ -8,10 +8,10 @@ import { before, describe, test } from 'node:test';
 
 import { readCostingWorkbook, readIndicesWorkbook } from '../../web/chiffrage/workbook.js';
 import { centreRates, indexAverage, minimumMargin, quote, saleMetalPrice } from '../../web/chiffrage/model.js';
-import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, bestRoutes, buildRoute, estimateMiseAuMille, rankRoutes } from '../../web/chiffrage/routes.js';
+import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, bestRoutes, buildRoute, castingCycle, cavityChoices, estimateMiseAuMille, rankRoutes } from '../../web/chiffrage/routes.js';
 import { readWorkbook } from '../../web/chiffrage/xlsxread.js';
 import { filledFields, heatTreatmentOf, orderValues, programmeFor, programmeOf, readSeriesOrder } from '../../web/chiffrage/rfq.js';
-import { DEFAULT_TOOLING, coefOf, estimateTooling, steelToolCost } from '../../web/chiffrage/tooling.js';
+import { DEFAULT_TOOLING, cavityFactor, coefOf, estimateTooling, steelToolCost } from '../../web/chiffrage/tooling.js';
 import { DEFAULT_CORES, boxSize, coreBoxCost, coresPerPiece } from '../../web/chiffrage/cores.js';
 import {
   DEFAULT_DENSITIES, GENERIC_DENSITY, adoptTendance, clearSaisies, clearSetting, clearTendances, currentQuoteTab, defaultQuote, defaultSettings, exportSaisies, importTendances,
@@ -20,6 +20,7 @@ import {
 import { DEMANDE, QUOTE_KEYS, SOURCES, demandeComparee, derive, missing, pieceKeys, resolve, summarize, traced, weakest } from '../../web/chiffrage/provenance.js';
 import { MASQUE, checkNumbers, isInternal, maskNumbers, numbersOf, traceForAI } from '../../web/chiffrage/ai-trace.js';
 import { anonymizer } from '../../web/engine/ai-context.js';
+import { checkProposals, readProposals, sameValue } from '../../web/chiffrage/ai-apply.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -293,6 +294,36 @@ describe('manufacturing routes', () => {
     assert.equal(ssp.parCycle, 4); // limited by the number of cavities, not by the shot weight
     assert.equal(ssp.operations.find((o) => o.code === 'SSP').trs, DEFAULT_TRS.SSP);
   });
+
+  test('more cavities chosen: a longer cycle for more pieces, so less time per piece; past the island, told', () => {
+    const p = DEFAULT_PROCESSES.CG3;
+    const estimate = buildRoute('CG3', 'FTR', part, settings, rates);
+    assert.deepEqual([estimate.parCycle, estimate.parCycleEstime, estimate.alertesEmpreintes], [1, 1, []]);
+    const kgCast = part.poids * estimate.miseAuMille;
+    let previous = estimate;
+    for (const n of [2, 3, 4]) {
+      const r = buildRoute('CG3', 'FTR', part, settings, rates, { empreintes: n });
+      const casting = r.operations.find((o) => o.code === 'CG3');
+      assert.deepEqual([r.parCycle, r.parCycleEstime, casting.parCycle], [n, 1, n]);
+      // The cycle of the cluster of n pieces: the formula of the island for n times the weight cast.
+      close(r.cycle, castingCycle(p, kgCast, n, part.moduleMm), 1e-12, `cycle, ${n} cavities`);
+      assert.equal(casting.cycle, r.cycle);
+      assert.ok(r.cycle > previous.cycle && r.cycle / n < previous.cycle / previous.parCycle, `${n} cavities: a longer cycle, less time per piece`);
+      assert.deepEqual(r.alertesEmpreintes, [`${n} empreintes > 1 maxi de l'îlot`]);
+      assert.ok(r.warnings.includes(r.alertesEmpreintes[0]) && r.feasible);
+      previous = r;
+    }
+    // The estimate chosen as such: the same route.
+    const same = buildRoute('CG3', 'FTR', part, settings, rates, { empreintes: 1 });
+    assert.deepEqual([same.cycle, same.outillage, same.warnings], [estimate.cycle, estimate.outillage, estimate.warnings]);
+    // Past the cluster of the island.
+    const heavy = buildRoute('CG3', 'FTR', { ...part, poids: 40 }, settings, rates, { empreintes: 2 });
+    assert.match(heavy.alertesEmpreintes.join(), /^2 empreintes > 1 maxi de l'îlot,grappe [\d,\s\u202f]+ kg > 100 kg maxi$/);
+    // The cavities compared in the page: 1 to the maximum of the island (at least 4, at most 8), and those chosen.
+    assert.deepEqual(cavityChoices(p, 1), [1, 2, 3, 4]);
+    assert.deepEqual(cavityChoices(DEFAULT_PROCESSES.SSP, 4, 6), [1, 2, 3, 4, 5, 6]);
+    assert.deepEqual(cavityChoices({ ...p, empreintesMax: 12 }, 1).length, 8);
+  });
 });
 
 describe('series order of a customer request', () => {
@@ -442,6 +473,43 @@ describe('in-house gravity die and heat treatments', () => {
     const complex = estimateTooling({ ...part, outillageTiroirs: 3, outillageComplexite: 'Compliqué(e)' }, 1);
     assert.equal(complex.tiroirs, 3);
     assert.ok(complex.total > one.total);
+  });
+
+  test('more cavities than the island would use: a bigger die, more hours for its cavities; the flat price scaled', () => {
+    assert.equal(cavityFactor(2, 2, 0.5), 1);
+    close(cavityFactor(3, 1, 0.5), 2, 1e-12, '3 cavities, 1 estimated');
+    close(cavityFactor(1, 2, 0.5), 1 / 1.5, 1e-12, '1 cavity, 2 estimated');
+    assert.equal(cavityFactor(4, 1, 0), 1);
+    // The die of the cavities the island would use: the method of the workbook, as before.
+    const two = estimateTooling(part, 2);
+    assert.deepEqual([two.facteurEmpreintes, two.empreintesEstimees], [1, 2]);
+    assert.equal(estimateTooling(part, 2, DEFAULT_TOOLING, 2).total, two.total);
+    // Two cavities where it would put one: the hours of milling, scan and fitting of the cavities, not those of design and CAM.
+    const more = estimateTooling(part, 2, DEFAULT_TOOLING, 1);
+    close(more.facteurEmpreintes, 1 + DEFAULT_TOOLING.parEmpreinte, 1e-12, 'factor');
+    const line = (t, label) => t.lines.find((l) => l.label === label);
+    for (const label of ['Usinage 3 axes', 'Usinage 5 axes', 'Scan 3D + rapport', 'Ajustage / montage']) close(line(more, label).value, line(two, label).value * more.facteurEmpreintes, 1e-9, label);
+    for (const label of ['FAO', 'Étude']) close(line(more, label).value, line(two, label).value, 1e-12, label);
+    assert.match(line(more, 'Ajustage / montage').detail, /^75 h × /, '50 h of the band × 1.5');
+    assert.ok(more.total > two.total && two.total > estimateTooling(part, 1).total);
+    // Without a share for a cavity: the size of the die only.
+    assert.equal(estimateTooling(part, 2, { ...DEFAULT_TOOLING, parEmpreinte: 0 }, 1).total, two.total);
+
+    const settings = { processes: DEFAULT_PROCESSES, operations: DEFAULT_OPERATIONS, trs: DEFAULT_TRS, tooling: DEFAULT_TOOLING };
+    const p = { ...part, poids: 1, toileMini: 5, epaisseurMax: 10, moduleMm: 3, volumeAnnuel: 5000, volumeTotal: 25000 };
+    const cg = buildRoute('CG3', 'FTR', p, settings, null, { empreintes: 2 });
+    assert.equal(cg.outillage, estimateTooling(p, 2, DEFAULT_TOOLING, cg.parCycleEstime).total);
+    assert.equal(cg.facteurOutillage, 1);
+    close(cg.outillagePiece, cg.outillage / 25000, 1e-12, 'per piece');
+    // The flat price of a die casting tool: for the 4 cavities estimated, scaled for 2 or 6.
+    const ssp = buildRoute('SSP', 'FSP', p, settings, null);
+    assert.deepEqual([ssp.parCycle, ssp.outillage, ssp.facteurOutillage], [4, DEFAULT_PROCESSES.SSP.outillage, 1]);
+    for (const n of [2, 6]) {
+      const r = buildRoute('SSP', 'FSP', p, settings, null, { empreintes: n });
+      close(r.facteurOutillage, (1 + 0.5 * (n - 1)) / (1 + 0.5 * 3), 1e-12, `factor, ${n} cavities`);
+      close(r.outillage, DEFAULT_PROCESSES.SSP.outillage * r.facteurOutillage, 1e-9, `flat price, ${n} cavities`);
+    }
+    assert.equal(buildRoute('SSP', 'FSP', p, { ...settings, tooling: { ...DEFAULT_TOOLING, parEmpreinte: 0 } }, null, { empreintes: 6 }).outillage, DEFAULT_PROCESSES.SSP.outillage);
   });
 
   test('gravity and low pressure islands get the estimate, the others their price', () => {
@@ -682,6 +750,11 @@ describe('settings layers: typed values, workbook, trends, defaults', () => {
       assert.ok(setSetting(path, 0, base), path);
       assert.ok(path.split('.').reduce((o, k) => o[k], loadSettings(base)) > 0, path);
     }
+    // The share of a cavity: 0 (the size of the die only) kept, a negative one refused.
+    assert.equal(setSetting('tooling.parEmpreinte', -0.2, base), "part d'une empreinte positive ou nulle");
+    assert.equal(setSetting('tooling.parEmpreinte', 0, base), null);
+    assert.equal(loadSettings(base).tooling.parEmpreinte, 0);
+    setSetting('tooling.parEmpreinte', null, base);
     assert.deepEqual(typedOnly(), { marge: 0 });
   });
 
@@ -982,6 +1055,8 @@ describe('traced values of a quote (provenance.js)', () => {
       auto: computed(),
       chosen: computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', cycle: 300, empreintes: 2, miseAuMille: 1.5, mode: '1*8', outillagePrix: 15000 } } } }),
       cycleOnly: computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', miseAuMille: 1.5, empreintes: 2 } } } }),
+      cavities: computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', empreintes: 3, outillagePrix: 18000 } } } }),
+      cavitiesFlat: computed({ quote: { pieces: { manuel: { ...PART, procede: 'SSP', empreintes: 2 } } } }),
       cores: computed({ quote: { pieces: { manuel: { ...PART, procede: 'BPR', noyaux: true, cores: [{ nom: 'N1', masse: 0.6, qte: 2, type: 1, complexite: 'Simple' }], tth: 'T6' } } } }),
       set: computed({ p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0, 1, 2] } }),
       request: computed({ quote: { serie: ORDER } }),
@@ -1018,6 +1093,47 @@ describe('traced values of a quote (provenance.js)', () => {
     assert.deepEqual([r.trace['piece.cycle'].source.type, r.trace['piece.empreintes'].source.type], ['calcul', 'saisie']);
     assert.ok(r.trace['piece.empreintes.estimee'] && r.trace['piece.miseAuMille.estimee'] && r.trace['parametres.cycle']);
     assert.equal(scenarios.chosen.results[0].trace['parametres.cycle'], undefined, 'the cycle typed in: its coefficients are not used');
+    // Cavities typed in: the cycle estimated for their cluster; the estimated ones, not retained, still price the tool unless it is typed in.
+    for (const [name, estimee] of [['cavities', false], ['cavitiesFlat', true]]) {
+      const T = scenarios[name].results[0].trace;
+      assert.equal(T['piece.empreintes'].source.type, 'saisie', name);
+      assert.ok(T['piece.cycle'].source.entrees.includes('piece.empreintes') && !T['piece.cycle'].source.entrees.includes('piece.empreintes.estimee'), name);
+      assert.match(T['piece.cycle'].hypotheses.join(), /cycle de la grappe des \d empreintes saisies/, name);
+      assert.equal(!!T['piece.empreintes.estimee'], estimee, name);
+    }
+    const flat = scenarios.cavitiesFlat.results[0].trace['piece.outillage.total'];
+    assert.deepEqual([flat.source.type, flat.source.ref], ['calcul', 'routes.js:buildRoute (forfait de l\'îlot × empreintes)']);
+    assert.ok(flat.source.entrees.includes('piece.empreintes.estimee') && flat.source.entrees.includes('parametres.outillage'));
+    assert.match(flat.hypotheses.join(), /prix forfaitaire de l'îlot SSP × 0,6 : 2 empreintes au lieu de 4 estimées/);
+  });
+
+  test('more cavities: the quote of each number of cavities, as "Retenir" makes it', () => {
+    const c = computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', cycle: 300, outillagePrix: 15000 } } } });
+    const r = c.results[0];
+    const rows = ui.cavityRows(c, r);
+    assert.deepEqual(rows.map((x) => x.n), [1, 2, 3, 4]);
+    // The row retained is the quote as it is (its cycle and tool typed in); the others are estimated.
+    assert.equal(rows[0].r, r);
+    const p = DEFAULT_PROCESSES.CG3;
+    const kgCast = PART.poids * r.estimated.miseAuMille;
+    for (const { n, r: x } of rows.slice(1)) {
+      const casting = x.route.operations.find((o) => o.code === 'CG3');
+      assert.deepEqual([x.inputs.procede, x.inputs.empreintes, x.inputs.cycle, x.inputs.outillagePrix, casting.parCycle], ['CG3', n, null, null, n]);
+      close(casting.cycle, castingCycle(p, kgCast, n, PART.moduleMm), 1e-12, `cycle, ${n} cavities`);
+      assert.equal(x.route.outillageMoule, x.route.tooling.total);
+    }
+    // More cavities: less time per piece, a dearer die; nothing saved.
+    const perPiece = rows.slice(1).map(({ n, r: x }) => x.route.operations.find((o) => o.code === 'CG3').cycle / n);
+    const moulds = rows.slice(1).map(({ r: x }) => x.route.outillageMoule);
+    assert.ok(perPiece.every((v, i) => i === 0 || v < perPiece[i - 1]), String(perPiece));
+    assert.ok(moulds.every((v, i) => i === 0 || v > moulds[i - 1]), String(moulds));
+    assert.deepEqual(loadQuote(base, indices).pieces.manuel, { ...PART, procede: 'CG3', cycle: 300, outillagePrix: 15000 });
+    // In automatic mode, the island of the best route.
+    const auto = computed();
+    const best = auto.results[0].route;
+    const autoRows = ui.cavityRows(auto, auto.results[0]);
+    assert.ok(autoRows.length >= 4 && autoRows.every(({ n, r: x }) => x.route.process === best.process && x.route.parCycle === n));
+    assert.equal(autoRows.find(({ n }) => n === best.parCycle).r, auto.results[0]);
   });
 
   test('the traces describe the values computed and change none of them', () => {
@@ -1653,5 +1769,201 @@ Le modèle 3D, l'alliage AS7G03, la 2e route, le classeur du 08/10/2026 à 12:30
     assert.equal(checkNumbers('15 000', { v: 15600 }).verifiee, false);
     assert.equal(checkNumbers('300 s', { v: 302 }).verifiee, true);
     assert.equal(checkNumbers('10', { v: 14 }).verifiee, false);
+  });
+});
+
+// --------------------------------------------------------------------------- values proposed by the AI, applied by a person
+
+// The task "Chiffrage" of the AI page may propose values of the inputs of a
+// piece (ai-apply.js); a person accepts them, ui.js:applyAIValues writes them
+// as inputs of that piece, undoAIValues takes them back.
+describe('values of a piece proposed by the AI, applied once accepted', () => {
+  before(async () => {
+    globalThis.window ??= { addEventListener() {} };
+    ui ??= await import('../../web/chiffrage/ui.js');
+  });
+
+  const trace = { pieces: [{ nom: 'Pièce', valeurs: { 'piece.poids': { valeur: 1.2, unite: 'kg' }, 'piece.empreintes': { valeur: 2 } } }] };
+  const sent = { costing_trace: trace, bodies: [] };
+
+  test('read and checked: only the inputs of a piece, each number from the source it claims for its own key, in the unit of the input', () => {
+    const read = readProposals([
+      { piece: 'Pièce', cle: 'piece.poids', valeur: '1,35', unite: 'kg', source: 'question', justification: 'donné par l\'utilisateur' },
+      { piece: 'Pièce', cle: 'piece.prix.vente', valeur: 12, unite: '€', source: 'trace', justification: '' },
+      { piece: 'Pièce', cle: 'piece.cycle', valeur: 137, unite: 's', source: 'trace', justification: 'calculé' },
+      { piece: 'Autre', cle: 'piece.dimMax', valeur: 250, unite: 'mm', source: 'trace', justification: '' },
+      { piece: 'Pièce', cle: 'centre.CG3.mode', valeur: '2*8', unite: '', source: 'question', justification: '' },
+      { piece: 'Pièce', cle: 'piece.noyaux', valeur: 'oui', unite: '', source: 'question', justification: '' },
+      { piece: 'Pièce', cle: 'piece.empreintes', valeur: 2.5, unite: '', source: 'question', justification: '' },
+      'pas un objet',
+    ], trace);
+    assert.deepEqual(read.map((p) => [p.cle, p.champ ?? null, p.valeur, p.index, p.refus === null]), [
+      ['piece.poids', 'poids', 1.35, 0, true],
+      ['piece.prix.vente', null, 12, 0, false],
+      ['piece.cycle', 'cycle', 137, 0, true],
+      ['piece.dimMax', 'dimMax', 250, -1, false],
+      ['piece.mode', 'mode', '2*8', 0, true],
+      ['piece.noyaux', 'noyaux', true, 0, true],
+      ['piece.empreintes', 'empreintes', 2.5, 0, false],
+    ]);
+    assert.equal(read[4].ilot_mode, 'CG3');
+    assert.match(read[1].refus, /prix, taux, paramètre ou valeur du devis entier/);
+    assert.match(read[3].refus, /pièce « Autre » absente/);
+    assert.equal(read[6].refus, 'nombre entier attendu');
+    // 1,35 kg written by the user; 137 s is not the cycle of the trace (computed by the model).
+    const checked = checkProposals(read, sent, ['Le poids réel est de 1,35 kg.']);
+    assert.equal(checked[0].refus, null);
+    assert.equal(checked[2].refus, 'valeur absente de la trace de cette pièce pour cette clé');
+    assert.equal(checkProposals(read, sent, [])[0].refus, 'nombre absent de vos messages');
+    // Read from the trace sent for the same key: 2 cavities; the weight of the trace is no cavity count.
+    const cavities = (valeur, source = 'trace') => checkProposals(readProposals([{ piece: 'Pièce', cle: 'piece.empreintes', valeur, source }], trace), sent, [])[0];
+    assert.deepEqual([cavities(2).refus, cavities(2).valeur], [null, 2]);
+    assert.equal(cavities(1.2).refus, 'nombre entier attendu');
+    assert.match(cavities(2, '').refus, /source du nombre non indiquée/);
+    assert.deepEqual(readProposals('rien', trace), []);
+  });
+
+  test('a number another source or field gives, or in another unit, is not taken for the one proposed', () => {
+    const t = { pieces: [{ nom: 'P', valeurs: { 'piece.poids': { valeur: 2.1, unite: 'kg', autres_sources: [{ source: 'demande client', valeur: 2.05 }] }, 'piece.cycle': { valeur: 302, unite: 's' } } }] };
+    const context = { costing_trace: t, bodies: [{ metrics: { bbox_mm: { size: [135, 48, 22] }, volume_mm3: 90000, surface_area_mm2: 30000 } }] };
+    const check = (list, asked = []) => checkProposals(readProposals(list.map((p) => ({ piece: 'P', ...p })), t), context, asked).map((p) => [p.cle, p.valeur, p.refus]);
+    // The user's units converted: 1350 g → 1,35 kg, 4 min → 240 s; the model may have converted them itself.
+    assert.deepEqual(check([{ cle: 'piece.poids', valeur: 1350, unite: 'g', source: 'question' }, { cle: 'piece.cycle', valeur: 4, unite: 'min', source: 'question' }, { cle: 'piece.poids', valeur: 1.35, unite: 'kg', source: 'question' }], ['Le poids réel est de 1350 g et le cycle mesuré est de 4 min']),
+      [['piece.poids', 1.35, null], ['piece.cycle', 240, null], ['piece.poids', 1.35, null]]);
+    assert.match(readProposals([{ piece: 'P', cle: 'piece.poids', valeur: 3, unite: 'lb', source: 'question' }], t)[0].refus, /unité « lb » : kg attendu/);
+    // The trace: the same key of the same piece, its value or another source's, to its rounding only.
+    assert.deepEqual(check([{ cle: 'piece.cycle', valeur: 300, source: 'trace' }, { cle: 'piece.poids', valeur: 2.05, source: 'trace' }, { cle: 'piece.cycle', valeur: 302, source: 'trace' }]).map((x) => x[2] === null), [false, true, true]);
+    // The analysis of the part: the measure of that input only (135 mm is no weight, 22 mm no cavity count).
+    assert.deepEqual(check([{ cle: 'piece.poids', valeur: 13.5, source: 'analyse_3d' }, { cle: 'piece.dimMax', valeur: 135, source: 'analyse_3d' }, { cle: 'piece.module', valeur: 3, source: 'analyse_3d' }, { cle: 'piece.empreintes', valeur: 22, source: 'analyse_3d' }]).map((x) => x[2] === null), [false, true, true, false]);
+    // The rounding of the trace: 194,02 sent for 194,0173 is the same value.
+    assert.equal(sameValue(194.0173, 194.02), true);
+    assert.equal(sameValue(1.234567, 1.23457), true);
+    assert.equal(sameValue(1.2345, 1.2346), false);
+  });
+
+  test('applied: the inputs of the piece that differ, the island imposed for a value of its route, traced; undone: what was there before', () => {
+    const c = computed();
+    const r = c.results[0];
+    const island = r.route.process;
+    const cavities = r.trace['piece.empreintes'].valeur;
+    const proposals = [{ cle: 'piece.poids', valeur: 1.35 }, { cle: 'piece.empreintes', valeur: cavities + 1 }, { cle: 'piece.dimMax', valeur: 250 }];
+    const target = { tab: 1, file: null, key: 'manuel' };
+    // What would change: the weight and the cavities; the largest size is already 250.
+    const dry = ui.applyAIValues(target, proposals, {}, { dryRun: true });
+    assert.deepEqual(dry.applied.map((x) => [x.champ, x.avant, x.apres]), [['poids', 1.2, 1.35], ['empreintes', cavities, cavities + 1]]);
+    assert.deepEqual(dry.same.map((x) => x.champ), ['dimMax']);
+    assert.equal(loadQuote(base, indices).pieces.manuel.poids, 1.2, 'a dry run changes nothing');
+    // Applied: the inputs written, the island of the route imposed with its finishing, each kept with what was there before.
+    const done = ui.applyAIValues(target, proposals, { date: '2026-10-09T10:00:00.000Z', provider: 'Groq', model: 'openai/gpt-oss-120b', message: 'm1' });
+    assert.equal(done.saved, true);
+    const saved = loadQuote(base, indices);
+    const piece = saved.pieces.manuel;
+    assert.deepEqual([piece.poids, piece.empreintes, piece.procede, piece.finition, piece.dimMax], [1.35, cavities + 1, island, r.route.finition, 250]);
+    assert.deepEqual(Object.fromEntries(Object.entries(piece.valeursIA).map(([k, v]) => [k, [v.avant, v.valeur, v.message]])), {
+      procede: [null, island, 'm1'], finition: [null, r.route.finition, 'm1'], poids: [1.2, 1.35, 'm1'], empreintes: [null, cavities + 1, 'm1'],
+    });
+    assert.deepEqual(saved.analysesIA.map((a) => [a.tache, a.question]), [['application_ia', 'Appliquer les valeurs au chiffrage']]);
+    // Traced as a saisie of its own source; the costing uses them.
+    const after = ui.compute().results[0];
+    assert.deepEqual([after.trace['piece.poids'].valeur, after.trace['piece.poids'].source.type, after.trace['piece.poids'].autorite], [1.35, 'ia_appliquee', 'hard']);
+    assert.match(after.trace['piece.poids'].hypotheses.join(), /proposée par Groq · openai\/gpt-oss-120b, acceptée par l'utilisateur/);
+    assert.equal(after.trace['piece.empreintes'].valeur, cavities + 1);
+    assert.equal(after.chosen, true);
+    // Applied again: nothing to change.
+    assert.deepEqual(ui.applyAIValues(target, proposals, {}, { dryRun: true }).applied, []);
+    // Undone: the weight typed before, the cavities and the island estimated again.
+    const undone = ui.undoAIValues({ ...target, name: 'Pièce' }, { message: 'm1' });
+    assert.deepEqual(undone.undone.map((x) => x.champ).sort(), ['empreintes', 'finition', 'poids', 'procede']);
+    const back = loadQuote(base, indices).pieces.manuel;
+    assert.deepEqual([back.poids, back.empreintes, back.procede, back.finition, back.valeursIA], [1.2, undefined, undefined, undefined, undefined]);
+    assert.equal(ui.compute().results[0].chosen, false);
+    assert.match(ui.undoAIValues(target).error, /Aucune valeur appliquée/);
+  });
+
+  test('the island first: refused with the values of its route; another island resets the route typed before; undone only with its route', () => {
+    const target = { tab: 1, file: null, key: 'manuel' };
+    const stored = () => loadQuote(base, indices).pieces.manuel;
+    const setPiece = (over) => {
+      const q = loadQuote(base, indices);
+      saveQuote({ ...q, pieces: { manuel: { ...q.pieces.manuel, ...over } } });
+    };
+    // An island refused: the values of its route refused with it, nothing written.
+    let c = computed();
+    const code = c.results[0].route.process;
+    let dry = ui.applyAIValues(target, [{ cle: 'piece.ilot', valeur: 'ZZZ' }, { cle: 'piece.cycle', valeur: 60 }, { cle: 'piece.poids', valeur: 1.35 }], {}, { dryRun: true });
+    assert.deepEqual(dry.refused.map((x) => [x.cle, x.refus]), [['piece.ilot', 'îlot « ZZZ » absent du classeur ou de Paramètres'], ['piece.cycle', 'proposée avec un îlot refusé']]);
+    assert.deepEqual([dry.applied.map((x) => x.champ), dry.consequences], [['poids'], []]);
+    // A value of the route on an automatic piece: the island imposed, said in the consequences.
+    dry = ui.applyAIValues(target, [{ cle: 'piece.cycle', valeur: 60 }], {}, { dryRun: true });
+    assert.deepEqual(dry.consequences.map((x) => [x.champ, x.avant, x.apres]), [['procede', 'automatique', `${code} imposé`], ['finition', c.results[0].route.finition, `${c.results[0].route.finition} imposée`]]);
+
+    // Another island: the cycle typed for the one before reset (said), the finishing proposed compared with nothing.
+    c = computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', finition: 'FTR', cycle: 120 } } } });
+    const other = Object.keys(c.results[0].ranked.reduce((m, r) => ({ ...m, [r.process]: 1 }), {})).find((x) => x !== 'CG3' && x.startsWith('CG') && ui.applyAIValues(target, [{ cle: 'piece.ilot', valeur: x }, { cle: 'piece.finition', valeur: 'FTR' }], {}, { dryRun: true }).refused.length === 0);
+    dry = ui.applyAIValues(target, [{ cle: 'piece.ilot', valeur: other }, { cle: 'piece.finition', valeur: 'FTR' }], {}, { dryRun: true });
+    assert.deepEqual(dry.applied.map((x) => [x.champ, x.avant, x.apres]), [['procede', 'CG3', other], ['finition', null, 'FTR']]);
+    assert.deepEqual(dry.consequences.map((x) => [x.champ, x.avant, x.apres]), [['cycle', 120, null]]);
+    ui.applyAIValues(target, [{ cle: 'piece.ilot', valeur: other }], { message: 'a' });
+    assert.deepEqual([stored().procede, stored().finition, stored().cycle], [other, 'auto', null]);
+    // A second answer: a cycle for the new island; undone, back to its estimate, not to the 120 s typed for CG3.
+    ui.applyAIValues(target, [{ cle: 'piece.cycle', valeur: 80 }], { message: 'b' });
+    assert.equal(stored().cycle, 80);
+    ui.undoAIValues(target, { message: 'b' });
+    assert.equal(stored().cycle ?? null, null);
+    // Another island chosen since by a person: the finishing and the route of the first answer are left as they are.
+    setPiece({ procede: 'CG3', finition: 'auto', cycle: null });
+    const undone = ui.undoAIValues(target, { message: 'a' });
+    assert.deepEqual([stored().procede, stored().finition, stored().cycle ?? null], ['CG3', 'auto', null]);
+    assert.ok(undone.kept.includes('procédé / îlot') && undone.kept.includes('finition'));
+
+    // A cycle applied (island imposed), then typed by a person: undone, the island and its cycle stay.
+    computed();
+    ui.applyAIValues(target, [{ cle: 'piece.cycle', valeur: 60 }], { message: 'c' });
+    setPiece({ cycle: 90 });
+    const u = ui.undoAIValues(target, { message: 'c' });
+    assert.deepEqual([stored().procede, stored().cycle], [code, 90]);
+    assert.deepEqual(u.undone, []);
+  });
+
+  test('cores added only when the application checks them, taken back with it; an adopted estimate of the cycle back with an undo', () => {
+    const target = { tab: 1, file: null, key: 'manuel' };
+    const stored = () => loadQuote(base, indices).pieces.manuel;
+    // Cores already checked without a core described: another value applied adds none.
+    computed({ quote: { pieces: { manuel: { ...PART, noyaux: true, cores: [] } } } });
+    ui.applyAIValues(target, [{ cle: 'piece.dimMax', valeur: 260 }], { message: 'd' });
+    assert.deepEqual(stored().cores, []);
+    // Checked by the application: a first core, removed by the undo.
+    computed();
+    ui.applyAIValues(target, [{ cle: 'piece.noyaux', valeur: true }], { message: 'e' });
+    assert.equal(stored().cores.length, 1);
+    ui.undoAIValues(target, { message: 'e' });
+    assert.deepEqual([stored().noyaux, stored().cores], [undefined, undefined]);
+    // An estimate of the cycle adopted (traced "estimation IA validée"): replaced by the AI's cycle, back with the undo.
+    const c = computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', cycle: 75, cycleIA: { date: '2026-10-01T00:00:00.000Z', valeur: 75, avant: { procede: 'auto', finition: 'auto', cycle: null }, estimation: { ilot: 'CG3', estimation_s: 75, fournisseur: 'Groq', modele: 'm', date: '2026-10-01T00:00:00.000Z', confiance: 'moyenne' } } } } } });
+    assert.equal(c.results[0].trace['piece.cycle'].source.type, 'ia_validee');
+    ui.applyAIValues(target, [{ cle: 'piece.cycle', valeur: 60 }], { message: 'f' });
+    assert.equal(stored().cycleIA, undefined);
+    ui.undoAIValues(target, { message: 'f' });
+    assert.deepEqual([stored().cycle, stored().cycleIA?.valeur], [75, 75]);
+    assert.equal(ui.compute().results[0].trace['piece.cycle'].source.type, 'ia_validee');
+  });
+
+  test('a value changed since by a person is kept when undone; the codes checked against the settings; another 3D model refused', () => {
+    computed();
+    const target = { tab: 1, file: null, key: 'manuel' };
+    ui.applyAIValues(target, [{ cle: 'piece.poids', valeur: 1.35 }, { cle: 'piece.toileMini', valeur: 4 }], { message: 'm2' });
+    // The weight typed again since in the page.
+    const q = loadQuote(base, indices);
+    saveQuote({ ...q, pieces: { manuel: { ...q.pieces.manuel, poids: 1.5 } } });
+    const undone = ui.undoAIValues(target, { message: 'm2' });
+    assert.deepEqual([undone.undone.map((x) => x.champ), undone.kept], [['toileMini'], ['poids pièce']]);
+    assert.deepEqual([loadQuote(base, indices).pieces.manuel.poids, loadQuote(base, indices).pieces.manuel.toileMini], [1.5, 5]);
+    // Codes unknown: refused, nothing written.
+    const refused = ui.applyAIValues(target, [{ cle: 'piece.ilot', valeur: 'ZZZ' }, { cle: 'piece.mode', valeur: '4*8' }, { cle: 'piece.tth', valeur: 'T99' }], {}, { dryRun: true });
+    assert.deepEqual(refused.refused.map((x) => x.cle), ['piece.ilot', 'piece.mode', 'piece.tth']);
+    assert.deepEqual(refused.applied, []);
+    // The quote of another 3D file: the model of the tab changed since the answer.
+    assert.match(ui.applyAIValues({ ...target, file: 'autre.step' }, [{ cle: 'piece.poids', valeur: 1.35 }]).error, /Le modèle 3D de l'onglet a changé/);
+    assert.match(ui.applyAIValues({ ...target, key: '0:Absente' }, [{ cle: 'piece.poids', valeur: 1.35 }]).error, /n'est plus chiffrée/);
   });
 });
