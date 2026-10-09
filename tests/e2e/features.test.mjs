@@ -1022,16 +1022,20 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.deepEqual(files[name].part, part);
     // The next answer written there too, merged in the same conversation.
     await ask('Et sa masse ?');
-    await page.waitForFunction(async (file) => {
+    // Its file as written: the four messages, and still them a moment later (a file that went back to two
+    // would be a write lost; Chromium's own file system may give a read of before for a moment).
+    const written = (file) => page.waitForFunction(async (f) => {
       try {
         const dir = await navigator.storage.getDirectory();
-        return JSON.parse(await (await (await dir.getFileHandle(file)).getFile()).text()).conversations[0].messages.length === 4;
+        const messages = JSON.parse(await (await (await dir.getFileHandle(f)).getFile()).text()).conversations[0].messages;
+        return JSON.stringify(messages.map((m) => [m.role, m.role === 'user' ? m.content : m.provider])) === JSON.stringify([['user', 'Quel volume ?'], ['assistant', 'Groq'], ['user', 'Et sa masse ?'], ['assistant', 'Groq']]);
       } catch {
         return false; // being written
       }
-    }, name, { timeout: 10_000 });
-    files = await folderFiles();
-    assert.deepEqual(files[name].conversations[0].messages.map((m) => [m.role, m.role === 'user' ? m.content : m.provider]), [['user', 'Quel volume ?'], ['assistant', 'Groq'], ['user', 'Et sa masse ?'], ['assistant', 'Groq']]);
+    }, file, { timeout: 10_000 });
+    await written(name);
+    await page.waitForTimeout(300);
+    await written(name);
     assert.equal(await page.getAttribute('#ai-hist-tab-reseau', 'aria-selected'), 'true');
 
     // The tab closed, the same file opened again: its conversation back.
