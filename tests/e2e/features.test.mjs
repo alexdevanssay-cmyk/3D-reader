@@ -402,12 +402,12 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(request.messages[0].content.length < 6000, `system prompt of ${request.messages[0].content.length} characters`);
     assert.match(await page.textContent('#ai-status'), /chargement du modèle 2 s, lecture de 900 tokens 3 s, rédaction de 40 tokens 1 s/);
     assert.deepEqual(request.messages.slice(1).map((m) => m.role), ['user']);
-    // An origin refused by Ollama: the question fails with the page's own origin in the explanation, and is not kept.
+    // A task clicked: its question asked. An origin refused by Ollama: the question fails with the page's own
+    // origin in the explanation, and is not kept.
     allowed = false;
     await page.click('.ai-task[data-task="manufacturing_analysis"]');
-    await page.fill('#ai-input', 'Et les noyaux ?');
-    await page.press('#ai-input', 'Enter');
     await page.waitForFunction(() => document.getElementById('ai-status').textContent === 'Erreur', null, { timeout: 30_000 });
+    assert.match(await page.textContent('#ai-chat'), /Quels procédés et quelles opérations pour fabriquer cette pièce \?/);
     assert.match(await page.textContent('#ai-chat .ai-error'), new RegExp(`OLLAMA_ORIGINS contient ${base.replace(/\/$/, '').replace(/[.]/g, '\\.')}`));
     allowed = true;
     await page.fill('#ai-input', 'Et les noyaux ?');
@@ -434,9 +434,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // quote and the rates the model was asked for; the answer labelled, its numbers checked.
     await page.uncheck('#ai-think');
     await page.click('.ai-task[data-task="costing"]');
-    await page.fill('#ai-input', 'Pourquoi ce prix ?');
-    await page.press('#ai-input', 'Enter');
     await page.waitForSelector('#ai-chat .ai-check', { timeout: 30_000 });
+    assert.match(chats[3].messages.at(-1).content, /^Explique le chiffrage de cette pièce/);
     const costing = chats[3].messages[0].content;
     assert.match(costing, /"costing_trace":null/);
     assert.doesNotMatch(costing, /costing_contract|costing_inputs|"quote"/);
@@ -615,10 +614,16 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const gatewayUrl = `http://127.0.0.1:${gateway.address().port}/api/ai`;
     const status = () => page.textContent('#ai-status');
     const waitStatus = (re) => page.waitForFunction((source) => new RegExp(source).test(document.getElementById('ai-status').textContent), re.source, { timeout: 30_000 });
+    const answered = () => page.waitForFunction(() => !document.getElementById('ai-send').disabled && !/Analyse/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
     const ask = async (question) => {
       await page.fill('#ai-input', question);
       await page.press('#ai-input', 'Enter');
-      await page.waitForFunction(() => !document.getElementById('ai-send').disabled && !/Analyse/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+      await answered();
+    };
+    // A task clicked: its own question asked.
+    const askTask = async (name) => {
+      await page.click(`.ai-task[data-task="${name}"]`);
+      await answered();
     };
     const contextOf = (completion) => completion.body.messages[1].content.replace(/^[\s\S]*?<<<DONNEES_3D_READER\n/, '').replace(/\nDONNEES_3D_READER>>>$/, '');
 
@@ -689,8 +694,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     await page.click('.tab[data-page="ia"]');
-    await page.click('.ai-task[data-task="feature_analysis"]');
-    await ask('Quelles features ?');
+    await askTask('feature_analysis');
+    assert.match(completions[1].body.messages.at(-1).content, /^Liste les features de la pièce par type/);
     const detail = contextOf(completions[1]);
     const whole = await page.evaluate(() => JSON.stringify(window.reader3d.aiContext({ task: 'feature_analysis' })).length);
     assert.match(detail, /"compaction"/);
@@ -698,8 +703,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // The conversation goes with it.
     assert.deepEqual(completions[1].body.messages.slice(2).map((m) => m.role), ['user', 'assistant', 'user']);
     // The general questions too get the detail (the gateway reads it in seconds), within its budget, with the bodies sent.
-    await page.click('.ai-task[data-task="general"]');
-    await ask('Résume la pièce.');
+    await askTask('general');
     const general = contextOf(completions[2]);
     assert.doesNotMatch(general, /"summary_only"/);
     assert.ok(general.length <= 2500, `context of ${general.length} characters`);
@@ -818,11 +822,17 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.fill('#ai-url', `http://127.0.0.1:${gateway.address().port}/api/ai`);
     assert.equal(await page.isChecked('#ai-anon'), true);
     assert.equal(await page.isChecked('#ai-fallback'), true);
+    const answered = () => page.waitForFunction(() => !document.getElementById('ai-send').disabled && !/Analyse|Lecture|Rédaction/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
     const ask = async (question) => {
       await page.fill('#ai-input', question);
       await page.press('#ai-input', 'Enter');
-      await page.waitForFunction(() => !document.getElementById('ai-send').disabled && !/Analyse|Lecture|Rédaction/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+      await answered();
       return page.locator('#ai-chat .ai-msg').last();
+    };
+    // A task clicked: its own question asked.
+    const askTask = async (name) => {
+      await page.click(`.ai-task[data-task="${name}"]`);
+      await answered();
     };
 
     // Tab 1: a part of two named bodies. Online, the labels in place of its names, in the context and the question.
@@ -830,13 +840,13 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     await page.click('.tab[data-page="ia"]');
-    await page.click('.ai-task[data-task="feature_analysis"]');
+    await askTask('feature_analysis');
     let answer = await ask("Quel est le volume de l'Équerre ?");
-    let sent = contextOf(completions[0]);
+    let sent = contextOf(completions[1]);
     assert.equal(sent.source.file, 'Pièce.step');
     assert.deepEqual(sent.bodies.map((b) => b.name), ['Corps 1', 'Corps 2']);
-    for (const name of ['Équerre', 'named_assembly']) assert.ok(!JSON.stringify(completions[0].messages).includes(name), name);
-    assert.equal(completions[0].messages.at(-1).content, "Quel est le volume de l'Corps 1 ?");
+    for (const name of ['Équerre', 'named_assembly']) assert.ok(!JSON.stringify(completions.slice(0, 2).map((c) => c.messages)).includes(name), name);
+    assert.equal(completions[1].messages.at(-1).content, "Quel est le volume de l'Corps 1 ?");
     // Under the answer: the real names of its labels; its made-up number counted, the volume of the part is not.
     assert.equal(await answer.locator('.ai-names').textContent(), 'Noms réels : Corps 1 = Équerre ; Corps 2 = Pin');
     assert.equal(await answer.locator('.ai-numbers').textContent(), '1 nombre ne vient pas des données envoyées');
@@ -844,14 +854,14 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // Unticked: the real names.
     await page.uncheck('#ai-anon');
     await ask('Et la Pin ?');
-    assert.match(JSON.stringify(contextOf(completions[1])), /Équerre/);
+    assert.match(JSON.stringify(contextOf(completions[2])), /Équerre/);
     assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.ai.anonymize')), '0');
     await page.check('#ai-anon');
 
     // The names of the quote of the tab (no costing workbook needed), in any task: the customer named in a general question.
     const quote = (over) => page.evaluate((q) => localStorage.setItem('reader3d.chiffrage.quote.v1', JSON.stringify(q)), { client: 'Fonderie Exemple', reference: 'REF-EX-1', ...over });
     await quote({});
-    await page.click('.ai-task[data-task="general"]');
+    await askTask('general');
     await ask('Et pour Fonderie Exemple, avec la REF-EX-1 ?');
     assert.equal(completions.at(-1).messages.at(-1).content, 'Et pour Client, avec la Référence ?');
     // The customer changed since in the quote: its former name, in the conversation, still replaced.
@@ -862,7 +872,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(online.includes('Et pour Client, avec la Référence ?'));
     assert.equal(completions.at(-1).messages.at(-1).content, 'Et pour Client ?');
     await page.evaluate(() => localStorage.removeItem('reader3d.chiffrage.quote.v1'));
-    await page.click('.ai-task[data-task="feature_analysis"]');
+    await askTask('feature_analysis');
 
     // Tab 2: its own conversation, empty; its question sent without the conversation of tab 1.
     await page.click('.doc-tab-new');
@@ -874,7 +884,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(contextOf(completions.at(-1)).source.file, 'Pièce.stl');
     // Back to tab 1: its conversation; to tab 2: its own.
     await page.click('.doc-tab:first-child');
-    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 8);
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 14);
     assert.match(await page.textContent('#ai-chat'), /Noms réels : Corps 1 = Équerre ; Corps 2 = Pin/);
     await page.click('.doc-tab:nth-child(2)');
     assert.equal(await page.locator('#ai-chat .ai-msg').count(), 2);
@@ -902,7 +912,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.ok(await page.evaluate(() => sessionStorage.getItem('reader3d.ai.messages.2')));
     await page.click('.doc-tab:nth-child(2) .doc-tab-close');
     assert.equal(await page.evaluate(() => sessionStorage.getItem('reader3d.ai.messages.2')), null);
-    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 8);
+    assert.equal(await page.locator('#ai-chat .ai-msg').count(), 14);
     // Another part opened in tab 1: not its conversation, but the one of that part kept in the history (tab 2's, closed).
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
     await page.waitForFunction(() => window.reader3d.tab.file === 'box.stl' && document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });

@@ -58,14 +58,23 @@ const MAX_WINDOW = 16384; // largest window (tokens) asked of Ollama
 const GATEWAY_CONTEXT_CHARS = 9000;
 const GATEWAY_EXAMPLE = "https://<projet>.vercel.app/api/ai";
 
+// The tasks of the IA page: [value, label, what the AI is given for it, a question it answers]. The task
+// chooses what of the analysis goes with the question (engine/ai-context.js) and the instructions.
 const TASKS = [
-  ["general", "Analyse générale"],
-  ["feature_analysis", "Features"],
-  ["manufacturing_analysis", "Fabrication"],
-  ["dfm", "DFM"],
-  ["planning", "Planification"],
-  ["costing", "Chiffrage"],
+  ["general", "Analyse générale", "Questions libres : la pièce, ses features et son criblage fonderie.",
+    "Fais l'analyse de la pièce : ce qui est mesuré, les features principales avec leurs cotes, le criblage fonderie, et ce qui reste à valider."],
+  ["feature_analysis", "Features", "Les features détectées (trous, alésages, poches, congés, motifs, relations coaxiales) avec leurs cotes et leurs identifiants.",
+    "Liste les features de la pièce par type, avec leurs cotes et leurs identifiants ; distingue celles qui sont établies des provisoires."],
+  ["manufacturing_analysis", "Fabrication", "Les pistes de procédés et d'opérations, les épaisseurs fonctionnelles et le criblage fonderie.",
+    "Quels procédés et quelles opérations pour fabriquer cette pièce ? Avec le besoin en noyaux, les contre-dépouilles et les épaisseurs à surveiller."],
+  ["dfm", "DFM", "La conception pour la fabrication : recommandations, contre-dépouilles, épaisseurs, risques fonderie.",
+    "Quelles modifications de conception faciliteraient la fabrication de cette pièce ? Classe-les par impact."],
+  ["planning", "Planification", "Une gamme indicative : mises en position et opérations (une piste, pas une gamme exécutable).",
+    "Propose une gamme d'usinage indicative : mises en position, opérations et outils, avec les points à valider."],
+  ["costing", "Chiffrage", "Le devis en cours et sa trace : la réponse explique ses valeurs sans rien modifier, chaque nombre vérifié.",
+    "Explique le chiffrage de cette pièce : les postes principaux, les écarts signalés et les valeurs à valider."],
 ];
+const TASK_NOTE = "Un clic sur une tâche pose sa question ; vos questions suivantes gardent la tâche choisie.";
 
 const KEYS = {
   gateway: "reader3d.ai.gateway", code: "reader3d.ai.gatewayCode", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider",
@@ -677,8 +686,9 @@ export function mount({ page, reader }) {
           <button id="ai-test" class="btn" type="button">Tester la connexion</button>
         </div>
         <div class="ai-row ai-tasks" role="group" aria-label="Type d'analyse">
-          ${TASKS.map(([v, l]) => `<button type="button" class="small ai-task" data-task="${v}" aria-pressed="${v === "general"}">${l}</button>`).join("")}
+          ${TASKS.map(([v, l, help, question]) => `<button type="button" class="small ai-task" data-task="${v}" aria-pressed="${v === "general"}" title="${escapeHtml(`${help} Question posée : « ${question} »`)}">${l}</button>`).join("")}
         </div>
+        <p id="ai-task-help" class="ai-scope">${escapeHtml(`${TASKS[0][2]} ${TASK_NOTE}`)}</p>
         <p id="ai-scope" class="ai-scope"></p>
       </section>
 
@@ -1485,8 +1495,14 @@ export function mount({ page, reader }) {
       task = button.dataset.task;
       page.querySelectorAll(".ai-task").forEach((b) => b.setAttribute("aria-pressed", String(b === button)));
       $("ai-amounts-field").hidden = isLocal() || task !== "costing";
-      setStatus(`Tâche : ${button.textContent}`);
-      $("ai-input").focus();
+      const [, label, help, question] = TASKS.find(([v]) => v === task);
+      $("ai-task-help").textContent = `${help} ${TASK_NOTE}`;
+      // The click asks its question (a question being written stays in the box), when it can be answered.
+      if (busy) return setStatus(`Tâche « ${label} » choisie : une question est déjà en cours, cliquez de nouveau une fois la réponse écrite`);
+      if (reader.status === "analysing") return setStatus(`Tâche « ${label} » choisie : la pièce est encore en cours d'analyse, cliquez de nouveau une fois l'analyse finie`);
+      // The costing reads the quote of the tab, the other tasks the part.
+      if (task !== "costing" && !readPart({ withSemantic: false })) return setStatus(`Tâche « ${label} » choisie : ouvrez une pièce dans le lecteur 3D pour son analyse`);
+      ask(question);
     });
   });
 
@@ -1829,9 +1845,14 @@ export function mount({ page, reader }) {
       return;
     }
     input.value = "";
+    await ask(question);
+  });
+
+  /** Asks `question` under the task chosen: its answer, or its error, in the conversation. */
+  async function ask(question) {
     await send(question).catch((err) => bubble("error", err?.message || String(err)));
     showScope();
-  });
+  }
 
   /** The status line when no question is asked: is there a part, is it still analysed. */
   function showReady() {

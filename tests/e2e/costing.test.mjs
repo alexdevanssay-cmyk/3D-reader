@@ -592,13 +592,15 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const stored = await costingStorage();
     await page.selectOption('#ai-provider', 'ollama');
     await page.fill('#ai-url', `http://127.0.0.1:${ollama.address().port}`);
-    await page.click('.ai-task[data-task="costing"]');
-    assert.equal(await page.isVisible('#ai-amounts-field'), false, 'the local model gets the whole trace');
     const fr = (v) => v.toLocaleString('fr-FR', { maximumFractionDigits: 2 });
+    // Without a question: the task "Chiffrage" clicked, its own question asked.
+    const costingQuestion = 'Explique le chiffrage de cette pièce : les postes principaux, les écarts signalés et les valeurs à valider.';
     const ask = async (question) => {
       const n = await page.locator('#ai-chat .ai-check').count();
-      await page.fill('#ai-input', question);
-      await page.press('#ai-input', 'Enter');
+      if (question) {
+        await page.fill('#ai-input', question);
+        await page.press('#ai-input', 'Enter');
+      } else await page.click('.ai-task[data-task="costing"]');
       await page.waitForFunction((count) => document.querySelectorAll('#ai-chat .ai-check').length > count, n, { timeout: 30_000 });
       // The answer is shown before it is kept with the quote: the status tells when the question is over.
       await page.waitForFunction(() => /^Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
@@ -606,7 +608,9 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     };
     // The stand-in cites the sale price of the trace it was given.
     answer = (trace) => `Le prix de vente (piece.prix.vente) est de ${typeof trace.pieces[0].valeurs['piece.prix.vente'].valeur === 'number' ? `${fr(trace.pieces[0].valeurs['piece.prix.vente'].valeur)} €` : 'masqué'}.`;
-    let reply = await ask('Pourquoi ce prix ?');
+    let reply = await ask();
+    assert.equal(await page.isVisible('#ai-amounts-field'), false, 'the local model gets the whole trace');
+    assert.equal(chats[0].messages.at(-1).content, costingQuestion);
     const system = chats[0].messages[0].content;
     assert.doesNotMatch(system, /costing_contract|costing_inputs|"quote"/);
     assert.match(system, /N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux\. Ne cite que des nombres présents dans costing_trace/);
@@ -630,7 +634,7 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // The AI wrote nothing: the costing data of this browser are unchanged. Its answers are kept with the quote, for the record.
     assert.equal(await costingStorage(), stored);
     const kept = await analyses();
-    assert.deepEqual(kept.map((a) => [a.provider, a.model, a.question, a.verified]), [['Ollama', 'qwen3:8b', 'Pourquoi ce prix ?', true], ['Ollama', 'qwen3:8b', 'Et avec un autre taux ?', false]]);
+    assert.deepEqual(kept.map((a) => [a.provider, a.model, a.question, a.verified]), [['Ollama', 'qwen3:8b', costingQuestion, true], ['Ollama', 'qwen3:8b', 'Et avec un autre taux ?', false]]);
     assert.match(kept[1].answer, /Avec un taux de 85 €\/h/);
     assert.ok(kept.every((a) => !Number.isNaN(Date.parse(a.date))));
 
