@@ -41,7 +41,9 @@ const MAX_CANDIDATES = 6;
 const SAME_AXIS = Math.cos((10 * Math.PI) / 180); // two candidates closer than 10° are one
 const SNAP = Math.cos((1 * Math.PI) / 180); // within 1° of X, Y or Z: that axis
 const NORMAL_BINS = 25; // per side of a face of the cube of directions (odd: an axis is the middle of a bin)
-const DOMINANT_SHARE = 0.02; // a direction of face normals is dominant above this share of the surface
+// A direction of face normals is dominant above this share of the surface (not
+// one facet of a curved face).
+const DOMINANT_SHARE = 0.05;
 // A face reachable from both sides, square to d within this, goes to the upper half.
 const TIE = 1e-6;
 // Planar: the points of the line within this height along d (the larger of the two).
@@ -50,14 +52,19 @@ const PLANAR_TOL_SHARE = 0.005; // of the height of the part along d
 // Ranking: undercut and zero-draft areas closer than these shares of the surface are equal.
 const UNDERCUT_TIE = 0.002;
 const ZERO_DRAFT_TIE = 0.01;
+const RATIO_TIE = 0.01; // of the larger projected area per height
 const BARY_MARGIN = 1e-7; // a line through the common edge of two triangles meets one of them
+// Facets of one smooth surface: normals closer than this (35°, above the angular deflection of a coarse tessellation).
+const SMOOTH_FACETS = Math.cos((35 * Math.PI) / 180);
 
 // ------------------------------------------------------------------ mesh
 
 /**
  * What every direction needs of a mesh: positions in double precision, moved
  * to the centre of the box (precision far from the origin), unit outward
- * normals (flipped when the enclosed volume is negative), areas, centres.
+ * normals (flipped when the enclosed volume is negative), areas, centres,
+ * longest edges, and the vertices merged by position (the faces of a CAD
+ * body have their own vertices): {welded (per corner), nv}.
  */
 export function prepareMesh(positions, indices) {
   const nt = indices.length / 3;
@@ -77,6 +84,7 @@ export function prepareMesh(positions, indices) {
   const normals = new Float64Array(3 * nt);
   const centres = new Float64Array(3 * nt);
   const areas = new Float64Array(nt);
+  const reach = new Float64Array(nt); // longest edge
   let volume = 0;
   for (let f = 0; f < nt; f++) {
     const a = 3 * indices[3 * f], b = 3 * indices[3 * f + 1], c = 3 * indices[3 * f + 2];
@@ -92,12 +100,15 @@ export function prepareMesh(positions, indices) {
       normals[3 * f + 2] = nz / len;
     }
     for (let k = 0; k < 3; k++) centres[3 * f + k] = (P[a + k] + P[b + k] + P[c + k]) / 3;
+    reach[f] = Math.sqrt(Math.max(ux * ux + uy * uy + uz * uz, vx * vx + vy * vy + vz * vz, (vx - ux) ** 2 + (vy - uy) ** 2 + (vz - uz) ** 2));
   }
   if (volume < 0) for (let i = 0; i < normals.length; i++) normals[i] = -normals[i];
   let totalArea = 0;
   for (let f = 0; f < nt; f++) totalArea += areas[f];
   const diag = nv ? Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2]) : 0;
-  return { positions: P, indices, nt, nv, normals, centres, areas, totalArea, diag, centre };
+  // Slivers without area (thousands round a singular point of a B-spline face).
+  const sliver = 1e-9 * diag * diag;
+  return { positions: P, indices, nt, nv, normals, centres, areas, reach, totalArea, diag, centre, sliver, merged: weld(positions, indices) };
 }
 
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -163,9 +174,10 @@ function eigenvectors(m) {
 
 /**
  * Candidate draw axes: the directions of the face normals that hold the most
- * surface (both senses together), then the principal axes of the surface
- * (area-weighted covariance of the triangle centres); closer than 10° to an
- * earlier one, left out; at most six. Each axis covers both halves.
+ * surface (both senses together), the axes of the frame (a part is drawn in
+ * the frame of its design), then the principal axes of the surface; closer
+ * than 10° to an earlier one, left out; at most six. Each axis covers both
+ * halves. Ties of the ranking go to the earlier one.
  */
 export function candidateAxes(mesh, max = MAX_CANDIDATES) {
   const { normals, areas, centres, nt, totalArea } = mesh;
@@ -198,32 +210,29 @@ export function candidateAxes(mesh, max = MAX_CANDIDATES) {
   bins.sort((x, y) => binArea[y] - binArea[x]);
   const list = bins.map((i) => ({ axis: [binSum[3 * i], binSum[3 * i + 1], binSum[3 * i + 2]], source: "face_normals" }));
 
-  // Principal axes of the surface.
-  let mx = 0, my = 0, mz = 0;
+  for (let k = 0; k < 3; k++) list.push({ axis: [0, 1, 2].map((i) => (i === k ? 1 : 0)), source: "frame_axis" });
+  // Principal axes of the surface: its second moments about its centre, each
+  // triangle's exact (A/12 (a aT + b bT + c cT + 9 g gT)), whatever the
+  // triangulation (the centres alone tilt the axes of a box of 12 triangles).
+  const { positions: P, indices: I } = mesh;
+  const m1 = [0, 0, 0];
+  const m2 = [0, 0, 0, 0, 0, 0]; // xx xy xz yy yz zz
+  const pairs = [[0, 0], [0, 1], [0, 2], [1, 1], [1, 2], [2, 2]];
   for (let f = 0; f < nt; f++) {
-    mx += areas[f] * centres[3 * f];
-    my += areas[f] * centres[3 * f + 1];
-    mz += areas[f] * centres[3 * f + 2];
+    const A = areas[f];
+    if (!(A > 0)) continue;
+    const g = [centres[3 * f], centres[3 * f + 1], centres[3 * f + 2]];
+    for (let k = 0; k < 3; k++) m1[k] += A * g[k];
+    const a = 3 * I[3 * f], b = 3 * I[3 * f + 1], c = 3 * I[3 * f + 2];
+    pairs.forEach(([i, j], k) => {
+      m2[k] += (A / 12) * (P[a + i] * P[a + j] + P[b + i] * P[b + j] + P[c + i] * P[c + j] + 9 * g[i] * g[j]);
+    });
   }
   if (totalArea > 0) {
-    mx /= totalArea;
-    my /= totalArea;
-    mz /= totalArea;
-    const c = [0, 0, 0, 0, 0, 0]; // xx xy xz yy yz zz
-    for (let f = 0; f < nt; f++) {
-      const A = areas[f];
-      const x = centres[3 * f] - mx, y = centres[3 * f + 1] - my, z = centres[3 * f + 2] - mz;
-      c[0] += A * x * x;
-      c[1] += A * x * y;
-      c[2] += A * x * z;
-      c[3] += A * y * y;
-      c[4] += A * y * z;
-      c[5] += A * z * z;
-    }
-    for (const axis of eigenvectors(c)) list.push({ axis, source: "principal_axis" });
+    const mean = m1.map((x) => x / totalArea);
+    const cov = pairs.map(([i, j], k) => m2[k] - totalArea * mean[i] * mean[j]);
+    for (const axis of eigenvectors(cov)) list.push({ axis, source: "principal_axis" });
   }
-  // The frame's axes when nothing else (a degenerate mesh).
-  for (let k = 0; k < 3; k++) list.push({ axis: [0, 1, 2].map((i) => (i === k ? 1 : 0)), source: "frame_axis" });
 
   const out = [];
   for (const { axis, source } of list) {
@@ -248,8 +257,8 @@ function basis(d) {
 /**
  * Uniform grid of the triangles projected on the plane normal to d (u, v),
  * about one cell per triangle; each triangle in the cells its projected box
- * covers. Triangles square to the plane (a line along d cannot cross them)
- * are left out.
+ * covers, a crowded cell cut again (cellGrid). Triangles square to the plane
+ * (a line along d cannot cross them) are left out.
  */
 function lineGrid(mesh, d) {
   const { positions: P, indices: I, nt, nv, normals } = mesh;
@@ -270,53 +279,145 @@ function lineGrid(mesh, d) {
     if (c > wmax) wmax = c;
   }
   const crossing = new Uint8Array(nt);
-  let boxArea = 0;
+  const boxW = new Float64Array(nt), boxH = new Float64Array(nt);
+  const box = new Float64Array(4 * nt); // u min, u max, v min, v max
+  // Slivers block no line: left out, they would crowd a cell.
   let count = 0;
   for (let f = 0; f < nt; f++) {
     const nd = normals[3 * f] * d[0] + normals[3 * f + 1] * d[1] + normals[3 * f + 2] * d[2];
-    if (Math.abs(nd) < 1e-9) continue;
+    if (Math.abs(nd) < 1e-9 || mesh.areas[f] < mesh.sliver) continue;
     crossing[f] = 1;
     count++;
     const a = I[3 * f], b = I[3 * f + 1], c = I[3 * f + 2];
-    boxArea += (Math.max(pu[a], pu[b], pu[c]) - Math.min(pu[a], pu[b], pu[c])) * (Math.max(pv[a], pv[b], pv[c]) - Math.min(pv[a], pv[b], pv[c]));
+    box[4 * f] = Math.min(pu[a], pu[b], pu[c]);
+    box[4 * f + 1] = Math.max(pu[a], pu[b], pu[c]);
+    box[4 * f + 2] = Math.min(pv[a], pv[b], pv[c]);
+    box[4 * f + 3] = Math.max(pv[a], pv[b], pv[c]);
+    boxW[f] = box[4 * f + 1] - box[4 * f];
+    boxH[f] = box[4 * f + 3] - box[4 * f + 2];
   }
   const W = Math.max(umax - umin, 1e-12), H = Math.max(vmax - vmin, 1e-12);
-  // About one cell per triangle box; at most 2048 cells a side and 4 per triangle.
-  let cell = Math.sqrt(Math.max(boxArea, 1e-24) / Math.max(1, count));
-  cell = Math.max(cell, Math.max(W, H) / 2048);
-  while (Math.ceil(W / cell) * Math.ceil(H / cell) > 4 * count + 1024) cell *= 1.25;
-  const nu = Math.max(1, Math.ceil(W / cell)), nvv = Math.max(1, Math.ceil(H / cell));
-  const cu = (x) => Math.min(nu - 1, Math.max(0, Math.floor((x - umin) / cell)));
-  const cv = (x) => Math.min(nvv - 1, Math.max(0, Math.floor((x - vmin) / cell)));
-  // The cells of each triangle: counted, then filled (compressed rows).
-  const cells = (f, visit) => {
-    const a = I[3 * f], b = I[3 * f + 1], c = I[3 * f + 2];
-    const u0 = cu(Math.min(pu[a], pu[b], pu[c])), u1 = cu(Math.max(pu[a], pu[b], pu[c]));
-    const v0 = cv(Math.min(pv[a], pv[b], pv[c])), v1 = cv(Math.max(pv[a], pv[b], pv[c]));
-    for (let i = u0; i <= u1; i++) for (let j = v0; j <= v1; j++) visit(i * nvv + j);
+  // Cells the median size of the triangle boxes: long thin triangles (the
+  // meridians of a surface of revolution) cover several cells rather than
+  // make every cell large. At most 2048 cells a side, 4 per triangle, and
+  // 12 entries per triangle in all.
+  const sample = [];
+  for (let f = 0, step = Math.max(1, Math.floor(nt / 4096)); f < nt; f += step) if (crossing[f]) sample.push(Math.max(boxW[f], boxH[f]));
+  sample.sort((x, y) => x - y);
+  let cell = Math.max(sample[sample.length >> 1] ?? Math.max(W, H), Math.max(W, H) / 2048, 1e-12);
+  const entries = (size) => {
+    let n = 0;
+    for (let f = 0; f < nt; f++) if (crossing[f]) n += (Math.floor(boxW[f] / size) + 2) * (Math.floor(boxH[f] / size) + 2);
+    return n;
   };
-  const start = new Int32Array(nu * nvv + 1);
-  for (let f = 0; f < nt; f++) if (crossing[f]) cells(f, (k) => start[k + 1]++);
-  for (let k = 0; k < nu * nvv; k++) start[k + 1] += start[k];
-  const items = new Int32Array(start[nu * nvv]);
-  const fill = start.slice(0, nu * nvv);
-  for (let f = 0; f < nt; f++) if (crossing[f]) cells(f, (k) => (items[fill[k]++] = f));
-  return { d, u, v, pu, pv, pw, umin, vmin, cell, nu, nv: nvv, start, items, height: wmax - wmin };
+  while (Math.ceil(W / cell) * Math.ceil(H / cell) > 4 * count + 1024 || entries(cell) > 12 * count + 1024) cell *= 1.3;
+  const nu = Math.max(1, Math.ceil(W / cell)), nvv = Math.max(1, Math.ceil(H / cell));
+  const list = new Int32Array(count);
+  for (let f = 0, n = 0; f < nt; f++) if (crossing[f]) list[n++] = f;
+  const root = cellGrid(list, { box, I, pu, pv }, umin, vmin, cell, nu, nvv, 0, Infinity);
+  return { d, u, v, pu, pv, pw, root, height: wmax - wmin };
+}
+
+// A cell of more triangles than this gets a finer grid of its own (3 levels at most).
+const CELL_SPLIT = 48;
+
+/**
+ * Triangles `list` in an nu × nv grid of cells `size` wide from (u0, v0),
+ * each in the cells its projection overlaps (geo: {box (u min, u max, v min,
+ * v max per triangle), I, pu, pv}), in compressed rows; null above `limit`
+ * entries. A crowded cell (small details, triangles round a point) is cut
+ * again into a finer grid, when that does not copy its triangles into every
+ * sub-cell.
+ */
+function cellGrid(list, geo, u0, v0, size, nu, nv, depth, limit) {
+  const { box, I, pu, pv } = geo;
+  const margin = 1e-9 * size;
+  // Each cell of the box of the triangle that the triangle itself overlaps (an
+  // edge with the whole cell outside it separates them): long thin triangles
+  // round a point share few cells.
+  // Edge e of the triangle: inside where n·(c - p) >= 0, n its inward normal.
+  const ex = new Float64Array(3), ey = new Float64Array(3), nx = new Float64Array(3), ny = new Float64Array(3);
+  const cells = (f, visit) => {
+    const i0 = Math.min(nu - 1, Math.max(0, Math.floor((box[4 * f] - u0) / size)));
+    const i1 = Math.min(nu - 1, Math.max(0, Math.floor((box[4 * f + 1] - u0) / size)));
+    const j0 = Math.min(nv - 1, Math.max(0, Math.floor((box[4 * f + 2] - v0) / size)));
+    const j1 = Math.min(nv - 1, Math.max(0, Math.floor((box[4 * f + 3] - v0) / size)));
+    if (i0 === i1 && j0 === j1) return visit(i0 * nv + j0);
+    const a = I[3 * f], b = I[3 * f + 1], c = I[3 * f + 2];
+    const turn = (pu[b] - pu[a]) * (pv[c] - pv[a]) - (pv[b] - pv[a]) * (pu[c] - pu[a]) < 0 ? -1 : 1;
+    for (let e = 0; e < 3; e++) {
+      const p = e === 0 ? a : e === 1 ? b : c, q = e === 0 ? b : e === 1 ? c : a;
+      ex[e] = pu[p];
+      ey[e] = pv[p];
+      nx[e] = -turn * (pv[q] - pv[p]);
+      ny[e] = turn * (pu[q] - pu[p]);
+    }
+    for (let i = i0; i <= i1; i++) {
+      const xa = u0 + i * size - margin, xb = xa + size + 2 * margin;
+      for (let j = j0; j <= j1; j++) {
+        const ya = v0 + j * size - margin, yb = ya + size + 2 * margin;
+        // Apart when, for an edge, even the corner of the cell furthest inwards is outside it.
+        let apart = false;
+        for (let e = 0; e < 3; e++) {
+          if (nx[e] * ((nx[e] > 0 ? xb : xa) - ex[e]) + ny[e] * ((ny[e] > 0 ? yb : ya) - ey[e]) < 0) {
+            apart = true;
+            break;
+          }
+        }
+        if (!apart) visit(i * nv + j);
+      }
+    }
+  };
+  const start = new Int32Array(nu * nv + 1);
+  for (const f of list) cells(f, (k) => start[k + 1]++);
+  for (let k = 0; k < nu * nv; k++) start[k + 1] += start[k];
+  if (start[nu * nv] > limit) return null;
+  const items = new Int32Array(start[nu * nv]);
+  const fill = start.slice(0, nu * nv);
+  for (const f of list) cells(f, (k) => (items[fill[k]++] = f));
+  const sub = new Map();
+  if (depth < 2) {
+    for (let k = 0; k < nu * nv; k++) {
+      const n = start[k + 1] - start[k];
+      if (n <= CELL_SPLIT) continue;
+      const m = Math.min(16, Math.ceil(Math.sqrt(n / 8)));
+      const i = Math.floor(k / nv), j = k - i * nv;
+      const finer = cellGrid(items.subarray(start[k], start[k + 1]), geo, u0 + i * size, v0 + j * size, size / m, m, m, depth + 1, 4 * n);
+      if (finer) sub.set(k, finer);
+    }
+  }
+  return { u0, v0, size, nu, nv, start, items, sub, depth };
 }
 
 /**
  * Which senses of the line through point o along d meet a triangle other
- * than `self`: 1 ahead (+d), 2 behind (-d), 3 both.
+ * than `self`: 1 ahead (+d), 2 behind (-d), 3 both. Not the next facets of
+ * the same smooth surface (a vertex in common, normals less than 35° apart,
+ * within the size of `self`): a line from a facet at a silhouette grazes
+ * them, it is not an undercut.
  */
 function lineHits(mesh, grid, self, ox, oy, oz, tEps) {
-  const { indices: I } = mesh;
-  const { u, v, d, pu, pv, pw, umin, vmin, cell, nu, nv, start, items } = grid;
+  const { indices: I, normals: N, reach } = mesh;
+  const W = mesh.merged.welded;
+  const s0 = W[3 * self], s1 = W[3 * self + 1], s2 = W[3 * self + 2];
+  const { u, v, d, pu, pv, pw } = grid;
   const a0 = ox * u[0] + oy * u[1] + oz * u[2];
   const b0 = ox * v[0] + oy * v[1] + oz * v[2];
   const w0 = ox * d[0] + oy * d[1] + oz * d[2];
-  const i = Math.floor((a0 - umin) / cell), j = Math.floor((b0 - vmin) / cell);
-  if (i < 0 || j < 0 || i >= nu || j >= nv) return 0;
-  const k = i * nv + j;
+  // The cell of the line, in the finer grid of a crowded cell.
+  let g = grid.root;
+  let k;
+  for (;;) {
+    let i = Math.floor((a0 - g.u0) / g.size), j = Math.floor((b0 - g.v0) / g.size);
+    if (g.depth === 0 && (i < 0 || j < 0 || i >= g.nu || j >= g.nv)) return 0;
+    i = Math.min(g.nu - 1, Math.max(0, i)); // a finer grid: rounding at its border
+    j = Math.min(g.nv - 1, Math.max(0, j));
+    k = i * g.nv + j;
+    const finer = g.sub.size ? g.sub.get(k) : undefined;
+    if (!finer) break;
+    g = finer;
+  }
+  const { start, items } = g;
   let bits = 0;
   for (let s = start[k], end = start[k + 1]; s < end; s++) {
     const f = items[s];
@@ -331,8 +432,12 @@ function lineHits(mesh, grid, self, ox, oy, oz, tEps) {
     const m = -BARY_MARGIN * area;
     if (area > 0 ? ea < m || eb < m || ec < m : ea > m || eb > m || ec > m) continue;
     const t = (ea * pw[a] + eb * pw[b] + ec * pw[c]) / area - w0;
-    if (t > tEps) bits |= 1;
-    else if (t < -tEps) bits |= 2;
+    if (!(t > tEps || t < -tEps)) continue;
+    if (Math.abs(t) <= reach[self] && N[3 * f] * N[3 * self] + N[3 * f + 1] * N[3 * self + 1] + N[3 * f + 2] * N[3 * self + 2] > SMOOTH_FACETS) {
+      const v0 = W[3 * f], v1 = W[3 * f + 1], v2 = W[3 * f + 2];
+      if (v0 === s0 || v0 === s1 || v0 === s2 || v1 === s0 || v1 === s1 || v1 === s2 || v2 === s0 || v2 === s1 || v2 === s2) continue;
+    }
+    bits |= t > 0 ? 1 : 2;
     if (bits === 3) return 3;
   }
   return bits;
@@ -354,8 +459,13 @@ function classify(mesh, grid, d, list, sinDraft) {
     const nx = normals[3 * f], ny = normals[3 * f + 1], nz = normals[3 * f + 2];
     if (!(nx || ny || nz)) continue; // degenerate: no side, no area
     const nd = nx * d[0] + ny * d[1] + nz * d[2];
-    const hits = lineHits(mesh, grid, f, centres[3 * f] + eps * nx, centres[3 * f + 1] + eps * ny, centres[3 * f + 2] + eps * nz, tEps);
     let flag = Math.abs(nd) < sinDraft ? ZERO_DRAFT : 0;
+    // A sliver (no area, a normal of no meaning): either half, as its neighbours.
+    if (mesh.areas[f] < mesh.sliver) {
+      flags[s] = flag | REACH_UP | REACH_DOWN;
+      continue;
+    }
+    const hits = lineHits(mesh, grid, f, centres[3 * f] + eps * nx, centres[3 * f + 1] + eps * ny, centres[3 * f + 2] + eps * nz, tEps);
     if (!(hits & 1)) flag |= REACH_UP;
     if (!(hits & 2)) flag |= REACH_DOWN;
     flags[s] = flag;
@@ -490,8 +600,8 @@ function zeroDraftArea(mesh, d, sinDraft) {
  * by position (the faces of a CAD model have their own vertices) and the
  * triangle on the other side of each edge (-1 free, -2 shared by more).
  */
-export function lineMesh(positions, indices) {
-  const { welded, nv } = weld(positions, indices);
+export function lineMesh(positions, indices, merged = weld(positions, indices)) {
+  const { welded, nv } = merged;
   return { positions, indices, welded, neighbours: edgeNeighbours(nv, welded) };
 }
 
@@ -626,7 +736,19 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
 
   const span = hi - lo;
   const tol = Math.max(PLANAR_TOL_MM, PLANAR_TOL_SHARE * (height ?? span));
-  const planar = span <= tol;
+  // Planar: 95 % of its length within ±tol of one height (the median). A line
+  // along the edges of a curved silhouette zigzags by a facet: still planar.
+  const byHeight = pieces.map(([a, b], k) => [(hOf(a) + hOf(b)) / 2, lengths[k], Math.abs(hOf(b) - hOf(a)) / 2]).sort((x, y) => x[0] - y[0]);
+  let median = byHeight[0][0];
+  for (let k = 0, acc = 0; k < m; k++) {
+    if ((acc += byHeight[k][1]) >= length / 2) {
+      median = byHeight[k][0];
+      break;
+    }
+  }
+  let near = 0;
+  for (const [h, len, half] of byHeight) if (Math.abs(h - median) + half <= tol) near += len;
+  const planar = near >= 0.95 * length;
   // Stepped: most of its length in level runs, at two heights or more; else warped.
   const runs = [];
   let levelLength = 0;
@@ -761,22 +883,54 @@ function directionSummary(mesh, d, areas, height, parting, source) {
   };
 }
 
+// A planar line first, then stepped (flat levels), then warped (a 3D die surface).
+const LINE_RANK = { planar: 0, stepped: 1, warped: 2 };
+
 /**
- * Ranking of two directions: less undercut first; then a planar parting
- * line (a non-planar one only when it removes undercuts, a dearer die); then
+ * Ranking of two directions: less undercut first; then the simpler parting
+ * line (a non-planar one only when it removes undercuts: a dearer die); then
  * less zero-draft surface; then the larger projected area for the height of
  * the part (a shallower mould).
  */
 function better(a, b, total) {
   if (Math.abs(a.undercut - b.undercut) > UNDERCUT_TIE * total) return a.undercut - b.undercut;
-  const pa = a.planar === false ? 1 : 0, pb = b.planar === false ? 1 : 0;
+  const pa = LINE_RANK[a.kind] ?? 0, pb = LINE_RANK[b.kind] ?? 0;
   if (pa !== pb) return pa - pb;
   if (Math.abs(a.zeroDraft - b.zeroDraft) > ZERO_DRAFT_TIE * total) return a.zeroDraft - b.zeroDraft;
-  return b.ratio - a.ratio;
+  if (Math.abs(a.ratio - b.ratio) > RATIO_TIE * Math.max(a.ratio, b.ratio)) return b.ratio - a.ratio;
+  return 0;
 }
 
 /** Tolerance of a planar line of a part `height` high along d. */
 export const planarTolerance = (height) => Math.max(PLANAR_TOL_MM, PLANAR_TOL_SHARE * (height || 0));
+
+/** Slivers take the half of a triangle next to them (their normal means nothing), from one to the next. */
+function inheritSlivers(mesh, side, neighbours) {
+  const { areas, sliver, nt } = mesh;
+  let pending = [];
+  for (let f = 0; f < nt; f++) if (areas[f] < sliver) pending.push(f);
+  if (!pending.length) return;
+  const known = new Uint8Array(nt).fill(1);
+  for (const f of pending) known[f] = 0;
+  while (pending.length) {
+    const next = [], found = [];
+    for (const f of pending) {
+      let g = -1;
+      for (let e = 0; e < 3 && g < 0; e++) {
+        const n = neighbours[3 * f + e];
+        if (n >= 0 && known[n]) g = n;
+      }
+      if (g < 0) next.push(f);
+      else {
+        side[f] = side[g];
+        found.push(f);
+      }
+    }
+    if (!found.length) break; // slivers alone: as they are
+    for (const f of found) known[f] = 1;
+    pending = next;
+  }
+}
 
 /** A direction classified on every triangle: {areas, side, flags, plane, line, height}. */
 function fullDirection(mesh, d, sinDraft, getLine) {
@@ -784,6 +938,7 @@ function fullDirection(mesh, d, sinDraft, getLine) {
   const flags = classify(mesh, grid, d, null, sinDraft);
   const plane = planeHeight(mesh, flags, d, planarTolerance(grid.height));
   const side = sidesOf(mesh, flags, d, plane);
+  inheritSlivers(mesh, side, getLine().neighbours);
   const line = partingLine(getLine(), side, d, { flags, plane, height: grid.height });
   return { areas: areasOf(mesh, d, flags, null), side, flags, plane, line, height: grid.height };
 }
@@ -807,7 +962,7 @@ export function proposeParting(positions, indices, { draftDeg = DEFAULT_DRAFT_DE
   const sampled = mesh.nt > fullLimit;
   const list = sampled ? sampleByArea(mesh.areas, samples, seed) : null;
   let line = null;
-  const getLine = () => (line ??= lineMesh(positions, indices));
+  const getLine = () => (line ??= lineMesh(positions, indices, mesh.merged));
   const total = mesh.totalArea || 1;
   const steps = axes.length + (sampled ? 2 : 0);
   let step = 0;
@@ -826,7 +981,7 @@ export function proposeParting(positions, indices, { draftDeg = DEFAULT_DRAFT_DE
     progress();
     return item;
   });
-  const key = (e) => ({ undercut: e.areas.undercut, zeroDraft: e.areas.zeroDraft, ratio: e.height > 0 ? e.areas.projected / e.height : 0, planar: e.line ? e.line.planar : null });
+  const key = (e) => ({ undercut: e.areas.undercut, zeroDraft: e.areas.zeroDraft, ratio: e.height > 0 ? e.areas.projected / e.height : 0, kind: e.line?.kind ?? null });
   if (sampled) {
     // The planarity of the lines of the best ones (as little undercut as the least): on every triangle.
     const least = Math.min(...evaluated.map((e) => e.areas.undercut));
@@ -874,7 +1029,7 @@ export function evaluateParting(positions, indices, direction, { draftDeg = DEFA
   const d = normalize(direction);
   if (!d) throw new Error("Invalid draw direction");
   const mesh = prepareMesh(positions, indices);
-  const full = fullDirection(mesh, d, Math.sin((draftDeg * Math.PI) / 180), () => lineMesh(positions, indices));
+  const full = fullDirection(mesh, d, Math.sin((draftDeg * Math.PI) / 180), () => lineMesh(positions, indices, mesh.merged));
   return {
     summary: { ...directionSummary(mesh, d, full.areas, full.height, full.line, "manual"), draft_angle_deg: draftDeg, surface_area_mm2: round(mesh.totalArea, 1), triangles: mesh.nt },
     side: full.side,

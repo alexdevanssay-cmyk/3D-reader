@@ -83,6 +83,36 @@ function prism(profile, depth, kernel) {
   return { positions: Float32Array.from(positions), indices: Uint32Array.from(indices) };
 }
 
+/** Closed mesh of a profile (r, z) turned about z: from ring to ring, closed into a loop or capped at its ends. */
+function revolve(profile, segments, { loop = false, poles = null } = {}) {
+  const positions = [];
+  const indices = [];
+  const rings = profile.map(([r, z]) => {
+    const first = positions.length / 3;
+    for (let i = 0; i < segments; i++) {
+      const a = (2 * Math.PI * i) / segments;
+      positions.push(r * Math.cos(a), r * Math.sin(a), z);
+    }
+    return first;
+  });
+  const n = profile.length;
+  for (let k = 0; k < (loop ? n : n - 1); k++) {
+    const a = rings[k], b = rings[(k + 1) % n];
+    for (let i = 0; i < segments; i++) {
+      const j = (i + 1) % segments;
+      indices.push(a + i, a + j, b + j, a + i, b + j, b + i);
+    }
+  }
+  if (poles) {
+    const south = positions.push(0, 0, poles[0]) / 3 - 1, north = positions.push(0, 0, poles[1]) / 3 - 1;
+    for (let i = 0; i < segments; i++) {
+      const j = (i + 1) % segments;
+      indices.push(south, rings[0] + j, rings[0] + i, north, rings[n - 1] + i, rings[n - 1] + j);
+    }
+  }
+  return { positions: Float32Array.from(positions), indices: Uint32Array.from(indices) };
+}
+
 const byAxis = (proposal) => Object.fromEntries(proposal.candidates.map((c) => [c.axis, c]));
 
 describe('draw direction proposed from the geometry', () => {
@@ -167,6 +197,22 @@ describe('draw direction proposed from the geometry', () => {
     assert.deepEqual(proposal.parting.levels_mm, [0, 20]);
     // Round the part, and round each hole.
     assert.equal(proposal.parting.loops, 3);
+  });
+
+  test('curved silhouettes: no undercut where a line grazes the next facets, a planar line along their zigzag', () => {
+    // A sphere R 20 in 15 bands (no ring on its equator), a torus R 30 r 10 lying flat (none on its equators).
+    const bands = Array.from({ length: 14 }, (_, k) => -Math.PI / 2 + (Math.PI * (k + 1)) / 15);
+    const sphere = revolve(bands.map((t) => [20 * Math.cos(t), 20 * Math.sin(t)]), 24, { poles: [-20, 20] });
+    const tube = Array.from({ length: 15 }, (_, k) => (2 * Math.PI * (k + 0.5)) / 15);
+    const torus = revolve(tube.map((t) => [30 + 10 * Math.cos(t), 10 * Math.sin(t)]), 48, { loop: true });
+    for (const [mesh, loops] of [[sphere, 1], [torus, 2]]) {
+      const { summary } = evaluateParting(mesh.positions, mesh.indices, [0, 0, 1]);
+      assert.equal(summary.undercut_area_mm2, 0);
+      assert.deepEqual([summary.parting.planar, summary.parting.loops], [true, loops]);
+    }
+    // Round the outside of the torus and round its hole, at mid-height.
+    const { proposal } = proposeParting(torus.positions, torus.indices);
+    assert.deepEqual([proposal.axis, proposal.parting.loops, proposal.parting.level_mm], ['Z', 2, 0]);
   });
 
   test('a large mesh: candidates ranked on triangles drawn by area with a fixed seed, the same twice', () => {
