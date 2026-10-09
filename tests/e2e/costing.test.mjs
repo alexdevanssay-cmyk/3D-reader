@@ -352,6 +352,70 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await context.close();
   });
 
+  test('cavities per casting: the quote for 1 to 4 cavities and more, "Retenir" imposes the island, kept after a reload, back to the estimate', { timeout: 90_000 }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage .ccard');
+    await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
+    await page.waitForSelector('#page-chiffrage .cmsg.ok');
+    for (const [bind, value] of [['p.poids', 1.2], ['p.toileMini', 5], ['p.epaisseurMax', 10], ['p.moduleMm', 3], ['p.dimMax', 250]]) {
+      await page.fill(`#page-chiffrage [data-bind="${bind}"]`, String(value));
+      await page.dispatchEvent(`#page-chiffrage [data-bind="${bind}"]`, 'change');
+    }
+    const card = '#page-chiffrage #cempreintes';
+    await page.waitForSelector(`${card} tr.retained`);
+    assert.match(await page.textContent(card), /Empreintes par coulée — Pièce/);
+    // Automatic choice: the island of the best route, with its estimated cavities; the list of the casting card says where to change them.
+    const island = (await page.textContent(`${card} p strong`)).trim();
+    const estimated = Number(await page.getAttribute(`${card} tr.retained`, 'data-empreintes'));
+    assert.match(await page.textContent(`${card} tr.retained`), /estimé/);
+    assert.ok(await page.locator(`${card} tbody tr`).count() >= 4);
+    assert.match(await page.textContent('#page-chiffrage'), /à comparer dans « Empreintes par coulée »/);
+    const cells = (n) => page.$$eval(`${card} tr[data-empreintes="${n}"] td`, (tds) => tds.map((td) => td.textContent.trim()));
+    const num = (text) => Number(text.replace(/[^\d,]/g, '').replace(',', '.'));
+    // More cavities: a longer cycle, less time per piece, a dearer die.
+    const [one, two] = [await cells(1), await cells(2)];
+    assert.ok(num(two[2]) > num(one[2]), `cycle ${two[2]} > ${one[2]}`);
+    assert.ok(num(two[3]) < num(one[3]), `per piece ${two[3]} < ${one[3]}`);
+    assert.ok(num(two[4]) > num(one[4]), `die ${two[4]} > ${one[4]}`);
+    // "Retenir" a row of more cavities: the quote is that row, the island imposed with it.
+    const offered = await page.$$eval(`${card} [data-action="cavities"]`, (buttons) => buttons.map((b) => Number(b.dataset.n)));
+    const n = offered.find((x) => x > estimated) ?? offered[0];
+    const row = await cells(n);
+    await page.click(`${card} [data-action="cavities"][data-n="${n}"]`);
+    await page.waitForFunction((k) => document.querySelector('#page-chiffrage #cempreintes tr.retained')?.dataset.empreintes === String(k), n);
+    assert.match((await page.textContent('#page-chiffrage .cmsg.ok')).replace(/\u202f/g, ' '), new RegExp(`^${n} empreintes sur l'îlot ${island}, désormais imposé : cycle de [\\d,]+ s pour ${n} pièces, soit [\\d,]+ s par pièce, moule [\\d ]+ €\\.$`));
+    assert.deepEqual((await cells(n)).slice(0, 8), row.slice(0, 8));
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.procede"]'), island);
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.empreintes"]'), String(n));
+    assert.match(await page.textContent('#page-chiffrage'), /soit [\d,]+ s par pièce/);
+    assert.match(await page.textContent('#page-chiffrage'), new RegExp(`${n} empreintes`));
+    // Kept after a reload.
+    await page.reload();
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector(`${card} tr.retained`);
+    assert.equal(await page.getAttribute(`${card} tr.retained`, 'data-empreintes'), String(n));
+    // A phone: the card within 375 px, its table scrolling inside it, the page not sideways.
+    await page.setViewportSize({ width: 375, height: 800 });
+    const overflow = await page.evaluate(() => [...document.querySelectorAll('#cempreintes')].flatMap((c) => [c, ...c.querySelectorAll('button, .cscroll, p')])
+      .filter((x) => x.offsetParent && !x.parentElement.closest('.cscroll')).map((x) => [x.textContent.trim().slice(0, 30) || x.className, Math.round(x.getBoundingClientRect().right)]).filter(([, right]) => right > 375));
+    assert.deepEqual(overflow, []);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), true, 'no sideways scroll of the page');
+    await page.setViewportSize({ width: 1280, height: 800 });
+    // Back to the estimate: the island stays imposed.
+    await page.click(`${card} [data-action="cavities-auto"]`);
+    await page.waitForFunction((k) => document.querySelector('#page-chiffrage #cempreintes tr.retained')?.dataset.empreintes === String(k), estimated);
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.empreintes"]'), ' ');
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="p.procede"]'), island);
+    assert.equal(await page.locator(`${card} [data-action="cavities-auto"]`).count(), 0);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
   test('settings of an earlier version: taken over as values typed in, said; those equal to the trends imported since, offered to erase', { timeout: 60_000 }, async () => {
     const context = await browser.newContext({ locale: 'fr-FR' });
     const page = await context.newPage();

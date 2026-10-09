@@ -132,6 +132,12 @@ describe('the data sent to the model', () => {
     const typed = cycleData(computed({ procede: 'CG3', cycle: 240 }).results[0], { settings });
     assert.deepEqual(typed.cycle_devis, { valeur_s: 240, source: 'saisi dans le devis' });
     assert.equal(typed.formule.valeur_s, f.valeur_s, 'the formula, not the cycle typed in');
+    // Cavities typed in: the formula for their cluster, its terms adding up to the cycle the quote estimates.
+    const two = cycleData(computed({ procede: 'CG3', empreintes: 2 }).results[0], { settings });
+    assert.deepEqual([two.coulee.pieces_par_cycle, two.formule.pieces_par_cycle], [2, 2]);
+    assert.equal(two.cycle_devis.valeur_s, two.formule.valeur_s);
+    assert.ok(two.formule.valeur_s > f.valeur_s && two.formule.valeur_s < 2 * f.valeur_s, 'a longer cycle, less time per piece');
+    assert.ok(Math.abs(two.formule.termes_s.base + two.formule.termes_s.poids + two.formule.termes_s.module - two.formule.valeur_s) < 0.01);
   });
 
   test('within the budget of the gateway: the reasons of the similar parts left out first, then the parts', () => {

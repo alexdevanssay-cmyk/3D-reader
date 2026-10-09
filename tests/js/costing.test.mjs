@@ -8,10 +8,10 @@ import { before, describe, test } from 'node:test';
 
 import { readCostingWorkbook, readIndicesWorkbook } from '../../web/chiffrage/workbook.js';
 import { centreRates, indexAverage, minimumMargin, quote, saleMetalPrice } from '../../web/chiffrage/model.js';
-import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, bestRoutes, buildRoute, estimateMiseAuMille, rankRoutes } from '../../web/chiffrage/routes.js';
+import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, bestRoutes, buildRoute, castingCycle, cavityChoices, estimateMiseAuMille, rankRoutes } from '../../web/chiffrage/routes.js';
 import { readWorkbook } from '../../web/chiffrage/xlsxread.js';
 import { filledFields, heatTreatmentOf, orderValues, programmeFor, programmeOf, readSeriesOrder } from '../../web/chiffrage/rfq.js';
-import { DEFAULT_TOOLING, coefOf, estimateTooling, steelToolCost } from '../../web/chiffrage/tooling.js';
+import { DEFAULT_TOOLING, cavityFactor, coefOf, estimateTooling, steelToolCost } from '../../web/chiffrage/tooling.js';
 import { DEFAULT_CORES, boxSize, coreBoxCost, coresPerPiece } from '../../web/chiffrage/cores.js';
 import {
   DEFAULT_DENSITIES, GENERIC_DENSITY, adoptTendance, clearSaisies, clearSetting, clearTendances, currentQuoteTab, defaultQuote, defaultSettings, exportSaisies, importTendances,
@@ -294,6 +294,36 @@ describe('manufacturing routes', () => {
     assert.equal(ssp.parCycle, 4); // limited by the number of cavities, not by the shot weight
     assert.equal(ssp.operations.find((o) => o.code === 'SSP').trs, DEFAULT_TRS.SSP);
   });
+
+  test('more cavities chosen: a longer cycle for more pieces, so less time per piece; past the island, told', () => {
+    const p = DEFAULT_PROCESSES.CG3;
+    const estimate = buildRoute('CG3', 'FTR', part, settings, rates);
+    assert.deepEqual([estimate.parCycle, estimate.parCycleEstime, estimate.alertesEmpreintes], [1, 1, []]);
+    const kgCast = part.poids * estimate.miseAuMille;
+    let previous = estimate;
+    for (const n of [2, 3, 4]) {
+      const r = buildRoute('CG3', 'FTR', part, settings, rates, { empreintes: n });
+      const casting = r.operations.find((o) => o.code === 'CG3');
+      assert.deepEqual([r.parCycle, r.parCycleEstime, casting.parCycle], [n, 1, n]);
+      // The cycle of the cluster of n pieces: the formula of the island for n times the weight cast.
+      close(r.cycle, castingCycle(p, kgCast, n, part.moduleMm), 1e-12, `cycle, ${n} cavities`);
+      assert.equal(casting.cycle, r.cycle);
+      assert.ok(r.cycle > previous.cycle && r.cycle / n < previous.cycle / previous.parCycle, `${n} cavities: a longer cycle, less time per piece`);
+      assert.deepEqual(r.alertesEmpreintes, [`${n} empreintes > 1 maxi de l'îlot`]);
+      assert.ok(r.warnings.includes(r.alertesEmpreintes[0]) && r.feasible);
+      previous = r;
+    }
+    // The estimate chosen as such: the same route.
+    const same = buildRoute('CG3', 'FTR', part, settings, rates, { empreintes: 1 });
+    assert.deepEqual([same.cycle, same.outillage, same.warnings], [estimate.cycle, estimate.outillage, estimate.warnings]);
+    // Past the cluster of the island.
+    const heavy = buildRoute('CG3', 'FTR', { ...part, poids: 40 }, settings, rates, { empreintes: 2 });
+    assert.match(heavy.alertesEmpreintes.join(), /^2 empreintes > 1 maxi de l'îlot,grappe [\d,\s\u202f]+ kg > 100 kg maxi$/);
+    // The cavities compared in the page: 1 to the maximum of the island (at least 4, at most 8), and those chosen.
+    assert.deepEqual(cavityChoices(p, 1), [1, 2, 3, 4]);
+    assert.deepEqual(cavityChoices(DEFAULT_PROCESSES.SSP, 4, 6), [1, 2, 3, 4, 5, 6]);
+    assert.deepEqual(cavityChoices({ ...p, empreintesMax: 12 }, 1).length, 8);
+  });
 });
 
 describe('series order of a customer request', () => {
@@ -443,6 +473,43 @@ describe('in-house gravity die and heat treatments', () => {
     const complex = estimateTooling({ ...part, outillageTiroirs: 3, outillageComplexite: 'Compliqué(e)' }, 1);
     assert.equal(complex.tiroirs, 3);
     assert.ok(complex.total > one.total);
+  });
+
+  test('more cavities than the island would use: a bigger die, more hours for its cavities; the flat price scaled', () => {
+    assert.equal(cavityFactor(2, 2, 0.5), 1);
+    close(cavityFactor(3, 1, 0.5), 2, 1e-12, '3 cavities, 1 estimated');
+    close(cavityFactor(1, 2, 0.5), 1 / 1.5, 1e-12, '1 cavity, 2 estimated');
+    assert.equal(cavityFactor(4, 1, 0), 1);
+    // The die of the cavities the island would use: the method of the workbook, as before.
+    const two = estimateTooling(part, 2);
+    assert.deepEqual([two.facteurEmpreintes, two.empreintesEstimees], [1, 2]);
+    assert.equal(estimateTooling(part, 2, DEFAULT_TOOLING, 2).total, two.total);
+    // Two cavities where it would put one: the hours of milling, scan and fitting of the cavities, not those of design and CAM.
+    const more = estimateTooling(part, 2, DEFAULT_TOOLING, 1);
+    close(more.facteurEmpreintes, 1 + DEFAULT_TOOLING.parEmpreinte, 1e-12, 'factor');
+    const line = (t, label) => t.lines.find((l) => l.label === label);
+    for (const label of ['Usinage 3 axes', 'Usinage 5 axes', 'Scan 3D + rapport', 'Ajustage / montage']) close(line(more, label).value, line(two, label).value * more.facteurEmpreintes, 1e-9, label);
+    for (const label of ['FAO', 'Étude']) close(line(more, label).value, line(two, label).value, 1e-12, label);
+    assert.match(line(more, 'Ajustage / montage').detail, /^75 h × /, '50 h of the band × 1.5');
+    assert.ok(more.total > two.total && two.total > estimateTooling(part, 1).total);
+    // Without a share for a cavity: the size of the die only.
+    assert.equal(estimateTooling(part, 2, { ...DEFAULT_TOOLING, parEmpreinte: 0 }, 1).total, two.total);
+
+    const settings = { processes: DEFAULT_PROCESSES, operations: DEFAULT_OPERATIONS, trs: DEFAULT_TRS, tooling: DEFAULT_TOOLING };
+    const p = { ...part, poids: 1, toileMini: 5, epaisseurMax: 10, moduleMm: 3, volumeAnnuel: 5000, volumeTotal: 25000 };
+    const cg = buildRoute('CG3', 'FTR', p, settings, null, { empreintes: 2 });
+    assert.equal(cg.outillage, estimateTooling(p, 2, DEFAULT_TOOLING, cg.parCycleEstime).total);
+    assert.equal(cg.facteurOutillage, 1);
+    close(cg.outillagePiece, cg.outillage / 25000, 1e-12, 'per piece');
+    // The flat price of a die casting tool: for the 4 cavities estimated, scaled for 2 or 6.
+    const ssp = buildRoute('SSP', 'FSP', p, settings, null);
+    assert.deepEqual([ssp.parCycle, ssp.outillage, ssp.facteurOutillage], [4, DEFAULT_PROCESSES.SSP.outillage, 1]);
+    for (const n of [2, 6]) {
+      const r = buildRoute('SSP', 'FSP', p, settings, null, { empreintes: n });
+      close(r.facteurOutillage, (1 + 0.5 * (n - 1)) / (1 + 0.5 * 3), 1e-12, `factor, ${n} cavities`);
+      close(r.outillage, DEFAULT_PROCESSES.SSP.outillage * r.facteurOutillage, 1e-9, `flat price, ${n} cavities`);
+    }
+    assert.equal(buildRoute('SSP', 'FSP', p, { ...settings, tooling: { ...DEFAULT_TOOLING, parEmpreinte: 0 } }, null, { empreintes: 6 }).outillage, DEFAULT_PROCESSES.SSP.outillage);
   });
 
   test('gravity and low pressure islands get the estimate, the others their price', () => {
@@ -683,6 +750,11 @@ describe('settings layers: typed values, workbook, trends, defaults', () => {
       assert.ok(setSetting(path, 0, base), path);
       assert.ok(path.split('.').reduce((o, k) => o[k], loadSettings(base)) > 0, path);
     }
+    // The share of a cavity: 0 (the size of the die only) kept, a negative one refused.
+    assert.equal(setSetting('tooling.parEmpreinte', -0.2, base), "part d'une empreinte positive ou nulle");
+    assert.equal(setSetting('tooling.parEmpreinte', 0, base), null);
+    assert.equal(loadSettings(base).tooling.parEmpreinte, 0);
+    setSetting('tooling.parEmpreinte', null, base);
     assert.deepEqual(typedOnly(), { marge: 0 });
   });
 
@@ -983,6 +1055,8 @@ describe('traced values of a quote (provenance.js)', () => {
       auto: computed(),
       chosen: computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', cycle: 300, empreintes: 2, miseAuMille: 1.5, mode: '1*8', outillagePrix: 15000 } } } }),
       cycleOnly: computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', miseAuMille: 1.5, empreintes: 2 } } } }),
+      cavities: computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', empreintes: 3, outillagePrix: 18000 } } } }),
+      cavitiesFlat: computed({ quote: { pieces: { manuel: { ...PART, procede: 'SSP', empreintes: 2 } } } }),
       cores: computed({ quote: { pieces: { manuel: { ...PART, procede: 'BPR', noyaux: true, cores: [{ nom: 'N1', masse: 0.6, qte: 2, type: 1, complexite: 'Simple' }], tth: 'T6' } } } }),
       set: computed({ p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0, 1, 2] } }),
       request: computed({ quote: { serie: ORDER } }),
@@ -1019,6 +1093,47 @@ describe('traced values of a quote (provenance.js)', () => {
     assert.deepEqual([r.trace['piece.cycle'].source.type, r.trace['piece.empreintes'].source.type], ['calcul', 'saisie']);
     assert.ok(r.trace['piece.empreintes.estimee'] && r.trace['piece.miseAuMille.estimee'] && r.trace['parametres.cycle']);
     assert.equal(scenarios.chosen.results[0].trace['parametres.cycle'], undefined, 'the cycle typed in: its coefficients are not used');
+    // Cavities typed in: the cycle estimated for their cluster; the estimated ones, not retained, still price the tool unless it is typed in.
+    for (const [name, estimee] of [['cavities', false], ['cavitiesFlat', true]]) {
+      const T = scenarios[name].results[0].trace;
+      assert.equal(T['piece.empreintes'].source.type, 'saisie', name);
+      assert.ok(T['piece.cycle'].source.entrees.includes('piece.empreintes') && !T['piece.cycle'].source.entrees.includes('piece.empreintes.estimee'), name);
+      assert.match(T['piece.cycle'].hypotheses.join(), /cycle de la grappe des \d empreintes saisies/, name);
+      assert.equal(!!T['piece.empreintes.estimee'], estimee, name);
+    }
+    const flat = scenarios.cavitiesFlat.results[0].trace['piece.outillage.total'];
+    assert.deepEqual([flat.source.type, flat.source.ref], ['calcul', 'routes.js:buildRoute (forfait de l\'îlot × empreintes)']);
+    assert.ok(flat.source.entrees.includes('piece.empreintes.estimee') && flat.source.entrees.includes('parametres.outillage'));
+    assert.match(flat.hypotheses.join(), /prix forfaitaire de l'îlot SSP × 0,6 : 2 empreintes au lieu de 4 estimées/);
+  });
+
+  test('more cavities: the quote of each number of cavities, as "Retenir" makes it', () => {
+    const c = computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', cycle: 300, outillagePrix: 15000 } } } });
+    const r = c.results[0];
+    const rows = ui.cavityRows(c, r);
+    assert.deepEqual(rows.map((x) => x.n), [1, 2, 3, 4]);
+    // The row retained is the quote as it is (its cycle and tool typed in); the others are estimated.
+    assert.equal(rows[0].r, r);
+    const p = DEFAULT_PROCESSES.CG3;
+    const kgCast = PART.poids * r.estimated.miseAuMille;
+    for (const { n, r: x } of rows.slice(1)) {
+      const casting = x.route.operations.find((o) => o.code === 'CG3');
+      assert.deepEqual([x.inputs.procede, x.inputs.empreintes, x.inputs.cycle, x.inputs.outillagePrix, casting.parCycle], ['CG3', n, null, null, n]);
+      close(casting.cycle, castingCycle(p, kgCast, n, PART.moduleMm), 1e-12, `cycle, ${n} cavities`);
+      assert.equal(x.route.outillageMoule, x.route.tooling.total);
+    }
+    // More cavities: less time per piece, a dearer die; nothing saved.
+    const perPiece = rows.slice(1).map(({ n, r: x }) => x.route.operations.find((o) => o.code === 'CG3').cycle / n);
+    const moulds = rows.slice(1).map(({ r: x }) => x.route.outillageMoule);
+    assert.ok(perPiece.every((v, i) => i === 0 || v < perPiece[i - 1]), String(perPiece));
+    assert.ok(moulds.every((v, i) => i === 0 || v > moulds[i - 1]), String(moulds));
+    assert.deepEqual(loadQuote(base, indices).pieces.manuel, { ...PART, procede: 'CG3', cycle: 300, outillagePrix: 15000 });
+    // In automatic mode, the island of the best route.
+    const auto = computed();
+    const best = auto.results[0].route;
+    const autoRows = ui.cavityRows(auto, auto.results[0]);
+    assert.ok(autoRows.length >= 4 && autoRows.every(({ n, r: x }) => x.route.process === best.process && x.route.parCycle === n));
+    assert.equal(autoRows.find(({ n }) => n === best.parCycle).r, auto.results[0]);
   });
 
   test('the traces describe the values computed and change none of them', () => {

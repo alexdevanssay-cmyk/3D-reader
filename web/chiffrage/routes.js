@@ -10,7 +10,7 @@
 //   casting cycle = base + parKg × (kg cast per cycle)^exposant + parModule2 × module²
 
 import { quote } from "./model.js";
-import { estimateTooling, isGravityDie } from "./tooling.js";
+import { cavityFactor, estimateTooling, isGravityDie } from "./tooling.js";
 
 // Casting islands (codes of the profit centres of the workbook).
 export const DEFAULT_PROCESSES = {
@@ -138,6 +138,12 @@ export function piecesPerCycle(p, kgCast) {
   return Math.max(1, Math.min(p.empreintesMax, Math.floor(p.grappeMax / Math.max(kgCast, 1e-9))));
 }
 
+/** The numbers of cavities to compare on island `p`: 1 to its maximum, at least 4 and at most 8, and the `counts` estimated or chosen. */
+export function cavityChoices(p, ...counts) {
+  const max = Math.max(Math.min(8, Math.max(4, p.empreintesMax || 1)), ...counts.filter((n) => n > 0).map(Math.round));
+  return Array.from({ length: max }, (_, i) => i + 1);
+}
+
 /** Casting cycle (s) of island `p`: `parCycle` pieces of `kgCast` kg cast each, a modulus of `moduleMm` (unknown: 0). */
 export function castingCycle(p, kgCast, parCycle, moduleMm) {
   return p.cycle.base + p.cycle.parKg * (kgCast * parCycle) ** (p.cycle.exposant ?? 1) + (p.cycle.parModule2 || 0) * (moduleMm || 0) ** 2;
@@ -149,11 +155,16 @@ export function castingCycle(p, kgCast, parCycle, moduleMm) {
  *          volumeAnnuel, tth, noyaux, tribo, redressage, sableKg;
  *          bboxSize, volume, area: for the estimate of a gravity die}
  *   settings: {processes, operations, trs, tooling}
- * Returns {process, finition, operations, miseAuMille, parCycle, cycle, sableKg,
- *          feasible, reasons[], warnings[], qualite, outillage (€), tooling
- *          (estimate of the in-house die, or null), outillagePiece}.
+ *   options.empreintes: cavities chosen in the page, in place of the estimate:
+ *          the cycle is that of their cluster, the tool is priced for them
+ * Returns {process, finition, operations, miseAuMille, parCycle, parCycleEstime
+ *          (the estimate), cycle, sableKg, feasible, reasons[], warnings[],
+ *          alertesEmpreintes[] (the cavities chosen past the island's limits, also
+ *          in warnings), qualite, outillage (€), facteurOutillage (flat price of
+ *          the island × it), tooling (estimate of the in-house die, or null),
+ *          outillagePiece}.
  */
-export function buildRoute(code, finition, part, settings, rates) {
+export function buildRoute(code, finition, part, settings, rates, { empreintes = null } = {}) {
   const p = settings.processes[code];
   const ops = settings.operations;
   const trs = (c) => settings.trs?.[c] ?? DEFAULT_TRS[c] ?? 0.85;
@@ -185,7 +196,13 @@ export function buildRoute(code, finition, part, settings, rates) {
   const mam = estimateMiseAuMille(p, part);
   const miseAuMille = mam.value;
   const kgCast = part.poids * miseAuMille;
-  const parCycle = piecesPerCycle(p, kgCast);
+  const parCycleEstime = piecesPerCycle(p, kgCast);
+  // Cavities chosen: more pieces per cycle for a cycle a little longer (more metal cast at once).
+  const parCycle = empreintes > 0 ? Math.max(1, Math.round(empreintes)) : parCycleEstime;
+  const alertesEmpreintes = [];
+  if (parCycle > p.empreintesMax) alertesEmpreintes.push(`${parCycle} empreintes > ${p.empreintesMax} maxi de l'îlot`);
+  if (parCycle > parCycleEstime && kgCast * parCycle > p.grappeMax) alertesEmpreintes.push(`grappe ${fmt(kgCast * parCycle)} kg > ${fmt(p.grappeMax)} kg maxi`);
+  warnings.push(...alertesEmpreintes);
   const cycle = castingCycle(p, kgCast, parCycle, part.moduleMm);
   const simple = (c) => ({ code: c, cycle: ops[c].base + ops[c].parKg * part.poids ** (ops[c].exposant ?? 1), parCycle: ops[c].parCycle || 1, trs: trs(c) });
   const batch = (c) => {
@@ -211,9 +228,11 @@ export function buildRoute(code, finition, part, settings, rates) {
   if (missing.length) reasons.push(`centre absent du classeur : ${missing.join(", ")}`);
 
   const total = part.volumeTotal > 0 ? part.volumeTotal : part.volumeAnnuel > 0 ? part.volumeAnnuel * 5 : 0;
-  // Gravity dies made in-house: estimated from the part; other tools: the price of the island.
-  const tooling = settings.tooling?.actif && isGravityDie(p) ? estimateTooling(part, parCycle, settings.tooling) : null;
-  const outillage = tooling ? tooling.total : p.outillage;
+  // Gravity dies made in-house: estimated from the part; other tools: the price
+  // of the island, for the cavities it would use, scaled for those chosen.
+  const tooling = settings.tooling?.actif && isGravityDie(p) ? estimateTooling(part, parCycle, settings.tooling, parCycleEstime) : null;
+  const facteurOutillage = tooling ? 1 : cavityFactor(parCycle, parCycleEstime, settings.tooling?.parEmpreinte);
+  const outillage = tooling ? tooling.total : p.outillage * facteurOutillage;
   return {
     process: code,
     famille: p.famille,
@@ -222,13 +241,16 @@ export function buildRoute(code, finition, part, settings, rates) {
     miseAuMille,
     miseAuMilleDetail: mam,
     parCycle,
+    parCycleEstime,
     cycle,
     sableKg: part.noyaux ? part.sableKg || 0 : 0,
     feasible: reasons.length === 0,
     reasons,
     warnings,
+    alertesEmpreintes,
     qualite: Math.max(0, Math.min(10, qualite)),
     outillage,
+    facteurOutillage,
     tooling,
     outillagePiece: total > 0 ? outillage / total : 0,
   };
