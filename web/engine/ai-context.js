@@ -52,6 +52,20 @@ function operationContext(operation) {
   };
 }
 
+/** The parting line of a body, compact: its direction, its undercut and zero-draft shares, planar or not. */
+function partingContext(p) {
+  const line = p.parting ?? null;
+  return {
+    status: p.status ?? null,
+    axis: p.axis ?? null,
+    direction: p.direction ?? null,
+    undercut_share: p.undercut_share ?? null,
+    zero_draft_share: p.zero_draft_share ?? null,
+    planar: line?.planar ?? null,
+    ...(line?.planar === false ? { kind: line.kind, height_range_mm: line.height_range_mm } : {}),
+  };
+}
+
 function bodyContext(body, task) {
   const allFeatures = Array.isArray(body.features) ? body.features : [];
   const features = task === "feature_analysis" ? allFeatures : allFeatures;
@@ -67,6 +81,7 @@ function bodyContext(body, task) {
     metrics: body.metrics ?? {},
     topology: body.topology ?? null,
     geometry: body.geometry ?? {},
+    ...(body.parting ? { parting: partingContext(body.parting) } : {}),
     relations: body.relations ?? [],
     features: features.map(featureContext),
     quality: body.quality ?? {},
@@ -302,6 +317,7 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
       id: body.id, name: body.name, role: body.role,
       metrics: roundDeep(body.metrics),
       geometry: { ...roundDeep(geometry), analytic_surface_count: Array.isArray(analytic_surfaces) ? analytic_surfaces.length : 0 },
+      ...(body.parting ? { parting: body.parting } : {}),
       relation_counts: relationCounts(body.relations),
       features: (body.features ?? []).map(slimFeature),
       ...(body.manufacturing ? { manufacturing: roundDeep(body.manufacturing) } : {}),
@@ -418,7 +434,7 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   // 7: only the largest bodies in detail.
   const byVolume = [...bodies6].sort((a, b) => (b.metrics?.volume_mm3 ?? 0) - (a.metrics?.volume_mm3 ?? 0));
   const detailed = new Set(byVolume.slice(0, detailedBodies).map((b) => b.id));
-  const brief = (b) => ({ id: b.id, name: b.name, role: b.role, metrics: { volume_mm3: b.metrics?.volume_mm3 ?? null, surface_area_mm2: b.metrics?.surface_area_mm2 ?? null, bbox_size_mm: b.metrics?.bbox_mm?.size ?? null }, feature_count: b._features.length });
+  const brief = (b) => ({ id: b.id, name: b.name, role: b.role, metrics: { volume_mm3: b.metrics?.volume_mm3 ?? null, surface_area_mm2: b.metrics?.surface_area_mm2 ?? null, bbox_size_mm: b.metrics?.bbox_mm?.size ?? null }, ...(b.parting ? { parting: b.parting } : {}), feature_count: b._features.length });
   if (context.bodies.length > detailedBodies) {
     omitted.push(`details of the ${context.bodies.length - detailedBodies} smallest bodies`);
     out = build(bodies6.map((b) => (detailed.has(b.id) ? b : brief(b))), 7);

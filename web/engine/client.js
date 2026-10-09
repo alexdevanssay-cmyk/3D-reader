@@ -160,7 +160,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
       const state = await sharedState().catch(() => 'none');
       if (state === 'granted') share(key, { data: kept.data, thickness: kept.thickness, replace: false });
       return {
-        ...kept.data, file: file.name, cacheKey: key, cached: true, cachedThickness: kept.thickness ?? null, elapsed_s: Math.round(performance.now() - start) / 1000,
+        ...kept.data, file: file.name, cacheKey: key, cached: true, cachedThickness: kept.thickness ?? null, cachedParting: kept.parting ?? null, elapsed_s: Math.round(performance.now() - start) / 1000,
         networkNote: noteOf({ state }),
       };
     }
@@ -215,7 +215,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
     if (kept) share(key, { data });
     return kept;
   }));
-  return { ...data, cacheKey: key, cached: false, cachedThickness: null, networkNote };
+  return { ...data, cacheKey: key, cached: false, cachedThickness: null, cachedParting: null, networkNote };
 }
 
 /**

@@ -261,6 +261,29 @@ table.bodies .open { color: var(--warn); }
 .thick-min button { margin-left: auto; }
 .thick-min strong.overridden { color: var(--muted); font-weight: 400; }
 .thick-min-used label { color: var(--text); font-weight: 600; }
+/* Parting line */
+.parting-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.parting-head > span:first-child { color: var(--muted); }
+.parting-head strong { font-size: 20px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.parting-origin { font-size: 12px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; color: var(--muted); }
+.parting-origin.manual { color: var(--warn); border-color: var(--warn); }
+#parting-stats { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+table.parting-candidates { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+table.parting-candidates th { text-align: left; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); padding: 3px 4px; }
+table.parting-candidates td { padding: 3px 4px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+table.parting-candidates tr { cursor: pointer; }
+table.parting-candidates .num { text-align: right; white-space: nowrap; }
+table.parting-candidates tr.proposed td:nth-child(2) { font-weight: 600; }
+table.parting-candidates input { margin: 0; }
+.parting-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.parting-vector { display: inline-flex; gap: 6px; align-items: center; }
+.parting-vector input { width: 110px; }
+#parting-target { min-width: 0; max-width: 100%; }
+#parting-reset { margin-top: 8px; }
+#parting-hint { margin: 6px 0 0; color: var(--accent); }
+#parting-status, #parting-body { margin: 2px 0 6px; }
+.parting-legend { margin: 8px 0 0; line-height: 1.9; }
+.parting-legend .swatch { margin-left: 4px; margin-right: 3px; }
 .linklike { background: none; border: 0; padding: 0; color: inherit; font: inherit; text-decoration: underline dotted; cursor: pointer; }
 .linklike:hover { color: var(--accent, #4f8cff); }
 

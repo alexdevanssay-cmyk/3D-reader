@@ -109,6 +109,31 @@ function thicknessEvidence(body) {
   };
 }
 
+/**
+ * Draw direction and parting line of the body (parting.js, given with the
+ * Reader body): proposed from the geometry or defined by hand; its undercut
+ * and zero-draft areas measured by lines of sight along the draw direction.
+ */
+function partingEvidence(body) {
+  const p = body?.parting;
+  if (!p || (p.status !== "proposed" && p.status !== "manual") || !finite(p.undercut_area_mm2)) return { status: "not_evaluated" };
+  return {
+    status: p.status,
+    axis: p.axis ?? null,
+    direction: p.direction ?? null,
+    draft_angle_deg: p.draft_angle_deg ?? null,
+    undercut_area_mm2: p.undercut_area_mm2,
+    undercut_share: p.undercut_share ?? null,
+    zero_draft_area_mm2: finite(p.zero_draft_area_mm2) ? p.zero_draft_area_mm2 : null,
+    zero_draft_share: p.zero_draft_share ?? null,
+    parting_line: p.parting ?? null,
+    sampled: !!p.sampled,
+  };
+}
+
+const pct = (share) => `${(Math.round(share * 1000) / 10).toLocaleString("fr-FR")} %`;
+const mm = (v) => `${(Math.round(v * 10) / 10).toLocaleString("fr-FR")} mm`;
+
 function issue(code, severity, basis, message, source_ids = [], extra = {}) {
   return { code, severity, basis, message, source_ids, ...extra };
 }
@@ -116,6 +141,11 @@ function issue(code, severity, basis, message, source_ids = [], extra = {}) {
 export function buildFoundryAnalysis(body, features = [], principalAxes = null, profileId = "unspecified") {
   const profile = FOUNDRY_PROFILES[profileId] ?? FOUNDRY_PROFILES.unspecified;
   const thickness = thicknessEvidence(body);
+  const parting = partingEvidence(body);
+  const partingKnown = parting.status !== "not_evaluated";
+  const undercut = partingKnown && parting.undercut_area_mm2 > 0;
+  const zeroDraft = partingKnown && parting.zero_draft_area_mm2 > 0;
+  const nonPlanar = partingKnown && parting.parting_line?.planar === false;
   const risks = [];
   const requiredChecks = [];
   const confirmedEvidence = [];
@@ -179,7 +209,9 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
     .filter(i => i != null));
   const pocketCount = features.filter(f => f.type === "pocket_feature_candidate").length;
 
-  if (cylindricalFaces.size > 0) {
+  // With a draw direction, the lines of sight tell openings formed by the
+  // die from undercuts: the candidates' review gives way to them.
+  if (cylindricalFaces.size > 0 && !partingKnown) {
     risks.push(issue(
       "core_or_undercut_review",
       "review",
@@ -189,8 +221,45 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
     ));
   }
 
-  requiredChecks.push("select_parting_direction");
-  requiredChecks.push("evaluate_draft_and_pattern_release");
+  if (partingKnown) {
+    confirmedEvidence.push(parting.status === "manual" ? "parting_line_defined_manually" : "parting_line_proposed_from_geometry");
+    if (undercut) {
+      risks.push(issue(
+        "undercut_requires_core_or_slide",
+        "review",
+        "measured_line_of_sight_along_draw_direction",
+        `${pct(parting.undercut_share ?? 0)} de la surface ne se démoule par aucun des deux demi-moules selon la direction ${parting.axis ?? "choisie"} : noyaux ou tiroirs, ou une autre direction; à confirmer avec l'outillage.`,
+        ["sfsa_design_steps","sfsa_handbook_supplement_1"],
+        { undercut_area_mm2: parting.undercut_area_mm2 },
+      ));
+    }
+    if (zeroDraft) {
+      risks.push(issue(
+        "zero_draft_faces",
+        "review",
+        "measured_face_angle_to_draw_direction",
+        `${pct(parting.zero_draft_share ?? 0)} de la surface est à moins de ${parting.draft_angle_deg ?? 1}° de la direction de démoulage : dépouille à ajouter ou à confirmer avec la fonderie.`,
+        ["sfsa_design_steps"],
+        { zero_draft_area_mm2: parting.zero_draft_area_mm2 },
+      ));
+    }
+    if (nonPlanar) {
+      risks.push(issue(
+        "non_planar_parting_line",
+        "review",
+        "measured_parting_line_heights",
+        `La ligne de joint n'est pas plane (${parting.parting_line.kind === "stepped" ? "étagée" : "gauche"}, sur ${mm(parting.parting_line.height_range_mm)} le long de la direction de démoulage) : plan de joint et outillage plus complexes, à confirmer.`,
+        ["sfsa_design_steps"],
+      ));
+    }
+    requiredChecks.push(parting.status === "manual" ? "validate_manual_parting_line_with_tooling" : "confirm_proposed_parting_direction");
+    if (zeroDraft) requiredChecks.push("add_or_confirm_draft_on_zero_draft_faces");
+    if (undercut) requiredChecks.push("define_cores_or_slides_for_undercuts");
+    if (nonPlanar) requiredChecks.push("design_non_planar_parting_surface");
+  } else {
+    requiredChecks.push("select_parting_direction");
+    requiredChecks.push("evaluate_draft_and_pattern_release");
+  }
   requiredChecks.push("locate_and_size_risers_after_solidification_analysis");
   requiredChecks.push("design_gating_after_flow_analysis");
   requiredChecks.push("validate_directional_solidification");
@@ -199,10 +268,12 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
   const ruleStatus = {
     uniform_wall_thickness: thickness.status === "measured" ? "screened" : "not_available",
     section_transitions: "not_localized_from_current_semantic_geometry",
-    draft: "not_evaluated_without_parting_direction",
+    draft: partingKnown ? "evaluated_from_zero_draft_area" : "not_evaluated_without_parting_direction",
     fillets_and_junctions: "candidate_geometry_only",
-    parting_line: "not_evaluated",
-    cores: cylindricalFaces.size + pocketCount > 0 ? "undetermined_without_concavity_test" : "not_detected",
+    parting_line: !partingKnown ? "not_evaluated" : parting.status === "manual" ? "manual" : "proposed_from_geometry",
+    cores: partingKnown
+      ? (undercut ? "undercuts_detected" : "no_undercut_for_the_chosen_axis")
+      : cylindricalFaces.size + pocketCount > 0 ? "undetermined_without_concavity_test" : "not_detected",
     hot_spots: thickness.status === "measured" ? "screened_by_thickness_distribution" : "not_available",
     directional_solidification: "not_simulated",
     risering: "not_sized",
@@ -238,6 +309,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
       closed: body?.closed ?? null,
       topology: body?.topology ?? null,
       thickness,
+      parting,
       principal_axes: principalAxes,
       feature_counts: { cylindrical_opening_or_boss_candidates: cylindricalFaces.size, pocket_candidates: pocketCount },
       confirmed: confirmedEvidence,

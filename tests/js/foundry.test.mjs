@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildSemantic3D } from "../../web/engine/semantic.js";
-import { buildAIContext } from "../../web/engine/ai-context.js";
+import { buildAIContext, compactAIContext } from "../../web/engine/ai-context.js";
 import { FOUNDRY_SOURCES, FOUNDRY_SCHEMA_VERSION } from "../../web/engine/foundry-knowledge.js";
 
 function body(overrides = {}) {
@@ -180,4 +180,64 @@ test("AI context exposes foundry data for manufacturing and general reasoning", 
   assert.ok(manufacturing.bodies[0].foundry);
   assert.equal(manufacturing.reasoning_contract.foundry_geometry_screen_is_not_a_filling_or_solidification_simulation, true);
   assert.equal(manufacturing.foundry_schema_version, "1.0");
+});
+
+/** The parting of a body as the Reader gives it (web/engine/parting.js, app.js), with these changes. */
+function parting(overrides = {}) {
+  const line = { planar: true, kind: "planar", height_range_mm: 0, length_mm: 320, loops: 1, level_mm: 0 };
+  return {
+    status: "proposed", axis: "Z", direction: [0, 0, 1], source: "face_normals",
+    undercut_area_mm2: 0, undercut_share: 0, zero_draft_area_mm2: 6400, zero_draft_share: 0.3478,
+    projected_area_mm2: 6000, mould_height_mm: 20, parting: line, draft_angle_deg: 1,
+    candidates: [], sampled: null, method: "line_of_sight_along_draw_direction_uniform_grid",
+    ...overrides,
+  };
+}
+
+test("a parting line proposed from the geometry: draft and cores evaluated, the direction still to confirm", () => {
+  const semantic = buildSemantic3D({
+    file: "casting.step", kind: "cad", engine: "browser",
+    summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 },
+    bodies: [body({ parting: parting() })],
+  });
+  const b = semantic.bodies[0];
+  assert.equal(b.parting.status, "proposed");
+  const { rules, risks, required_checks: checks, evidence } = b.foundry;
+  assert.equal(rules.parting_line, "proposed_from_geometry");
+  assert.equal(rules.draft, "evaluated_from_zero_draft_area");
+  assert.equal(rules.cores, "no_undercut_for_the_chosen_axis");
+  assert.equal(evidence.parting.zero_draft_area_mm2, 6400);
+  assert.ok(evidence.confirmed.includes("parting_line_proposed_from_geometry"));
+  assert.ok(!checks.includes("select_parting_direction"));
+  assert.ok(checks.includes("confirm_proposed_parting_direction"));
+  assert.ok(checks.includes("add_or_confirm_draft_on_zero_draft_faces"));
+  const draft = risks.find(r => r.code === "zero_draft_faces");
+  assert.match(draft.message, /^34,8 % de la surface est à moins de 1°/);
+  assert.ok(!risks.some(r => r.code === "undercut_requires_core_or_slide" || r.code === "non_planar_parting_line"));
+  for (const r of risks) assert.ok(r.source_ids.every(id => FOUNDRY_SOURCES.some(src => src.id === id)), r.code);
+  // The AI context: compact, in every task and compacted.
+  const context = buildAIContext(semantic, { task: "general" });
+  assert.deepEqual(context.bodies[0].parting, { status: "proposed", axis: "Z", direction: [0, 0, 1], undercut_share: 0, zero_draft_share: 0.3478, planar: true });
+  assert.deepEqual(compactAIContext(context, { maxChars: 1 }).bodies[0].parting, context.bodies[0].parting);
+});
+
+test("a stepped parting line defined by hand, with undercuts: marked manual, its cores and its line to review", () => {
+  const semantic = buildSemantic3D({
+    file: "casting.step", kind: "cad", engine: "browser",
+    summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 },
+    bodies: [body({ parting: parting({
+      status: "manual", axis: "X", direction: [1, 0, 0], undercut_area_mm2: 1200, undercut_share: 0.05,
+      parting: { planar: false, kind: "stepped", height_range_mm: 20, length_mm: 360, loops: 1, levels_mm: [0, 20] },
+    }) })],
+  });
+  const { rules, risks, required_checks: checks } = semantic.bodies[0].foundry;
+  assert.equal(rules.parting_line, "manual");
+  assert.equal(rules.cores, "undercuts_detected");
+  assert.ok(checks.includes("validate_manual_parting_line_with_tooling"));
+  assert.ok(checks.includes("define_cores_or_slides_for_undercuts"));
+  assert.ok(checks.includes("design_non_planar_parting_surface"));
+  assert.equal(risks.find(r => r.code === "undercut_requires_core_or_slide").undercut_area_mm2, 1200);
+  assert.match(risks.find(r => r.code === "non_planar_parting_line").message, /étagée, sur 20 mm/);
+  const context = buildAIContext(semantic, { task: "manufacturing_analysis" });
+  assert.deepEqual(context.bodies[0].parting, { status: "manual", axis: "X", direction: [1, 0, 0], undercut_share: 0.05, zero_draft_share: 0.3478, planar: false, kind: "stepped", height_range_mm: 20 });
 });

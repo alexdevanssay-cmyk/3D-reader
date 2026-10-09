@@ -968,6 +968,8 @@ function semanticBody(body, index) {
       analytic_surfaces:body.geometric_surfaces ?? [],
       principal_axes:principalAxes(body),
     },
+    // Draw direction and parting line (parting.js), proposed or defined by hand, when computed.
+    ...(body.parting ? {parting:body.parting} : {}),
     features,
     relations,
     quality:{
