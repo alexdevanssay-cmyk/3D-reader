@@ -153,7 +153,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
   if (cache && key && !close) {
     const kept = await loadResult(key);
     if (kept?.data) {
-      return { ...kept.data, file: file.name, cacheKey: key, cached: true, cachedThickness: kept.thickness ?? null, elapsed_s: Math.round(performance.now() - start) / 1000 };
+      return { ...kept.data, file: file.name, cacheKey: key, cached: true, cachedThickness: kept.thickness ?? null, cachedParting: kept.parting ?? null, elapsed_s: Math.round(performance.now() - start) / 1000 };
     }
   }
 
@@ -196,7 +196,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
   };
   // Kept for the next opening of the same file (in the background).
   saveResult(key, { data }, { file: file.name });
-  return { ...data, cacheKey: key, cached: false, cachedThickness: null };
+  return { ...data, cacheKey: key, cached: false, cachedThickness: null, cachedParting: null };
 }
 
 /** Keep the wall thickness of a model with its results (see analyzeInBrowser). */

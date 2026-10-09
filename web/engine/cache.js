@@ -67,33 +67,34 @@ function sizeOf(value, seen = new Set()) {
   return n;
 }
 
-// Each part of the results is a record of its own: the thickness, computed
-// later, is added without reading and writing again the (large) analysis.
-const PARTS = ['data', 'thickness'];
+// Each part of the results is a record of its own: the thickness and the
+// parting line, computed later, are added without reading and writing again
+// the (large) analysis.
+const PARTS = ['data', 'thickness', 'parting'];
 const partKey = (key, part) => (part === 'data' ? key : `${key}#${part}`);
 
-/** The results kept for this key ({data, thickness}), or null. Never throws. */
+/** The results kept for this key ({data, thickness, parting}), or null. Never throws. */
 export async function loadResult(key) {
   if (!key) return null;
   try {
     const d = await db();
     const tx = d.transaction(['meta', 'data'], 'readwrite');
-    const [data, thickness] = await Promise.all(PARTS.map((part) => request(tx.objectStore('data').get(partKey(key, part)))));
+    const [data, thickness, parting] = await Promise.all(PARTS.map((part) => request(tx.objectStore('data').get(partKey(key, part)))));
     const meta = await request(tx.objectStore('meta').get(key));
     if (meta) tx.objectStore('meta').put({ ...meta, usedAt: Date.now() });
     await done(tx);
     // Kept by an earlier version: one record {data, thickness}; a thickness
     // computed since then is a record of its own.
-    if (data && 'data' in data) return { data: data.data, thickness: thickness ?? data.thickness ?? null };
-    return data ? { data, thickness: thickness ?? null } : null;
+    if (data && 'data' in data) return { data: data.data, thickness: thickness ?? data.thickness ?? null, parting: parting ?? null };
+    return data ? { data, thickness: thickness ?? null, parting: parting ?? null } : null;
   } catch {
     return null;
   }
 }
 
 /**
- * Keep a part of the results: record {data} (the analysis, first) or
- * {thickness} (added to the analysis already kept). Never throws: the cache
+ * Keep a part of the results: record {data} (the analysis, first),
+ * {thickness} or {parting} (added to the analysis already kept). Never throws: the cache
  * is an extra, a full disk or a private window just leave it out.
  */
 export async function saveResult(key, record, { file = '' } = {}) {
