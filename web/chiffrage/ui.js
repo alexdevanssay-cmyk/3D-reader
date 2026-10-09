@@ -1228,6 +1228,9 @@ function coresFields(r) {
     <p class="small muted">Par pièce : ${nf(per.sable, 3)} kg de sable, noyautage ${nf(per.cycle, 0)} s (centre ASN). Boîte vide = estimée d'après la masse du noyau (sable ${nf(sc.sableDensite, 2)} kg/dm³ + ${nf(sc.paroi, 0)} mm de paroi). Prix des boîtes : méthode de l'onglet « 4- Outillage » (BAN) de la demande client, ajoutés à l'outillage (taux et heures dans Paramètres).</p></section>`;
 }
 
+// Under a menu left on "Automatique": the solution it gives, in the colour of the values.
+const auto = (text) => `<span class="cauto">${esc(text)}</span>`;
+
 function castingCard(r) {
   const casting = Object.keys(settings.processes).filter((code) => base.centres.some((x) => x.code === code));
   const i = r.inputs;
@@ -1247,8 +1250,8 @@ function castingCard(r) {
   return `<section class="ccard">
       <h3>Paramètres de coulée — ${esc(r.piece.name)}</h3>
       <div class="cfields">
-        ${field("Procédé / îlot", select("p.procede", i.procede, [["auto", "Automatique (meilleure solution)"], ...casting.map((code) => [code, `${code} — ${settings.processes[code].famille}`])]))}
-        ${field("Finition", select("p.finition", i.finition, [["auto", "Automatique"], ...(routeCode ? settings.processes[routeCode].finitions.map((f) => [f, `${f} — ${settings.operations[f]?.label ?? f}`]) : [])]))}
+        ${field("Procédé / îlot", select("p.procede", i.procede, [["auto", "Automatique (meilleure solution)"], ...casting.map((code) => [code, `${code} — ${settings.processes[code].famille}`])]), locked ? auto(routeCode ? `${routeCode} — ${settings.processes[routeCode]?.famille ?? ""}` : "aucun îlot faisable") : "")}
+        ${field("Finition", select("p.finition", i.finition, [["auto", "Automatique"], ...(routeCode ? settings.processes[routeCode].finitions.map((f) => [f, `${f} — ${settings.operations[f]?.label ?? f}`]) : [])]), i.finition === "auto" && r.route?.finition ? auto(`${r.route.finition} — ${settings.operations[r.route.finition]?.label ?? r.route.finition}`) : "")}
         ${field("Fonctionnement", locked ? `<output>${esc(r.finalRates?.get(routeCode)?.mode ?? "—")}</output>` : select("p.mode", i.mode ?? "", [["", `Paramètre (${esc(settings.modes[routeCode] ?? base.centres.find((x) => x.code === routeCode)?.defaultMode ?? "")})`], ...MODES.map((m) => [m, m])], { kind: "nullraw" }), locked ? "choisissez un îlot pour le modifier" : "")}
         ${field("Temps de cycle", locked ? `<output>${e ? `${nf(e.cycle, 0)} s (estimé)` : "—"}</output>` : select("p.cycle", i.cycle ?? " ", cycleOptions, { kind: "num" }))}
         ${field("Empreintes / pièces par cycle", locked ? `<output>${e?.parCycle ?? "—"}</output>` : select("p.empreintes", i.empreintes ?? " ", empreintesOptions, { kind: "num" }))}

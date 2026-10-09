@@ -288,6 +288,7 @@ table.bodies .open { color: var(--warn); }
 .cf > input, .cf > select, .cf > output { font-size: 14px; color: var(--text); }
 .cf > output { padding: 5px 0; font-weight: 600; font-variant-numeric: tabular-nums; }
 .cf small { font-size: 11px; }
+.cf small .cauto { color: var(--text); font-size: 12px; font-weight: 600; }
 .crow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
 /* A data file dragged over its row (or over the settings buttons): dropped, it replaces the one in use. */
 [data-drop] { border: 2px dashed transparent; border-radius: 6px; padding: 2px 6px; margin-left: -8px; transition: border-color 0.1s, background 0.1s; }
