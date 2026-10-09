@@ -131,12 +131,32 @@ async function store(name, mode = "readonly") {
   return (await db()).transaction(name, mode).objectStore(name);
 }
 
-/** Keep a conversation in this browser (`synced`: when it was last written in the network folder). */
-export async function saveLocal(conversation, { synced } = {}) {
-  const kept = await getLocal(conversation.id).catch(() => null);
-  const record = { ...normalizeConversation(conversation), part_id: conversation.part?.id ?? "", synced: synced ?? kept?.synced ?? null };
-  await request((await store(CONVERSATIONS, "readwrite")).put(record));
-  return record;
+/** Change the record `id` of this browser in one transaction (`change(record or undefined)`: the record to put, or null). */
+async function update(id, change) {
+  const tx = (await db()).transaction(CONVERSATIONS, "readwrite");
+  const conversations = tx.objectStore(CONVERSATIONS);
+  let out = null;
+  return new Promise((resolve, reject) => {
+    const get = conversations.get(id);
+    get.onsuccess = () => {
+      out = change(get.result);
+      if (out) conversations.put(out);
+    };
+    tx.oncomplete = () => resolve(out);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error ?? new Error("historique : écriture annulée"));
+  });
+}
+
+/** Keep a conversation in this browser, as it is now (when it was last written in the network folder kept). */
+export async function saveLocal(conversation) {
+  const record = { ...normalizeConversation(conversation), part_id: conversation.part?.id ?? "" };
+  return update(record.id, (kept) => ({ ...record, synced: kept?.synced ?? null }));
+}
+
+/** The conversation `id` of this browser written in the network folder as it was at `updated`. */
+export async function markSynced(id, updated) {
+  return update(id, (kept) => (kept ? { ...kept, synced: updated } : null));
 }
 
 export async function getLocal(id) {
@@ -211,6 +231,10 @@ export function mergePartFile(existing, conversation) {
 }
 
 const notFound = (err) => err?.name === "NotFoundError" || err?.name === "TypeMismatchError";
+// A file being written (by this PC or another one): missing or unreadable for a moment.
+const busyFile = (err) => ["NotFoundError", "NotReadableError", "InvalidStateError"].includes(err?.name);
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const TRIES = 4;
 
 /** The file of the part `part` in the folder `dir`: its handle, found by its hash whatever the file's name; null when none. */
 async function partFileHandle(dir, part) {
@@ -226,18 +250,37 @@ async function partFileHandle(dir, part) {
   return null;
 }
 
+/**
+ * The file of the part `part` in the folder `dir`, read: {handle (null: no
+ * file yet), existing (parsePartFile; null: empty)}. A file being written,
+ * by this PC or another one, is read again a moment later; one that stays
+ * unreadable is an error, so that it is never replaced by this PC's copy
+ * alone (the conversations of the others would be lost).
+ */
+async function readPart(dir, part) {
+  for (let i = 1; ; i++) {
+    try {
+      const handle = await partFileHandle(dir, part);
+      const text = handle ? await (await handle.getFile()).text() : "";
+      const existing = text.trim() ? parsePartFile(text) : null;
+      if (!text.trim() || existing) return { handle, existing };
+      if (i >= TRIES) throw new Error(`le fichier « ${handle.name} » n'est pas un historique lisible : il n'est pas remplacé`);
+    } catch (err) {
+      if (i >= TRIES || !busyFile(err)) throw err;
+    }
+    await pause(100 * i);
+  }
+}
+
 /** The conversations of the part `part` kept in the folder `dir` ([] when none). */
 export async function readPartFile(dir, part) {
-  const handle = await partFileHandle(dir, part);
-  if (!handle) return [];
-  return parsePartFile(await (await handle.getFile()).text())?.conversations ?? [];
+  return (await readPart(dir, part)).existing?.conversations ?? [];
 }
 
 /** Write `conversation` (about a part) in the folder `dir`, merged with what its part's file holds. */
 export async function writePartFile(dir, conversation) {
   if (!partHash(conversation.part)) return false;
-  const handle = await partFileHandle(dir, conversation.part);
-  const existing = handle ? parsePartFile(await (await handle.getFile()).text()) : null;
+  const { handle, existing } = await readPart(dir, conversation.part);
   const doc = mergePartFile(existing, conversation);
   const target = handle ?? (await dir.getFileHandle(partFileName(conversation.part), { create: true }));
   const writable = await target.createWritable();
@@ -251,11 +294,16 @@ export async function listFolder(dir) {
   const out = [];
   for await (const entry of dir.values()) {
     if (entry.kind !== "file" || !entry.name.endsWith(".json")) continue;
-    try {
-      const parsed = parsePartFile(await (await entry.getFile()).text());
-      if (parsed) out.push(...parsed.conversations);
-    } catch {
-      // a file being written, or unreadable: the others are listed
+    for (let i = 1; i <= TRIES; i++) {
+      try {
+        const parsed = parsePartFile(await (await entry.getFile()).text());
+        if (parsed) out.push(...parsed.conversations);
+        break;
+      } catch (err) {
+        // A file being written: read again a moment later; unreadable: the others are listed.
+        if (!busyFile(err)) break;
+        await pause(100 * i);
+      }
     }
   }
   return out.sort((a, b) => Date.parse(b.updated) - Date.parse(a.updated));
@@ -300,13 +348,14 @@ export async function forgetNetworkFolder() {
  */
 export async function syncFolder(dir, { all = true } = {}) {
   let written = 0;
-  for (const c of await listLocal()) {
-    if (!partHash(c.part) || (c.synced && Date.parse(c.synced) >= Date.parse(c.updated))) continue;
+  for (const { id } of await listLocal()) {
+    const c = await getLocal(id); // as it is now: an answer may have come since the list
+    if (!c || !partHash(c.part) || (c.synced && Date.parse(c.synced) >= Date.parse(c.updated))) continue;
     if (all) {
       await writePartFile(dir, c);
       written++;
     }
-    await saveLocal(c, { synced: c.updated });
+    await markSynced(c.id, c.updated);
   }
   return written;
 }

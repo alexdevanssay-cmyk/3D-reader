@@ -974,10 +974,18 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       assert.equal(completions.length, n + 1);
     };
     const items = (list) => page.$$eval(`#ai-hist-list-${list} .ai-hist-item`, (els) => els.map((li) => [li.querySelector('.ai-hist-part').textContent, li.querySelector('.ai-hist-meta').textContent.replace(/^.* · /, ''), li.querySelector('.ai-hist-q').textContent]));
+    // Its .json files (Chrome writes each through a .crswap file of its own, there for a moment), read once written.
     const folderFiles = () => page.evaluate(async () => {
-      const out = {};
-      for await (const entry of (await navigator.storage.getDirectory()).values()) out[entry.name] = JSON.parse(await (await entry.getFile()).text());
-      return out;
+      for (let i = 0; ; i++) {
+        try {
+          const out = {};
+          for await (const entry of (await navigator.storage.getDirectory()).values()) if (entry.name.endsWith('.json')) out[entry.name] = JSON.parse(await (await entry.getFile()).text());
+          return out;
+        } catch (err) {
+          if (i > 20) throw err;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
     });
 
     // As a chat: the question field at the bottom of the window, the page itself not scrolled; the history on the right.
@@ -1001,7 +1009,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
 
     // The network folder chosen: the conversation written there, one file per part named by its file and its hash.
     await page.click('#ai-hist-tab-reseau');
-    assert.match(await page.textContent('#ai-hist-folder'), /Aucun dossier réseau choisi/);
+    await page.waitForFunction(() => /Aucun dossier réseau choisi/.test(document.getElementById('ai-hist-folder').textContent), null, { timeout: 10_000 });
     await page.click('[data-hist-action="choose"]');
     await page.waitForFunction(() => document.querySelectorAll('#ai-hist-list-reseau .ai-hist-item').length === 1, null, { timeout: 10_000 });
     let files = await folderFiles();
@@ -1012,8 +1020,12 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     // The next answer written there too, merged in the same conversation.
     await ask('Et sa masse ?');
     await page.waitForFunction(async (file) => {
-      const dir = await navigator.storage.getDirectory();
-      return JSON.parse(await (await (await dir.getFileHandle(file)).getFile()).text()).conversations[0].messages.length === 4;
+      try {
+        const dir = await navigator.storage.getDirectory();
+        return JSON.parse(await (await (await dir.getFileHandle(file)).getFile()).text()).conversations[0].messages.length === 4;
+      } catch {
+        return false; // being written
+      }
     }, name, { timeout: 10_000 });
     files = await folderFiles();
     assert.deepEqual(files[name].conversations[0].messages.map((m) => [m.role, m.role === 'user' ? m.content : m.provider]), [['user', 'Quel volume ?'], ['assistant', 'Groq'], ['user', 'Et sa masse ?'], ['assistant', 'Groq']]);

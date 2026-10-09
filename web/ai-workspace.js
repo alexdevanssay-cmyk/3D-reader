@@ -1484,8 +1484,20 @@ export function mount({ page, reader }) {
     return network?.permission === "granted" ? network.handle : null;
   }
 
+  // What is written in the history, one after the other (two tabs answered at once, the folder synchronised meanwhile).
+  let archiving = Promise.resolve();
+  const inTurn = (job) => {
+    const done = archiving.then(job);
+    archiving = done.catch(() => {});
+    return done;
+  };
+
   /** Keep a conversation in the history: this browser, and the network folder for a part (when its access is granted). */
-  async function archive(conversation) {
+  function archive(conversation) {
+    return inTurn(() => archiveNow(conversation)).catch(() => {});
+  }
+
+  async function archiveNow(conversation) {
     if (!conversation.messages.length) return;
     let record = null;
     try {
@@ -1497,7 +1509,7 @@ export function mount({ page, reader }) {
     if (folder) {
       try {
         await archives.writePartFile(folder, conversation);
-        if (record) await archives.saveLocal(conversation, { synced: conversation.updated });
+        if (record) await archives.markSynced(conversation.id, conversation.updated);
         networkNote = "";
       } catch (err) {
         networkNote = `Écriture dans le dossier réseau impossible : ${err?.message || err}`;
@@ -1665,9 +1677,9 @@ export function mount({ page, reader }) {
         // The conversations of before kept on this PC: written there too, if wanted.
         const before = (await archives.listLocal()).filter((c) => archives.partHash(c.part) && !(c.synced && Date.parse(c.synced) >= Date.parse(c.updated))).length;
         const all = !before || confirm(`Écrire aussi dans ce dossier les ${before} discussion${before > 1 ? "s" : ""} de pièces déjà gardée${before > 1 ? "s" : ""} sur ce PC ?`);
-        await archives.syncFolder(handle, { all });
+        await inTurn(() => archives.syncFolder(handle, { all }));
       } else if (action === "grant") {
-        if (network && (await archives.grantNetworkFolder(network.handle))) await archives.syncFolder(network.handle);
+        if (network && (await archives.grantNetworkFolder(network.handle))) await inTurn(() => archives.syncFolder(network.handle));
       }
     } catch (err) {
       if (err?.name !== "AbortError") networkNote = `Dossier réseau : ${err?.message || err}`;
