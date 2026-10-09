@@ -2,6 +2,8 @@
 // Converts the full semantic contract into a compact, evidence-linked context
 // for an LLM. It does not invent geometry and never upgrades provisional facts.
 
+import { ANALYSIS_HINTS } from "./analysis-hints.js";
+
 const TASKS = new Set(["general", "feature_analysis", "manufacturing_analysis", "dfm", "planning"]);
 
 function finite(v) { return typeof v === "number" && Number.isFinite(v); }
@@ -219,18 +221,72 @@ function relationCounts(relations) {
   return counts;
 }
 
+// Features that repeat other fields of their body: the closed solid (quality),
+// the kinds of surfaces (geometry), the fill ratio (metrics), the cylinders
+// bounded by planes (relation_counts).
+const REPEATED_FEATURES = new Set(["closed_solid", "cylindrical_geometry", "planar_geometry", "low_fill_ratio_geometry", "cylindrical_boundary_relation"]);
+
+// The provisional features listed first when not all fit: the bores and holes,
+// then the patterns, pockets and fillets, then the bosses; the other candidates
+// (a cylinder of unknown use, a relation between features) last.
+const FEATURE_ORDER = ["hole_feature_candidate", "stepped_cylindrical_feature_candidate", "coaxial_cylindrical_relation", "pattern_feature_candidate", "pocket_feature_candidate", "fillet_feature_candidate", "boss_feature_candidate"];
+const featureRank = (f) => {
+  const i = FEATURE_ORDER.indexOf(f.type);
+  return i < 0 ? FEATURE_ORDER.length : i;
+};
+
+/** How many of `items` of each kind (`kind` of an item). */
+function countBy(items, kind) {
+  const counts = {};
+  for (const item of items) counts[kind(item)] = (counts[kind(item)] ?? 0) + 1;
+  return counts;
+}
+
 /**
- * A smaller copy of an AI context (buildAIContext) for models with a small
- * context window (a local LLM): the same facts, less detail, until its JSON
- * fits in `maxChars`. Levels: 1 the per-surface geometry and the evidence
- * lists left out, the foundry knowledge common to every body given once;
- * 2 the features grouped by type; 3 only the largest bodies in detail;
- * 4 the bodies reduced to their metrics. What was left out is listed in
- * `compaction.omitted`, so that the model knows the context is partial.
+ * The foundry screen of a body without what repeats its body (closed,
+ * topology, principal axes) nor the rules not evaluated ("not_…"): its
+ * profile, the thickness and feature counts it read, the rules it could
+ * evaluate, its risks and the checks it requires.
+ */
+function shortFoundry(foundry) {
+  const { schema_version, knowledge_version, evidence, rules, ...own } = foundry;
+  const evaluated = Object.entries(rules ?? {}).filter(([, v]) => !(typeof v === "string" && /^not_/.test(v)));
+  return {
+    ...own,
+    evidence: { thickness: evidence?.thickness ?? null, feature_counts: evidence?.feature_counts ?? null },
+    ...(evaluated.length ? { rules: Object.fromEntries(evaluated) } : {}),
+  };
+}
+
+/**
+ * A smaller copy of an AI context (buildAIContext) for a model with a small
+ * context window (the gateway's budget, a local LLM): the same facts, less
+ * detail, until its JSON fits in `maxChars`. What is given up first is what
+ * matters least: the geometry of the part comes first, then how it is made by
+ * the right process, then the machining plan and its times. Levels:
+ *   1 the per-surface geometry and the evidence lists left out, the foundry
+ *     knowledge common to every body given once;
+ *   2 what repeats other fields or the instructions: the features repeating
+ *     their body (counted), the notes of every analysis, the reasoning rules,
+ *     the foundry knowledge and screens in short;
+ *   3 the machining plan summarized (operations in order, readiness);
+ *   4 the process in short: the operations counted by kind, the foundry
+ *     screen reduced to its profile, risks and checks;
+ *   5 the provisional features listed as the budget allows, bores and holes
+ *     first, the others grouped by type (the evidenced ones listed);
+ *   6 every feature grouped by type;
+ *   7 only the largest bodies in detail;
+ *   8 the bodies reduced to their metrics, the largest with its feature
+ *     groups and foundry screen;
+ *   9 a large assembly: the first warnings, the largest bodies listed, the
+ *     others counted; then, as a last resort, no foundry screen and fewer
+ *     warnings.
+ * What was left out is listed in `compaction.omitted`, so that the model
+ * knows the context is partial.
  */
 export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6 } = {}) {
   const size = (o) => JSON.stringify(o).length;
-  const common = {};
+  let common = {};
   const bodies1 = context.bodies.map((body) => {
     const { analytic_surfaces, ...geometry } = body.geometry ?? {};
     let foundry = body.foundry ?? null;
@@ -256,8 +312,9 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   });
   const omitted = ["analytic surfaces", "feature and relation evidence lists"];
   const strip = (bodies) => bodies.map(({ _features, ...b }) => b);
+  let top = context; // the fields besides the bodies
   const build = (bodies, level) => ({
-    ...context,
+    ...top,
     bodies: strip(bodies),
     foundry_common: Object.keys(common).length ? common : undefined,
     compaction: { level, omitted: [...omitted], original_body_count: context.bodies.length },
@@ -266,70 +323,146 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   let out = build(bodies1, 1);
   if (size(out) <= maxChars) return out;
 
-  // 2: features grouped by type, operations summarized.
-  omitted.push("individual features (grouped by type)");
-  const bodies2 = bodies1.map((b) => ({
-    ...b,
-    features: undefined,
-    feature_groups: featureGroups(b._features),
-    ...(b.manufacturing ? { manufacturing: {
-      process_candidates: b.manufacturing.process_candidates,
-      operation_count: b.manufacturing.operations?.length ?? 0,
-      functional_thickness: b.manufacturing.functional_thickness,
-      dfm_recommendations: b.manufacturing.dfm_recommendations,
-    } } : {}),
-    ...(b.manufacturing_plan ? { manufacturing_plan: { summary: b.manufacturing_plan.summary ?? null, setup_count: b.manufacturing_plan.setups?.length ?? null } } : {}),
-  }));
+  // 2: what repeats other fields, or the instructions of the model.
+  omitted.push("features repeating other fields of their body (counted in repeated_features)", "notes and reasoning rules common to every analysis (given in the instructions)", "foundry evidence repeating the body, foundry rules not evaluated");
+  const { reasoning_contract, ...rest } = context;
+  const hints = new Set(ANALYSIS_HINTS);
+  top = { ...rest, warnings: (context.warnings ?? []).filter((w) => !hints.has(w)) };
+  if (Object.keys(common).length) {
+    common = {
+      sources: (common.sources ?? []).map(({ id, title }) => ({ id, title })),
+      simulation_boundary: common.simulation_boundary?.message ?? common.simulation_boundary ?? null,
+      confidence_policy: common.confidence_policy ?? null,
+      engineering_inputs: { required: common.engineering_inputs?.required ?? [] },
+    };
+  }
+  const bodies2 = bodies1.map((b) => {
+    const repeated = b._features.filter((f) => REPEATED_FEATURES.has(f.type));
+    return {
+      ...b,
+      features: b.features.filter((f) => !REPEATED_FEATURES.has(f.type)),
+      ...(repeated.length ? { repeated_features: countBy(repeated, (f) => f.type) } : {}),
+      ...(b.foundry ? { foundry: shortFoundry(b.foundry) } : {}),
+      _features: b._features.filter((f) => !REPEATED_FEATURES.has(f.type)),
+    };
+  });
   out = build(bodies2, 2);
   if (size(out) <= maxChars) return out;
 
-  // 3: only the largest bodies in detail.
-  const byVolume = [...bodies2].sort((a, b) => (b.metrics?.volume_mm3 ?? 0) - (a.metrics?.volume_mm3 ?? 0));
+  // 3: the machining plan (and its times) summarized.
+  omitted.push("machining plan details (setups, dependencies, constraints)");
+  const bodies3 = bodies2.map((b) => (b.manufacturing_plan ? { ...b, manufacturing_plan: {
+    operation_count: b.manufacturing_plan.operation_count ?? null,
+    setup_count: b.manufacturing_plan.setup_count ?? b.manufacturing_plan.setups?.length ?? null,
+    planned_order: (b.manufacturing_plan.planned_order ?? []).map((s) => s.operation),
+    readiness: b.manufacturing_plan.readiness?.status ?? null,
+    unresolved_constraints: b.manufacturing_plan.readiness?.unresolved_constraints ?? [],
+  } } : b));
+  out = build(bodies3, 3);
+  if (size(out) <= maxChars) return out;
+
+  // 4: the process in short.
+  omitted.push("individual operations (counted by kind)", "foundry screen details (profile, risks and checks kept)");
+  const bodies4 = bodies3.map((b) => ({
+    ...b,
+    ...(b.manufacturing ? { manufacturing: {
+      process_candidates: b.manufacturing.process_candidates,
+      operations: countBy(b.manufacturing.operations ?? [], (o) => o.operation),
+      functional_thickness: b.manufacturing.functional_thickness,
+      dfm_recommendations: b.manufacturing.dfm_recommendations,
+    } } : {}),
+    ...(b.foundry ? { foundry: {
+      profile: b.foundry.profile?.label ?? b.foundry.profile?.id ?? null,
+      ...(b.foundry.evidence?.thickness ? { thickness: b.foundry.evidence.thickness } : {}),
+      risks: (b.foundry.risks ?? []).map(({ code, severity, message }) => ({ code, severity, message })),
+      required_checks: b.foundry.required_checks ?? [],
+    } } : {}),
+  }));
+  out = build(bodies4, 4);
+  if (size(out) <= maxChars) return out;
+
+  // 5: the provisional features listed as the budget allows, the bores and holes first (FEATURE_RANK), the
+  // others grouped by type; the evidenced ones listed.
+  omitted.push("provisional features past the budget (grouped by type)");
+  const ranked = bodies4
+    .flatMap((b, bi) => b._features.map((f, fi) => ({ bi, fi, f })).filter(({ f }) => f.status === "provisional"))
+    .sort((x, y) => featureRank(x.f) - featureRank(y.f) || x.bi - y.bi || x.fi - y.fi);
+  const listing = (count) => {
+    const listed = new Set(ranked.slice(0, count).map(({ f }) => f));
+    return bodies4.map((b) => {
+      const grouped = b._features.filter((f) => f.status === "provisional" && !listed.has(f));
+      return {
+        ...b,
+        features: b._features.filter((f) => f.status !== "provisional" || listed.has(f)).map(slimFeature),
+        ...(grouped.length ? { provisional_feature_groups: featureGroups(grouped) } : {}),
+      };
+    });
+  };
+  // The most features listed that fit (none listed: every provisional one grouped).
+  let [low, high] = [0, ranked.length - 1];
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (size(build(listing(mid), 5)) <= maxChars) low = mid;
+    else high = mid - 1;
+  }
+  const bodies5 = listing(low);
+  out = build(bodies5, 5);
+  if (size(out) <= maxChars) return out;
+
+  // 6: every feature grouped by type.
+  omitted.push("individual features (grouped by type)");
+  const bodies6 = bodies5.map(({ features, provisional_feature_groups, ...b }) => ({ ...b, feature_groups: featureGroups(b._features) }));
+  out = build(bodies6, 6);
+  if (size(out) <= maxChars) return out;
+
+  // 7: only the largest bodies in detail.
+  const byVolume = [...bodies6].sort((a, b) => (b.metrics?.volume_mm3 ?? 0) - (a.metrics?.volume_mm3 ?? 0));
   const detailed = new Set(byVolume.slice(0, detailedBodies).map((b) => b.id));
   const brief = (b) => ({ id: b.id, name: b.name, role: b.role, metrics: { volume_mm3: b.metrics?.volume_mm3 ?? null, surface_area_mm2: b.metrics?.surface_area_mm2 ?? null, bbox_size_mm: b.metrics?.bbox_mm?.size ?? null }, feature_count: b._features.length });
   if (context.bodies.length > detailedBodies) {
     omitted.push(`details of the ${context.bodies.length - detailedBodies} smallest bodies`);
-    out = build(bodies2.map((b) => (detailed.has(b.id) ? b : brief(b))), 3);
+    out = build(bodies6.map((b) => (detailed.has(b.id) ? b : brief(b))), 7);
     if (size(out) <= maxChars) return out;
   }
 
-  // 4: every body reduced to its metrics and feature counts; the foundry screen of the largest one.
+  // 8: every body reduced to its metrics and feature counts; the feature groups and foundry screen of the largest one.
   omitted.push("per-body foundry and manufacturing details (kept for the largest body only)");
   const largest = byVolume[0]?.id;
-  const level4 = (b) => (b.id === largest ? { ...brief(b), feature_groups: b.feature_groups, foundry: b.foundry } : brief(b));
-  out = build(bodies2.map(level4), 4);
+  const level8 = (b) => (b.id === largest ? { ...brief(b), feature_groups: b.feature_groups, foundry: b.foundry } : brief(b));
+  out = build(bodies6.map(level8), 8);
   if (size(out) <= maxChars) return out;
 
-  // 5: a large assembly. The first warnings only, then only the largest bodies
+  // 9: a large assembly. The first warnings only, then only the largest bodies
   // listed, the others counted: the context always fits the window of a local
   // model (a longer prompt would be cut by Ollama, the model reading part of it).
-  const warningCount = (context.warnings ?? []).length;
-  const fewWarnings = (o) => ({ ...o, warnings: (o.warnings ?? []).slice(0, 5), ...(warningCount > 5 ? { warning_count: warningCount } : {}) });
+  const warnings = top.warnings ?? [];
+  const warningCount = warnings.length;
+  const fewWarnings = (o) => ({ ...o, warnings: warnings.slice(0, 5), ...(warningCount > 5 ? { warning_count: warningCount } : {}) });
   if (warningCount > 5) omitted.push(`${warningCount - 5} warnings`);
-  out = fewWarnings(build(bodies2.map(level4), 5));
+  out = fewWarnings(build(bodies6.map(level8), 9));
   if (size(out) <= maxChars) return out;
   const omittedBefore = [...omitted];
   for (const keep of [24, 12, 6, 3, 1]) {
     if (keep >= byVolume.length) continue;
-    const rest = byVolume.slice(keep);
-    omitted.splice(0, omitted.length, ...omittedBefore, `the ${rest.length} smallest bodies (counted in other_bodies)`);
+    const others = byVolume.slice(keep);
+    omitted.splice(0, omitted.length, ...omittedBefore, `the ${others.length} smallest bodies (counted in other_bodies)`);
     out = fewWarnings({
-      ...build(byVolume.slice(0, keep).map(level4), 5), // the largest first
-      other_bodies: { count: rest.length, volume_mm3: Math.round(rest.reduce((s, b) => s + (b.metrics?.volume_mm3 ?? 0), 0)) },
+      ...build(byVolume.slice(0, keep).map(level8), 9), // the largest first
+      other_bodies: { count: others.length, volume_mm3: Math.round(others.reduce((s, b) => s + (b.metrics?.volume_mm3 ?? 0), 0)) },
     });
     if (size(out) <= maxChars) return out;
   }
   // Last resort: the largest body without its foundry screen, nor the foundry notes that only explain it.
   omitted.push("foundry screen of the largest body", "foundry sources and policies");
-  const { foundry_common, ...rest } = out;
-  out = { ...rest, bodies: out.bodies.map(({ foundry, feature_groups, ...b }) => b), compaction: { ...out.compaction, omitted: [...omitted] } };
+  const { foundry_common, ...kept } = out;
+  out = { ...kept, bodies: out.bodies.map(({ foundry, feature_groups, ...b }) => b), compaction: { ...out.compaction, omitted: [...omitted] } };
   // Still over (a small budget): fewer warnings, down to none; their count stays.
   const warningsAt = omitted.findIndex((o) => / warnings$/.test(o));
   for (const keep of [3, 1, 0]) {
     if (size(out) <= maxChars || out.warnings.length <= keep) break;
     const label = `${warningCount - keep} warnings`;
     const omittedNow = warningsAt >= 0 ? omitted.map((o, i) => (i === warningsAt ? label : o)) : [...omitted, label];
-    out = { ...out, warnings: (context.warnings ?? []).slice(0, keep), warning_count: warningCount, compaction: { ...out.compaction, omitted: omittedNow } };
+    out = { ...out, warnings: warnings.slice(0, keep), warning_count: warningCount, compaction: { ...out.compaction, omitted: omittedNow } };
   }
   return out;
 }
