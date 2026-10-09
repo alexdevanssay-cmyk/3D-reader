@@ -650,7 +650,8 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(gatewayRequests[0].task, 'costing');
     assert.ok(JSON.stringify(masked).length <= 4000, `trace of ${JSON.stringify(masked).length} characters`);
     assert.ok(JSON.stringify(gatewayRequests[0].context).length <= 6000);
-    assert.match(await page.textContent('#ai-status'), /^Réponse en \d+ s · Groq · openai\/gpt-oss-120b · 997 questions restantes aujourd'hui$/);
+    assert.match(await page.textContent('#ai-status'), /^Réponse en \d+ s · Groq · openai\/gpt-oss-120b$/);
+    assert.equal(await page.textContent('#ai-quota'), "997 questions restantes aujourd'hui");
     assert.match(await reply.locator('.ai-text').textContent(), /Analyse du chiffrage :\nExplications :\n- Le prix de vente \(piece\.prix\.vente\) est masqué\.\nÉcarts signalés :\n- devis\.densite : défaut du code/);
     assert.equal(await reply.locator('.ai-check').textContent(), 'Aucun nombre cité.');
     await page.check('#ai-amounts');

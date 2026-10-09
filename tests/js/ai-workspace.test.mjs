@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { addressSpace, answerText, costingText, defaultGateway, formatAnswer, gatewayLabel, numbersLabel, onlineMessages } from "../../web/ai-workspace.js";
+import { addressSpace, answerText, costingText, defaultGateway, formatAnswer, gatewayLabel, numbersLabel, quotaLabel, onlineMessages } from "../../web/ai-workspace.js";
 import { anonymizer, checkContextNumbers } from "../../web/engine/ai-context.js";
 
 test("Ollama's address declares the address space the browser checks it against", () => {
@@ -44,12 +44,15 @@ test("the gateway's address: the site's own on Vercel, pasted on GitHub Pages", 
   assert.equal(defaultGateway(new URL("http://127.0.0.1:8000/")), "");
 });
 
-test("an answer of the gateway tells its provider, model and the questions left today", () => {
+test("an answer of the gateway tells its provider and model, and the questions left today apart", () => {
   const quota = { requests_remaining_day: 1234, requests_limit_day: 2000, tokens_remaining_minute: 5000, tokens_limit_minute: 8000 };
-  assert.equal(gatewayLabel({ provider: "Groq", model: "openai/gpt-oss-120b", quota }), "Groq · openai/gpt-oss-120b · 1\u202f234 questions restantes aujourd'hui");
-  assert.equal(gatewayLabel({ provider: "Groq", model: "openai/gpt-oss-120b", quota: { requests_remaining_day: 1 } }), "Groq · openai/gpt-oss-120b · 1 question restante aujourd'hui");
-  assert.equal(gatewayLabel({ provider: "Groq", model: "openai/gpt-oss-120b", quota: { requests_remaining_day: 0 } }), "Groq · openai/gpt-oss-120b · 0 question restante aujourd'hui");
-  // Unknown quota (another provider), or an older gateway.
+  assert.equal(gatewayLabel({ provider: "Groq", model: "openai/gpt-oss-120b", quota }), "Groq · openai/gpt-oss-120b");
+  assert.equal(quotaLabel(quota), "1\u202f234 questions restantes aujourd'hui");
+  assert.equal(quotaLabel({ requests_remaining_day: 1 }), "1 question restante aujourd'hui");
+  assert.equal(quotaLabel({ requests_remaining_day: 0 }), "0 question restante aujourd'hui");
+  // Unknown quota (another provider, or OpenAI counting per minute), or an older gateway.
+  assert.equal(quotaLabel(null), "");
+  assert.equal(quotaLabel({ requests_remaining: 50 }), "");
   assert.equal(gatewayLabel({ provider: "Mistral", model: "m", quota: null }), "Mistral · m");
   assert.equal(gatewayLabel({ output: "x" }), "");
 });
