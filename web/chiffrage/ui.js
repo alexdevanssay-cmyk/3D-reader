@@ -1010,14 +1010,14 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
       ? inputs.finition
       : ranked.find((r) => r.process === code && r.feasible)?.finition ?? ranked.find((r) => r.process === code)?.finition ?? process.finitions[0];
   const finalRates = chosen && inputs.mode ? centreRates(base, { modes: { ...settings.modes, [code]: inputs.mode }, energy }) : rates;
-  // The cavities typed in: the cycle estimated for their cluster, the tool priced for them (routes.js).
-  const route = buildRoute(code, finition, part, settings, finalRates, chosen && inputs.empreintes > 0 ? { empreintes: inputs.empreintes } : {});
-  out.estimated = { cycle: route.cycle, parCycle: route.parCycleEstime, miseAuMille: route.miseAuMille, miseAuMilleDetail: route.miseAuMilleDetail };
-  if (chosen) {
-    const casting = route.operations.find((o) => o.code === code);
-    if (inputs.miseAuMille > 0) route.miseAuMille = inputs.miseAuMille;
-    if (inputs.cycle > 0) casting.cycle = inputs.cycle;
-  }
+  // The cavities typed in: the cycle estimated for their cluster, the tool priced for them; the mise
+  // au mille typed in: the metal of that cluster (routes.js).
+  const route = buildRoute(code, finition, part, settings, finalRates, {
+    ...(chosen && inputs.empreintes > 0 ? { empreintes: inputs.empreintes } : {}),
+    ...(chosen && inputs.miseAuMille > 0 ? { miseAuMille: inputs.miseAuMille } : {}),
+  });
+  out.estimated = { cycle: route.cycle, parCycle: route.parCycleEstime, miseAuMille: route.miseAuMilleDetail.value, miseAuMilleDetail: route.miseAuMilleDetail };
+  if (chosen && inputs.cycle > 0) route.operations.find((o) => o.code === code).cycle = inputs.cycle;
   // The tool estimated for the cavities retained; or the price typed in.
   route.outillageEstime = route.outillage;
   if (inputs.outillagePrix > 0) route.outillage = inputs.outillagePrix;

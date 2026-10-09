@@ -157,14 +157,18 @@ export function castingCycle(p, kgCast, parCycle, moduleMm) {
  *   settings: {processes, operations, trs, tooling}
  *   options.empreintes: cavities chosen in the page, in place of the estimate:
  *          the cycle is that of their cluster, the tool is priced for them
- * Returns {process, finition, operations, miseAuMille, parCycle, parCycleEstime
+ *   options.miseAuMille: the one typed in the page, in place of the estimate:
+ *          the kg cast per cycle (cycle, cluster alert) weighed with it; the
+ *          cavities are still estimated with the estimated one
+ * Returns {process, finition, operations, miseAuMille (retained: typed in, else
+ *          estimated), miseAuMilleDetail (the estimate), parCycle, parCycleEstime
  *          (the estimate), cycle, sableKg, feasible, reasons[], warnings[],
- *          alertesEmpreintes[] (the cavities chosen past the island's limits, also
+ *          alertesEmpreintes[] (the cavities past the island's limits, also
  *          in warnings), qualite, outillage (€), facteurOutillage (flat price of
  *          the island × it), tooling (estimate of the in-house die, or null),
  *          outillagePiece}.
  */
-export function buildRoute(code, finition, part, settings, rates, { empreintes = null } = {}) {
+export function buildRoute(code, finition, part, settings, rates, { empreintes = null, miseAuMille: typedMam = null } = {}) {
   const p = settings.processes[code];
   const ops = settings.operations;
   const trs = (c) => settings.trs?.[c] ?? DEFAULT_TRS[c] ?? 0.85;
@@ -194,14 +198,16 @@ export function buildRoute(code, finition, part, settings, rates, { empreintes =
   }
 
   const mam = estimateMiseAuMille(p, part);
-  const miseAuMille = mam.value;
+  const parCycleEstime = piecesPerCycle(p, part.poids * mam.value);
+  // The mise au mille typed in weighs the metal cast per cycle: the cycle and the cluster shown with it.
+  const miseAuMille = typedMam > 0 ? typedMam : mam.value;
   const kgCast = part.poids * miseAuMille;
-  const parCycleEstime = piecesPerCycle(p, kgCast);
   // Cavities chosen: more pieces per cycle for a cycle a little longer (more metal cast at once).
   const parCycle = empreintes > 0 ? Math.max(1, Math.round(empreintes)) : parCycleEstime;
   const alertesEmpreintes = [];
   if (parCycle > p.empreintesMax) alertesEmpreintes.push(`${parCycle} empreintes > ${p.empreintesMax} maxi de l'îlot`);
-  if (parCycle > parCycleEstime && kgCast * parCycle > p.grappeMax) alertesEmpreintes.push(`grappe ${fmt(kgCast * parCycle)} kg > ${fmt(p.grappeMax)} kg maxi`);
+  // A piece alone heavier than the cluster is cast alone: no alert.
+  if (parCycle > 1 && kgCast * parCycle > p.grappeMax) alertesEmpreintes.push(`grappe ${fmt(kgCast * parCycle)} kg > ${fmt(p.grappeMax)} kg maxi`);
   warnings.push(...alertesEmpreintes);
   const cycle = castingCycle(p, kgCast, parCycle, part.moduleMm);
   const simple = (c) => ({ code: c, cycle: ops[c].base + ops[c].parKg * part.poids ** (ops[c].exposant ?? 1), parCycle: ops[c].parCycle || 1, trs: trs(c) });

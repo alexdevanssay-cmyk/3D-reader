@@ -711,11 +711,12 @@ export function tracePiece(r, ctx, devis) {
   T["piece.ilot"].validation_requise ||= needsValidation(T["piece.ilot"]);
 
   // Mise au mille, cavities and cycle: typed in (island chosen), else
-  // estimated (routes.js:buildRoute). The estimates of the cavities and of the
-  // cycle use the estimated mise au mille, not the one typed in; the cycle is
-  // that of the cavities retained, and the tool is priced from the estimated
-  // ones: an estimate not retained that another one uses is traced under its
-  // own key (".estimee"). The settings of an estimate are traced when it is used.
+  // estimated (routes.js:buildRoute). The estimate of the cavities uses the
+  // estimated mise au mille, not the one typed in; the cycle is that of the
+  // cavities retained, their metal weighed with the mise au mille retained, and
+  // the tool is priced from the estimated cavities: an estimate not retained
+  // that another one uses is traced under its own key (".estimee"). The
+  // settings of an estimate are traced when it is used.
   const mamTyped = r.chosen && i.miseAuMille > 0;
   const cavitiesTyped = r.chosen && i.empreintes > 0;
   const cycleTyped = r.chosen && i.cycle > 0;
@@ -725,7 +726,7 @@ export function tracePiece(r, ctx, devis) {
   const mamSettings = mamDetail.estimated
     ? settingsGroup(ctx, ["base", "parDoublement", "petitePiece"].map((k) => `processes.${code}.rendement.${k}`), { label: `rendement de ${code}`, ref: `settings.processes.${code}.rendement` })
     : null;
-  if (mamSettings && !(mamTyped && cavitiesTyped && cycleTyped && mouldTyped)) T["parametres.miseAuMille"] = mamSettings;
+  if (mamSettings && !(mamTyped && cavitiesTyped && mouldTyped)) T["parametres.miseAuMille"] = mamSettings;
   const mamEstimate = mamDetail.estimated
     ? derive(e.miseAuMille, {
       unite: "kg/kg", ref: "routes.js:estimateMiseAuMille (1 / rendement)",
@@ -737,7 +738,7 @@ export function tracePiece(r, ctx, devis) {
   if (ctx.demandePiece) compareDemande(T["piece.miseAuMille"], q.serie, "miseAuMille");
   T["piece.kgCast"] = derive(r.final.kgCast, { unite: "kg", ref: "model.js:quote (poids × mise au mille)", entrees: { "piece.poids": T["piece.poids"], "piece.miseAuMille": T["piece.miseAuMille"] } });
   const mamKey = mamTyped ? "piece.miseAuMille.estimee" : "piece.miseAuMille";
-  if (mamTyped && !(cavitiesTyped && cycleTyped && mouldTyped)) T[mamKey] = { ...mamEstimate, hypotheses: [...mamEstimate.hypotheses, "non retenue : sert à estimer les empreintes et le cycle"] };
+  if (mamTyped && !(cavitiesTyped && mouldTyped)) T[mamKey] = { ...mamEstimate, hypotheses: [...mamEstimate.hypotheses, "non retenue : sert à estimer les empreintes"] };
 
   const cavitySettings = settingsGroup(ctx, [`processes.${code}.empreintesMax`, `processes.${code}.grappeMax`], { label: `empreintes et grappe de ${code}`, ref: `settings.processes.${code}` });
   if (!(cavitiesTyped && mouldTyped)) T["parametres.empreintes"] = cavitySettings;
@@ -757,9 +758,9 @@ export function tracePiece(r, ctx, devis) {
   if (!cycleTyped) T["parametres.cycle"] = cycleSettings;
   const cycleEstimate = derive(e.cycle, {
     unite: "s", ref: "routes.js:buildRoute (base + coef × (kg coulés par cycle)^exposant + s/mm² × module²)",
-    entrees: { "piece.poids": T["piece.poids"], [mamKey]: mamEstimate, "piece.empreintes": T["piece.empreintes"], "piece.module": T["piece.module"], "parametres.cycle": cycleSettings },
+    entrees: { "piece.poids": T["piece.poids"], "piece.miseAuMille": T["piece.miseAuMille"], "piece.empreintes": T["piece.empreintes"], "piece.module": T["piece.module"], "parametres.cycle": cycleSettings },
     plafond: ["moyenne", "estimation à confirmer par les méthodes"],
-    hypotheses: [...(mamTyped ? ["cycle estimé avec la mise au mille estimée, pas celle saisie"] : []), ...(cavitiesTyped ? [`cycle de la grappe des ${plural(i.empreintes, "empreinte")} saisie${i.empreintes > 1 ? "s" : ""}`] : [])],
+    hypotheses: [...(mamTyped ? [`kg coulés avec la mise au mille saisie (${fr(i.miseAuMille, 2)})`] : []), ...(cavitiesTyped ? [`cycle de la grappe des ${plural(i.empreintes, "empreinte")} saisie${i.empreintes > 1 ? "s" : ""}`] : [])],
   });
   // The estimate of the AI adopted by a person ("Utiliser cette valeur"): a value typed in, from its own source.
   const ai = cycleTyped ? adoptedEstimate(i, code) : null;

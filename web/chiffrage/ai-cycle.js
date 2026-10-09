@@ -65,12 +65,12 @@ export function cycleData(r, { settings, history = [], trend = null, serie = nul
   const part = r.part;
   const module = part.moduleMm > 0 ? part.moduleMm : 0;
   const cores = part.noyaux ? (r.inputs.cores ?? []).reduce((n, c) => n + (c?.qte > 0 ? c.qte : 0), 0) : 0;
-  // The formula as routes.js:buildRoute computed it: the estimated mise au mille, the cavities retained.
+  // The formula as routes.js:buildRoute computed it: the mise au mille and the cavities retained.
   const p = settings.processes[code];
   const cavities = casting.parCycle;
-  const kgFormula = part.poids * e.miseAuMille * cavities;
+  const kgFormula = part.poids * route.miseAuMille * cavities;
   const terms = { base: p.cycle.base, poids: p.cycle.parKg * kgFormula ** (p.cycle.exposant ?? 1), module: (p.cycle.parModule2 || 0) * module ** 2 };
-  const trendCycle = trend?.processes?.[code]?.cycle ? castingCycle(trend.processes[code], part.poids * e.miseAuMille, cavities, module) : null;
+  const trendCycle = trend?.processes?.[code]?.cycle ? castingCycle(trend.processes[code], part.poids * route.miseAuMille, cavities, module) : null;
   const typed = r.chosen && r.inputs.cycle > 0;
   const similar = history.length ? similarParts(history, { ilot: code, poids_kg: part.poids, module_mm: module || null, noyaux: part.noyaux }, { k }) : [];
   return {

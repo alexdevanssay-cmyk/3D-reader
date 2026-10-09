@@ -21,6 +21,7 @@ import { DEMANDE, QUOTE_KEYS, SOURCES, demandeComparee, derive, missing, pieceKe
 import { MASQUE, checkNumbers, isInternal, maskNumbers, numbersOf, traceForAI } from '../../web/chiffrage/ai-trace.js';
 import { anonymizer } from '../../web/engine/ai-context.js';
 import { checkProposals, readProposals } from '../../web/chiffrage/ai-apply.js';
+import { cycleData } from '../../web/chiffrage/ai-cycle.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -323,6 +324,30 @@ describe('manufacturing routes', () => {
     assert.deepEqual(cavityChoices(p, 1), [1, 2, 3, 4]);
     assert.deepEqual(cavityChoices(DEFAULT_PROCESSES.SSP, 4, 6), [1, 2, 3, 4, 5, 6]);
     assert.deepEqual(cavityChoices({ ...p, empreintesMax: 12 }, 1).length, 8);
+  });
+
+  test('a mise au mille typed in: the kg cast per cycle, the cycle and the cluster alert weighed with it; the cavities and the tool still estimated', () => {
+    // CG1: cluster of 50 kg at most; 13 kg, no wall thickness: mise au mille 1.6 of the island, 20.8 kg cast, 2 cavities estimated.
+    const p = DEFAULT_PROCESSES.CG1;
+    const heavy = { ...part, poids: 13, toileMini: 0, epaisseurMax: 0, dimMax: 300 };
+    const estimate = buildRoute('CG1', 'FTR', heavy, settings, rates);
+    assert.deepEqual([estimate.miseAuMille, estimate.parCycleEstime, estimate.alertesEmpreintes], [1.6, 2, []]);
+    close(estimate.cycle, castingCycle(p, 13 * 1.6, 2, part.moduleMm), 1e-12, 'cycle of the estimate');
+    // 2.0 typed in: 26 kg cast per piece, 52 kg for the 2 cavities estimated, past the cluster: said.
+    const typed = buildRoute('CG1', 'FTR', heavy, settings, rates, { miseAuMille: 2 });
+    assert.deepEqual([typed.miseAuMille, typed.miseAuMilleDetail.value, typed.parCycleEstime, typed.parCycle], [2, 1.6, 2, 2]);
+    close(typed.cycle, castingCycle(p, 26, 2, part.moduleMm), 1e-12, 'cycle with the mise au mille typed in');
+    assert.deepEqual(typed.alertesEmpreintes, ['grappe 52 kg > 50 kg maxi']);
+    // 3 cavities: the cluster of the alert is the one of the cycle.
+    const three = buildRoute('CG1', 'FTR', heavy, settings, rates, { empreintes: 3, miseAuMille: 2 });
+    close(three.cycle, castingCycle(p, 26, 3, part.moduleMm), 1e-12, 'cycle, 3 cavities');
+    assert.deepEqual(three.alertesEmpreintes, ['3 empreintes > 2 maxi de l\'îlot', 'grappe 78 kg > 50 kg maxi']);
+    // Without it, the same as before: the estimated mise au mille.
+    assert.deepEqual(buildRoute('CG1', 'FTR', heavy, settings, rates, { empreintes: 3 }).alertesEmpreintes, ['3 empreintes > 2 maxi de l\'îlot', 'grappe 62,4 kg > 50 kg maxi']);
+    // The tool is priced from the cavities estimated with the estimated mise au mille, typed in or not.
+    for (const n of [null, 1, 3]) assert.equal(buildRoute('CG1', 'FTR', heavy, settings, rates, { empreintes: n, miseAuMille: 2 }).outillage, buildRoute('CG1', 'FTR', heavy, settings, rates, { empreintes: n }).outillage, String(n));
+    // One piece alone heavier than the cluster is cast alone: no alert.
+    assert.deepEqual(buildRoute('CG1', 'FTR', { ...heavy, poids: 24 }, settings, rates, { miseAuMille: 2.5 }).alertesEmpreintes, []);
   });
 });
 
@@ -1134,6 +1159,39 @@ describe('traced values of a quote (provenance.js)', () => {
     const autoRows = ui.cavityRows(auto, auto.results[0]);
     assert.ok(autoRows.length >= 4 && autoRows.every(({ n, r: x }) => x.route.process === best.process && x.route.parCycle === n));
     assert.equal(autoRows.find(({ n }) => n === best.parCycle).r, auto.results[0]);
+  });
+
+  test('more cavities with a mise au mille typed in: each row cast, cycled and alerted with the same kg; the traces say which mise au mille', () => {
+    // CG1 imposed (cluster of 50 kg at most), 13 kg, mise au mille 2.0 typed in (1.6 estimated): 2 cavities estimated.
+    const heavy = { poids: 13, moduleMm: 3, dimMax: 300, procede: 'CG1' };
+    const p = DEFAULT_PROCESSES.CG1;
+    const c = computed({ quote: { pieces: { manuel: { ...heavy, miseAuMille: 2 } } } });
+    const r = c.results[0];
+    assert.deepEqual([r.route.miseAuMille, r.estimated.miseAuMille, r.estimated.parCycle], [2, 1.6, 2]);
+    for (const { n, r: x } of ui.cavityRows(c, r)) {
+      const casting = x.route.operations.find((o) => o.code === 'CG1');
+      const kg = x.final.kgCast * n; // the "Kg coulés / cycle" of the card
+      close(kg, 26 * n, 1e-12, `kg cast per cycle, ${n} cavities`);
+      close(casting.cycle, castingCycle(p, x.final.kgCast, n, 3), 1e-12, `cycle, ${n} cavities`);
+      const grappe = x.route.alertesEmpreintes.find((a) => a.startsWith('grappe'));
+      assert.equal(grappe, kg > p.grappeMax ? `grappe ${kg.toLocaleString('fr-FR', { maximumFractionDigits: 1 })} kg > 50 kg maxi` : undefined, `${n} cavities`);
+    }
+    // The traces: the cycle estimated with the mise au mille retained; the estimated one only for the cavities.
+    const T = r.trace;
+    assert.ok(T['piece.cycle'].source.entrees.includes('piece.miseAuMille') && !T['piece.cycle'].source.entrees.includes('piece.miseAuMille.estimee'));
+    assert.match(T['piece.cycle'].hypotheses.join(), /kg coulés avec la mise au mille saisie \(2\)/);
+    assert.ok(T['piece.empreintes'].source.entrees.includes('piece.miseAuMille.estimee'));
+    assert.match(T['piece.miseAuMille.estimee'].hypotheses.join(), /non retenue : sert à estimer les empreintes$/);
+    assert.deepEqual(T['piece.empreintes'].alertes.map((a) => a.message), ['grappe 52 kg > 50 kg maxi']);
+    const mould = r.route.outillageEstime;
+    // Without a mise au mille typed in: the cycle of the estimate, the same tool.
+    const plain = computed({ quote: { pieces: { manuel: heavy } } }).results[0];
+    close(plain.route.operations.find((o) => o.code === 'CG1').cycle, castingCycle(p, 13 * 1.6, 2, 3), 1e-12, 'cycle without a typed mise au mille');
+    assert.deepEqual([plain.route.alertesEmpreintes, plain.route.outillageEstime], [[], mould]);
+    // The data of the AI cycle estimate: the formula of the cycle retained, its terms adding up to it.
+    const data = cycleData(r, { settings: loadSettings(base) });
+    assert.equal(data.formule.kg_coules_par_cycle, 52);
+    close(data.formule.termes_s.base + data.formule.termes_s.poids + data.formule.termes_s.module, data.formule.valeur_s, 1e-3, 'terms of the formula');
   });
 
   test('the traces describe the values computed and change none of them', () => {
