@@ -211,7 +211,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
     elapsed_s: Math.round(performance.now() - start) / 1000,
   };
   // Kept for the next opening of the same file (in the background), and on the shared network folder for the other PCs.
-  saving.set(key, saveResult(key, { data }, { file: file.name }).then((kept) => {
+  keeping(key, saveResult(key, { data }, { file: file.name }).then((kept) => {
     if (kept) share(key, { data });
     return kept;
   }));
@@ -235,6 +235,12 @@ export async function saveThickness(key, results, bodies = null) {
 const saving = new Map(); // key -> the analysis being kept in this browser (the thickness waits for it)
 const networkReads = new Set(); // the reads in progress (AbortController), stopped by cancelAll
 const sharedListeners = new Set();
+
+/** The analysis of `key` being kept in this browser (`job`): what is kept next of it waits for it. */
+function keeping(key, job) {
+  saving.set(key, job);
+  job.finally(() => saving.get(key) === job && saving.delete(key)).catch(() => {});
+}
 
 /** Called with {key, note} when a write in the shared folder failed, to be said discreetly (the results of `key` are shown by then). */
 export function onShared(fn) {
@@ -261,7 +267,7 @@ async function readFromNetwork(key, onProgress) {
 
 /** Results read from the shared folder, kept in this browser too (the analysis, then its thickness). */
 function keep(key, shared, name) {
-  saving.set(key, saveResult(key, { data: shared.data }, { file: name }).then(async (kept) => {
+  keeping(key, saveResult(key, { data: shared.data }, { file: name }).then(async (kept) => {
     if (kept && shared.thickness) await saveResult(key, { thickness: shared.thickness });
     return kept;
   }));

@@ -136,10 +136,8 @@ export async function checkSharedFolder({ timeout = 5000 } = {}) {
   if (!folder) return { state: "none", name: null, error: null };
   if (folder.permission !== "granted") return { state: folder.permission === "denied" ? "denied" : "prompt", name: folder.name, error: null };
   try {
-    const list = async () => {
-      for await (const entry of folder.handle.values()) break; // eslint-disable-line no-unused-vars
-    };
-    await withTimeout(list(), timeout, "pas de réponse du réseau");
+    // Its first entry listed: a network that does not answer, or a folder gone, says so.
+    await withTimeout(folder.handle.values().next(), timeout, "pas de réponse du réseau");
     return { state: "accessible", name: folder.name, error: null };
   } catch (err) {
     return { state: "unreadable", name: folder.name, error: err?.message || String(err) };

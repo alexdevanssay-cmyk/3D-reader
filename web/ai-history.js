@@ -392,8 +392,8 @@ export async function writePartFile(dir, conversation) {
     const { conversations } = await readPart(dir, conversation.part, mine?.name ?? null);
     const copies = conversations.filter((c) => c.id === conversation.id);
     const name = mine?.name ?? partFileName(conversation.part, conversation.id);
-    // Read back below: another PC's write meanwhile is merged, never written over by a retry.
-    await writeFile(dir, name, JSON.stringify(mergePartFile(copies.length ? { part: conversation.part, conversations: copies } : null, conversation), null, 1), { verify: false });
+    // Read back below, tried again here with what the folder holds then: another PC's write meanwhile is merged, never written over.
+    await writeFile(dir, name, JSON.stringify(mergePartFile(copies.length ? { part: conversation.part, conversations: copies } : null, conversation), null, 1), { verify: false, tries: 1 });
     const target = await dir.getFileHandle(name);
     const back = (await readFile(target, false).catch(() => null))?.conversations.find((c) => c.id === conversation.id);
     if (back && conversation.messages.every((m) => back.messages.some((k) => k.id === m.id))) return true;

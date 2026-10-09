@@ -2594,7 +2594,9 @@ function refreshNetwork() {
     netFolder = await network.checkSharedFolder().catch((err) => ({ state: "unreadable", name: null, error: err?.message || String(err) }));
     drawNetwork();
     if (netFolder.state !== "accessible") return;
-    const report = await syncFeedback({ load: store.loadHistorique, save: store.saveHistorique });
+    // A network that stops answering midway: said, read again at the next showing of the page.
+    const report = await network.withTimeout(syncFeedback({ load: store.loadHistorique, save: store.saveHistorique }), 120_000, "le dossier réseau ne répond plus")
+      .catch((err) => ({ state: "error", error: err?.message || String(err) }));
     const total = { added: (netSync?.total.added ?? 0) + (report.added ?? 0), replaced: (netSync?.total.replaced ?? 0) + (report.replaced ?? 0) };
     netSync = { ...report, total };
     // A real time that was waiting for the folder: written with the others.
