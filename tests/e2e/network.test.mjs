@@ -55,6 +55,15 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     page.on('dialog', (dialog) => dialog.accept());
     await page.addInitScript(() => {
       window.showDirectoryPicker = async () => navigator.storage.getDirectory();
+      // A browser restarted (the flag "test.prompt"): the access to the folder to grant again, by a click.
+      const query = FileSystemHandle.prototype.queryPermission;
+      FileSystemHandle.prototype.queryPermission = function (options) {
+        return localStorage.getItem('test.prompt') ? Promise.resolve('prompt') : query.call(this, options);
+      };
+      FileSystemHandle.prototype.requestPermission = async () => {
+        localStorage.removeItem('test.prompt');
+        return 'granted';
+      };
       window.__posted = [];
       const post = Worker.prototype.postMessage;
       Worker.prototype.postMessage = function (message, ...rest) {
@@ -260,6 +269,52 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     await page.click('#cnetwork [data-action="network-forget"]');
     await page.waitForFunction(() => /Dossier réseau partagé :\s*aucun/.test(document.querySelector('#cnetwork .crow')?.textContent));
     assert.equal(Object.keys(await folderFiles(page, 'retours-experience')).length, 5);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('the browser restarted: the access to grant said; a real time saved meanwhile waits, written once the access is granted', { timeout: TIMEOUT }, async () => {
+    const { context, page, errors } = await newPage();
+    await page.goto(`${base}?lang=fr`);
+    await chooseFolder(page);
+    await page.evaluate(() => localStorage.setItem('test.prompt', '1'));
+    await page.reload();
+    await page.click('.tab[data-page="parametres"]');
+    await page.waitForFunction(() => /« *» — accès à autoriser/.test(document.querySelector('#cnetwork .crow')?.textContent));
+    assert.deepEqual(await page.$$eval('#cnetwork button', (bs) => bs.map((b) => b.textContent)), ["Autoriser l'accès", 'Changer de dossier…', 'Ne plus utiliser']);
+
+    // A part analysed: said not shared.
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
+    assert.match(await page.textContent('#method'), /Dossier réseau partagé : accès à autoriser \(page Paramètres\), l'analyse n'y est pas partagée\./);
+
+    // A real time saved: kept here, waiting for the folder.
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
+    await page.waitForSelector('#page-chiffrage .cmsg.ok');
+    const typeIn = async (bind, value) => {
+      await page.fill(`#page-chiffrage [data-bind="${bind}"]`, String(value));
+      await page.dispatchEvent(`#page-chiffrage [data-bind="${bind}"]`, 'change');
+    };
+    await page.selectOption('#page-chiffrage [data-bind="p.procede"]', 'CG3');
+    await page.waitForSelector('#cfeedback');
+    await typeIn('q.reference', 'REF-ATTENTE');
+    await typeIn('p.cycleReel', 120);
+    await page.waitForSelector('#cfeedback [data-action="save-feedback"]:not([disabled])');
+    await page.click('#cfeedback [data-action="save-feedback"]');
+    await page.waitForFunction(() => /Retour « REF-ATTENTE » pas encore écrit dans le dossier réseau partagé \(accès au dossier à autoriser\) : il le sera à la prochaine lecture du dossier/.test(document.getElementById('cfeedback-net')?.textContent));
+    assert.deepEqual(await folderFiles(page, 'retours-experience'), {});
+
+    // The access granted in Paramètres: written, said.
+    await page.click('.tab[data-page="parametres"]');
+    await page.waitForFunction(() => /1 retour d'expérience de ce poste à écrire dans le dossier réseau partagé dès que son accès est autorisé/.test(document.getElementById('cnetwork')?.textContent));
+    await page.click('#cnetwork [data-action="network-grant"]');
+    await page.waitForFunction(() => /— accessible/.test(document.querySelector('#cnetwork .crow')?.textContent) && /1 retour de ce poste écrit/.test(document.getElementById('cnetwork').textContent));
+    const files = Object.keys(await folderFiles(page, 'retours-experience'));
+    assert.equal(files.length, 1);
+    assert.match(files[0], /^REF-ATTENTE__CG3__/);
+    assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.reseau.retours-a-ecrire.v1')), null);
     assert.deepEqual(errors, []);
     await context.close();
   });

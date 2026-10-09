@@ -341,6 +341,7 @@ export async function readShared(key, { signal, onProgress } = {}) {
     return { state: 'read', data, thickness };
   } catch (err) {
     if (err?.cancelled || signal?.aborted) throw cancelled();
+    if (err?.name === 'TimeoutError') downUntil = Date.now() + DOWN_FOR;
     return { state: 'error', error: err?.message || String(err) };
   }
 }

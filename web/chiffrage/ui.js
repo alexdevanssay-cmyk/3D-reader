@@ -17,7 +17,7 @@ import { addressSpace, askJSON, numbersLabel, savedAI } from "../ai-workspace.js
 import * as store from "./store.js";
 import { PROPOSAL_FIELDS, sameValue, valueLabel } from "./ai-apply.js";
 import * as network from "../network-folder.js";
-import { forgetRead, syncFeedback, writeFeedback } from "./feedback.js";
+import { forgetRead, pendingCount, syncFeedback, writeFeedback } from "./feedback.js";
 
 let el = null;
 let page = "chiffrage";
@@ -2592,6 +2592,8 @@ let netChecking = null;
 function refreshNetwork() {
   netChecking ??= (async () => {
     netFolder = await network.checkSharedFolder().catch((err) => ({ state: "unreadable", name: null, error: err?.message || String(err) }));
+    // Its access to grant: the real times of this PC waiting for it said.
+    if (["prompt", "denied"].includes(netFolder.state)) netSync = { state: "prompt", total: netSync?.total ?? { added: 0, replaced: 0 } };
     drawNetwork();
     if (netFolder.state !== "accessible") return;
     // A network that stops answering midway: said, read again at the next showing of the page.
@@ -2663,7 +2665,8 @@ function networkRow() {
 function netSyncHtml() {
   const s = netSync;
   if (!s || s.state === "none") return "";
-  if (s.state === "prompt") return s.waiting ? `<p class="small cnetwork-sync">${plural(s.waiting, "retour")} d'expérience de ce poste à écrire dans le dossier réseau partagé dès que son accès est autorisé.</p>` : "";
+  const waiting = pendingCount();
+  if (s.state === "prompt") return waiting ? `<p class="small cnetwork-sync">${plural(waiting, "retour")} d'expérience de ce poste à écrire dans le dossier réseau partagé dès que son accès est autorisé.</p>` : "";
   if (s.state === "error") return `<p class="small cnetwork-sync">Dossier réseau partagé non lu : ${esc(s.error)}.</p>`;
   const time = new Date(s.at).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
   const { added, replaced } = s.total;

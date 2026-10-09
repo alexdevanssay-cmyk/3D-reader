@@ -142,17 +142,19 @@ export function syncFeedback({ load, save }) {
     if (folder.permission !== "granted") return { state: "prompt", waiting: pendingCount() };
     try {
       const dir = await sharedDir(SUBFOLDERS.retours);
-      let written = 0;
-      const left = [];
+      const done = new Set();
       for (const record of pending()) {
         try {
           await writeRecord(dir, record);
-          written++;
+          done.add(JSON.stringify(record));
         } catch {
-          left.push(record);
+          // left for the next reading
         }
       }
+      // Those written taken out (one saved meanwhile stays).
+      const left = pending().filter((r) => !done.has(JSON.stringify(r)));
       setPending(left);
+      const written = done.size;
       const merged = await mergeFolder(dir, load(), seen);
       if (merged.added || merged.replaced) save(merged.pieces);
       const { pieces, ...report } = merged;
