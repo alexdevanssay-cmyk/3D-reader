@@ -274,8 +274,12 @@ table.bodies .open { color: var(--warn); }
 @media (max-width: 900px) { .page { height: auto; } }
 
 /* Costing pages */
-.cpage { max-width: 1400px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
-.cgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 14px; }
+.cpage { margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+/* The cards side by side over the whole width: all on one row when there is room (5 from about 1 900 px), else
+   wrapped, those of the last row stretched. */
+.cgrid { display: flex; flex-wrap: wrap; gap: 14px; }
+.cgrid > .ccard { flex: 1 1 360px; }
+.cgrid .cfields { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
 .ccard { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; min-width: 0; }
 .ccard h3 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .ccard h4 { margin: 14px 0 6px; font-size: 13px; }
@@ -316,7 +320,7 @@ table.bodies .open { color: var(--warn); }
 .csrc.tendance { border-color: var(--warn); color: var(--warn); }
 .csrc.defaut { border-style: dashed; }
 .ctrend { display: block; margin-top: 2px; color: var(--warn); font-size: 11px; white-space: normal; }
-@media (max-width: 700px) { .cgrid { grid-template-columns: 1fr; } }
+@media (max-width: 700px) { .cgrid > .ccard { flex-basis: 100%; } }
 .ctable td.bad { color: var(--error-text); }
 /* Chiffrage: traced values (provenance.js), the banner "N valeurs à valider / N alertes" and the card "Traçabilité". */
 .ctrace-banner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
