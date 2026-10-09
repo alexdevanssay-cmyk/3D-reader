@@ -1221,6 +1221,34 @@ describe('traced values of a quote (provenance.js)', () => {
     }
   });
 
+  test('"Retenir" a number of cavities: the island imposed without the mode and mise au mille typed for another island; the rows priced the same way', () => {
+    // A piece back on the automatic island (an undo, another workbook) with a mode and a mise au mille typed for another one: not applied.
+    const stale = computed({ quote: { pieces: { manuel: { ...PART, mode: '1*8', miseAuMille: 1.9 } } } });
+    const r = stale.results[0];
+    const island = r.route.process;
+    assert.deepEqual([r.chosen, r.route.miseAuMille], [false, r.estimated.miseAuMille]);
+    // Each row: [cavities, mode and mise au mille of its inputs (the row retained: the quote as it is), those applied, PRI].
+    const rowOf = (c) => ui.cavityRows(c, c.results[0]).map(({ n, r: x }) => [n, x === c.results[0] ? 'retenue' : [x.inputs.mode ?? null, x.inputs.miseAuMille ?? null], x.finalRates.get(island).mode, x.route.miseAuMille, x.final.pri]);
+    const rows = rowOf(stale);
+    const n = r.route.parCycle + 1;
+    const clean = computed();
+    const cleanRows = rowOf(clean);
+    assert.deepEqual(rows.map((x) => x.slice(0, 4)), cleanRows.map((x) => x.slice(0, 4)));
+    rows.forEach((x, i) => close(x[4], cleanRows[i][4], 1e-12, `PRI, ${x[0]} cavities`));
+    assert.ok(rows.every(([k, inputs]) => (k === r.route.parCycle ? inputs === 'retenue' : inputs[0] === null && inputs[1] === null)));
+    // "Retenir": the island imposed with these cavities, its mode and mise au mille those of the island; the price of the row.
+    computed({ quote: { pieces: { manuel: { ...PART, mode: '1*8', miseAuMille: 1.9 } } } });
+    ui.retainCavities(n);
+    const piece = loadQuote(base, indices).pieces.manuel;
+    assert.deepEqual([piece.procede, piece.empreintes, piece.mode, piece.miseAuMille], [island, n, null, null]);
+    close(ui.compute().results[0].final.pri, rows.find(([k]) => k === n)[4], 1e-12, 'PRI of the row retained');
+    // The island already imposed: its own mode and mise au mille stay, in the rows too.
+    const own = computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', mode: '1*8', miseAuMille: 1.9 } } } });
+    assert.ok(ui.cavityRows(own, own.results[0]).every(({ r: x }) => x.finalRates.get('CG3').mode === '1*8' && x.route.miseAuMille === 1.9));
+    ui.retainCavities(2);
+    assert.deepEqual(pick(loadQuote(base, indices).pieces.manuel, ['procede', 'empreintes', 'mode', 'miseAuMille']), { procede: 'CG3', empreintes: 2, mode: '1*8', miseAuMille: 1.9 });
+  });
+
   test('non-regression: the prices of the fixture are those computed before the traces', () => {
     // [PRI, sale price of the first year] of each piece, and of the set: ui.js:compute of the
     // previous version (settings layers), on the same quotes of the made-up workbook.

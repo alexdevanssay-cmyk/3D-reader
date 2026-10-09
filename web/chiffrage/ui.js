@@ -1495,14 +1495,17 @@ function toolingCard(r) {
 /**
  * The piece costed with 1, 2... cavities on the island retained: each row is
  * the quote as "Retenir" makes it (the island imposed, these cavities, the
- * cycle and the tool estimated for them), the row retained the quote as it is.
+ * cycle and the tool estimated for them; an island not chosen yet without a
+ * mode or a mise au mille typed for another one), the row retained the quote
+ * as it is.
  * `c`: compute(), `r`: one of its results. Nothing is saved.
  */
 export function cavityRows(c, r) {
   const route = r.route;
+  const override = { procede: route.process, finition: route.finition, cycle: null, outillagePrix: null, ...(r.chosen ? {} : { mode: null, miseAuMille: null }) };
   return cavityChoices(settings.processes[route.process], route.parCycleEstime, route.parCycle).map((n) => ({
     n,
-    r: n === route.parCycle ? r : computePiece(r.piece, c, null, { procede: route.process, finition: route.finition, empreintes: n, cycle: null, outillagePrix: null }),
+    r: n === route.parCycle ? r : computePiece(r.piece, c, null, { ...override, empreintes: n }),
   }));
 }
 
@@ -1904,7 +1907,8 @@ function aiChoice() {
 /**
  * "Retenir" in the card "Empreintes par coulée": `n` cavities for the piece
  * shown (null: back to the estimate), on the island of its route, imposed with
- * them (a number of cavities is that of its island). The cycle and the price
+ * them (a number of cavities is that of its island; the mode and the mise au
+ * mille typed for another island do not apply to it). The cycle and the price
  * of the tool typed in for other cavities give way to their estimate.
  * Exported for the tests.
  */
@@ -1914,7 +1918,10 @@ export function retainCavities(n) {
   if (!r?.route) return;
   const piece = pieceStore(r.piece.key);
   const imposed = r.inputs.procede !== r.route.process;
-  if (imposed) [piece.procede, piece.finition] = [r.route.process, r.route.finition];
+  if (imposed) {
+    [piece.procede, piece.finition] = [r.route.process, r.route.finition];
+    piece.mode = piece.miseAuMille = null;
+  }
   const replaced = n === null ? [] : [piece.cycle > 0 ? `temps de cycle saisi (${piece.cycle} s)` : "", piece.outillagePrix > 0 ? `prix d'outillage saisi (${eur(piece.outillagePrix, 0)})` : ""].filter(Boolean);
   piece.empreintes = n;
   if (n !== null) piece.cycle = piece.outillagePrix = null;
