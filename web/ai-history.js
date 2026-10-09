@@ -303,10 +303,22 @@ async function readText(handle) {
 async function partFiles(dir, part) {
   const name = partFileName(part);
   const suffix = name.slice(name.lastIndexOf("__"));
+  const names = [];
+  for await (const entry of dir.values()) if (entry.kind === "file" && entry.name.endsWith(suffix)) names.push(entry.name);
+  names.sort((a, b) => (a === name ? -1 : b === name ? 1 : a.localeCompare(b)));
+  // Each one by its name: what the folder lists may be the file as it was before its last write.
   const out = [];
-  for await (const entry of dir.values()) if (entry.kind === "file" && entry.name.endsWith(suffix)) out.push(entry);
-  return out.sort((a, b) => (a.name === name ? -1 : b.name === name ? 1 : a.name.localeCompare(b.name)));
+  for (const n of names) {
+    try {
+      out.push(await dir.getFileHandle(n));
+    } catch (err) {
+      if (!notFound(err)) throw err; // removed since
+    }
+  }
+  return out;
 }
+
+const notFound = (err) => err?.name === "NotFoundError" || err?.name === "TypeMismatchError";
 
 /**
  * The files of the part `part` in the folder `dir`, read: {handles,
@@ -362,13 +374,14 @@ export async function writePartFile(dir, conversation) {
 /** Every conversation of the folder `dir`, the latest first ({...conversation, part}); the files that are not of this history are left. */
 export async function listFolder(dir) {
   const out = [];
-  for await (const entry of dir.values()) {
-    if (entry.kind !== "file" || !entry.name.endsWith(".json")) continue;
+  const names = [];
+  for await (const entry of dir.values()) if (entry.kind === "file" && entry.name.endsWith(".json")) names.push(entry.name);
+  for (const name of names) {
     try {
-      const parsed = parsePartFile(await readText(entry));
+      const parsed = parsePartFile(await readText(await dir.getFileHandle(name)));
       if (parsed) out.push(...parsed.conversations);
     } catch {
-      // unreadable: the others are listed
+      // unreadable, or removed since: the others are listed
     }
   }
   return mergeAll(out).sort(latestFirst);

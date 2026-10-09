@@ -979,7 +979,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       for (let i = 0; ; i++) {
         try {
           const out = {};
-          for await (const entry of (await navigator.storage.getDirectory()).values()) if (entry.name.endsWith('.json')) out[entry.name] = JSON.parse(await (await entry.getFile()).text());
+          const dir = await navigator.storage.getDirectory();
+          for await (const entry of dir.values()) if (entry.name.endsWith('.json')) out[entry.name] = JSON.parse(await (await (await dir.getFileHandle(entry.name)).getFile()).text());
           return out;
         } catch (err) {
           if (i > 20) throw err;
