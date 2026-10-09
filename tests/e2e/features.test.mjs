@@ -986,12 +986,13 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       assert.equal(completions.length, n + 1);
     };
     const items = (list) => page.$$eval(`#ai-hist-list-${list} .ai-hist-item`, (els) => els.map((li) => [li.querySelector('.ai-hist-part').textContent, /\d+ messages?/.exec(li.querySelector('.ai-hist-meta').textContent)[0], li.querySelector('.ai-hist-q').textContent]));
-    // Its .json files (Chrome writes each through a .crswap file of its own, there for a moment), read once written.
+    // Its .json files (Chrome writes each through a .crswap file of its own, there for a moment), read once written;
+    // in the subfolder "historique-ia" of the shared folder (network-folder.js), chosen here.
     const folderFiles = () => page.evaluate(async () => {
       for (let i = 0; ; i++) {
         try {
           const out = {};
-          const dir = await navigator.storage.getDirectory();
+          const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle('historique-ia');
           for await (const entry of dir.values()) if (entry.name.endsWith('.json')) out[entry.name] = JSON.parse(await (await (await dir.getFileHandle(entry.name)).getFile()).text());
           return out;
         } catch (err) {
@@ -1020,7 +1021,7 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.waitForFunction(() => document.querySelector('#ai-hist-list-local .ai-hist-item.current.this-part'), null, { timeout: 10_000 });
     assert.deepEqual(await items('local'), [['box', '2 messages', '« Quel volume ? »']]);
 
-    // The network folder chosen: the conversation written there, one file per part named by its file and its hash.
+    // The shared network folder chosen here: the conversation written in its subfolder "historique-ia", one file per part named by its file and its hash.
     await page.click('#ai-hist-tab-reseau');
     await page.waitForFunction(() => /Aucun dossier réseau choisi/.test(document.getElementById('ai-hist-folder').textContent), null, { timeout: 10_000 });
     await page.click('[data-hist-action="choose"]');
@@ -1036,15 +1037,22 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await ask('Et sa masse ?');
     // Its file as written: the four messages, and still them a moment later (a file that went back to two
     // would be a write lost; Chromium's own file system may give a read of before for a moment).
-    const written = (file) => page.waitForFunction(async (f) => {
-      try {
-        const dir = await navigator.storage.getDirectory();
-        const messages = JSON.parse(await (await (await dir.getFileHandle(f)).getFile()).text()).conversations[0].messages;
-        return JSON.stringify(messages.map((m) => [m.role, m.role === 'user' ? m.content : m.provider])) === JSON.stringify([['user', 'Quel volume ?'], ['assistant', 'Groq'], ['user', 'Et sa masse ?'], ['assistant', 'Groq']]);
-      } catch {
-        return false; // being written
+    // Polled from here: page.waitForFunction takes the promise of an async function for a true value.
+    const written = async (file) => {
+      for (const end = Date.now() + 10_000; ; await page.waitForTimeout(100)) {
+        const ok = await page.evaluate(async (f) => {
+          try {
+            const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle('historique-ia');
+            const messages = JSON.parse(await (await (await dir.getFileHandle(f)).getFile()).text()).conversations[0].messages;
+            return JSON.stringify(messages.map((m) => [m.role, m.role === 'user' ? m.content : m.provider])) === JSON.stringify([['user', 'Quel volume ?'], ['assistant', 'Groq'], ['user', 'Et sa masse ?'], ['assistant', 'Groq']]);
+          } catch {
+            return false; // being written
+          }
+        }, file);
+        if (ok) return;
+        assert.ok(Date.now() < end, `${file}: not written as expected`);
       }
-    }, file, { timeout: 10_000 });
+    };
     await written(name);
     await page.waitForTimeout(300);
     await written(name);
