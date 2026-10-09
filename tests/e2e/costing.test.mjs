@@ -600,6 +600,8 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       await page.fill('#ai-input', question);
       await page.press('#ai-input', 'Enter');
       await page.waitForFunction((count) => document.querySelectorAll('#ai-chat .ai-check').length > count, n, { timeout: 30_000 });
+      // The answer is shown before it is kept with the quote: the status tells when the question is over.
+      await page.waitForFunction(() => /^Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
       return page.locator('#ai-chat .ai-msg').last();
     };
     // The stand-in cites the sale price of the trace it was given.
