@@ -5,6 +5,10 @@ import { engravingMask, thicknessHistogram, thicknessStats } from "./engine/thic
 import { summarize } from "./engine/summary.js";
 import { buildSemantic3D, SEMANTIC_VERSION } from "./engine/semantic.js";
 import { buildAIContext, AI_CONTEXT_VERSION } from "./engine/ai-context.js";
+import {
+  PARTING_VERSION, SIDE_LOWER, SIDE_NONE, SIDE_UPPER, ZERO_DRAFT,
+  applyOverrides, canonicalAxis, faceRegions, lineMesh, lineSummary, partingLine,
+} from "./engine/parting.js";
 
 // ---------------------------------------------------------------- units
 
@@ -521,6 +525,7 @@ function showModel(data) {
   buildModel(data);
   renderPanel();
   thicknessNewModel(data.cachedThickness?.length === data.bodies.length ? data.cachedThickness : null);
+  partingNewModel(data);
 }
 
 /** The loading box of the tab shown: its analysis in progress, if any. */
@@ -633,6 +638,8 @@ function setIncluded(indices) {
   state.included = new Set(indices);
   state.meshes.forEach((m, i) => (m.visible = state.included.has(i)));
   renderPanel();
+  renderParting();
+  applyParting();
   // The wall thickness card: the values of the bodies checked, on a scale fitted to them.
   if (thick.results) {
     if (!thick.userMax) thick.max = niceCeil((thickQuantiles([0.99]) ?? [thick.max])[0]);
@@ -745,6 +752,9 @@ function select(i) {
   });
   document.querySelectorAll("#bodies tr").forEach((tr) => tr.classList.toggle("selected", +tr.dataset.index === i));
   renderBodyDetail();
+  // The parting line card is the body selected's.
+  renderParting();
+  applyParting();
   document.querySelector("#bodies tr.selected")?.scrollIntoView({ block: "nearest" });
 }
 
@@ -764,7 +774,7 @@ function exportableResult(r, indices = includedIndices()) {
     summary: { ...(currentSummary(indices) ?? r.summary), mass: mass((currentSummary(indices) ?? r.summary).volume) },
     bodies: indices.map((i) => {
       const { mesh, ...b } = r.bodies[i];
-      return { ...b, mass: mass(b.volume), ...thicknessExport(r, [i]) };
+      return { ...b, mass: mass(b.volume), ...thicknessExport(r, [i]), ...partingExport(r, i) };
     }),
     ...thicknessExport(r, indices),
     elapsed_s: r.elapsed_s,
@@ -1078,6 +1088,7 @@ renderer.domElement.addEventListener("pointerup", (e) => {
   const hits = raycaster
     .intersectObjects(state.meshes.filter((m) => m.visible), false)
     .filter((h) => !sectionOn || sectionPlane.distanceToPoint(h.point) >= 0);
+  if (partingClick(hits)) return;
   select(hits.length ? hits[0].object.userData.index : -1);
 });
 
@@ -1369,28 +1380,50 @@ function setSeeThrough(mesh, on) {
   m.needsUpdate = true;
 }
 
+/** A mesh in its own colour: its indexed geometry back. */
+function plainColors(mesh) {
+  if (!mesh.userData.indexed) return;
+  mesh.geometry = mesh.userData.indexed;
+  mesh.material.vertexColors = false;
+  mesh.material.color.copy(mesh.userData.color);
+  mesh.material.needsUpdate = true;
+}
+
+/**
+ * One colour per triangle: a geometry without shared vertices (RGBA: the
+ * alpha fades the rest during a highlight), made the first time. The caller
+ * sets its colours, then shows it (showFlat).
+ */
+function flatGeometry(mesh) {
+  if (!mesh.userData.indexed) {
+    mesh.userData.indexed = mesh.geometry;
+    mesh.userData.flat = mesh.geometry.toNonIndexed();
+    mesh.userData.flat.setAttribute("color", new THREE.BufferAttribute(new Float32Array(mesh.userData.flat.attributes.position.count * 4), 4));
+  }
+  return mesh.userData.flat;
+}
+
+/** Show the flat geometry of a mesh, in the colours of its triangles. */
+function showFlat(mesh, geom) {
+  geom.attributes.color.needsUpdate = true;
+  if (mesh.geometry !== geom) mesh.geometry = geom;
+  if (!mesh.material.vertexColors) {
+    mesh.material.vertexColors = true;
+    mesh.material.color.set(0xffffff);
+    mesh.material.needsUpdate = true;
+  }
+}
+
 /** Colour the meshes by thickness, or give them their own colour back. */
 function applyThickness() {
   const active = (thick.colors || thick.highlight) && thick.results;
+  // Not by thickness: the parting line when it is shown.
+  if (!active && partingShown()) return applyParting();
   state.meshes.forEach((mesh, i) => {
     const values = thickValues(i);
     setSeeThrough(mesh, active && thick.highlight);
-    if (!active) {
-      if (mesh.userData.indexed) {
-        mesh.geometry = mesh.userData.indexed;
-        mesh.material.vertexColors = false;
-        mesh.material.color.copy(mesh.userData.color);
-        mesh.material.needsUpdate = true;
-      }
-      return;
-    }
-    // One colour per triangle: a geometry without shared vertices (RGBA: the alpha fades the rest during a highlight).
-    if (!mesh.userData.indexed) {
-      mesh.userData.indexed = mesh.geometry;
-      mesh.userData.flat = mesh.geometry.toNonIndexed();
-      mesh.userData.flat.setAttribute("color", new THREE.BufferAttribute(new Float32Array(mesh.userData.flat.attributes.position.count * 4), 4));
-    }
-    const geom = mesh.userData.flat;
+    if (!active) return plainColors(mesh);
+    const geom = flatGeometry(mesh);
     const colors = geom.attributes.color.array;
     const color = new THREE.Color();
     const lo = thick.value - thick.tol;
@@ -1413,13 +1446,7 @@ function applyThickness() {
         colors[12 * f + 4 * k + 3] = alpha;
       }
     }
-    geom.attributes.color.needsUpdate = true;
-    if (mesh.geometry !== geom) mesh.geometry = geom;
-    if (!mesh.material.vertexColors) {
-      mesh.material.vertexColors = true;
-      mesh.material.color.set(0xffffff);
-      mesh.material.needsUpdate = true;
-    }
+    showFlat(mesh, geom);
   });
 }
 
@@ -1575,6 +1602,7 @@ function drawScale(area, total) {
 
 async function setThickness(changes) {
   Object.assign(thick, changes);
+  if (thick.colors || thick.highlight) partingOff();
   if ((thick.colors || thick.highlight) && !(await ensureThickness())) {
     renderThickness();
     return;
@@ -1682,6 +1710,645 @@ $("thick-max").addEventListener("change", (e) => {
 }
 new ResizeObserver(() => thick.results && renderThickness()).observe($("thick-scale"));
 
+// ---------------------------------------------------------------- parting line
+
+// Draw direction and parting line of a cast part (engine/parting.js):
+// proposed for the closed bodies once the model is shown, in a worker of its
+// own (engine/partclient.js), and kept with the results of the file in this
+// browser. It can be defined by hand: another candidate, the normal of a face
+// picked on the 3D view, a direction typed in, and faces reassigned to the
+// upper or lower half by clicking them (a stepped or warped line). That
+// definition is kept per part (the SHA-256 of its file) in this browser.
+const PARTING_KEY = "reader3d.parting.v1";
+const PARTING_PARTS = 200; // parts whose definition by hand is kept, the latest
+const PARTING_COLORS = {
+  [SIDE_UPPER]: new THREE.Color(0x4f86d9),
+  [SIDE_LOWER]: new THREE.Color(0x52a861),
+  [SIDE_NONE]: new THREE.Color(0xe0302a), // undercut
+};
+const PARTING_LINE = 0xffc400;
+const PARTING_ARROW = 0x1f5fd0;
+const WHITE = new THREE.Color(0xffffff);
+
+const partClient = () => (partClient.module ??= import("./engine/partclient.js"));
+
+// Per result: {results (per body {proposal, side, flags, plane, segments} or
+// null), pending, percent, error, current (body -> definition by hand), geom
+// (body -> its faces and edges), evaluated (directions classified), show,
+// mode ("pick" | "assign" | null), busy, message, restored}.
+const partings = new WeakMap();
+
+function partingOf(r = state.result) {
+  if (!r) return null;
+  let p = partings.get(r);
+  if (!p) {
+    p = { results: null, pending: null, percent: null, error: null, current: new Map(), geom: new Map(), evaluated: new Map(), show: false, mode: null, busy: false, message: null, restored: false };
+    partings.set(r, p);
+  }
+  return p;
+}
+
+/** The body of the card: the one selected in the list, else the largest closed body checked (-1: none). */
+function partingBody() {
+  const r = state.result;
+  if (!r) return -1;
+  if (state.selected >= 0 && state.selected < r.bodies.length) return state.selected;
+  let best = -1;
+  for (const i of includedIndices()) {
+    if (r.bodies[i].closed && (best < 0 || (r.bodies[i].volume ?? 0) > (r.bodies[best].volume ?? 0))) best = i;
+  }
+  return best;
+}
+
+/** The id of the part of a result ("sha256:…" of its file), for its definitions by hand. */
+function partIdOf(r) {
+  return tabs.find((tab) => tab.result === r)?.part?.id ?? null;
+}
+
+/** Positions and indices of body i of the model shown (as analysed). */
+function bodyArrays(i) {
+  const geom = bodyGeometry(i);
+  return { positions: geom.attributes.position.array, indices: geom.index.array };
+}
+
+const sameDirection = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2] > 1 - 1e-9;
+
+/** The proposal of a body as a classification: {direction, summary, side, flags, plane, segments}. */
+function proposalBase(res) {
+  return { direction: res.proposal.direction, summary: res.proposal, side: res.side, flags: res.flags, plane: res.plane, segments: res.segments };
+}
+
+/** What body i shows: its definition by hand, else its proposal (null: none). */
+function partingField(i, r = state.result) {
+  const p = partingOf(r);
+  const res = p?.results?.[i];
+  if (!res) return null;
+  return p.current.get(i) ?? { manual: false, source: null, overrides: {}, candidate: res.proposal.candidate_index, ...proposalBase(res) };
+}
+
+const partingShown = () => {
+  const p = partingOf();
+  return !!(p?.show && partingField(partingBody()));
+};
+
+// ---- definitions kept in this browser: {part id: {savedAt, bodies: {index: {direction, source, candidate, overrides, faces}}}}
+
+function partingSaved() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PARTING_KEY));
+    return saved && typeof saved === "object" ? saved : {};
+  } catch {
+    return {};
+  }
+}
+
+function savePartingDef(partId, body, def) {
+  if (!partId) return;
+  const all = partingSaved();
+  const entry = all[partId] ?? { bodies: {} };
+  if (def) entry.bodies[body] = def;
+  else delete entry.bodies[body];
+  if (Object.keys(entry.bodies).length) all[partId] = { ...entry, savedAt: Date.now() };
+  else delete all[partId];
+  // The latest parts only.
+  const ids = Object.keys(all).sort((a, b) => (all[b].savedAt ?? 0) - (all[a].savedAt ?? 0));
+  for (const id of ids.slice(PARTING_PARTS)) delete all[id];
+  try {
+    localStorage.setItem(PARTING_KEY, JSON.stringify(all));
+  } catch {
+    // kept for this visit only
+  }
+}
+
+// ---- computation
+
+/** A new model is shown: its parting, kept from an earlier opening, else computed in the background. */
+function partingNewModel(data) {
+  const p = partingOf(data);
+  const kept = data.cachedParting;
+  if (!p.results && kept?.version === PARTING_VERSION && kept.bodies?.length === data.bodies.length) p.results = kept.bodies;
+  if (p.results) restoreParting();
+  else computePartings(data);
+  renderParting();
+}
+
+/** Propose the parting of the closed bodies of the model shown, in the background. */
+function computePartings(r) {
+  const p = partingOf(r);
+  if (p.results || p.pending || r !== state.result) return;
+  const bodies = r.bodies.map((b, i) => (b.closed ? bodyArrays(i) : null));
+  if (!bodies.some(Boolean)) {
+    p.results = r.bodies.map(() => null);
+    return;
+  }
+  p.error = null;
+  p.percent = 0;
+  p.pending = partClient()
+    .then((client) => client.computeParting(bodies, {
+      onProgress: ({ percent }) => {
+        p.percent = percent;
+        if (r === state.result) renderParting();
+      },
+    }).then((results) => {
+      p.results = results.bodies;
+      client.saveParting(r.cacheKey, results);
+    }))
+    .catch((err) => {
+      p.error = err.message || String(err);
+    })
+    .finally(() => {
+      p.pending = null;
+      if (r !== state.result) return;
+      renderParting();
+      if (p.results) {
+        restoreParting();
+        applyParting();
+        updatePublished(r);
+      }
+    });
+}
+
+/** The faces (B-rep faces, else regions) and the edges of body i, computed once. */
+function partingGeometry(i) {
+  const p = partingOf();
+  let g = p.geom.get(i);
+  if (!g) {
+    const { positions, indices } = bodyArrays(i);
+    const line = lineMesh(positions, indices);
+    g = { line, ...faceRegions(positions, indices, { brep: state.result.bodies[i].method === "brep", line }) };
+    p.geom.set(i, g);
+  }
+  return g;
+}
+
+/** Direction d of body i classified on every triangle (in the worker), the proposal's as it is. */
+async function partingDirection(i, d) {
+  const r = state.result;
+  const p = partingOf(r);
+  const res = p.results[i];
+  if (sameDirection(d, res.proposal.direction)) return proposalBase(res);
+  const key = `${i}|${d.map((x) => x.toFixed(9)).join(",")}`;
+  if (p.evaluated.has(key)) return p.evaluated.get(key);
+  p.busy = true;
+  renderParting();
+  try {
+    const client = await partClient();
+    const ev = await client.evaluateDirection(bodyArrays(i), d);
+    const base = { direction: ev.summary.direction, summary: ev.summary, side: ev.side, flags: ev.flags, plane: ev.plane, segments: ev.segments };
+    p.evaluated.set(key, base);
+    return base;
+  } finally {
+    p.busy = false;
+    if (r === state.result) renderParting();
+  }
+}
+
+/**
+ * Body i defined by hand: a direction (its classification `base`) and faces
+ * reassigned ({face: SIDE_UPPER | SIDE_LOWER}); the line follows the
+ * boundary between the halves. The proposal itself, no face moved: no longer
+ * a definition by hand.
+ */
+function setPartingDefinition(i, { base, source, overrides = {}, candidate = null }) {
+  const r = state.result;
+  const p = partingOf(r);
+  const res = p.results[i];
+  const moved = Object.keys(overrides).length;
+  if (!moved && sameDirection(base.direction, res.proposal.direction)) {
+    p.current.delete(i);
+    savePartingDef(partIdOf(r), i, null);
+  } else {
+    let { side, segments } = base;
+    let line = base.summary.parting;
+    let faces = null;
+    if (moved) {
+      const g = partingGeometry(i);
+      faces = g.count;
+      side = applyOverrides(base.side, g.region, overrides);
+      const fixed = Uint8Array.from(g.region, (face) => (face in overrides ? 1 : 0));
+      const l = partingLine(g.line, side, base.direction, { flags: base.flags, plane: base.plane, fixed, height: base.summary.mould_height_mm });
+      segments = l.segments;
+      line = lineSummary(l);
+    }
+    p.current.set(i, { manual: true, source, overrides, candidate, base, direction: base.direction, summary: { ...base.summary, parting: line }, side, flags: base.flags, plane: base.plane, segments });
+    savePartingDef(partIdOf(r), i, { direction: base.direction, source, candidate, overrides, faces });
+  }
+  applyParting();
+  renderParting();
+  updatePublished(r);
+}
+
+/** Back to the proposal for body i. */
+function resetParting(i) {
+  const p = partingOf();
+  p.current.delete(i);
+  p.mode = null;
+  savePartingDef(partIdOf(state.result), i, null);
+  applyParting();
+  renderParting();
+  updatePublished(state.result);
+}
+
+/** The definitions by hand kept for the part shown, once its proposals are known. */
+async function restoreParting() {
+  const r = state.result;
+  const p = partingOf(r);
+  if (!p?.results || p.restored) return;
+  p.restored = true;
+  const defs = partingSaved()[partIdOf(r)]?.bodies ?? {};
+  for (const [key, def] of Object.entries(defs)) {
+    const i = Number(key);
+    if (!p.results[i] || !Array.isArray(def?.direction) || def.direction.length !== 3) continue;
+    try {
+      const base = await partingDirection(i, def.direction);
+      if (r !== state.result) {
+        p.restored = false; // finished when its tab is shown again
+        return;
+      }
+      let overrides = def.overrides ?? {};
+      // Another tessellation of the part (its faces numbered otherwise): only the direction.
+      if (Object.keys(overrides).length && def.faces !== partingGeometry(i).count) overrides = {};
+      setPartingDefinition(i, { base, source: def.source ?? "vector", overrides, candidate: def.candidate ?? null });
+    } catch (err) {
+      console.warn("Parting line kept not restored", err);
+    }
+  }
+}
+
+/** The parting of body i of the result shown, for the exports and the semantic contract: {parting} or {}. */
+function partingExport(r, i) {
+  if (r !== state.result) return {};
+  const p = partingOf(r);
+  const res = p?.results?.[i];
+  if (!res) return {};
+  const cur = p.current.get(i);
+  if (!cur) return { parting: res.proposal };
+  const { candidates, ranking, sampled, method, version, draft_angle_deg, surface_area_mm2, triangles } = res.proposal;
+  return {
+    parting: {
+      ...cur.summary,
+      status: "manual",
+      source: cur.source,
+      candidate_index: cur.candidate,
+      reassigned_faces: Object.keys(cur.overrides).length,
+      proposed: { axis: res.proposal.axis, direction: res.proposal.direction },
+      candidates, ranking, sampled, method, version, draft_angle_deg, surface_area_mm2, triangles,
+    },
+  };
+}
+
+// ---- 3D view
+
+function removePartingOverlay(mesh) {
+  const group = mesh.userData.partingOverlay;
+  if (!group) return;
+  mesh.remove(group);
+  group.traverse((o) => {
+    if (o.userData.own) o.geometry?.dispose();
+    o.material?.dispose();
+  });
+  mesh.userData.partingOverlay = null;
+}
+
+/**
+ * The parting of the card's body on the 3D view ("Show"): the two halves
+ * tinted, lighter where the faces have no draft, the undercuts in red, the
+ * parting line, and an arrow along the draw direction of the upper half.
+ */
+function applyParting() {
+  // Shown before: its colours to take back (else the view is left as it is).
+  const shown = state.meshes.some((mesh) => mesh.userData.parting);
+  state.meshes.forEach(removePartingOverlay);
+  const p = partingOf();
+  const i = partingBody();
+  const field = p?.show && i >= 0 ? partingField(i) : null;
+  if (!field) {
+    if (!shown) return;
+    state.meshes.forEach((mesh) => (mesh.userData.parting = false));
+    return applyThickness(); // its own colours back, or the thickness
+  }
+  const color = new THREE.Color();
+  state.meshes.forEach((mesh, j) => {
+    setSeeThrough(mesh, false);
+    mesh.userData.parting = j === i;
+    if (j !== i) return plainColors(mesh);
+    const geom = flatGeometry(mesh);
+    const colors = geom.attributes.color.array;
+    const triangles = colors.length / 12;
+    for (let f = 0; f < triangles; f++) {
+      color.copy(PARTING_COLORS[field.side[f]] ?? PARTING_COLORS[SIDE_NONE]);
+      if (field.flags[f] & ZERO_DRAFT && field.side[f] !== SIDE_NONE) color.lerp(WHITE, 0.45);
+      for (let k = 0; k < 3; k++) {
+        colors[12 * f + 4 * k] = color.r;
+        colors[12 * f + 4 * k + 1] = color.g;
+        colors[12 * f + 4 * k + 2] = color.b;
+        colors[12 * f + 4 * k + 3] = 1;
+      }
+    }
+    showFlat(mesh, geom);
+  });
+  const mesh = state.meshes[i];
+  const group = new THREE.Group();
+  const lineGeom = new THREE.BufferGeometry();
+  lineGeom.setAttribute("position", new THREE.BufferAttribute(field.segments, 3));
+  const lines = new THREE.LineSegments(lineGeom, new THREE.LineBasicMaterial({ color: PARTING_LINE, clippingPlanes: [sectionPlane] }));
+  lines.userData.own = true;
+  group.add(lines);
+  // The arrow above the body, along the direction.
+  const { min, max, size } = state.result.bodies[i].bbox;
+  const centre = new THREE.Vector3(...min.map((v, k) => (v + max[k]) / 2));
+  const d = new THREE.Vector3(...field.direction);
+  const reach = Math.max(...size);
+  const along = Math.abs(d.x) * size[0] + Math.abs(d.y) * size[1] + Math.abs(d.z) * size[2];
+  const length = 0.35 * reach;
+  group.add(new THREE.ArrowHelper(d, centre.clone().addScaledVector(d, along / 2 + 0.05 * reach), length, PARTING_ARROW, 0.3 * length, 0.15 * length));
+  mesh.add(group);
+  mesh.userData.partingOverlay = group;
+}
+
+/** The parting line no longer shown (the thickness is coloured instead). */
+function partingOff() {
+  const p = partingOf();
+  if (!p?.show) return;
+  p.show = false;
+  p.mode = null;
+  state.meshes.forEach((mesh) => {
+    removePartingOverlay(mesh);
+    mesh.userData.parting = false; // coloured by the thickness next
+  });
+  renderParting();
+}
+
+/** A click on the 3D view while picking a face or reassigning faces: handled here (true), the selection unchanged. */
+function partingClick(hits) {
+  const p = partingOf();
+  if (!p?.mode) return false;
+  const i = partingBody();
+  const hit = hits[0];
+  if (!hit) return true;
+  if (hit.object.userData.index !== i) {
+    p.message = t("parting.otherBody");
+    renderParting();
+    return true;
+  }
+  p.message = null;
+  if (p.mode === "pick") {
+    p.mode = null;
+    pickPartingFace(i, hit.faceIndex);
+  } else assignPartingFace(i, hit.faceIndex, Number($("parting-target").value));
+  return true;
+}
+
+/** Draw direction from a face picked on the 3D view: its outward normal (that face upwards). */
+async function pickPartingFace(i, f) {
+  const r = state.result;
+  const { positions: P, indices: I } = bodyArrays(i);
+  const g = partingGeometry(i);
+  // The normal of its B-rep face (or region) when planar, else of the triangle; outwards.
+  const normal = (t) => {
+    const a = 3 * I[3 * t], b = 3 * I[3 * t + 1], c = 3 * I[3 * t + 2];
+    const u = [P[b] - P[a], P[b + 1] - P[a + 1], P[b + 2] - P[a + 2]];
+    const v = [P[c] - P[a], P[c + 1] - P[a + 1], P[c + 2] - P[a + 2]];
+    return [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+  };
+  if (g.outward == null) {
+    let volume = 0;
+    for (let t = 0; t < I.length / 3; t++) {
+      const n = normal(t);
+      volume += P[3 * I[3 * t]] * n[0] + P[3 * I[3 * t] + 1] * n[1] + P[3 * I[3 * t] + 2] * n[2];
+    }
+    g.outward = volume < 0 ? -1 : 1;
+  }
+  const sum = [0, 0, 0];
+  let area = 0;
+  for (let t = 0; t < g.region.length; t++) {
+    if (g.region[t] !== g.region[f]) continue;
+    const n = normal(t);
+    for (let k = 0; k < 3; k++) sum[k] += n[k];
+    area += Math.hypot(...n);
+  }
+  const planar = area > 0 && Math.hypot(...sum) > 0.999 * area;
+  const n = (planar ? sum : normal(f)).map((x) => x * g.outward);
+  const d = snapDirection(n);
+  if (!d) return;
+  try {
+    const base = await partingDirection(i, d);
+    if (r === state.result) setPartingDefinition(i, { base, source: "face" });
+  } catch (err) {
+    showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
+  }
+}
+
+/** Face f of body i (its B-rep face, or region) moved to a half of the mould. */
+function assignPartingFace(i, f, target) {
+  const field = partingField(i);
+  if (!field) return;
+  const face = partingGeometry(i).region[f];
+  const overrides = { ...field.overrides, [face]: target };
+  const base = field.manual ? field.base : proposalBase(partingOf().results[i]);
+  setPartingDefinition(i, { base, source: field.manual ? field.source : "proposal", overrides, candidate: field.candidate });
+}
+
+/** A unit direction with the sense given; within 1° of an axis of the frame, that axis. */
+function snapDirection(v) {
+  const c = canonicalAxis(v);
+  if (!c) return null;
+  return v[0] * c[0] + v[1] * c[1] + v[2] * c[2] < 0 ? c.map((x) => -x + 0) : c;
+}
+
+/** "0 0 1", "0;0;1", "0,5 0 1", "X", "-z"… as a direction, or null. */
+function parseDirection(text) {
+  const s = String(text ?? "").trim();
+  const axis = /^([+-]?)([xyz])$/i.exec(s);
+  if (axis) {
+    const v = [0, 0, 0];
+    v["xyz".indexOf(axis[2].toLowerCase())] = axis[1] === "-" ? -1 : 1;
+    return v;
+  }
+  // Spaces or semicolons between the components (then a comma is a decimal comma), else commas.
+  const parts = /[\s;]/.test(s) ? s.split(/[\s;]+/).map((x) => x.replace(",", ".")) : s.split(",");
+  if (parts.length !== 3 || parts.some((x) => !/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(x))) return null;
+  const v = parts.map(Number);
+  return snapDirection(v);
+}
+
+// ---- card
+
+const fmtShare = (share) => `${(share * 100).toLocaleString(locale(), { maximumFractionDigits: 1 })} %`;
+
+/** The parting line in words: planar at a height, stepped, warped, or none. */
+function partingLineText(summary) {
+  const line = summary.parting;
+  if (!line?.kind) return t("parting.line.none");
+  if (line.planar) {
+    const axis = /^(-?)([XYZ])$/.exec(summary.axis);
+    if (!axis) return t("parting.line.planarAlong", { level: fmtNum(line.level_mm, 2) });
+    return t("parting.line.planar", { axis: axis[2], level: fmtNum((axis[1] ? -1 : 1) * line.level_mm + 0, 2) });
+  }
+  if (line.kind === "stepped") return t("parting.line.stepped", { range: fmtNum(line.height_range_mm, 1), levels: (line.levels_mm ?? []).map((h) => fmtNum(h, 1)).join(" / ") });
+  return t("parting.line.warped", { range: fmtNum(line.height_range_mm, 1) });
+}
+
+/** Rebuilt only when it changes: a click must not lose its row between the press and the release. */
+const htmlShown = new WeakMap();
+function setHtml(el, html) {
+  if (htmlShown.get(el) === html) return;
+  el.innerHTML = html;
+  htmlShown.set(el, html);
+}
+
+function renderParting() {
+  const card = $("parting-card");
+  const r = state.result;
+  card.hidden = !r;
+  renderer.domElement.style.cursor = "";
+  if (!r) return;
+  const p = partingOf(r);
+  const i = partingBody();
+  const field = i >= 0 ? partingField(i) : null;
+  const named = r.bodies.length > 1 && i >= 0;
+  $("parting-body").hidden = !named;
+  if (named) $("parting-body").textContent = t("parting.body", { name: r.bodies[i].name });
+  let status = "";
+  if (i < 0) status = t("parting.none");
+  else if (!r.bodies[i].closed) status = t("parting.open");
+  else if (p.pending) status = t("parting.computing", { percent: p.percent != null ? `${p.percent} %` : "" });
+  else if (p.error) status = t("parting.error", { message: tMessage(p.error) });
+  else if (p.busy) status = t("parting.busy");
+  $("parting-status").hidden = !status;
+  $("parting-status").textContent = status;
+  $("parting-retry").hidden = !(p.error && !p.pending);
+  $("parting-show").checked = p.show && !!field;
+  $("parting-show").disabled = !field;
+  $("parting-main").hidden = !field;
+  if (!field) return;
+  if (p.mode) renderer.domElement.style.cursor = "crosshair";
+
+  const s = field.summary;
+  const res = p.results[i];
+  $("parting-axis").textContent = s.axis;
+  const origin = $("parting-origin");
+  origin.textContent = t(field.manual ? "parting.manual" : "parting.proposed");
+  origin.classList.toggle("manual", field.manual);
+  const draft = s.draft_angle_deg ?? res.proposal.draft_angle_deg;
+  const rows = [
+    [t("parting.undercut"), `${fmtShare(s.undercut_share)} (${fmtArea(s.undercut_area_mm2)})`],
+    [t("parting.zeroDraft", { angle: fmtNum(draft, 2) }), `${fmtShare(s.zero_draft_share)} (${fmtArea(s.zero_draft_area_mm2)})`],
+    [t("parting.line"), partingLineText(s)],
+    ...(s.parting?.kind ? [[t("parting.length"), t("parting.length.value", { length: fmtNum(s.parting.length_mm, 1), loops: s.parting.loops })]] : []),
+    [t("parting.height"), `${fmtNum(s.mould_height_mm, 2)} mm`],
+    [t("parting.projected"), fmtArea(s.projected_area_mm2)],
+    ...(Object.keys(field.overrides).length ? [[t("parting.reassigned"), String(Object.keys(field.overrides).length)]] : []),
+  ];
+  setHtml($("parting-stats"), rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join(""));
+  const sampled = res.proposal.sampled;
+  $("parting-sampled").hidden = !sampled;
+  if (sampled) $("parting-sampled").textContent = t("parting.sampled", { samples: fmtNum(sampled.samples, 0), triangles: fmtNum(sampled.triangles, 0) });
+
+  // The candidates, the proposal first: a click takes one.
+  const short = (c) => (c.parting?.kind ? t(`parting.short.${c.parting.kind}`) : "—");
+  const order = res.proposal.ranking ?? res.proposal.candidates.map((_, k) => k);
+  setHtml($("parting-candidates").tBodies[0], order
+    .map((k) => {
+      const c = res.proposal.candidates[k];
+      const on = sameDirection(c.direction, field.direction);
+      const proposed = k === res.proposal.candidate_index;
+      return `<tr class="${proposed ? "proposed" : ""}" data-candidate="${k}" title="${escapeHtml(t("parting.candidate.title"))}">` +
+        `<td><input type="radio" name="parting-candidate" value="${k}"${on ? " checked" : ""}></td>` +
+        `<td>${escapeHtml(c.axis)}${proposed ? " ★" : ""}</td><td class="num">${fmtShare(c.undercut_share)}</td><td class="num">${fmtShare(c.zero_draft_share)}</td><td>${escapeHtml(short(c))}</td></tr>`;
+    })
+    .join(""));
+
+  $("parting-pick").classList.toggle("active", p.mode === "pick");
+  $("parting-assign").classList.toggle("active", p.mode === "assign");
+  const hint = p.message ?? (p.mode === "pick" ? t("parting.pick.hint") : p.mode === "assign" ? t("parting.assign.hint", { target: $("parting-target").selectedOptions[0]?.textContent ?? "" }) : "");
+  $("parting-hint").hidden = !hint;
+  $("parting-hint").textContent = hint;
+  $("parting-reset").disabled = !field.manual;
+  $("parting-legend").innerHTML = t("parting.legend");
+}
+
+$("parting-show").addEventListener("change", (e) => {
+  const p = partingOf();
+  if (!p) return;
+  p.show = e.target.checked;
+  if (!p.show) p.mode = null;
+  if (p.show && (thick.colors || thick.highlight)) {
+    thick.colors = thick.highlight = false;
+    renderThickness();
+  }
+  applyParting();
+  renderParting();
+});
+$("parting-retry").addEventListener("click", () => {
+  const p = partingOf();
+  if (!p) return;
+  p.error = null;
+  computePartings(state.result);
+  renderParting();
+});
+$("parting-candidates").addEventListener("click", async (e) => {
+  const row = e.target.closest("[data-candidate]");
+  const i = partingBody();
+  const p = partingOf();
+  if (!row || !p?.results?.[i] || p.busy) return;
+  const k = Number(row.dataset.candidate);
+  const r = state.result;
+  try {
+    const base = await partingDirection(i, p.results[i].proposal.candidates[k].direction);
+    if (r === state.result) setPartingDefinition(i, { base, source: "candidate", candidate: k });
+  } catch (err) {
+    showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
+    renderParting();
+  }
+});
+/** Turn a mode of the 3D view on or off; reassigning faces shows the halves. */
+function setPartingMode(mode) {
+  const p = partingOf();
+  if (!p) return;
+  p.mode = p.mode === mode ? null : mode;
+  p.message = null;
+  if (p.mode === "assign" && !p.show) {
+    p.show = true;
+    if (thick.colors || thick.highlight) {
+      thick.colors = thick.highlight = false;
+      renderThickness();
+    }
+    applyParting();
+  }
+  renderParting();
+}
+$("parting-pick").addEventListener("click", () => setPartingMode("pick"));
+$("parting-assign").addEventListener("click", () => setPartingMode("assign"));
+$("parting-target").addEventListener("change", renderParting);
+async function applyTypedDirection() {
+  const p = partingOf();
+  const i = partingBody();
+  if (!p?.results?.[i]) return;
+  const d = parseDirection($("parting-vector").value);
+  if (!d) {
+    p.message = t("parting.vector.invalid");
+    renderParting();
+    return;
+  }
+  p.message = null;
+  const r = state.result;
+  try {
+    const base = await partingDirection(i, d);
+    if (r === state.result) setPartingDefinition(i, { base, source: "vector" });
+  } catch (err) {
+    showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
+  }
+}
+$("parting-apply").addEventListener("click", applyTypedDirection);
+$("parting-vector").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") applyTypedDirection();
+});
+$("parting-reset").addEventListener("click", () => {
+  const i = partingBody();
+  if (i >= 0) resetParting(i);
+});
+
 // ---------------------------------------------------------------- tabs
 
 // Several parts open side by side, like the tabs of a browser: a part can be
@@ -1778,6 +2445,8 @@ function showTab(tab) {
     if (view.thickReady) adoptThickness(thick.results);
     applyThickness();
     renderThickness();
+    renderParting();
+    restoreParting();
   } else if (tab.result) {
     showModel(tab.result);
   } else {
@@ -1788,6 +2457,7 @@ function showTab(tab) {
     $("drop-hint").hidden = false;
     $("refresh").disabled = true;
     thicknessNewModel();
+    renderParting();
   }
   renderLoading();
   setStatus(tab.loading && !tab.result ? "analysing" : tab.result ? "done" : "idle");
@@ -2362,6 +3032,7 @@ function applyLanguage() {
   renderPanel();
   renderMemory();
   renderThickness();
+  renderParting();
 }
 
 $("language").addEventListener("change", (e) => {
