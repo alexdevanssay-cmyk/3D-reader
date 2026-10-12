@@ -64,13 +64,20 @@ camera.position.set(1, -1, 1);
 // Trackball: the model turns freely in every direction (an orbit stops at the poles,
 // half a turn over the top); the camera's up turns with it.
 const controls = new TrackballControls(camera, renderer.domElement);
-controls.rotateSpeed = 3;
+controls.rotateSpeed = 2;
 controls.zoomSpeed = 1.2;
 controls.panSpeed = 0.8;
-controls.staticMoving = true; // no drift after the mouse is released: a view stays where it is put
+controls.dynamicDampingFactor = 0.2; // a little inertia after the mouse is released
 controls.keys = []; // no A/S/D keys held for rotate/zoom/pan: they are typed in the fields of the page
 // Where the view is on the page, read again at each drag: the bar above it may have wrapped since.
 renderer.domElement.addEventListener("pointerdown", () => controls.handleResize(), true);
+
+/** The view stopped where it is: no turn, zoom or pan left from the inertia of the last drag (TrackballControls 0.180 fields). */
+function stopInertia() {
+  controls._lastAngle = 0;
+  controls._zoomStart.copy(controls._zoomEnd);
+  controls._panStart.copy(controls._panEnd);
+}
 
 scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.6));
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.8);
@@ -992,6 +999,7 @@ function setView(name) {
   camera.updateProjectionMatrix();
   controls.target.copy(center);
   keyLight.position.copy(center).add(new THREE.Vector3(radius, -radius * 2, radius * 3));
+  stopInertia();
   controls.update();
 }
 
@@ -3189,6 +3197,7 @@ function showTab(tab) {
     camera.far = view.camera.far;
     camera.updateProjectionMatrix();
     controls.target.copy(view.camera.target);
+    stopInertia();
     controls.update();
     Object.assign(thick, view.thick);
     thick.statsHtml = null;
