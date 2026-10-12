@@ -73,6 +73,7 @@ const REQUIRED_ADDONS = [
 const REQUIRED_DIST_FILES = [
   'index.html',
   'app.js',
+  'panels.js',
   'config.json',
   'engine/client.js',
   'engine/worker.js',
