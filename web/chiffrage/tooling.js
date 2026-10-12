@@ -76,6 +76,8 @@ export function coefOf(coefPoids, bareKg) {
  * Factor of the work of a tool of `n` cavities over that of the tool of the
  * `estimated` cavities the island would use, each cavity past the first one
  * counting for `share` of the first: (1 + share (n − 1)) / (1 + share (estimated − 1)).
+ * The price of the method stays anchored on the estimated cavities (a choice
+ * of the trade): a tool of 1 cavity is not the reference.
  */
 export function cavityFactor(n, estimated = n, share = 0) {
   const k = Math.max(0, Number(share) || 0);
