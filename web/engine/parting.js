@@ -533,6 +533,9 @@ function sampleSpacing(mesh) {
   }
 }
 
+/** True when the point at offset u of P comes before the one at v: by x, then y, then z. */
+const before = (P, u, v) => P[u] < P[v] || (P[u] === P[v] && (P[u + 1] < P[v + 1] || (P[u + 1] === P[v + 1] && P[u + 2] < P[v + 2])));
+
 /**
  * Flags (REACH_UP, REACH_DOWN, ZERO_DRAFT) of the triangles `list` (all when
  * null) for direction d: each sense reached from at least half of the points
@@ -567,7 +570,11 @@ function classify(mesh, grid, d, list, sinDraft) {
     }
     const cx = centres[3 * f], cy = centres[3 * f + 1], cz = centres[3 * f + 2];
     let k = sampleCount(mesh, f, h);
-    const a = 3 * I[3 * f], b = 3 * I[3 * f + 1], c = 3 * I[3 * f + 2];
+    // Its corners by position (x, then y, then z): the same points whichever corner it starts with, either winding.
+    let a = 3 * I[3 * f], b = 3 * I[3 * f + 1], c = 3 * I[3 * f + 2];
+    if (before(P, b, a)) [a, b] = [b, a];
+    if (before(P, c, b)) [b, c] = [c, b];
+    if (before(P, b, a)) [a, b] = [b, a];
     let up = 0, down = 0;
     for (let j = 0; j < k; j++) {
       // Its first SAMPLE_FIRST points (spread over it) agree both ways: the rest would not change the majority.

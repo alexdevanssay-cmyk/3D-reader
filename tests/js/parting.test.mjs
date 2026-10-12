@@ -411,6 +411,25 @@ describe('flat faces along the draw direction (a CAD body: flat faces cut into l
     assert.deepEqual(summary.parting.levels_mm, [0, 10, 20]);
   });
 
+  test('the same triangles with their corners in another order, or wound the other way: the same halves and figures', () => {
+    // The points of the lines of sight of a long triangle do not depend on the corner it starts with.
+    const plate = castPlate();
+    const I = plate.indices;
+    const tris = triangleGeometry(plate.positions, I);
+    const reorder = (order) => Uint32Array.from(I, (_, i) => I[i - (i % 3) + order[i % 3]]);
+    for (const d of [[0, 1, 0], [0.6, 0.8, 0], [1, 0, 0]]) {
+      const base = evaluateParting(plate.positions, I, d);
+      for (const order of [[1, 2, 0], [2, 0, 1], [0, 2, 1]]) {
+        const other = evaluateParting(plate.positions, reorder(order), d);
+        assert.deepEqual(other.summary, base.summary, `${d}: corners ${order}`);
+        assert.deepEqual(other.flags, base.flags, `${d}: corners ${order}`);
+        assert.equal(other.plane, base.plane);
+        // The halves too, but of the slivers without area (the half of a neighbour, any).
+        tris.forEach(({ area }, f) => area > 1e-6 && assert.equal(other.side[f], base.side[f], `${d}: corners ${order}, triangle ${f}`));
+      }
+    }
+  });
+
   test('lines of sight from several points of a long triangle: its halves by most of its area, not by its centre', () => {
     // A narrow pillar (2 mm across Y) on the plate: its shadows along ±Y on
     // the top face, strips 2 mm wide that long triangles of the face cross.
