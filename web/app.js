@@ -11,7 +11,7 @@ import {
 } from "./engine/parting.js";
 import {
   FEEDING_VERSION, METHOD as FEEDING_METHOD, feedingContext, feedingYield, feeds, gateFromPoint, hotSpotsWithoutRiser,
-  placeFeeding, resizeRiser, riserFromPoint,
+  resizeRiser, riserFromPoint,
 } from "./engine/feeding.js";
 
 // ---------------------------------------------------------------- units
@@ -2390,8 +2390,8 @@ $("parting-reset").addEventListener("click", () => {
 // (engine/feeding.js): the feeding zones of the closed bodies are found once
 // the model is shown, in a worker of their own (engine/feedclient.js), and
 // kept with the results of the file in this browser; the risers and the
-// ingate are placed here for the parting line of the body (proposed or by
-// hand), and placed again when it changes. They can be placed by hand: a
+// ingate are placed for the parting line of the body (proposed or by hand) in
+// a second worker, and placed again when it changes. They can be placed by hand: a
 // riser added, moved, resized or deleted, the ingate placed (brought onto the
 // parting line). That definition is kept per part (the SHA-256 of its file)
 // in this browser, for the body as it was read (its triangles, its size: not
@@ -2408,17 +2408,18 @@ const feedClient = () => (feedClient.module ??= import("./engine/feedclient.js")
 // Per result: {results (per body {zones, body, zone, sphere, …} or null),
 // pending, percent, error, manual (body -> {risers: [...] or null (the
 // proposal's), gate: {...} or null (the proposal's)}), placed (body -> the
-// placement for a parting: {key, ctx, placement}), outward (body -> 1, or -1
-// when its triangles turn inwards), show, mode ("add" | "move" | "gate" |
-// null), selected (a riser id), body (the card's, for the selection),
-// message, restored}.
+// placement for a parting: {key, placement, error}), placing (body -> the
+// parting key being placed in the worker), queued (body -> {key, parting},
+// to send), outward (body -> 1, or -1 when its triangles turn inwards), show,
+// mode ("add" | "move" | "gate" | null), selected (a riser id), body (the
+// card's, for the selection), message, restored}.
 const feedings = new WeakMap();
 
 function feedingOf(r = state.result) {
   if (!r) return null;
   let f = feedings.get(r);
   if (!f) {
-    f = { results: null, pending: null, percent: null, error: null, manual: new Map(), placed: new Map(), outward: new Map(), show: false, mode: null, selected: null, body: -1, message: null, restored: false };
+    f = { results: null, pending: null, percent: null, error: null, manual: new Map(), placed: new Map(), placing: new Map(), queued: new Map(), outward: new Map(), show: false, mode: null, selected: null, body: -1, message: null, restored: false };
     feedings.set(r, f);
   }
   return f;
@@ -2440,10 +2441,11 @@ function feedingParting(i, r = state.result) {
 
 /**
  * The risers and the ingate of body i proposed for its parting line as shown
- * (proposed or by hand; +Z without one), placed once per parting:
- * {key, placement (placeFeeding)}, or null without zones. The context of
- * the placement (a grid of the triangles) is not kept: large on a large
- * body, it is made again for an ingate placed by hand.
+ * (proposed or by hand; +Z without one), placed once per parting in the
+ * worker (seconds on a large body: never on the page): {key, placement
+ * (placeFeeding), error}, or null while it is placed, or without zones. Its
+ * placement is asked for here (the model shown); the card and the exports
+ * follow when it comes.
  */
 function feedingPlacement(i, r = state.result) {
   const f = feedingOf(r);
@@ -2452,10 +2454,45 @@ function feedingPlacement(i, r = state.result) {
   const { key, parting } = feedingParting(i, r);
   const kept = f.placed.get(i);
   if (kept && kept.key === key) return kept;
-  const { positions, indices } = bodyArrays(i);
-  const placed = { key, placement: placeFeeding(positions, indices, res, { parting }) };
-  f.placed.set(i, placed);
-  return placed;
+  if (r === state.result && f.placing.get(i) !== key && f.queued.get(i)?.key !== key) {
+    // Asked for in one go with the others asked for now (the bodies of an export), sent at the end of this task.
+    if (!f.queued.size) queueMicrotask(() => placeQueued(r));
+    f.queued.set(i, { key, parting });
+  }
+  return null;
+}
+
+/**
+ * The bodies queued sent to the worker: the card's body first, on its own,
+ * then the others together; each answer kept when its parting is still the
+ * one shown, then the card, the view and the published results once.
+ */
+function placeQueued(r) {
+  const f = feedingOf(r);
+  const queued = [...f.queued];
+  f.queued.clear();
+  if (r !== state.result || !queued.length) return;
+  const card = feedingBody();
+  const batches = [queued.filter(([i]) => i === card), queued.filter(([i]) => i !== card)].filter((b) => b.length);
+  for (const batch of batches) {
+    const bodies = batch.map(([i, { key, parting }]) => {
+      f.placing.set(i, key);
+      const res = f.results[i];
+      return { ...bodyArrays(i), zones: { zone: res.zone, sphere: res.sphere, zones: res.zones, body: res.body }, parting };
+    });
+    const done = (each) => {
+      batch.forEach(([i, { key }], n) => {
+        if (f.placing.get(i) !== key) return; // asked for again since, for another parting
+        f.placing.delete(i);
+        if (feedingParting(i, r).key === key) f.placed.set(i, { key, ...each(n) });
+      });
+      if (r === state.result) refreshFeeding();
+    };
+    feedClient()
+      .then((client) => client.placeFeedings(bodies))
+      .then((placements) => done((n) => ({ placement: placements[n], error: null })))
+      .catch((err) => done(() => ({ placement: null, error: err.message || String(err) })));
+  }
 }
 
 const densityShown = () => {
@@ -2466,14 +2503,15 @@ const massOfVolume = (mm3, density = densityShown()) => (density && Number.isFin
 
 /**
  * What body i shows: {manual, risers, gate, yield, without (zones needing a
- * riser without one), placement, res}, or null (no zones yet, or the
- * parting line still being computed).
+ * riser without one), placement, res}, or null (no zones yet, the parting
+ * line still being computed, the risers being placed).
  */
 function feedingField(i, r = state.result) {
   const f = feedingOf(r);
   const res = f?.results?.[i];
   if (!res || partingOf(r)?.pending) return null;
   const placed = feedingPlacement(i, r);
+  if (!placed?.placement) return null;
   const manual = f.manual.get(i) ?? null;
   const risers = (manual?.risers ?? placed.placement.risers).map((x) => ({ ...x, mass_g: massOfVolume(x.volume_mm3) }));
   const gate = manual?.gate ?? placed.placement.gate;
@@ -2862,9 +2900,14 @@ function renderFeeding() {
   else if (f.pending) status = t("feeding.computing", { percent: f.percent != null ? `${f.percent} %` : "" });
   else if (f.error) status = t("feeding.error", { message: tMessage(f.error) });
   else if (p?.pending) status = t("feeding.waitParting");
+  else if (f.results?.[i] && !field) {
+    // Being placed in the worker, or not placed.
+    const placed = f.placed.get(i);
+    status = placed?.error && placed.key === feedingParting(i).key ? t("feeding.error", { message: tMessage(placed.error) }) : t("feeding.placing");
+  }
   $("feeding-status").hidden = !status;
   $("feeding-status").textContent = status;
-  $("feeding-retry").hidden = !(f.error && !f.pending);
+  $("feeding-retry").hidden = !((f.error && !f.pending) || (i >= 0 && f.placed.get(i)?.error));
   $("feeding-show").checked = f.show && !!field;
   $("feeding-show").disabled = !field;
   $("feeding-main").hidden = !field;
@@ -2976,8 +3019,10 @@ $("feeding-retry").addEventListener("click", () => {
   const f = feedingOf();
   if (!f) return;
   f.error = null;
+  // The placements that failed, asked for again.
+  for (const [i, placed] of f.placed) if (placed.error) f.placed.delete(i);
   computeFeedings(state.result);
-  renderFeeding();
+  refreshFeeding();
 });
 $("feeding-risers").addEventListener("click", (e) => {
   const row = e.target.closest("[data-riser]");

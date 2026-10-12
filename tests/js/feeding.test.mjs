@@ -448,6 +448,20 @@ describe('large meshes', () => {
     assert.ok(inBox(a.risers[0].position_mm, [45, 25, 35], [60, 40, 35]), `riser at ${a.risers[0].position_mm}`);
   });
 
+  test('a hot spot of many triangles: the places tried drawn from a sample of it, the riser on top all the same', () => {
+    // A plate 100 × 60 × 10 in 0.625 mm squares: every triangle of its top in its hot spot (30 720).
+    const mesh = voxels(() => true, [20, 12, 2], { size: 5, subdivide: 8 });
+    const zones = feedingZones(mesh.positions, mesh.indices, { sphere: new Float32Array(mesh.indices.length / 3).fill(10) });
+    const parting = partingOf(mesh);
+    const run = () => placeFeeding(mesh.positions, mesh.indices, zones, { parting });
+    const a = run();
+    assert.equal(a.risers.length, 1);
+    const [riser] = a.risers;
+    assert.equal(riser.type, 'top');
+    assert.ok(inBox(riser.position_mm, [riser.diameter_mm / 2, riser.diameter_mm / 2, 10], [100 - riser.diameter_mm / 2, 60 - riser.diameter_mm / 2, 10]), `riser at ${riser.position_mm}, its footprint on the plate`);
+    assert.deepEqual(run(), a, 'the same proposal every time');
+  });
+
   test('the inscribed spheres given (from the thickness card): used as they are', () => {
     const mesh = plate();
     const sphere = new Float32Array(mesh.indices.length / 3).fill(10);

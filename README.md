@@ -92,7 +92,8 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
 ## Risers and gating: method and limits
 
 `web/engine/feeding.js` proposes where to feed a cast part (gravity die or sand) from its
-closed mesh, in a worker after the analysis (`feedworker.js`), kept with the results:
+closed mesh, in a worker after the analysis (`feedworker.js`), kept with the results; the
+risers and the ingate are placed for the parting line shown in a second worker of it:
 
 - **Feeding zones.** The local section is the diameter *D* of the largest sphere inscribed
   at each triangle (the "inscribed sphere" of the wall thickness). A watershed of *D* from

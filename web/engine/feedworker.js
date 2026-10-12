@@ -1,13 +1,20 @@
 // Worker of the feeding zones (see feeding.js): the hot spots of each body of
-// a model and the zones they feed, for the risers and the ingate placed on the
-// page. Plain JavaScript, no bare imports. A worker of its own: the parting
+// a model and the zones they feed, and the risers and the ingate placed for
+// the parting line shown (feedclient.js runs a second one of this script for
+// those). Plain JavaScript, no bare imports. A worker of its own: the parting
 // line (its worker) and the wall thickness (pool) do not wait for it, nor a
 // direction chosen by hand for the parting line.
 
-import { FEEDING_VERSION, feedingZones } from './feeding.js';
+import { FEEDING_VERSION, feedingZones, placeFeeding } from './feeding.js';
 
 self.onmessage = ({ data: msg }) => {
   try {
+    if (msg.type === 'place') {
+      // Bodies: {positions, indices, zones ({zone, sphere, zones, body}), parting (or null)}.
+      const result = msg.bodies.map((b) => placeFeeding(b.positions, b.indices, b.zones, { parting: b.parting ?? null }));
+      postMessage({ type: 'result', id: msg.id, result });
+      return;
+    }
     if (msg.type !== 'zones') return;
     // Bodies: {positions, indices, sphere (inscribed diameters, or null)} or null (open bodies: no inside).
     const total = Math.max(1, msg.bodies.reduce((n, b) => n + (b ? b.indices.length : 0), 0));

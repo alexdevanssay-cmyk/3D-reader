@@ -108,6 +108,9 @@ const NOISE_TRIANGLES = 3;
 // Places tried for the top riser of a zone (spread over its hot spot), and the
 // points of its footprint tested: [share of the radius, count] per circle.
 const TOP_TRIES = 256;
+// The triangles of a hot spot (its balls, its faces turned up) looked at for those places:
+// at most this many, spread over it in index order (a large mesh, a uniform plate).
+const PLACE_SAMPLES = 4096;
 const FOOTPRINT_RINGS = [[1 / 3, 8], [2 / 3, 12], [1, 16]];
 // A large triangle of the top of a hot spot cut into at most this many parts a side, for the places tried.
 const FACE_SPLIT = 8;
@@ -755,6 +758,20 @@ export function sizeRiser(modulus, { diameter = null, height = null, type = 'top
 
 const massOf = (volume, density) => (density > 0 && Number.isFinite(volume) ? round((volume / 1000) * density, 1) : null);
 
+/** The ball of triangle f (its inscribed sphere): {f, w (its area), c (its centre)}. */
+function ballOf(ctx, f) {
+  const { g } = ctx;
+  const D = ctx.sphere[f];
+  return { f, w: g.areas[f], c: [0, 1, 2].map((k) => g.centres[3 * f + k] - (g.normals[3 * f + k] * D) / 2) };
+}
+
+/** At most PLACE_SAMPLES of a list of triangles, spread over it (every n-th). */
+function sampled(list) {
+  if (list.length <= PLACE_SAMPLES) return list;
+  const step = list.length / PLACE_SAMPLES;
+  return Int32Array.from({ length: PLACE_SAMPLES }, (_, k) => list[Math.floor(k * step)]);
+}
+
 /**
  * Where a riser stands on the part, for one zone: on top, over the hot spot.
  * On a face of the hot spot turned up with nothing above it; else where the
@@ -762,17 +779,20 @@ const massOf = (volume, density) => (density > 0 && Number.isFinite(volume) ? ro
  * above; of these, the place whose footprint the part holds best (not over
  * a hole), the nearest to the middle of the hot spot first. Else on the
  * highest free face of the zone.
+ * patch, tops -- the triangles of its hot spot, of its faces turned up near it (indices)
  */
 function topPlace(ctx, zoneId, patch, tops, diameter) {
   const { g, grid, d } = ctx;
   const R = diameter / 2;
   const tol = Math.max(1, 0.15 * diameter);
   const lift = Math.max(1e-3 * (g.diag || 1), 0.02 * diameter);
+  // The middle of the hot spot: the centres of all its balls, area-weighted.
   const mean = [0, 0, 0];
   let wsum = 0;
-  for (const p of patch) {
-    for (let k = 0; k < 3; k++) mean[k] += p.w * p.c[k];
-    wsum += p.w;
+  for (const f of patch) {
+    const w = g.areas[f], D = ctx.sphere[f];
+    for (let k = 0; k < 3; k++) mean[k] += w * (g.centres[3 * f + k] - (g.normals[3 * f + k] * D) / 2);
+    wsum += w;
   }
   for (let k = 0; k < 3; k++) mean[k] /= wsum || 1;
   // Points of the footprint of a riser at `contact` on the part (its top there,
@@ -822,7 +842,8 @@ function topPlace(ctx, zoneId, patch, tops, diameter) {
   // about R/2 apart inside each (a CAD face is a few long triangles), FACE_POINTS at most.
   const points = [];
   const P = g.positions, I = g.indices;
-  for (const p of tops) {
+  for (const f of sampled(tops)) {
+    const p = ballOf(ctx, f);
     const [a, b, c] = [0, 1, 2].map((k) => [P[3 * I[3 * p.f + k]], P[3 * I[3 * p.f + k] + 1], P[3 * I[3 * p.f + k] + 2]]);
     const longest = Math.max(length(sub(b, a)), length(sub(c, b)), length(sub(a, c)));
     const n = Math.min(FACE_SPLIT, Math.max(1, Math.ceil(longest / Math.max(R / 2, 1e-9))));
@@ -839,7 +860,10 @@ function topPlace(ctx, zoneId, patch, tops, diameter) {
     return { contact: p.at, triangle: p.f, depth: length(sub(p.at, p.c)), centre: p.c };
   });
   // From the balls of the hot spot (a hot spot inside the part): where the line along d leaves it.
-  best ??= pick(spread(patch.map((p) => ({ ...p, r: length(sub(p.c, mean)) }))), (p) => {
+  best ??= pick(spread(Array.from(sampled(patch), (f) => {
+    const p = ballOf(ctx, f);
+    return { ...p, r: length(sub(p.c, mean)) };
+  })), (p) => {
     const up = grid.crossings(p.c, 1);
     // From inside the material: the first crossing leaves it by an upward face, and nothing is above.
     if (up.length !== 1 || dot(normalAt(g, up[0].f), d) <= 0) return null;
@@ -868,7 +892,7 @@ const centreAt = (g, f) => [g.centres[3 * f], g.centres[3 * f + 1], g.centres[3 
 /**
  * Riser of a zone (a summary of feedingZones): on top, or on the side at the
  * parting line when the hot spot is closer to it than to the top.
- * patch -- the balls of its hot spot; tops -- its faces near the hot spot turned up
+ * patch -- the triangles of its hot spot; tops -- of its faces near the hot spot turned up (indices)
  */
 function placeRiser(ctx, z, patch, tops, n) {
   const size = sizeRiser(z.modulus_mm);
@@ -1122,42 +1146,72 @@ export function sizeGate(wall) {
 }
 
 /**
- * The undercut triangles (SIDE_NONE) in a hash grid of their centres, cells
- * at least `radius` wide: within(p, r <= radius) tells whether one is within
- * r of point p (from its centre, plus its own size). Null without any.
+ * The undercut triangles (SIDE_NONE) in a grid of their centres, cells about
+ * a quarter of `radius` (the largest query) and the largest triangle wide:
+ * within(p, r <= radius) tells whether one is within r of point p (from its
+ * centre, plus its own size), looking only at the cells within r and the
+ * size of the largest triangle of p. Null without any.
  */
 function undercutIndex(g, side, radius) {
-  const list = [];
-  for (let f = 0; f < g.nt; f++) if (side[f] === SIDE_NONE && g.areas[f] > 0) list.push(f);
-  if (!list.length) return null;
+  let n = 0;
+  for (let f = 0; f < g.nt; f++) if (side[f] === SIDE_NONE && g.areas[f] > 0) n++;
+  if (!n) return null;
   const P = g.positions, I = g.indices;
-  const size = new Float64Array(g.nt);
-  let cell = radius;
-  for (const f of list) {
+  // Their centres and sizes (the farthest vertex from the centre), and the box of the centres.
+  const at = new Float64Array(4 * n);
+  const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+  let largest = 0;
+  for (let f = 0, m = 0; f < g.nt; f++) {
+    if (side[f] !== SIDE_NONE || !(g.areas[f] > 0)) continue;
     let s = 0;
     for (let k = 0; k < 3; k++) {
       const a = 3 * I[3 * f + k];
       s = Math.max(s, Math.hypot(P[a] - g.centres[3 * f], P[a + 1] - g.centres[3 * f + 1], P[a + 2] - g.centres[3 * f + 2]));
     }
-    size[f] = s;
-    cell = Math.max(cell, s);
+    for (let k = 0; k < 3; k++) {
+      const c = g.centres[3 * f + k];
+      at[4 * m + k] = c;
+      if (c < min[k]) min[k] = c;
+      if (c > max[k]) max[k] = c;
+    }
+    at[4 * m + 3] = s;
+    largest = Math.max(largest, s);
+    m++;
   }
-  cell = Math.max(cell, 1e-3 * (g.diag || 1));
-  const cells = new Map();
-  const key = (i, j, k) => `${i},${j},${k}`;
-  for (const f of list) {
-    const k = key(...[0, 1, 2].map((j) => Math.floor(g.centres[3 * f + j] / cell)));
-    const bucket = cells.get(k);
-    if (bucket) bucket.push(f);
-    else cells.set(k, [f]);
-  }
+  // Cells of a quarter of the largest reach (at most 9 a side looked at), fewer when too many.
+  let cell = Math.max((radius + largest) / 4, largest, 1e-3 * (g.diag || 1));
+  const dims = () => min.map((m, k) => Math.floor((max[k] - m) / cell) + 1);
+  while (dims().reduce((a, b) => a * b, 1) > 4 * n + 4096) cell *= 1.25;
+  const [nx, ny, nz] = dims();
+  const index = (x, k) => Math.floor((x - min[k]) / cell);
+  const start = new Int32Array(nx * ny * nz + 1);
+  const cellOf = (m) => (index(at[4 * m], 0) * ny + index(at[4 * m + 1], 1)) * nz + index(at[4 * m + 2], 2);
+  for (let m = 0; m < n; m++) start[cellOf(m) + 1]++;
+  for (let c = 0; c < nx * ny * nz; c++) start[c + 1] += start[c];
+  const items = new Int32Array(n);
+  const fill = start.slice(0, nx * ny * nz);
+  for (let m = 0; m < n; m++) items[fill[cellOf(m)]++] = m;
   return {
     within(p, r) {
-      const reach = Math.ceil((r + cell) / cell);
-      const [ci, cj, ck] = p.map((x) => Math.floor(x / cell));
-      for (let i = ci - reach; i <= ci + reach; i++) for (let j = cj - reach; j <= cj + reach; j++) for (let k = ck - reach; k <= ck + reach; k++) {
-        for (const f of cells.get(key(i, j, k)) ?? []) {
-          if (Math.hypot(p[0] - g.centres[3 * f], p[1] - g.centres[3 * f + 1], p[2] - g.centres[3 * f + 2]) <= r + size[f]) return true;
+      const reach = r + largest;
+      const lo = [0, 1, 2].map((k) => Math.max(0, index(p[k] - reach, k)));
+      const hi = [0, 1, 2].map((k, j) => Math.min([nx, ny, nz][j] - 1, index(p[k] + reach, k)));
+      for (let i = lo[0]; i <= hi[0]; i++) {
+        const dx = Math.max(min[0] + i * cell - p[0], 0, p[0] - min[0] - (i + 1) * cell);
+        for (let j = lo[1]; j <= hi[1]; j++) {
+          const dy = Math.max(min[1] + j * cell - p[1], 0, p[1] - min[1] - (j + 1) * cell);
+          for (let k = lo[2]; k <= hi[2]; k++) {
+            const c = (i * ny + j) * nz + k;
+            if (start[c] === start[c + 1]) continue;
+            // A cell farther than the reach: none of its triangles.
+            const dz = Math.max(min[2] + k * cell - p[2], 0, p[2] - min[2] - (k + 1) * cell);
+            if (dx * dx + dy * dy + dz * dz > reach * reach) continue;
+            for (let s = start[c]; s < start[c + 1]; s++) {
+              const m = 4 * items[s];
+              const ex = p[0] - at[m], ey = p[1] - at[m + 1], ez = p[2] - at[m + 2], w = r + at[m + 3];
+              if (ex * ex + ey * ey + ez * ez <= w * w) return true;
+            }
+          }
         }
       }
       return false;
@@ -1284,26 +1338,46 @@ export function feedingContext(positions, indices, zones, { parting = null, dens
  */
 export function placeFeeding(positions, indices, zones, { parting = null, density = null, ctx = null } = {}) {
   ctx ??= feedingContext(positions, indices, zones, { parting, density });
-  const { g } = ctx;
-  // The balls of the hot spot of each zone, and its faces near the hot spot turned up.
-  const peak = new Map(zones.zones.map((z) => [z.id, z.sphere_mm]));
-  const patches = new Map(zones.zones.map((z) => [z.id, []]));
-  const tops = new Map(zones.zones.map((z) => [z.id, []]));
+  const { g, d } = ctx;
+  // The triangles of the hot spot of each zone (its balls), and of its faces near the hot spot
+  // turned up: their indices, by zone (a list of numbers, not an object per triangle).
+  const ids = zones.zones.length;
+  const peak = new Float64Array(ids).fill(Infinity);
+  for (const z of zones.zones) if (z.id >= 0 && z.id < ids) peak[z.id] = z.sphere_mm;
+  const kind = new Uint8Array(g.nt); // 1: of the hot spot, 2: turned up near it
+  const patchStart = new Int32Array(ids + 1), topStart = new Int32Array(ids + 1);
   for (let f = 0; f < g.nt; f++) {
     const z = ctx.zone[f];
+    if (!(z >= 0 && z < ids)) continue;
     const D = ctx.sphere[f];
-    const top = peak.get(z) ?? Infinity;
-    if (!(D >= TOP_PATCH * top - 1e-9) || !(g.areas[f] > 0)) continue;
-    const ball = { f, w: g.areas[f], c: [0, 1, 2].map((k) => g.centres[3 * f + k] - (g.normals[3 * f + k] * D) / 2) };
-    if (D >= HOT_PATCH * top - 1e-9) patches.get(z).push(ball);
-    if (dot(normalAt(g, f), ctx.d) >= 0.5) tops.get(z).push(ball);
+    if (!(D >= TOP_PATCH * peak[z] - 1e-9) || !(g.areas[f] > 0)) continue;
+    if (D >= HOT_PATCH * peak[z] - 1e-9) {
+      kind[f] |= 1;
+      patchStart[z + 1]++;
+    }
+    if (g.normals[3 * f] * d[0] + g.normals[3 * f + 1] * d[1] + g.normals[3 * f + 2] * d[2] >= 0.5) {
+      kind[f] |= 2;
+      topStart[z + 1]++;
+    }
   }
+  for (let z = 0; z < ids; z++) {
+    patchStart[z + 1] += patchStart[z];
+    topStart[z + 1] += topStart[z];
+  }
+  const patchList = new Int32Array(patchStart[ids]), topList = new Int32Array(topStart[ids]);
+  const patchFill = patchStart.slice(0, ids), topFill = topStart.slice(0, ids);
+  for (let f = 0; f < g.nt; f++) {
+    if (kind[f] & 1) patchList[patchFill[ctx.zone[f]]++] = f;
+    if (kind[f] & 2) topList[topFill[ctx.zone[f]]++] = f;
+  }
+  const patchOf = (z) => (z >= 0 && z < ids ? patchList.subarray(patchStart[z], patchStart[z + 1]) : new Int32Array(0));
+  const topsOf = (z) => (z >= 0 && z < ids ? topList.subarray(topStart[z], topStart[z + 1]) : new Int32Array(0));
   const risers = [];
   const order = zones.zones.filter((z) => z.needs_riser).sort((a, b) => b.modulus_mm - a.modulus_mm || a.id - b.id);
   for (const z of order) {
     // MAX_RISERS at most: the zones left are listed without a riser.
     if (risers.length >= MAX_RISERS) break;
-    const r = placeRiser(ctx, z, patches.get(z.id), tops.get(z.id), risers.length + 1);
+    const r = placeRiser(ctx, z, patchOf(z.id), topsOf(z.id), risers.length + 1);
     if (r) risers.push(r);
   }
   const gate = placeGate(ctx, risers);
