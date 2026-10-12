@@ -86,15 +86,16 @@ hand" of `web/app.js`:
   the part, a rounded corner on a face square to the axis), its centre on the bisector
   plane of the chord (typed or clicked: moved onto it), draped on the surface along the
   normal of its plane.
-- **Closing, editing**: point 1 clicked (or *Fermer la boucle*, Enter) closes the loop and
-  ends the placing; *Nouvelle boucle* draws another one (a bore through the parting plane
+- **Closing, editing**: the loop's first point clicked (or *Fermer la boucle*, Enter) closes
+  the loop and ends the placing; *Nouvelle boucle* draws another one (a bore through the parting plane
   needs its own: the outer loop alone does not split the part). Points are dragged,
   deleted (Suppr), added in the middle of a segment ("+"); undo and redo (Ctrl+Z, Ctrl+Y);
   *Aligner* moves the points of a loop to one height typed in (hand-placed points are never
   exactly level), its line then planar.
 - **Halves**: the loops cut the surface into parts (union-find of its vertices, the edges
   crossed by a loop as barriers); the parts are proposed to the halves by what each one
-  can form (the lines of sight of the axis), then chosen by a click on a part; a passage
+  can form (the lines of sight of the axis), then chosen by a click on a part (another
+  axis proposes them again: the parts chosen along the one before are forgotten); a passage
   formed by neither half (a core) is left out when it would join them. Undercuts: the
   faces a half cannot form, or of no half. The drawn line is applied as any definition by
   hand (red line, yellow undercuts, blocks, risers placed again) and kept per part in the

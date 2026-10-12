@@ -12,9 +12,9 @@ import {
   PARTING_VERSION, REACH_DOWN, REACH_UP, SIDE_UPPER, ZERO_DRAFT,
   applyOverrides, faceRegions, lineMesh, lineSummary, mouldBlocks, parseDirection, partingLine, sameDirection, snapDirection,
 } from "./engine/parting.js";
-import { SIDE_LOWER, axisLabel, parseTriple } from "./engine/parting.js";
+import { SIDE_LOWER, SIDE_NONE, axisLabel, parseTriple } from "./engine/parting.js";
 import {
-  MAX_LOOPS, alignPoints, arcDefault, arcFromCentre, arcGeometry, drawMesh, drawnParting, layArc, layStraight, parseDrawing,
+  MAX_LOOPS, MAX_POINTS, alignPoints, arcDefault, arcFromCentre, arcGeometry, drawMesh, drawnParting, layArc, layStraight, parseDrawing,
   reviveDrawing, rotateAbout, segmentName, segmentPlane, serializeDrawing, surfacePoint, turnSign,
 } from "./engine/parting-draw.js";
 import {
@@ -2940,6 +2940,7 @@ function restoreSnapshot(i, d, snapshot) {
     finishTurn();
     turn.base = null;
     drawBase(i, d).catch(() => {});
+    drawingView(d);
   }
   changed(i, d, { apply: true, recolour: axisChanged });
 }
@@ -3067,8 +3068,9 @@ function segmentError(d, L, K, path) {
  * part not known), as drawnParting tells its pieces apart.
  */
 function segmentActive(result, L, K) {
-  const path = result.paths[L][K];
-  const pr = result.split.pieceRegions[L][K];
+  const path = result.paths[L]?.[K];
+  const pr = result.split.pieceRegions[L]?.[K];
+  if (!path || !pr) return true; // not in that result (a segment added since)
   const side = result.regionSide;
   const x = path.xyz;
   let apart = 0, together = 0, unknown = false, any = false;
@@ -3146,10 +3148,14 @@ async function applyDrawing(i, d) {
   }
   d.tint = result;
   setPartingDefinition(i, { base, source: "drawn", drawn: { drawing: d, result } });
-  scheduleDraft(i); // applied as it is: no draft
+  saveDraftNow(i); // applied as it is: no draft (at once: a reload right after finds none)
 }
 
-/** The definition of body i drawn by hand: {field (p.current), def (kept in this browser)}. */
+/**
+ * The definition of body i drawn by hand: {field (p.current), def (kept in
+ * this browser)}. Its side has the undercuts as SIDE_NONE, as the other
+ * definitions have them: the ingate is placed away from them.
+ */
 function drawnDefinition(i, base, { drawing: d, result }) {
   const saved = serializeDrawing(d, d.nt);
   const info = drawnInfo(d, result);
@@ -3157,7 +3163,8 @@ function drawnDefinition(i, base, { drawing: d, result }) {
     field: {
       manual: true, source: "drawn", overrides: {}, candidate: null, base, direction: base.direction,
       summary: { ...base.summary, undercut_area_mm2: result.figures.undercut_area_mm2, undercut_share: result.figures.undercut_share, parting: lineSummary(result.shape) },
-      side: result.side, flags: base.flags, plane: null, segments: result.segments, fixed: null, undercut: result.undercut,
+      side: result.side.map((s, f) => (result.undercut[f] ? SIDE_NONE : s)),
+      flags: base.flags, plane: null, segments: result.segments, fixed: null, undercut: result.undercut,
       drawing: saved, drawn: info, drawSnap: drawSnapshot(d),
     },
     def: { direction: base.direction, source: "drawn", candidate: null, overrides: {}, faces: null, drawing: saved },
@@ -3252,6 +3259,9 @@ function saveDraftNow(i) {
   flushDraft();
 }
 
+// The page left (reloaded, closed): the draft pending saved first.
+window.addEventListener("pagehide", flushDraft);
+
 /** Body i's definition replaced by another one (a candidate, a face, a direction, the proposal): its drawing by hand kept as a draft. */
 function keepDrawing(i) {
   const d = partingOf()?.draw.get(i);
@@ -3292,6 +3302,25 @@ function enterDrawing() {
   renderParting(); // the view's controls on
   drawingView(d);
   applyParting();
+  resumeHalves(i, d);
+}
+
+/**
+ * A closed drawing taken back without its halves (a draft, a drawing not
+ * restored): its halves once its axis is classified, shown (or why there
+ * are none), not applied: the definition stays until the drawing changes.
+ */
+function resumeHalves(i, d) {
+  if (d.result || !allClosed(d) || !laidOk(d)) return;
+  const r = state.result;
+  const key = d.axis.join(",");
+  drawBase(i, d).then((base) => {
+    if (r !== state.result || drawShown(i) !== d || d.result || d.axis.join(",") !== key || !allClosed(d) || !laidOk(d)) return;
+    d.result = drawnParting(drawGeometry(i), engineDrawing(d), { axis: d.axis, flags: base.flags, height: base.summary.mould_height_mm, bodyCentre: d.centre });
+    d.tint = d.result.ok ? d.result : null;
+    applyParting();
+    renderParting();
+  }).catch(() => {});
 }
 
 /** Drawing by hand left ("Terminer", Esc, the toggle, another mode): the drawing kept, the definition shown as usual. */
@@ -3389,7 +3418,8 @@ function applyDrawVector() {
 /**
  * Another rotation axis (the draw direction): the points stay, every segment
  * laid again in planes found anew, the side view along it, the turn from
- * there; its classification asked for, the halves again once it comes.
+ * there; its classification asked for, the halves proposed again once it
+ * comes (the parts chosen along the axis before forgotten: undone with it).
  */
 function changeAxis(i, d, axis, { plane = d.plane, vector = null } = {}) {
   const same = d.axis && sameDirection(axis, d.axis);
@@ -3402,6 +3432,10 @@ function changeAxis(i, d, axis, { plane = d.plane, vector = null } = {}) {
     return applyDrawOverlay();
   }
   pushHistory(d);
+  // The chapes chosen per part were along the axis before (upper: towards +axis): proposed again along this one.
+  d.seeds = [];
+  d.swap = false;
+  d.target = SIDE_UPPER;
   d.plane = plane;
   d.vector = vector ?? axisText(axis);
   d.axis = axis;
@@ -3428,6 +3462,10 @@ function addPoint(i, d, hit, at) {
   const p = partingOf();
   const dm = drawGeometry(i);
   const before = drawSnapshot(d);
+  if (drawPoints(d) >= MAX_POINTS) {
+    p.message = t("parting.draw.maxPoints", { max: MAX_POINTS });
+    return renderParting();
+  }
   if (!openLoop(d)) {
     const open = d.loops.findIndex((loop) => !loop.closed);
     if (open >= 0) d.current = open;
@@ -3452,6 +3490,7 @@ function addPoint(i, d, hit, at) {
   pushHistory(d, before);
   loop.points.push(sp);
   d.selected = null;
+  d.result = null;
   d.stage = "points";
   if (loop.points.length > 1) {
     loop.segs.push(straightSpec());
@@ -3477,6 +3516,7 @@ function closeLoop(i, d) {
   loop.segs.push(straightSpec());
   loop.paths.push(null);
   loop.closed = true;
+  d.result = null;
   const K = loop.points.length - 1;
   const path = laySegment(drawGeometry(i), d, d.current, K);
   p.message = path.status !== "ok" ? segmentError(d, d.current, K, path) : null;
@@ -3505,6 +3545,7 @@ function newLoop() {
   d.current = d.loops.length - 1;
   d.stage = "points";
   d.selected = null;
+  d.result = null; // that of the loops before: applied again once this one is closed
   changed(i, d);
 }
 
@@ -3545,6 +3586,7 @@ function deletePoint(i, d, { loop: L, k }) {
     if (open >= 0) d.current = open;
   }
   d.selected = null;
+  d.sub = null;
   d.result = null;
   d.inputs.clear();
   d.stage = stageOf(d);
@@ -3557,6 +3599,10 @@ function splitSegment(i, d, L, K) {
   const loop = d.loops[L];
   const path = loop.paths[K];
   if (!path || path.status !== "ok") return;
+  if (drawPoints(d) >= MAX_POINTS) {
+    partingOf().message = t("parting.draw.maxPoints", { max: MAX_POINTS });
+    return renderParting();
+  }
   const dm = drawGeometry(i);
   // The point at half its length, on the triangle of that piece.
   const x = path.xyz;
@@ -3586,6 +3632,7 @@ function splitSegment(i, d, L, K) {
   loop.segs.splice(K, 1, first, second);
   loop.paths.splice(K, 1, null, null);
   d.selected = null;
+  d.sub = null;
   d.result = null;
   d.inputs.clear();
   layAll(dm, d);
@@ -3688,7 +3735,7 @@ function clearDrawing() {
 /** A segment turned "droit" or "courbe": an arc of the default radius (the chord: 60°) in the plane of its line; back to its straight line. */
 function setSegmentType(i, d, L, K, type) {
   const loop = d.loops[L];
-  const spec = loop.segs[K];
+  const spec = loop?.segs[K];
   if (!spec || (type === "arc") === (spec.kind === "arc")) return;
   pushHistory(d);
   const A = loop.points[K], B = loop.points[(K + 1) % loop.points.length];
@@ -3702,6 +3749,7 @@ function setSegmentType(i, d, L, K, type) {
   }
   loop.paths[K] = null;
   d.inputs.delete(`${L}:${K}`);
+  d.sub = null;
   d.result = null;
   layAll(drawGeometry(i), d);
   changed(i, d, { apply: true });
@@ -3710,7 +3758,7 @@ function setSegmentType(i, d, L, K, type) {
 /** The radius typed for an arc: at least half the chord (else not applied, said), at most 1 km; its side kept. */
 function setSegmentRadius(i, d, L, K, text) {
   const loop = d.loops[L];
-  const spec = loop.segs[K];
+  const spec = loop?.segs[K];
   if (spec?.kind !== "arc") return;
   const key = `${L}:${K}`;
   const R = Number(String(text).trim().replace(",", "."));
@@ -3733,7 +3781,7 @@ function setSegmentRadius(i, d, L, K, text) {
 function setSegmentCentre(i, d, L, K, centre, text = null) {
   const p = partingOf();
   const loop = d.loops[L];
-  const spec = loop.segs[K];
+  const spec = loop?.segs[K];
   if (spec?.kind !== "arc") return;
   const key = `${L}:${K}`;
   const A = loop.points[K], B = loop.points[(K + 1) % loop.points.length];
@@ -4570,8 +4618,10 @@ function drawHint(i) {
   if (d.stage === "points") {
     const loop = openLoop(d);
     if (d.closeHover && loop) return t("parting.draw.hint.closeHover", { segments: loop.points.length });
-    if (!drawPoints(d)) return t("parting.draw.hint.first", { step: `1/${drawUi.step}`, axis: axisLabel(d.axis) });
-    return t("parting.draw.hint.next", { n: pointNumber(d, d.current, loop ? loop.points.length : 0) });
+    // The number of the next point, and of the first point of its loop (the one closing it).
+    const n = pointNumber(d, d.current, loop ? loop.points.length : 0);
+    if (!loop?.points.length) return t("parting.draw.hint.first", { n, step: `1/${drawUi.step}`, axis: axisLabel(d.axis) });
+    return t("parting.draw.hint.next", { n, first: pointNumber(d, d.current, 0) });
   }
   // The halves: a segment not laid, the loops not splitting the part, a warning; else what to do.
   for (let L = 0; L < d.loops.length; L++) {
@@ -4588,6 +4638,9 @@ function lockControl(el, locked, why, titleKey = null) {
   el.disabled = locked;
   el.title = locked ? why : titleKey ? t(titleKey) : "";
 }
+
+/** A point as its field shows it to be edited: 2 decimals, the thousands not grouped (parseTriple reads it back). */
+const pointField = (p) => p.map((x) => (Math.abs(x) < 5e-3 ? 0 : x).toLocaleString(locale(), { maximumFractionDigits: 2, useGrouping: false })).join(language() === "fr" ? " ; " : ", ");
 
 /** The rows of the segments: name, type, length, actions; the radius and centre of an arc; an error. */
 function segmentRows(d) {
@@ -4626,7 +4679,7 @@ function segmentRows(d) {
         const min = Math.ceil((dist3(A, B) / 2) * 100) / 100;
         const placing = d.sub?.kind === "centre" && d.sub.loop === L && d.sub.seg === K;
         const radius = typed?.radius ?? String(round(spec.radius, 2));
-        const centre = typed?.centre ?? (geo.error ? "" : fmtPoint(geo.centre));
+        const centre = typed?.centre ?? (geo.error ? "" : pointField(geo.centre));
         rows.push(`<tr class="seg-arc-edit" data-seg="${key}"><td colspan="4"><div class="seg-edit">` +
           `<label>${escapeHtml(t("parting.draw.radius"))} <input type="number" data-field="radius" step="0.1" min="${min}" value="${escapeHtml(radius)}"${typed?.radius != null ? ' aria-invalid="true"' : ""}></label>` +
           `<label>${escapeHtml(t("parting.draw.centre"))} <input type="text" class="seg-centre" data-field="centre" autocomplete="off" placeholder="${escapeHtml(t("parting.draw.centre.placeholder"))}" value="${escapeHtml(centre)}"${typed?.centre != null ? ' aria-invalid="true"' : ""}></label>` +
@@ -4742,18 +4795,27 @@ function renderViewControls(d, hint) {
 
 // ---- keys
 
-/** The keys of the drawing (true: handled): ← → turn, Ctrl+Z / Ctrl+Y, Enter closes, Delete, Esc. Not while typing, nor with a button pressed. */
+/**
+ * The keys of the drawing (true: handled): ← → turn, Ctrl+Z / Ctrl+Y, Enter
+ * closes, Delete, Esc (a point dragged: put back). Not while typing, nor with
+ * a button pressed, nor on another page than the 3D view.
+ */
 function drawKey(e) {
   const active = drawActive();
-  if (!active || drawUi.pressed) return false;
+  // Esc during a drag (its button still pressed): the point back where it was.
+  if (active && drawUi.drag && e.key === "Escape") {
+    endDrag(null, false);
+    e.preventDefault();
+    return true;
+  }
+  if (!active || drawUi.pressed || $("page-viewer").hidden) return false;
   const el = document.activeElement;
   if (el && (el.isContentEditable || /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName))) return false;
   const { p, i, d } = active;
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   const mod = e.ctrlKey || e.metaKey;
   if (key === "Escape") {
-    if (drawUi.drag) endDrag(null, false);
-    else if (d.stage === "axis-face") {
+    if (d.stage === "axis-face") {
       d.plane = d.prev?.plane ?? d.plane;
       if (d.plane === "face" && d.axis) d.plane = defaultPlane(d.axis).plane;
       d.prev = null;
@@ -4809,7 +4871,11 @@ const withDrawing = (fn) => () => {
 };
 
 $("parting-draw").addEventListener("click", () => setPartingMode("draw"));
-$("parting-draw-plane").addEventListener("change", (e) => drawPlaneChosen(e.target.value));
+// The plane chosen: the focus leaves the list (← → turn the part, Esc goes back), but to the normal to type.
+$("parting-draw-plane").addEventListener("change", (e) => {
+  drawPlaneChosen(e.target.value);
+  if (e.target.value !== "vector") e.target.blur();
+});
 $("parting-draw-vector-apply").addEventListener("click", applyDrawVector);
 $("parting-draw-vector").addEventListener("keydown", (e) => {
   if (e.key === "Enter") applyDrawVector();

@@ -373,13 +373,16 @@ table.parting-segments .parting-seg-error td { color: var(--error-text); font-si
 @media (max-width: 900px) {
   .turn { width: 44px; height: 44px; }
 }
-/* A phone: the arrows smaller, the step without its label, readout and reset (aria-label kept), the actions as icons. */
-@media (max-width: 520px) {
+/* A narrow view (a phone; a narrow window or a wide panel beside it), by the width of the view itself: the arrows
+   smaller, the step without its label, readout and reset (aria-label kept), the actions as icons; the step and the
+   actions side by side at the bottom down to a phone's width. */
+.viewport { container-type: inline-size; }
+@container (max-width: 800px) {
   .turn { width: 44px; height: 44px; }
   .turn svg { width: 30px; height: 30px; }
   .turn-step { padding: 3px 4px; gap: 3px; }
   .turn-step-label, .turn-angle, .turn-reset { display: none; }
-  .draw-hint { max-width: calc(100% - 136px); font-size: 11px; padding: 3px 10px; border-radius: 12px; }
+  .draw-hint { max-width: min(calc(100% - 136px), 520px); font-size: 11px; padding: 3px 10px; border-radius: 12px; }
   .turn-step button { min-width: 40px; min-height: 36px; padding: 2px 4px; }
   .draw-actions { padding: 3px 4px; gap: 3px; }
   .draw-actions button { width: 40px; height: 40px; justify-content: center; padding: 0; }
