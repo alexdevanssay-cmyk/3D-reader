@@ -8,7 +8,9 @@ import {
   REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_UPPER, applyOverrides, axisLabel, canonicalAxis, evaluateParting, faceRegions,
   lineMesh, lineSummary, parseDirection, partingLine, proposeParting, sameDirection, sampleByArea,
 } from '../../web/engine/parting.js';
+import { LEVEL, SIDE_NONE, TRAPPED, ZERO_DRAFT } from '../../web/engine/parting.js';
 import { approx } from './helpers.mjs';
+import { PLATE, castPlate } from './plate-mesh.mjs';
 
 /**
  * Closed mesh of a union of cubes (cells x, y, z of an nx × ny × nz grid where
@@ -298,6 +300,207 @@ describe('draw direction proposed from the geometry', () => {
     assert.equal(flags.length, side.length);
     assert.equal(summary.parting.planar, true);
     assert.throws(() => evaluateParting(mesh.positions, mesh.indices, [0, 0, 0]));
+  });
+});
+
+/** Per triangle of a mesh: {c (centre), n (unit normal), area}. */
+function triangleGeometry(positions, indices) {
+  const P = positions, I = indices;
+  return Array.from({ length: I.length / 3 }, (_, f) => {
+    const [a, b, c] = [0, 1, 2].map((k) => 3 * I[3 * f + k]);
+    const u = [0, 1, 2].map((k) => P[b + k] - P[a + k]), v = [0, 1, 2].map((k) => P[c + k] - P[a + k]);
+    const n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    const len = Math.hypot(...n);
+    return { c: [0, 1, 2].map((k) => (P[a + k] + P[b + k] + P[c + k]) / 3), n: n.map((x) => x / len), area: len / 2 };
+  });
+}
+
+/** The ends of the pieces of a line met by an odd number of pieces (within 1e-4 mm): 0 when it is in closed loops. */
+function looseEnds(segments) {
+  const ends = [];
+  for (let i = 0; i < segments.length; i += 3) ends.push([segments[i], segments[i + 1], segments[i + 2]]);
+  return ends.filter((p) => ends.filter((q) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]) < 1e-4).length % 2).length;
+}
+
+/** Area of the part of a triangle (xy) where keep(p) >= 0 for every half-plane `keep` (Sutherland-Hodgman). */
+function clippedArea(triangle, halfPlanes) {
+  let poly = triangle;
+  for (const keep of halfPlanes) {
+    const out = [];
+    poly.forEach((p, i) => {
+      const q = poly[(i + 1) % poly.length];
+      const a = keep(p), b = keep(q);
+      if (a >= 0) out.push(p);
+      if (a >= 0 !== b >= 0) out.push([p[0] + (a / (a - b)) * (q[0] - p[0]), p[1] + (a / (a - b)) * (q[1] - p[1])]);
+    });
+    poly = out;
+  }
+  let s = 0;
+  poly.forEach((p, i) => (s += p[0] * poly[(i + 1) % poly.length][1] - poly[(i + 1) % poly.length][0] * p[1]));
+  return Math.abs(s) / 2;
+}
+
+describe('flat faces along the draw direction (a CAD body: flat faces cut into long triangles round their holes)', () => {
+  test('a plate drawn along its length: one planar line across it, closed; its flat faces cut straight, not along their triangles', () => {
+    // Its pillars, letters and boss cast shadows along Y on its top face: no
+    // plane leaves every face one half only can form on its side. The line
+    // was the boundary of those shadows along the triangles of the top face
+    // (warped, 470 mm in 5 pieces); it is now the section of the plate at
+    // the level that leaves the least surface with draft on the wrong side:
+    // through the axis of the boss.
+    for (const welded of [false, true]) {
+      const plate = castPlate({ welded });
+      const { summary, side, flags, segments, plane } = evaluateParting(plate.positions, plate.indices, [0, 1, 0]);
+      const label = welded ? 'STL' : 'B-rep faces';
+      assert.deepEqual([summary.parting.kind, summary.parting.level_mm, summary.parting.loops], ['planar', 0, 2], label);
+      assert.equal(plane, 0, label);
+      // Every piece at y = 0, none loose: the section of the plate, on each side of its bore
+      // (bottom 25, side 15, top 20, boss 8 + 5, bore 23: twice 96 mm).
+      for (let i = 1; i < segments.length; i += 3) approx(segments[i], 0, 0, 1e-4, `${label}: y of the line`);
+      assert.equal(looseEnds(segments), 0, label);
+      approx(summary.parting.length_mm, 192, 0, 0.05, `${label}: length`);
+      // Every triangle in the half of its side of the plane, unless an undercut: no face split along its triangles.
+      const tris = triangleGeometry(plate.positions, plate.indices);
+      tris.forEach(({ c }, f) => {
+        if (side[f] !== SIDE_NONE) assert.equal(side[f], c[1] < 0 ? SIDE_LOWER : SIDE_UPPER, `${label}: triangle ${f} at y = ${c[1]}`);
+        assert.ok(flags[f] & LEVEL);
+      });
+      // Trapped (undercuts): faces with draft that only the other half could
+      // form; the faces of the pillars that face the line (2 × 8 × 12 mm²),
+      // half of a side of the L in the shadow of a pillar.
+      let trapped = 0;
+      tris.forEach(({ c, n, area }, f) => {
+        if (!(flags[f] & TRAPPED)) return;
+        trapped += area;
+        assert.equal(flags[f] & (REACH_UP | REACH_DOWN | ZERO_DRAFT), 0);
+        assert.equal(side[f], SIDE_NONE);
+        assert.ok(n[1] * c[1] < 0, `trapped on its own side: ${c}`);
+        assert.ok(Math.abs(c[1]) >= 16, c.join());
+      });
+      approx(trapped, 2 * 8 * PLATE.pillarHeight + 1, 1e-6, 0, `${label}: trapped`);
+      approx(summary.trapped_area_mm2, trapped, 0, 0.05, `${label}: trapped in the summary`);
+      // Part of the undercut figure, with the bore and holes across Y and the shadows between details.
+      assert.ok(summary.undercut_area_mm2 > trapped);
+    }
+  });
+
+  test('the same plate along Z (its proposal): planar at its bottom face, round the plate and its three holes, no undercut', () => {
+    for (const welded of [false, true]) {
+      const plate = castPlate({ welded });
+      const { proposal, segments } = proposeParting(plate.positions, plate.indices);
+      assert.deepEqual([proposal.axis, proposal.undercut_area_mm2, proposal.trapped_area_mm2], ['Z', 0, 0]);
+      assert.deepEqual([proposal.parting.kind, proposal.parting.level_mm, proposal.parting.loops], ['planar', 0, 4]);
+      assert.equal(looseEnds(segments), 0);
+      // Its line along Y, as typed by hand: the one above.
+      assert.equal(byAxis(proposal).Y.parting.kind, 'planar');
+    }
+  });
+
+  test('a stepped part with a block on a flat side: still stepped, a planar line would trap more than the shadows it avoids', () => {
+    // The Z profile of the stepped part above, a block (5 mm cube) standing on
+    // its flat front face at mid-height: the block's shadows split that face
+    // (50 mm² in the lower half); a planar line would trap a flange (575 mm²).
+    const profile = (x, y, z) => {
+      const bottom = z < 1 && x < 4, web = x === 3, top = z >= 4 && x >= 3;
+      const hole = y >= 3 && y < 5 && ((x === 1 && z < 1) || (x === 5 && z >= 4));
+      return (bottom || web || top) && !hole;
+    };
+    const mesh = voxels((x, y, z) => (y >= 1 && profile(x, y - 1, z)) || (y === 0 && x === 3 && z === 2), [7, 9, 5], { size: 5 });
+    const { summary } = evaluateParting(mesh.positions, mesh.indices, [0, 0, 1]);
+    assert.deepEqual([summary.parting.kind, summary.undercut_area_mm2, summary.trapped_area_mm2], ['stepped', 0, 0]);
+    assert.deepEqual(summary.parting.levels_mm, [0, 10, 20]);
+  });
+
+  test('lines of sight from several points of a long triangle: its halves by most of its area, not by its centre', () => {
+    // A narrow pillar (2 mm across Y) on the plate: its shadows along ±Y on
+    // the top face, strips 2 mm wide that long triangles of the face cross.
+    const pillar = [20, 0, 22, 4];
+    const plate = castPlate({ pillars: [pillar], letters: [], boss: false, holes: false });
+    const { flags } = evaluateParting(plate.positions, plate.indices, [0, 1, 0]);
+    const P = plate.positions, I = plate.indices;
+    const across = [(p) => p[0] - pillar[0], (p) => pillar[2] - p[0]];
+    let checked = 0, centreWrong = 0;
+    for (let f = 0; f < I.length / 3; f++) {
+      if (plate.face[f] !== plate.top) continue;
+      const tri = [0, 1, 2].map((k) => [P[3 * I[3 * f + k]], P[3 * I[3 * f + k] + 1]]);
+      const area = clippedArea(tri, []);
+      // Shares of it in the shadow behind the pillar along +Y (the upper half cannot form it), in front of it (the lower).
+      const behind = clippedArea(tri, [...across, (p) => pillar[1] - p[1]]) / area;
+      const before = clippedArea(tri, [...across, (p) => p[1] - pillar[3]]) / area;
+      const c = [(tri[0][0] + tri[1][0] + tri[2][0]) / 3, (tri[0][1] + tri[1][1] + tri[2][1]) / 3];
+      if (c[0] > pillar[0] && c[0] < pillar[2] && (c[1] < pillar[1] || c[1] > pillar[3]) && Math.max(behind, before) < 0.35) centreWrong++;
+      for (const [share, bit] of [[behind, REACH_UP], [before, REACH_DOWN]]) {
+        if (Math.abs(share - 0.5) < 0.15) continue;
+        assert.equal(!!(flags[f] & bit), share < 0.5, `triangle ${f}: ${(100 * share).toFixed(0)} % in a shadow`);
+        checked++;
+      }
+    }
+    // Triangles whose centre is in a shadow but most of their area is not: their centre alone got them wrong.
+    assert.ok(centreWrong >= 1, 'no triangle of that kind');
+    assert.ok(checked >= 60, String(checked));
+  });
+
+  test('an undercut region between the halves: the line goes round it, it does not stop at it', () => {
+    // Three cubes in a row along the draw direction X: the first in the lower
+    // half, the last in the upper one, the middle one an undercut (a core)
+    // between them. The line was nothing: the halves do not touch.
+    const mesh = voxels(() => true, [3, 1, 1], { size: 10 });
+    const tris = triangleGeometry(mesh.positions, mesh.indices);
+    const side = Uint8Array.from(tris, ({ c }) => (c[0] < 10 ? SIDE_LOWER : c[0] > 20 ? SIDE_UPPER : SIDE_NONE));
+    const flags = Uint8Array.from(side, (s) => (s === SIDE_UPPER ? REACH_UP : s === SIDE_LOWER ? REACH_DOWN : 0));
+    const line = lineMesh(mesh.positions, mesh.indices);
+    // No plane: the undercut region joins one half (ties: the upper one), the line round its border with the other.
+    const round = partingLine(line, side, [1, 0, 0], { flags, height: 30 });
+    assert.deepEqual([round.kind, round.loops, round.length_mm, round.level], ['planar', 1, 40, 10]);
+    // The bottom of the middle cube in the lower half too: the undercut region's border with it longer, it joins it.
+    const longer = side.map((s, f) => (s === SIDE_NONE && tris[f].c[2] === 0 ? SIDE_LOWER : s));
+    const other = partingLine(line, longer, [1, 0, 0], { flags, height: 30 });
+    assert.deepEqual([other.kind, other.loops, other.length_mm, other.level], ['planar', 1, 40, 20]);
+    assert.equal(looseEnds(other.segments), 0);
+    assert.equal(looseEnds(round.segments), 0);
+    // A planar line across it: cut at its plane.
+    const across = partingLine(line, side, [1, 0, 0], { flags: flags.map((f) => f | LEVEL), plane: 15, height: 30 });
+    assert.deepEqual([across.kind, across.loops, across.length_mm, across.level], ['planar', 1, 40, 15]);
+    assert.equal(looseEnds(across.segments), 0);
+  });
+
+  test('a face moved by hand on that planar line: the line along its edges, continuous; none moved, the line proposed', () => {
+    const plate = castPlate();
+    const base = evaluateParting(plate.positions, plate.indices, [0, 1, 0]);
+    const { region } = faceRegions(plate.positions, plate.indices, { brep: true });
+    const top = region[plate.face.indexOf(plate.top)];
+    const moved = applyOverrides(base.side, region, { [top]: SIDE_LOWER });
+    const fixed = Uint8Array.from(region, (r) => (r === top ? 1 : 0));
+    const line = lineMesh(plate.positions, plate.indices);
+    const l = partingLine(line, moved, [0, 1, 0], { flags: base.flags, plane: base.plane, fixed, height: base.summary.mould_height_mm });
+    assert.equal(l.planar, false);
+    assert.equal(looseEnds(l.segments), 0);
+    // The top face no longer cut: its pieces at its height all along its border (its outline, its holes).
+    const P = plate.positions, I = plate.indices;
+    const border = [];
+    for (let f = 0; f < I.length / 3; f++) {
+      if (plate.face[f] !== plate.top) continue;
+      for (let e = 0; e < 3; e++) {
+        const g = line.neighbours[3 * f + e];
+        if (g >= 0 && plate.face[g] === plate.top) continue;
+        border.push([I[3 * f + e], I[3 * f + ((e + 1) % 3)]].map((v) => [P[3 * v], P[3 * v + 1], P[3 * v + 2]]));
+      }
+    }
+    const onEdge = (p, [a, b]) => {
+      const ab = [0, 1, 2].map((k) => b[k] - a[k]), ap = [0, 1, 2].map((k) => p[k] - a[k]);
+      const t = (ab[0] * ap[0] + ab[1] * ap[1] + ab[2] * ap[2]) / (ab[0] ** 2 + ab[1] ** 2 + ab[2] ** 2);
+      return t > -1e-6 && t < 1 + 1e-6 && Math.hypot(...[0, 1, 2].map((k) => ap[k] - t * ab[k])) < 1e-4;
+    };
+    let onTop = 0;
+    for (let i = 0; i < l.segments.length; i += 6) {
+      const a = l.segments.subarray(i, i + 3), b = l.segments.subarray(i + 3, i + 6);
+      if (Math.abs(a[2] - PLATE.thickness) > 1e-4 || Math.abs(b[2] - PLATE.thickness) > 1e-4) continue;
+      onTop++;
+      assert.ok(border.some((edge) => onEdge(a, edge) && onEdge(b, edge)), `piece across the top face: ${a} ${b}`);
+    }
+    assert.ok(onTop > 0);
+    const back = partingLine(line, applyOverrides(base.side, region, {}), [0, 1, 0], { flags: base.flags, plane: base.plane, height: base.summary.mould_height_mm });
+    assert.deepEqual(lineSummary(back), base.summary.parting);
   });
 });
 

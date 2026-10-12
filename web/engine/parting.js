@@ -2,12 +2,27 @@
 // sand), proposed from the geometry of its closed triangle mesh (mm).
 //
 // For a draw direction d, a triangle is formed by the half of the mould it can
-// leave the part from: a line from its centre, moved off the surface along its
-// normal, meets no other triangle along +d -> the upper half can form it;
+// leave the part from: lines from points of it, moved off the surface along
+// its normal, meet no other triangle along +d -> the upper half can form it;
 // along -d -> the lower half; neither -> an undercut, formed by a core or a
-// slide. Faces at less than the draft angle from d have no draft. The parting
-// line is the boundary between the triangles of the two halves: planar when
-// its points are at one height along d, else stepped or warped.
+// slide. Its centre, and more points spread over a large or long triangle (the
+// faces of a CAD body are fans of long triangles): each sense by the majority
+// of them. Faces at less than the draft angle from d have no draft.
+//
+// The halves, and the parting line between them:
+// - a plane leaves every triangle only one half can form on its side: a
+//   planar line; the faces both halves can form, and the undercuts, on the
+//   side of the plane, cut by it when across it;
+// - else each triangle in the half that can form it (both: the upper one): a
+//   stepped or warped line, round the undercut regions (each joins the half
+//   it shares the longer border with);
+// - unless that splits flat faces along d (no draft) between the halves:
+//   the line would run across them along their triangles, round the shadow
+//   each detail casts along d. Then, when it traps less surface than that
+//   splits, the line is planar at the level that leaves the least surface
+//   with draft on the wrong side: the faces along d on the side of the
+//   plane, cut by it, and the faces with draft that only the other half
+//   could form kept in theirs, trapped: undercuts (slides).
 //
 // The lines along d are tested against a uniform grid of the triangles
 // projected on the plane normal to d (one grid per direction): a line meets
@@ -18,16 +33,18 @@
 
 import { edgeNeighbours, weld } from './thickness.js';
 
-export const PARTING_VERSION = 1;
+export const PARTING_VERSION = 2;
 
 // Half of the mould of a triangle: none (an undercut), upper (+d), lower (-d).
 export const SIDE_NONE = 0;
 export const SIDE_UPPER = 1;
 export const SIDE_LOWER = 2;
 // Flags of a triangle for a direction.
-export const REACH_UP = 1; // a line along +d leaves the part
-export const REACH_DOWN = 2; // along -d
+export const REACH_UP = 1; // the upper half can form it: lines along +d leave the part
+export const REACH_DOWN = 2; // the lower half: along -d
 export const ZERO_DRAFT = 4; // |n.d| below the sine of the draft angle
+export const LEVEL = 8; // in the half of its side of the planar line (cut by its plane when across it), not of its reach
+export const TRAPPED = 16; // only one half could form it, kept in the other by the planar line: an undercut (slide), its REACH_* cleared
 
 export const DEFAULT_DRAFT_DEG = 1;
 // Every candidate is classified on every triangle up to this size; above,
@@ -56,6 +73,26 @@ const RATIO_TIE = 0.01; // of the larger projected area per height
 const BARY_MARGIN = 1e-7; // a line through the common edge of two triangles meets one of them
 // Facets of one smooth surface: normals closer than this (35°, above the angular deflection of a coarse tessellation).
 const SMOOTH_FACETS = Math.cos((35 * Math.PI) / 180);
+// Points of a triangle its lines of sight start from: its centre, and on a
+// triangle larger or longer than the spacing, one per spacing of its longest
+// edge or per spacing² of its area (the more), SAMPLE_MAX at most. The
+// spacing: SAMPLE_DENSITY points over the surface, wider when the triangles
+// would get more points besides their centres than a quarter of their count
+// (SAMPLE_EXTRA_MIN at least): at most a quarter more lines than with the
+// centres alone (a mesh of millions of small triangles: their centres only).
+const SAMPLE_DENSITY = 20_000;
+const SAMPLE_EXTRA_SHARE = 0.25;
+const SAMPLE_EXTRA_MIN = 50_000;
+const SAMPLE_MAX = 32;
+const SAMPLE_FIRST = 4; // its first points all agree (both senses): the triangle is decided by them
+const R2A = 0.7548776662466927; // 1/g, 1/g² (g the plastic number): a low-discrepancy sequence in the unit square
+const R2B = 0.5698402909980532;
+const SAMPLE_INSET = 0.98; // the points pulled towards the centre, off the edges
+// A flat face along d (normals within 0.5°, joined by their edges) is split
+// between the halves when each has more than this share of it (and than
+// UNDERCUT_TIE of the surface): a line across it along its triangles.
+const FLAT_FACET = Math.cos((0.5 * Math.PI) / 180);
+const MIXED_SHARE = 0.05;
 
 // ------------------------------------------------------------------ mesh
 
@@ -477,31 +514,86 @@ function lineHits(mesh, grid, self, ox, oy, oz, tEps) {
   return bits;
 }
 
+/** Points of triangle f its lines of sight start from, at spacing h (see SAMPLE_DENSITY). */
+function sampleCount(mesh, f, h) {
+  if (!(mesh.areas[f] >= mesh.sliver)) return 1;
+  return Math.min(SAMPLE_MAX, Math.max(1, Math.ceil(mesh.areas[f] / (h * h)), Math.ceil(mesh.reach[f] / h)));
+}
+
+/** The spacing of the points of the lines of sight of a mesh, computed once (the same for every direction). */
+function sampleSpacing(mesh) {
+  if (mesh.spacing) return mesh.spacing;
+  const most = Math.max(SAMPLE_EXTRA_MIN, SAMPLE_EXTRA_SHARE * mesh.nt);
+  let h = Math.sqrt(mesh.totalArea / SAMPLE_DENSITY) || mesh.diag || 1;
+  for (;;) {
+    let extra = 0;
+    for (let f = 0; f < mesh.nt && extra <= most; f++) extra += sampleCount(mesh, f, h) - 1;
+    if (extra <= most) return (mesh.spacing = h);
+    h *= 1.25;
+  }
+}
+
 /**
  * Flags (REACH_UP, REACH_DOWN, ZERO_DRAFT) of the triangles `list` (all when
- * null) for direction d.
+ * null) for direction d: each sense reached from at least half of the points
+ * of the triangle (its centre first, then a low-discrepancy sequence over it,
+ * as many as sampleCount gives). A triangle drawn several times in `list`:
+ * classified once.
  */
 function classify(mesh, grid, d, list, sinDraft) {
-  const { normals, centres, nt, diag } = mesh;
+  const { positions: P, indices: I, normals, centres, nt, diag } = mesh;
   const n = list ? list.length : nt;
   const flags = new Uint8Array(n);
+  const known = list ? new Map() : null;
+  const h = sampleSpacing(mesh);
   // Off the surface by more than the rounding of float32 positions, far less than a detail.
   const eps = diag * 1e-5;
   const tEps = diag * 1e-7;
   for (let s = 0; s < n; s++) {
     const f = list ? list[s] : s;
+    const seen = known?.get(f);
+    if (seen !== undefined) {
+      flags[s] = seen;
+      continue;
+    }
     const nx = normals[3 * f], ny = normals[3 * f + 1], nz = normals[3 * f + 2];
     const nd = nx * d[0] + ny * d[1] + nz * d[2];
     let flag = Math.abs(nd) < sinDraft ? ZERO_DRAFT : 0;
     // A sliver (no area, a normal of no meaning, or none): either half, as its neighbours.
     if (mesh.areas[f] < mesh.sliver || !(nx || ny || nz)) {
       flags[s] = flag | REACH_UP | REACH_DOWN;
+      known?.set(f, flags[s]);
       continue;
     }
-    const hits = lineHits(mesh, grid, f, centres[3 * f] + eps * nx, centres[3 * f + 1] + eps * ny, centres[3 * f + 2] + eps * nz, tEps);
-    if (!(hits & 1)) flag |= REACH_UP;
-    if (!(hits & 2)) flag |= REACH_DOWN;
+    const cx = centres[3 * f], cy = centres[3 * f + 1], cz = centres[3 * f + 2];
+    let k = sampleCount(mesh, f, h);
+    const a = 3 * I[3 * f], b = 3 * I[3 * f + 1], c = 3 * I[3 * f + 2];
+    let up = 0, down = 0;
+    for (let j = 0; j < k; j++) {
+      // Its first SAMPLE_FIRST points (spread over it) agree both ways: the rest would not change the majority.
+      if (j === SAMPLE_FIRST && up % SAMPLE_FIRST === 0 && down % SAMPLE_FIRST === 0) {
+        k = SAMPLE_FIRST;
+        break;
+      }
+      let x = cx, y = cy, z = cz;
+      if (j) {
+        let p = (0.5 + j * R2A) % 1, q = (0.5 + j * R2B) % 1;
+        if (p + q > 1) {
+          p = 1 - p;
+          q = 1 - q;
+        }
+        x += SAMPLE_INSET * (P[a] + p * (P[b] - P[a]) + q * (P[c] - P[a]) - cx);
+        y += SAMPLE_INSET * (P[a + 1] + p * (P[b + 1] - P[a + 1]) + q * (P[c + 1] - P[a + 1]) - cy);
+        z += SAMPLE_INSET * (P[a + 2] + p * (P[b + 2] - P[a + 2]) + q * (P[c + 2] - P[a + 2]) - cz);
+      }
+      const hits = lineHits(mesh, grid, f, x + eps * nx, y + eps * ny, z + eps * nz, tEps);
+      if (!(hits & 1)) up++;
+      if (!(hits & 2)) down++;
+    }
+    if (2 * up >= k) flag |= REACH_UP;
+    if (2 * down >= k) flag |= REACH_DOWN;
     flags[s] = flag;
+    known?.set(f, flag);
   }
   return flags;
 }
@@ -536,9 +628,10 @@ function planeHeight(mesh, flags, d, tol) {
 }
 
 /**
- * Half of each triangle from its flags: the side it leaves by. A face both
- * can form: with a planar line (height `plane`), the side of its centre; else
- * by the sense of its normal, square to d: upper.
+ * Half of each triangle from its flags: the side it leaves by; none for an
+ * undercut. With a planar line (height `plane`), a face both halves can form,
+ * or flagged LEVEL: the side of its centre; else a face both can form, by the
+ * sense of its normal, square to d: upper.
  */
 export function sidesOf(mesh, flags, d, plane = null) {
   const { normals, centres, nt, centre } = mesh;
@@ -547,16 +640,147 @@ export function sidesOf(mesh, flags, d, plane = null) {
   for (let f = 0; f < nt; f++) {
     if (!(normals[3 * f] || normals[3 * f + 1] || normals[3 * f + 2])) continue; // degenerate: no side
     const reach = flags[f] & (REACH_UP | REACH_DOWN);
-    if (reach === REACH_UP) side[f] = SIDE_UPPER;
+    if (!reach) continue;
+    if (level != null && (flags[f] & LEVEL || reach === (REACH_UP | REACH_DOWN))) {
+      side[f] = centres[3 * f] * d[0] + centres[3 * f + 1] * d[1] + centres[3 * f + 2] * d[2] - level < 0 ? SIDE_LOWER : SIDE_UPPER;
+    } else if (reach === REACH_UP) side[f] = SIDE_UPPER;
     else if (reach === REACH_DOWN) side[f] = SIDE_LOWER;
-    else if (reach) {
-      const w = level == null
-        ? normals[3 * f] * d[0] + normals[3 * f + 1] * d[1] + normals[3 * f + 2] * d[2] + TIE
-        : centres[3 * f] * d[0] + centres[3 * f + 1] * d[1] + centres[3 * f + 2] * d[2] - level;
-      side[f] = w < 0 ? SIDE_LOWER : SIDE_UPPER;
-    }
+    else side[f] = normals[3 * f] * d[0] + normals[3 * f + 1] * d[1] + normals[3 * f + 2] * d[2] + TIE < 0 ? SIDE_LOWER : SIDE_UPPER;
   }
   return side;
+}
+
+/**
+ * The faces both halves can form and the undercuts, with a planar line:
+ * flagged LEVEL (on the side of its plane, cut by it when across it).
+ */
+function levelFree(flags) {
+  for (let f = 0; f < flags.length; f++) {
+    const reach = flags[f] & (REACH_UP | REACH_DOWN);
+    if (reach !== REACH_UP && reach !== REACH_DOWN) flags[f] |= LEVEL;
+  }
+}
+
+/**
+ * Area of the flat faces along d (ZERO_DRAFT triangles joined by their
+ * edges, normals within 0.5°: one plane) that sides split between the halves,
+ * each half with more than MIXED_SHARE of the face and UNDERCUT_TIE of the
+ * surface: the area of the smaller half of each. The line would run across
+ * them along their triangles (round the shadows of the details standing on
+ * them), not along their edges or straight.
+ */
+function splitFlatArea(mesh, neighbours, flags, side) {
+  const { normals: N, areas, nt, totalArea, sliver } = mesh;
+  const seen = new Uint8Array(nt);
+  const queue = new Int32Array(nt);
+  const flat = (f) => flags[f] & ZERO_DRAFT && areas[f] >= sliver;
+  let split = 0;
+  for (let f0 = 0; f0 < nt; f0++) {
+    if (seen[f0] || !flat(f0)) continue;
+    seen[f0] = 1;
+    let head = 0, tail = 0, upper = 0, lower = 0;
+    queue[tail++] = f0;
+    while (head < tail) {
+      const f = queue[head++];
+      if (side[f] === SIDE_UPPER) upper += areas[f];
+      else if (side[f] === SIDE_LOWER) lower += areas[f];
+      for (let e = 0; e < 3; e++) {
+        const g = neighbours[3 * f + e];
+        if (g < 0 || seen[g] || !flat(g)) continue;
+        if (N[3 * f] * N[3 * g] + N[3 * f + 1] * N[3 * g + 1] + N[3 * f + 2] * N[3 * g + 2] < FLAT_FACET) continue;
+        seen[g] = 1;
+        queue[tail++] = g;
+      }
+    }
+    const smaller = Math.min(upper, lower);
+    if (smaller > Math.max(MIXED_SHARE * (upper + lower), UNDERCUT_TIE * totalArea)) split += smaller;
+  }
+  return split;
+}
+
+/**
+ * Height along d (centred frame) of the plane of a planar line across
+ * halves that interleave: the one that leaves the least area of faces with
+ * draft that only one half can form on the other side of it (by their
+ * centres). Of the ranges of heights as good, the widest (then the lowest),
+ * at its middle: halfway between the details on either side. The faces
+ * without draft only one half can form do not count (see trapAtLevel), but
+ * when there are no others.
+ */
+function bestLevel(mesh, flags, d) {
+  const { positions: P, centres, areas, nt, nv, sliver, totalArea } = mesh;
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < nv; i++) {
+    const w = P[3 * i] * d[0] + P[3 * i + 1] * d[1] + P[3 * i + 2] * d[2];
+    if (w < lo) lo = w;
+    if (w > hi) hi = w;
+  }
+  // The faces that count: their heights, and their areas (negative: those only the lower half can form).
+  const counted = (f, withDraft) => {
+    const reach = flags[f] & (REACH_UP | REACH_DOWN);
+    return (reach === REACH_UP || reach === REACH_DOWN) && areas[f] >= sliver && !(withDraft && flags[f] & ZERO_DRAFT);
+  };
+  let withDraft = true;
+  let n = 0;
+  for (let f = 0; f < nt; f++) if (counted(f, true)) n++;
+  if (!n) {
+    withDraft = false;
+    for (let f = 0; f < nt; f++) if (counted(f, false)) n++;
+  }
+  if (!n || !(hi > lo)) return (lo + hi) / 2 || 0;
+  const height = new Float64Array(n), area = new Float64Array(n);
+  for (let f = 0, k = 0; f < nt; f++) {
+    if (!counted(f, withDraft)) continue;
+    height[k] = centres[3 * f] * d[0] + centres[3 * f + 1] * d[1] + centres[3 * f + 2] * d[2];
+    area[k++] = flags[f] & REACH_UP ? areas[f] : -areas[f];
+  }
+  const order = new Uint32Array(n).map((_, k) => k).sort((a, b) => height[a] - height[b]);
+  // Below every centre: the lower faces all on the wrong side; each centre passed moves its face.
+  let wrong = 0;
+  for (let k = 0; k < n; k++) if (area[k] < 0) wrong -= area[k];
+  // The ranges between successive heights, the least wrong (ties within a part in 1e9 of the surface: the widest, then the lowest).
+  let best = null;
+  let from = lo;
+  for (let k = 0; k <= n;) {
+    const to = k < n ? Math.min(hi, Math.max(lo, height[order[k]])) : hi;
+    if (to > from && (!best || wrong < best.wrong - 1e-9 * totalArea || (wrong <= best.wrong + 1e-9 * totalArea && to - from > best.to - best.from))) {
+      best = { from, to, wrong: Math.min(wrong, best?.wrong ?? Infinity) };
+    }
+    if (k === n) break;
+    const h = height[order[k]];
+    for (; k < n && height[order[k]] === h; k++) wrong += area[order[k]];
+    from = Math.max(from, Math.min(hi, h));
+  }
+  return best ? (best.from + best.to) / 2 : (lo + hi) / 2;
+}
+
+/**
+ * The flags of the halves split by a plane at height `level` (centred frame)
+ * along d: every triangle on its side (LEVEL); a face with draft only one
+ * half can form whose centre is on the other side: TRAPPED there (an
+ * undercut, its REACH_* cleared). The faces without draft keep their reach:
+ * on the side of the plane, cut straight by it; what keeps a half from
+ * forming one on the wrong side is the shadow of a detail standing on it,
+ * whose faces with draft are trapped (the slide that forms them forms that
+ * strip of flat face too: not counted, it would follow the triangles of the
+ * face). A new array, and the area trapped.
+ */
+function trapAtLevel(mesh, flags, d, level) {
+  const { centres, nt, areas, sliver } = mesh;
+  const tiny = 1e-9 * Math.max(1, mesh.diag);
+  const out = new Uint8Array(nt);
+  let trapped = 0;
+  for (let f = 0; f < nt; f++) {
+    out[f] = flags[f] | LEVEL;
+    const reach = flags[f] & (REACH_UP | REACH_DOWN);
+    if ((reach !== REACH_UP && reach !== REACH_DOWN) || flags[f] & ZERO_DRAFT || !(areas[f] >= sliver)) continue;
+    const w = centres[3 * f] * d[0] + centres[3 * f + 1] * d[1] + centres[3 * f + 2] * d[2] - level;
+    if (reach === REACH_UP ? w < -tiny : w > tiny) {
+      out[f] = (out[f] & ~(REACH_UP | REACH_DOWN)) | TRAPPED;
+      trapped += areas[f];
+    }
+  }
+  return { flags: out, trapped };
 }
 
 /** Small fast deterministic generator (mulberry32). */
@@ -599,7 +823,7 @@ export function sampleByArea(areas, count, seed = SEED) {
  */
 function areasOf(mesh, d, flags, list) {
   const { normals, areas, totalArea, nt } = mesh;
-  let undercut = 0, zeroDraft = 0, projected = 0;
+  let undercut = 0, trapped = 0, zeroDraft = 0, projected = 0;
   const n = list ? list.length : nt;
   for (let s = 0; s < n; s++) {
     const f = list ? list[s] : s;
@@ -608,10 +832,11 @@ function areasOf(mesh, d, flags, list) {
     if (!(normals[3 * f] || normals[3 * f + 1] || normals[3 * f + 2])) continue;
     const nd = normals[3 * f] * d[0] + normals[3 * f + 1] * d[1] + normals[3 * f + 2] * d[2];
     if (!(flag & (REACH_UP | REACH_DOWN))) undercut += w;
+    if (flag & TRAPPED) trapped += w;
     if (flag & ZERO_DRAFT) zeroDraft += w;
-    if (flag & REACH_UP && nd > 0) projected += w * nd;
+    if (flag & (REACH_UP | TRAPPED) && nd > 0) projected += w * nd;
   }
-  return { undercut, zeroDraft, projected };
+  return { undercut, trapped, zeroDraft, projected };
 }
 
 /** Zero-draft area of a direction, from the normals only (exact on a sampled mesh too). */
@@ -639,11 +864,66 @@ export function lineMesh(positions, indices, merged = weld(positions, indices)) 
 }
 
 /**
+ * The halves of the undercut triangles (SIDE_NONE: a core or a slide), for
+ * the line only: it goes round an undercut region, it does not stop at it.
+ * With a planar line (`plane`), the side of the plane of their centres (cut
+ * by it when across it, see partingLine); else each region of them (joined
+ * by their edges) in the half it shares the longer border with (the line
+ * follows its shorter one), ties the upper one. A new array, or `side` itself
+ * without undercuts.
+ */
+function undercutHalves(line, side, d, plane) {
+  const { positions: P, indices: I, neighbours } = line;
+  const nt = I.length / 3;
+  let first = -1;
+  for (let f = 0; f < nt && first < 0; f++) if (side[f] === SIDE_NONE) first = f;
+  if (first < 0) return side;
+  const out = Uint8Array.from(side);
+  const w = (r) => P[3 * r] * d[0] + P[3 * r + 1] * d[1] + P[3 * r + 2] * d[2];
+  if (plane != null) {
+    for (let f = first; f < nt; f++) {
+      if (side[f] === SIDE_NONE) out[f] = (w(I[3 * f]) + w(I[3 * f + 1]) + w(I[3 * f + 2])) / 3 < plane ? SIDE_LOWER : SIDE_UPPER;
+    }
+    return out;
+  }
+  const queue = new Int32Array(nt);
+  const seen = new Uint8Array(nt);
+  for (let f0 = first; f0 < nt; f0++) {
+    if (side[f0] !== SIDE_NONE || seen[f0]) continue;
+    seen[f0] = 1;
+    let head = 0, tail = 0, upper = 0, lower = 0;
+    queue[tail++] = f0;
+    while (head < tail) {
+      const f = queue[head++];
+      for (let e = 0; e < 3; e++) {
+        const g = neighbours[3 * f + e];
+        if (g < 0) continue;
+        if (side[g] === SIDE_NONE) {
+          if (!seen[g]) {
+            seen[g] = 1;
+            queue[tail++] = g;
+          }
+          continue;
+        }
+        const ra = 3 * I[3 * f + e], rb = 3 * I[3 * f + ((e + 1) % 3)];
+        const len = Math.hypot(P[rb] - P[ra], P[rb + 1] - P[ra + 1], P[rb + 2] - P[ra + 2]);
+        if (side[g] === SIDE_UPPER) upper += len;
+        else lower += len;
+      }
+    }
+    const half = lower > upper ? SIDE_LOWER : SIDE_UPPER;
+    for (let k = 0; k < tail; k++) out[queue[k]] = half;
+  }
+  return out;
+}
+
+/**
  * Parting line of a split into halves: where the surface goes from the upper
- * half to the lower one (undercut triangles belong to neither). Along the
- * edges between triangles of the two halves, and, with a planar line
- * (`plane`: its height along d), across the faces both halves can form
- * (`flags`), cut at that height, unless reassigned by hand (`fixed`).
+ * half to the lower one, round the undercut regions (undercutHalves). Along
+ * the edges between triangles of the two halves, and, with a planar line
+ * (`plane`: its height along d), across the faces both halves can form, the
+ * undercuts and the faces flagged LEVEL (`flags`), cut at that height,
+ * unless reassigned by hand (`fixed`).
  *
  * side   -- half of each triangle (SIDE_*)
  * height -- of the part along d, for the planarity tolerance
@@ -658,9 +938,10 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
   const nt = I.length / 3;
   const w = (r) => P[3 * r] * d[0] + P[3 * r + 1] * d[1] + P[3 * r + 2] * d[2];
   const tiny = 1e-9 * Math.max(1, Math.abs(plane ?? 0), height ?? 0);
-  // A face both halves can form, across the plane: its side changes at the plane.
+  side = undercutHalves(line, side, d, plane);
+  // A face both halves can form, an undercut or a face flagged LEVEL, across the plane: its side changes at the plane.
   const split = (f) => {
-    if (plane == null || !flags || !isFree(flags[f]) || fixed?.[f]) return false;
+    if (plane == null || !flags || fixed?.[f] || !(flags[f] & LEVEL || isFree(flags[f]))) return false;
     let below = false, above = false;
     for (let k = 0; k < 3; k++) {
       const h = w(I[3 * f + k]);
@@ -907,6 +1188,8 @@ function directionSummary(mesh, d, areas, height, parting, source) {
     source,
     undercut_area_mm2: round(areas.undercut, 1),
     undercut_share: round(areas.undercut / total, 4),
+    // Of it, faces only one half could form, kept in the other by the planar line (slides).
+    trapped_area_mm2: round(areas.trapped ?? 0, 1),
     zero_draft_area_mm2: round(areas.zeroDraft, 1),
     zero_draft_share: round(areas.zeroDraft / total, 4),
     projected_area_mm2: round(areas.projected, 1),
@@ -964,15 +1247,41 @@ function inheritSlivers(mesh, side, neighbours) {
   }
 }
 
-/** A direction classified on every triangle: {areas, side, flags, plane, line, height}. */
+/**
+ * A direction classified on every triangle: {areas, side, flags, plane, line,
+ * height}. A plane that leaves every triangle one half only can form on its
+ * side: a planar line. Else each triangle in its half: a stepped or warped
+ * line, unless that splits flat faces along d between the halves (round the
+ * shadows of the details on them) over more area than a planar line at the
+ * best level traps (bestLevel, trapAtLevel): then that planar line.
+ */
 function fullDirection(mesh, d, sinDraft, getLine) {
   const grid = lineGrid(mesh, d);
-  const flags = classify(mesh, grid, d, null, sinDraft);
-  const plane = planeHeight(mesh, flags, d, planarTolerance(grid.height));
-  const side = sidesOf(mesh, flags, d, plane);
-  inheritSlivers(mesh, side, getLine().neighbours);
-  const line = partingLine(getLine(), side, d, { flags, plane, height: grid.height });
-  return { areas: areasOf(mesh, d, flags, null), side, flags, plane, line, height: grid.height };
+  let flags = classify(mesh, grid, d, null, sinDraft);
+  let plane = planeHeight(mesh, flags, d, planarTolerance(grid.height));
+  const split = (plane) => {
+    const side = sidesOf(mesh, flags, d, plane);
+    inheritSlivers(mesh, side, getLine().neighbours);
+    return { side, line: partingLine(getLine(), side, d, { flags, plane, height: grid.height }) };
+  };
+  let halves;
+  if (plane != null) {
+    levelFree(flags);
+    halves = split(plane);
+  } else {
+    halves = split(null);
+    const across = halves.line.planar ? 0 : splitFlatArea(mesh, getLine().neighbours, flags, halves.side);
+    if (across > 0) {
+      const level = bestLevel(mesh, flags, d);
+      const trap = trapAtLevel(mesh, flags, d, level);
+      if (trap.trapped <= across) {
+        flags = trap.flags;
+        plane = level + dot(mesh.centre, d);
+        halves = split(plane);
+      }
+    }
+  }
+  return { areas: areasOf(mesh, d, flags, null), side: halves.side, flags, plane, line: halves.line, height: grid.height };
 }
 
 /**
