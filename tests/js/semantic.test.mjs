@@ -814,6 +814,34 @@ test("V6 readiness reads the closedness of the semantic body", () => {
   assert.ok(holed(false).unresolved_constraints.includes("body_not_confirmed_closed"));
 });
 
+test("V6 planning drills blind holes from their opening: one setup per side, a through hole with either", () => {
+  // Three holes of 6 along Z, measured: blind from the top, blind from the bottom, through.
+  const cylinder=(index,x)=>({index,type:"cylinder",radius_mm:3,axis:[0,0,1],center_mm:[x,0,5],orientation:"reversed",edge_signatures:[]});
+  const measured=(surfaces,axis,through)=>({surfaces,axis,diameter_mm:6,length_mm:6,through,open_ends:through ? 2 : 1,measured:true,method:"axis_rays_on_mesh",
+    ...(through ? {} : {depth_mm:6,bottom:"flat"})});
+  const result=buildSemantic3D({
+    file:"sides.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({
+      geometric_surfaces:[cylinder(0,-10),cylinder(1,0),cylinder(2,10)],
+      holes:{version:HOLES_VERSION,method:"axis_rays_on_mesh",holes:[measured([0],[0,0,-1],false),measured([1],[0,0,1],false),measured([2],[0,0,1],true)]},
+    })],
+  }).bodies[0];
+  const drillings=result.manufacturing.operations.filter(o=>o.operation.startsWith("drilling"));
+  const blind=(surface)=>drillings.find(o=>o.operation==="drilling_blind" && o.surfaces.includes(surface));
+  assert.deepEqual([blind(0).accessibility.tool_axis,blind(1).accessibility.tool_axis],[[0,0,-1],[0,0,1]]);
+  const {setups}=result.manufacturing_plan;
+  const setupOf=(operation)=>setups.find(s=>s.operation_ids.includes(operation.operation_id));
+  // Not one setup for both: each from its own side, along its own sense.
+  assert.notEqual(setupOf(blind(0)),setupOf(blind(1)));
+  assert.deepEqual([setupOf(blind(0)).tool_axis,setupOf(blind(1)).tool_axis],[[0,0,-1],[0,0,1]]);
+  assert.notEqual(setupOf(blind(0)).axis_key,setupOf(blind(1)).axis_key);
+  // The through hole joins one of them.
+  const through=drillings.find(o=>o.operation==="drilling");
+  assert.ok([setupOf(blind(0)),setupOf(blind(1))].includes(setupOf(through)));
+  assert.equal(setups.length,2);
+});
+
 /** A bore (surface 0) along Z with its counterbore (surface 1) and their planar faces. */
 function counterboredHole() {
   const e=(z,r)=>[r,0,z,r,0,z];
