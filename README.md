@@ -69,7 +69,10 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   hole candidates.
 - Assemblies: one row per part with names and colours from the STEP file, per-part
   volume and share, show/hide, and click a part in 3D to select it.
-- Viewer: orbit, pan, zoom, standard views, wireframe, envelope display, section plane.
+- Viewer: orbit, pan, zoom, standard views, wireframe, envelope display, section plane
+  (the solids it cuts, bodies, risers and ingate, are closed: the cut shows as a solid
+  face, a body's darker than its own colour; open bodies, meshes whose triangles had to be
+  turned round or held duplicates, and the mould halves stay open).
 - Side panel of the 3D view, condensed at will: each card folds to its title (its chevron,
   a click on the title, or « Tout replier / Tout déplier »), its head's controls still at
   hand and its key value (volume, mass, thinnest wall) beside the title; the panel's width

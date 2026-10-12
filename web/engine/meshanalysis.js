@@ -85,9 +85,14 @@ export function analyzeMesh(name, positions, indices = null, color = null) {
   const edges = buildEdges(work.faces, work.nv);
   const closed = isWatertight(edges, work.faces.length / 3);
   const topology = edgeTopology(work, edges, faces.length / 3);
+  // Whether the display triangles bound the solid once each, all wound alike: the
+  // section view counts them to close its cut (app.js syncCaps). Not when the winding
+  // had to be repaired or duplicate triangles were dropped: only on the analysis copy.
+  let countable = closed && work.duplicates === 0;
 
   if (closed) {
     if (!isWindingConsistent(edges, work.faces)) {
+      countable = false;
       fixWinding(work.faces, work.nv, edges);
       notes.push('Inconsistent triangle orientation was repaired');
     }
@@ -123,7 +128,7 @@ export function analyzeMesh(name, positions, indices = null, color = null) {
     }
   }
 
-  const mesh = { positions: displayPositions, indices: faces };
+  const mesh = { positions: displayPositions, indices: faces, countable };
   // The display copy is float32. When that rounded the analysed coordinates, they are
   // kept for the oriented envelope (summary.js), which the Python engine measures on
   // its double-precision vertices (far from the origin, float32 would not even resolve
@@ -261,7 +266,8 @@ function roundHalfEven(v) {
 
 /**
  * The analysis copy of the mesh: welded vertices (float64), faces without degenerate
- * triangles nor duplicates, unreferenced vertices removed. Vertex and face order
+ * triangles nor duplicates (`duplicates`: how many were dropped), unreferenced
+ * vertices removed. Vertex and face order
  * follow trimesh so that order-dependent steps (winding repair start face, hole
  * cycles) behave the same.
  */
@@ -284,7 +290,7 @@ function buildWorkMesh(pos, faces) {
   // update_faces(unique_faces())
   const unique = dropDuplicateFaces(t, kept);
   // remove_unreferenced_vertices()
-  return compactVertices(welded, unique);
+  return { ...compactVertices(welded, unique), duplicates: kept - unique.length / 3 };
 }
 
 /**
