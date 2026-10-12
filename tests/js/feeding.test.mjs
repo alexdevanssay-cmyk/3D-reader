@@ -193,6 +193,22 @@ describe('gating', () => {
     assert.ok(!(y < 1 && x < 70), `ingate at ${f.gate.position_mm}, next to the groove`);
   });
 
+  test('a ring finely cut: the points of the hole, nearer the middle, are not tried first; the ingate on the outer outline', () => {
+    // A square ring 120 × 120 × 10 with a hole 40 × 40, drawn along Z: 128 pieces of its line round the hole
+    // (more than the candidates tried), every point low, as thick, in one zone fed.
+    const mesh = voxels((x, y) => !(x >= 8 && x < 16 && y >= 8 && y < 16), [24, 24, 2], { size: 5, subdivide: 4 });
+    const { side, segments } = evaluateParting(mesh.positions, mesh.indices, [0, 0, 1]);
+    assert.equal(segments.length / 6, 512);
+    const zones = feedingZones(mesh.positions, mesh.indices, { sphere: new Float32Array(mesh.indices.length / 3).fill(10) });
+    const { gate } = placeFeeding(mesh.positions, mesh.indices, zones, { parting: { direction: [0, 0, 1], side, segments } });
+    assert.ok(gate, 'an ingate');
+    assert.equal(gate.outer_outline, true);
+    const [x, y] = gate.position_mm;
+    assert.ok([x, y].some((c) => Math.abs(c) < 1e-6 || Math.abs(c - 120) < 1e-6), `on the outer outline: ${gate.position_mm}`);
+    const inside = gate.position_mm.map((c, k) => c + 5 * gate.direction[k]);
+    assert.ok(inBox(inside, [0, 0, 0], [120, 120, 0]), `inwards: ${inside}`);
+  });
+
   test('without a parting line: risers along +Z, no ingate', () => {
     const mesh = plateWithBoss();
     const f = proposeFeeding(mesh.positions, mesh.indices);

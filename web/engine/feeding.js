@@ -112,6 +112,8 @@ const FACE_SPLIT = 8;
 // Parting line points looked at (spread along it), ingate candidates tested for a free way out.
 const PARTING_POINTS = 4096;
 const GATE_TRIES = 64;
+// Points of each loop of the parting line tested for a free way out (is it on the outer outline, or a hole?).
+const LOOP_TRIES = 16;
 // The ingate at the bottom: within this height of the lowest point of the line (the larger).
 const LOW_BAND_MM = 1;
 const LOW_BAND_SHARE = 0.02;
@@ -1009,6 +1011,76 @@ function flatten(segments, u, v) {
   return flat;
 }
 
+/**
+ * The loops of the parting line: its pieces chained by their ends (ends
+ * closer than 1e-5 of the diagonal of the body are one). The number of the
+ * loop of each piece (Int32Array).
+ */
+function lineLoops(segments, diag) {
+  const m = segments.length / 6;
+  const q = 1e-5 * (diag || 1);
+  const parent = Int32Array.from({ length: m }, (_, s) => s);
+  const find = (x) => {
+    while (parent[x] !== x) x = parent[x] = parent[parent[x]];
+    return x;
+  };
+  const ends = new Map();
+  for (let s = 0; s < m; s++) {
+    for (const e of [6 * s, 6 * s + 3]) {
+      const key = `${Math.round(segments[e] / q)},${Math.round(segments[e + 1] / q)},${Math.round(segments[e + 2] / q)}`;
+      const other = ends.get(key);
+      if (other === undefined) ends.set(key, s);
+      else {
+        const a = find(s), b = find(other);
+        if (a !== b) parent[Math.max(a, b)] = Math.min(a, b);
+      }
+    }
+  }
+  const loop = new Int32Array(m);
+  for (let s = 0; s < m; s++) loop[s] = find(s);
+  return loop;
+}
+
+/**
+ * The loops of the parting line on the outer outline (reached from outside
+ * the mould): those with a point whose way out is free; a hole has none.
+ * LOOP_TRIES points of each loop tested: its extremes across d, then spread
+ * along it. Returns {outer (the loop numbers), free (Map point -> its way
+ * out, the points found free)}.
+ */
+function outerLoops(ctx, points) {
+  const byLoop = new Map();
+  for (const p of points) {
+    const id = ctx.loops[p.segment];
+    const list = byLoop.get(id);
+    if (list) list.push(p);
+    else byLoop.set(id, [p]);
+  }
+  const outer = new Set();
+  const free = new Map();
+  for (const [id, list] of byLoop) {
+    const tries = new Set();
+    for (const axis of [ctx.u, ctx.v]) {
+      let lo = list[0], hi = list[0];
+      for (const p of list) {
+        if (dot(p.at, axis) < dot(lo.at, axis)) lo = p;
+        if (dot(p.at, axis) > dot(hi.at, axis)) hi = p;
+      }
+      tries.add(lo).add(hi);
+    }
+    const step = Math.max(1, Math.ceil(list.length / (LOOP_TRIES - tries.size)));
+    for (let k = 0; k < list.length && tries.size < LOOP_TRIES; k += step) tries.add(list[k]);
+    for (const p of tries) {
+      const dir = outward(ctx, p);
+      if (!dir) continue;
+      outer.add(id);
+      free.set(p, dir);
+      break;
+    }
+  }
+  return { outer, free };
+}
+
 // ------------------------------------------------------------------ gating
 
 /**
@@ -1070,19 +1142,26 @@ function undercutIndex(g, side, radius) {
 
 /**
  * The ingate on the parting line: on its outer outline (a free way out in the
- * parting plane), not next to an undercut (a core or a slide there), the
- * lowest along d (bottom filling: a planar line is level), then away from
- * the risers and their zones, the thickest wall, the first along the line.
+ * parting plane; the loops of the line with none, the holes, last), not next
+ * to an undercut (a core or a slide there), the lowest along d (bottom
+ * filling: a planar line is level), then away from the risers and their
+ * zones, the thickest wall, the first along the line.
  */
 function placeGate(ctx, risers) {
   const { g, grid, d, points, side } = ctx;
   if (!points?.length) return null;
-  let low = Infinity, high = -Infinity;
+  // The points of the outer outline first: those of a hole have no way out (whatever their rank).
+  const { outer, free } = outerLoops(ctx, points);
+  const onOuter = (p) => outer.has(ctx.loops[p.segment]);
+  let low = Infinity, high = -Infinity, lowOuter = Infinity;
   for (const p of points) {
     low = Math.min(low, p.height);
     high = Math.max(high, p.height);
+    if (onOuter(p)) lowOuter = Math.min(lowOuter, p.height);
   }
   const band = Math.max(LOW_BAND_MM, LOW_BAND_SHARE * (dot(g.max, d.map(Math.abs)) - dot(g.min, d.map(Math.abs)) || high - low));
+  // The lowest of the outer outline (of the whole line without one found).
+  const bottom = Number.isFinite(lowOuter) ? lowOuter : low;
   const fedZones = new Set(risers.map((r) => r.zone));
   // An undercut within the reach of the ingate and its wall.
   const reach = (p) => Math.max(sizeGate(p.sphere).width_mm, 2 * p.sphere);
@@ -1095,12 +1174,12 @@ function placeGate(ctx, risers) {
     const nearRiser = risers.some((r) => across(sub(r.position_mm, p.at)) < r.diameter_mm / 2 + gate.width_mm / 2);
     // The way into the part: from the point to the centroid, in the parting plane.
     const way = across(sub(p.at, g.centroid));
-    return { p, k, gate, undercut, low: p.height <= low + band, nearRiser, fed: fedZones.has(p.zone), way };
+    return { p, k, gate, outer: onOuter(p), undercut, low: p.height <= bottom + band, nearRiser, fed: fedZones.has(p.zone), way };
   });
   // The thickest walls (within THICK_SHARE of the thickest, where the ingate may go), a zone
   // without a riser, then the shortest way into the part (the middle of a long side rather than a corner).
-  const thickest = Math.max(0, ...scored.filter((s) => !s.undercut && s.low).map((s) => s.p.sphere));
-  const rank = (s) => [s.undercut ? 1 : 0, s.low ? 0 : 1, s.nearRiser ? 1 : 0, s.p.sphere >= THICK_SHARE * thickest ? 0 : 1, s.fed ? 1 : 0, Math.round(s.way * 10), s.k];
+  const thickest = Math.max(0, ...scored.filter((s) => (s.outer || !outer.size) && !s.undercut && s.low).map((s) => s.p.sphere));
+  const rank = (s) => [s.outer ? 0 : 1, s.undercut ? 1 : 0, s.low ? 0 : 1, s.nearRiser ? 1 : 0, s.p.sphere >= THICK_SHARE * thickest ? 0 : 1, s.fed ? 1 : 0, Math.round(s.way * 10), s.k];
   scored.sort((a, b) => {
     const x = rank(a), y = rank(b);
     for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] - y[i];
@@ -1113,6 +1192,20 @@ function placeGate(ctx, risers) {
       chosen = s;
       break;
     }
+  }
+  // None of the first free (a notch of the outline): GATE_TRIES more spread over the others of
+  // the outer outline, in their order; else the best of the points found free on it.
+  if (!chosen) {
+    const rest = scored.slice(GATE_TRIES).filter((s) => s.outer);
+    const step = Math.max(1, Math.ceil(rest.length / GATE_TRIES));
+    for (let k = 0; k < rest.length && !chosen; k += step) {
+      out = outward(ctx, rest[k].p);
+      if (out) chosen = rest[k];
+    }
+  }
+  if (!chosen) {
+    chosen = scored.find((s) => free.has(s.p)) ?? null;
+    out = chosen ? free.get(chosen.p) : null;
   }
   if (!chosen) return null;
   const planar = high - low <= band;
@@ -1150,9 +1243,10 @@ export function feedingContext(positions, indices, zones, { parting = null, dens
   const d = normalize(parting?.direction ?? [0, 0, 1]) ?? [0, 0, 1];
   const grid = columnGrid(g, d);
   const segments = parting?.segments?.length ? parting.segments : null;
-  const ctx = { g, grid, d, u: grid.u, v: grid.v, zone: zones.zone, sphere: zones.sphere, zones: zones.zones, side: parting?.side ?? null, density, segments, points: null, flat: null, parting: !!parting?.direction };
+  const ctx = { g, grid, d, u: grid.u, v: grid.v, zone: zones.zone, sphere: zones.sphere, zones: zones.zones, side: parting?.side ?? null, density, segments, points: null, flat: null, loops: null, parting: !!parting?.direction };
   if (segments) {
     ctx.flat = flatten(segments, grid.u, grid.v);
+    ctx.loops = lineLoops(segments, g.diag);
     ctx.points = partingPoints(ctx, segments);
   }
   return ctx;

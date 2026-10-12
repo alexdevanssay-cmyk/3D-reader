@@ -2843,7 +2843,8 @@ function renderFeeding() {
 
   const g = field.gate;
   const rows = [
-    [t("feeding.gate"), g ? `${fmtPoint(g.position_mm)} mm` : t("feeding.gate.none")],
+    // None: no parting line, or no point of it reached from outside the mould.
+    [t("feeding.gate"), g ? `${fmtPoint(g.position_mm)} mm` : t(feedingParting(i).parting?.segments?.length ? "feeding.gate.noneFree" : "feeding.gate.none")],
     ...(g ? [
       [t("feeding.gate.section"), t("feeding.gate.sectionValue", { thickness: fmtNum(g.thickness_mm, 1), width: fmtNum(g.width_mm, 1), area: fmtNum(g.section_mm2, 1) })],
       [t("feeding.gate.wall"), `Ø ${fmtNum(g.wall_sphere_mm, 1)} mm`],
