@@ -569,9 +569,9 @@ export function holesToMeasure(bodies) {
  * version): those kept since (`kept`: per body a record or null, the cache
  * part "holes") given to them, the others measured by `measure` (a list of
  * {positions, indices, surfaces} -> a promise of their records, the engine
- * worker; `closed`: whether the mesh is watertight). Resolves to the records
- * of every body (null where none) when some were measured now, to keep; else
- * to null.
+ * worker; `closed`: whether the mesh is watertight; null: not measured now).
+ * Resolves to the records of every body (null where none) when some were
+ * measured now, to keep; else to null.
  */
 export async function restoreHoles(bodies, kept, measure) {
   const todo = holesToMeasure(bodies);
@@ -587,6 +587,7 @@ export async function restoreHoles(bodies, kept, measure) {
     const { mesh, geometric_surfaces, topology } = bodies[i];
     return { positions: ArrayBuffer.isView(mesh.positions64) ? mesh.positions64 : mesh.positions, indices: mesh.indices, surfaces: geometric_surfaces, closed: topology?.watertight !== false };
   }));
+  if (!records) return null;
   missing.forEach((i, k) => {
     if (currentHoles(records?.[k])) bodies[i].holes = records[k];
   });

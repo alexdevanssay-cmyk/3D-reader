@@ -188,6 +188,16 @@ test('results kept before the holes were measured: measured once, then given fro
   assert.deepEqual(calls, [2]);
 });
 
+test('a measurement left for later (the engine busy): nothing kept, the holes kept before still given', async () => {
+  const through = partBody(plate({ H: 10, sections: [{ r: 5, top: 10, bottom: 0 }] }));
+  const blind = partBody(plate({ H: 20, sections: [{ r: 4, top: 20, bottom: 8 }], end: 'flat' }));
+  const kept = [measure(plate({ H: 10, sections: [{ r: 5, top: 10, bottom: 0 }] })), null];
+  const bodies = [through, blind];
+  assert.equal(await restoreHoles(bodies, kept, async () => null), null);
+  assert.equal(bodies[0].holes.holes[0].through, true);
+  assert.equal(bodies[1].holes, undefined);
+});
+
 test('the holes of another instance of a part: the same, along its own axes; none for another part', () => {
   const part = plate({ H: 20, sections: [{ r: 4, top: 20, bottom: 8 }], end: 'drill' });
   const record = measure(part);

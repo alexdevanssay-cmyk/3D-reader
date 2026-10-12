@@ -241,12 +241,15 @@ export async function saveThickness(key, results, bodies = null) {
  * The holes of results kept by a version that did not measure them (see
  * holes.js restoreHoles): those measured since, else measured now in the
  * engine worker (a mesh ray cast, no OpenCascade) and kept with the results.
- * Not measured (left provisional) when the worker fails; stopped by cancelAll.
+ * Not measured (left provisional) when the worker fails, or is busy with
+ * another analysis (another tab's, which may take minutes: not waited for,
+ * measured at a later opening); stopped by cancelAll.
  */
 async function withHoles(key, data, kept, onProgress) {
   let records;
   try {
     records = await restoreHoles(data.bodies, kept, (bodies) => {
+      if (pending.size) return null;
       onProgress?.({ stage: 'analyze', percent: 97, step: 'holes' });
       return call({ type: 'holes', bodies });
     });
