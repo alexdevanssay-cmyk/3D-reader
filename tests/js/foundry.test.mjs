@@ -241,3 +241,96 @@ test("a stepped parting line defined by hand, with undercuts: marked manual, its
   const context = buildAIContext(semantic, { task: "manufacturing_analysis" });
   assert.deepEqual(context.bodies[0].parting, { status: "manual", axis: "X", direction: [1, 0, 0], undercut_share: 0.05, zero_draft_share: 0.3478, planar: false, kind: "stepped", height_range_mm: 20 });
 });
+
+/** The risers and ingate of a body as the Reader gives them (web/engine/feeding.js, app.js), with these changes. */
+function feeding(overrides = {}) {
+  const riser = (id, zone, position, d, h, sphere, modulus) => ({
+    id, zone, position_mm: position, axis: [0, 0, 1], type: "top", open: true, offset: null, source: "proposed",
+    diameter_mm: d, height_mm: h, volume_mm3: Math.round((Math.PI * d * d * h) / 4), mass_g: null,
+    zone_sphere_mm: sphere, modulus_mm: modulus, riser_modulus_mm: (3 * d) / 14, reason: "isolated_hot_spot_top", why: "…",
+  });
+  return {
+    status: "proposed", version: 1, method: "inscribed_sphere_watershed_modulus", draw_direction: [0, 0, 1], parting_known: true,
+    risers: [riser("R1", 0, [52.5, 32.5, 35], 23, 35, 15, 3.93), riser("R2", 1, [10, 30, 20], 17, 26, 12, 3.01)],
+    gate: {
+      position_mm: [48.75, 60, 0], direction: [0, -1, 0], on_parting_line: true, outer_outline: true, zone: 0,
+      wall_sphere_mm: 10.09, thickness_mm: 7, width_mm: 21, length_mm: 31.5, section_mm2: 147, volume_mm3: 4630.5, source: "proposed",
+    },
+    yield: { value: 0.7739, part_volume_mm3: 65625, risers_volume_mm3: 14541.6, gating_volume_mm3: 4630.5, counted: "part_risers_ingate" },
+    hot_spots_without_riser: [],
+    zones: [
+      { id: 0, sphere_mm: 15, modulus_mm: 3.93, volume_share: 0.8, needs_riser: true, small: false, hot_spot_mm: [52.5, 32.5, 19], necks: [{ zone: 1, sphere_mm: 5 }] },
+      { id: 1, sphere_mm: 12, modulus_mm: 3.01, volume_share: 0.2, needs_riser: true, small: false, hot_spot_mm: [10, 30, 10], necks: [{ zone: 0, sphere_mm: 5 }] },
+    ],
+    ...overrides,
+  };
+}
+
+test("risers and an ingate proposed from the geometry: located, sized by a heuristic, still to validate", () => {
+  const semantic = buildSemantic3D({
+    file: "casting.step", kind: "cad", engine: "browser",
+    summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 },
+    bodies: [body({ parting: parting(), feeding: feeding() })],
+  });
+  const b = semantic.bodies[0];
+  assert.equal(b.feeding.status, "proposed");
+  const { rules, risks, required_checks: checks, evidence, simulation_boundary } = b.foundry;
+  assert.equal(rules.risering, "proposed_by_modulus_heuristic");
+  assert.equal(rules.gating, "proposed_on_parting_line");
+  assert.equal(rules.hot_spots, "located_by_inscribed_sphere_feeding_zones");
+  assert.equal(evidence.feeding.riser_count, 2);
+  assert.equal(evidence.feeding.zones_needing_riser, 2);
+  assert.ok(evidence.confirmed.includes("risers_proposed_from_geometry"));
+  assert.ok(evidence.confirmed.includes("gate_on_parting_line"));
+  assert.ok(checks.includes("validate_proposed_risers_and_gate_with_solidification_and_flow_analysis"));
+  assert.ok(!checks.includes("locate_and_size_risers_after_solidification_analysis"));
+  assert.ok(checks.includes("run_fill_and_solidification_simulation_for_advanced_claims"));
+  assert.equal(simulation_boundary.riser_design, "heuristic_proposal_not_simulated");
+  assert.ok(!risks.some(r => r.code === "hot_spot_without_riser" || r.code === "gate_off_parting_line"));
+  // The AI context: each riser where it stands, its kind and size, the hot spot and modulus it feeds.
+  const context = buildAIContext(semantic, { task: "general" });
+  assert.deepEqual(context.bodies[0].feeding, {
+    status: "proposed",
+    risers: [
+      { position_mm: [52.5, 32.5, 35], type: "top", diameter_mm: 23, height_mm: 35, zone_sphere_mm: 15, modulus_mm: 3.93 },
+      { position_mm: [10, 30, 20], type: "top", diameter_mm: 17, height_mm: 26, zone_sphere_mm: 12, modulus_mm: 3.01 },
+    ],
+    gate: { position_mm: [48.8, 60, 0], direction: [0, -1, 0], section_mm2: 147, on_parting_line: true },
+    yield: 0.7739,
+  });
+  // Compacted: counted, the largest kept.
+  const compact = compactAIContext(context, { maxChars: 1 });
+  assert.deepEqual(compact.bodies[0].feeding, {
+    status: "proposed", riser_count: 2, largest_riser: context.bodies[0].feeding.risers[0],
+    gate: { position_mm: [48.8, 60, 0], section_mm2: 147 }, yield: 0.7739,
+  });
+  assert.ok(compact.compaction.omitted.includes("risers one by one (counted, the largest kept)"));
+  // A context that has room: the risers one by one.
+  assert.deepEqual(compactAIContext(context, { maxChars: 1e6 }).bodies[0].feeding, context.bodies[0].feeding);
+});
+
+test("a riser deleted by hand: the hot spot left without one is a risk; an ingate off the parting line too", () => {
+  const semantic = buildSemantic3D({
+    file: "casting.step", kind: "cad", engine: "browser",
+    summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 },
+    bodies: [body({ feeding: feeding({
+      status: "manual",
+      risers: feeding().risers.slice(0, 1),
+      hot_spots_without_riser: [1],
+      gate: { ...feeding().gate, on_parting_line: false, source: "manual" },
+    }) })],
+  });
+  const { rules, risks, required_checks: checks, evidence } = semantic.bodies[0].foundry;
+  assert.equal(rules.risering, "placed_manually");
+  assert.equal(rules.gating, "placed_manually");
+  assert.ok(evidence.confirmed.includes("risers_placed_manually") && !evidence.confirmed.includes("gate_on_parting_line"));
+  const hot = risks.find(r => r.code === "hot_spot_without_riser");
+  assert.deepEqual(hot.zones, [1]);
+  assert.match(hot.message, /^1 zone\(s\) d'alimentation isolée\(s\) .* \(zones 2\) sans masselotte/);
+  assert.ok(risks.some(r => r.code === "gate_off_parting_line"));
+  for (const r of risks) assert.ok(r.source_ids.every(id => FOUNDRY_SOURCES.some(src => src.id === id)), r.code);
+  assert.ok(checks.includes("validate_manual_risers_and_gate_with_solidification_and_flow_analysis"));
+  const context = buildAIContext(semantic, { task: "manufacturing_analysis" });
+  assert.equal(context.bodies[0].feeding.hot_spots_without_riser, 1);
+  assert.equal(context.bodies[0].feeding.status, "manual");
+});

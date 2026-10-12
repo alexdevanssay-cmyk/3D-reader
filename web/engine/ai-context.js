@@ -66,6 +66,51 @@ function partingContext(p) {
   };
 }
 
+/**
+ * The risers and ingate of a body (feeding.js via the semantic contract),
+ * compact: where each riser stands, its kind and size, the hot spot and the
+ * modulus it feeds; the ingate; the casting yield.
+ */
+function feedingSummary(f) {
+  const r1 = (v) => (finite(v) ? Math.round(v * 10) / 10 : v ?? null);
+  const point = (p) => (Array.isArray(p) ? p.map(r1) : null);
+  const gate = f.gate ?? null;
+  return {
+    status: f.status ?? null,
+    risers: (f.risers ?? []).map((r) => ({
+      position_mm: point(r.position_mm),
+      type: r.type ?? null,
+      diameter_mm: r1(r.diameter_mm),
+      height_mm: r1(r.height_mm),
+      zone_sphere_mm: r1(r.zone_sphere_mm),
+      modulus_mm: finite(r.modulus_mm) ? Math.round(r.modulus_mm * 100) / 100 : null,
+    })),
+    gate: gate ? {
+      position_mm: point(gate.position_mm),
+      direction: Array.isArray(gate.direction) ? gate.direction.map((x) => Math.round(x * 1000) / 1000) : null,
+      section_mm2: r1(gate.section_mm2),
+      on_parting_line: gate.on_parting_line === true,
+    } : null,
+    yield: finite(f.yield?.value) ? f.yield.value : null,
+    ...(f.hot_spots_without_riser?.length ? { hot_spots_without_riser: f.hot_spots_without_riser.length } : {}),
+  };
+}
+
+/** The risers and ingate in short (a compacted context): how many risers, the largest, the ingate, the yield. */
+function shortFeeding(f) {
+  const risers = f.risers ?? [];
+  const volume = (r) => (r.diameter_mm ?? 0) ** 2 * (r.height_mm ?? 0);
+  const largest = risers.reduce((a, r) => (!a || volume(r) > volume(a) ? r : a), null);
+  return {
+    status: f.status ?? null,
+    riser_count: risers.length,
+    ...(largest ? { largest_riser: largest } : {}),
+    gate: f.gate ? { position_mm: f.gate.position_mm, section_mm2: f.gate.section_mm2 } : null,
+    yield: f.yield ?? null,
+    ...(f.hot_spots_without_riser ? { hot_spots_without_riser: f.hot_spots_without_riser } : {}),
+  };
+}
+
 function bodyContext(body, task) {
   const allFeatures = Array.isArray(body.features) ? body.features : [];
   const features = task === "feature_analysis" ? allFeatures : allFeatures;
@@ -82,6 +127,7 @@ function bodyContext(body, task) {
     topology: body.topology ?? null,
     geometry: body.geometry ?? {},
     ...(body.parting ? { parting: partingContext(body.parting) } : {}),
+    ...(body.feeding ? { feeding: feedingSummary(body.feeding) } : {}),
     relations: body.relations ?? [],
     features: features.map(featureContext),
     quality: body.quality ?? {},
@@ -286,7 +332,8 @@ function shortFoundry(foundry) {
  *     the foundry knowledge and screens in short;
  *   3 the machining plan summarized (operations in order, readiness);
  *   4 the process in short: the operations counted by kind, the foundry
- *     screen reduced to its profile, risks and checks;
+ *     screen reduced to its profile, risks and checks, the risers counted
+ *     (the largest kept, with the ingate and the yield);
  *   5 the provisional features listed as the budget allows, bores and holes
  *     first, the others grouped by type (the evidenced ones listed);
  *   6 every feature grouped by type;
@@ -318,6 +365,7 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
       metrics: roundDeep(body.metrics),
       geometry: { ...roundDeep(geometry), analytic_surface_count: Array.isArray(analytic_surfaces) ? analytic_surfaces.length : 0 },
       ...(body.parting ? { parting: body.parting } : {}),
+      ...(body.feeding ? { feeding: body.feeding } : {}),
       relation_counts: relationCounts(body.relations),
       features: (body.features ?? []).map(slimFeature),
       ...(body.manufacturing ? { manufacturing: roundDeep(body.manufacturing) } : {}),
@@ -379,8 +427,10 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
 
   // 4: the process in short.
   omitted.push("individual operations (counted by kind)", "foundry screen details (profile, risks and checks kept)");
+  if (bodies3.some((b) => b.feeding)) omitted.push("risers one by one (counted, the largest kept)");
   const bodies4 = bodies3.map((b) => ({
     ...b,
+    ...(b.feeding ? { feeding: shortFeeding(b.feeding) } : {}),
     ...(b.manufacturing ? { manufacturing: {
       process_candidates: b.manufacturing.process_candidates,
       operations: countBy(b.manufacturing.operations ?? [], (o) => o.operation),
@@ -434,7 +484,7 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   // 7: only the largest bodies in detail.
   const byVolume = [...bodies6].sort((a, b) => (b.metrics?.volume_mm3 ?? 0) - (a.metrics?.volume_mm3 ?? 0));
   const detailed = new Set(byVolume.slice(0, detailedBodies).map((b) => b.id));
-  const brief = (b) => ({ id: b.id, name: b.name, role: b.role, metrics: { volume_mm3: b.metrics?.volume_mm3 ?? null, surface_area_mm2: b.metrics?.surface_area_mm2 ?? null, bbox_size_mm: b.metrics?.bbox_mm?.size ?? null }, ...(b.parting ? { parting: b.parting } : {}), feature_count: b._features.length });
+  const brief = (b) => ({ id: b.id, name: b.name, role: b.role, metrics: { volume_mm3: b.metrics?.volume_mm3 ?? null, surface_area_mm2: b.metrics?.surface_area_mm2 ?? null, bbox_size_mm: b.metrics?.bbox_mm?.size ?? null }, ...(b.parting ? { parting: b.parting } : {}), ...(b.feeding ? { feeding: b.feeding } : {}), feature_count: b._features.length });
   if (context.bodies.length > detailedBodies) {
     omitted.push(`details of the ${context.bodies.length - detailedBodies} smallest bodies`);
     out = build(bodies6.map((b) => (detailed.has(b.id) ? b : brief(b))), 7);

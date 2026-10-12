@@ -153,6 +153,40 @@ function partingEvidence(body) {
   };
 }
 
+/**
+ * Risers and ingate of the body (feeding.js, given with the Reader body):
+ * proposed from the inscribed spheres and the moduli (heuristics of the
+ * modulus method, not a solidification simulation), or placed by hand.
+ */
+function feedingEvidence(body) {
+  const f = body?.feeding;
+  if (!f || (f.status !== "proposed" && f.status !== "manual") || !Array.isArray(f.risers)) return { status: "not_evaluated" };
+  const zones = Array.isArray(f.zones) ? f.zones : [];
+  const gate = f.gate ?? null;
+  return {
+    status: f.status,
+    zone_count: zones.length,
+    zones_needing_riser: zones.filter(z => z.needs_riser).length,
+    small_isolated_hot_spots: zones.filter(z => z.small && !z.needs_riser).length,
+    riser_count: f.risers.length,
+    risers: f.risers.map(r => ({
+      id: r.id ?? null, type: r.type ?? null, source: r.source ?? null, zone: r.zone ?? null,
+      position_mm: r.position_mm ?? null, diameter_mm: r.diameter_mm ?? null, height_mm: r.height_mm ?? null,
+      zone_sphere_mm: r.zone_sphere_mm ?? null, modulus_mm: r.modulus_mm ?? null,
+    })),
+    hot_spots_without_riser: Array.isArray(f.hot_spots_without_riser) ? f.hot_spots_without_riser : [],
+    gate: gate ? {
+      source: gate.source ?? null,
+      position_mm: gate.position_mm ?? null,
+      on_parting_line: gate.on_parting_line === true,
+      section_mm2: gate.section_mm2 ?? null,
+    } : null,
+    yield: f.yield?.value ?? null,
+    parting_known: f.parting_known ?? null,
+    sampled: !!f.sampled,
+  };
+}
+
 const pct = (share) => `${(Math.round(share * 1000) / 10).toLocaleString("fr-FR")} %`;
 const mm = (v) => `${(Math.round(v * 10) / 10).toLocaleString("fr-FR")} mm`;
 
@@ -165,6 +199,8 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
   const thickness = thicknessEvidence(body);
   const parting = partingEvidence(body);
   const partingKnown = parting.status !== "not_evaluated";
+  const feeding = feedingEvidence(body);
+  const feedingKnown = feeding.status !== "not_evaluated";
   const undercut = partingKnown && parting.undercut_area_mm2 > 0;
   const zeroDraft = partingKnown && parting.zero_draft_area_mm2 > 0;
   const nonPlanar = partingKnown && parting.parting_line?.planar === false;
@@ -282,8 +318,36 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
     requiredChecks.push("select_parting_direction");
     requiredChecks.push("evaluate_draft_and_pattern_release");
   }
-  requiredChecks.push("locate_and_size_risers_after_solidification_analysis");
-  requiredChecks.push("design_gating_after_flow_analysis");
+  // Risers and ingate proposed from the geometry (feeding.js) or placed by
+  // hand: a starting point, to be validated; a hot spot needing a riser left
+  // without one is a likely shrinkage.
+  if (feedingKnown) {
+    confirmedEvidence.push(feeding.status === "manual" ? "risers_placed_manually" : "risers_proposed_from_geometry");
+    if (feeding.gate?.on_parting_line) confirmedEvidence.push("gate_on_parting_line");
+    if (feeding.hot_spots_without_riser.length) {
+      risks.push(issue(
+        "hot_spot_without_riser",
+        "review",
+        "measured_feeding_zones_inscribed_spheres",
+        `${feeding.hot_spots_without_riser.length} zone(s) d'alimentation isolée(s) par une section plus mince (zones ${feeding.hot_spots_without_riser.map(z => z + 1).join(", ")}) sans masselotte : retassure probable sans masselotte, refroidisseur ou refroidissement local; à confirmer par une simulation ou avec la fonderie.`,
+        ["wlodawer_1966","chvorinov_1940","sfsa_design_steps"],
+        { zones: feeding.hot_spots_without_riser },
+      ));
+    }
+    if (feeding.gate && !feeding.gate.on_parting_line) {
+      risks.push(issue(
+        "gate_off_parting_line",
+        "review",
+        "manual_gate_position",
+        "L'attaque placée à la main n'est pas sur la ligne de joint (aucune ligne connue) : son accès par le moule est à confirmer.",
+        ["campbell_casting_handbook","sfsa_design_steps"],
+      ));
+    }
+    requiredChecks.push(feeding.status === "manual" ? "validate_manual_risers_and_gate_with_solidification_and_flow_analysis" : "validate_proposed_risers_and_gate_with_solidification_and_flow_analysis");
+  } else {
+    requiredChecks.push("locate_and_size_risers_after_solidification_analysis");
+    requiredChecks.push("design_gating_after_flow_analysis");
+  }
   requiredChecks.push("validate_directional_solidification");
   requiredChecks.push("run_fill_and_solidification_simulation_for_advanced_claims");
 
@@ -296,10 +360,10 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
     cores: partingKnown
       ? (undercut ? "undercuts_detected" : "no_undercut_for_the_chosen_axis")
       : cylindricalFaces.size + pocketCount > 0 ? "undetermined_without_concavity_test" : "not_detected",
-    hot_spots: thickness.status === "measured" ? "screened_by_thickness_distribution" : "not_available",
-    directional_solidification: "not_simulated",
-    risering: "not_sized",
-    gating: "not_sized",
+    hot_spots: feedingKnown ? "located_by_inscribed_sphere_feeding_zones" : thickness.status === "measured" ? "screened_by_thickness_distribution" : "not_available",
+    directional_solidification: feedingKnown ? "screened_by_section_necks_not_simulated" : "not_simulated",
+    risering: !feedingKnown ? "not_sized" : feeding.status === "manual" ? "placed_manually" : "proposed_by_modulus_heuristic",
+    gating: !feedingKnown || !feeding.gate ? "not_sized" : feeding.gate.source === "manual" ? "placed_manually" : "proposed_on_parting_line",
     filling: "not_simulated",
     porosity: "not_simulated",
     distortion: "not_simulated",
@@ -332,6 +396,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
       topology: body?.topology ?? null,
       thickness,
       parting,
+      feeding,
       principal_axes: principalAxes,
       feature_counts: { cylindrical_opening_or_boss_candidates: cylindricalFaces.size, pocket_candidates: pocketCount },
       confirmed: confirmedEvidence,
@@ -350,8 +415,9 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
       filling: "not_computed",
       solidification: "not_computed",
       shrinkage_porosity: "not_computed",
-      riser_design: "not_computed",
-      gating_design: "not_computed",
+      // A proposal of the modulus method from the geometry, not a design computed by a solver.
+      riser_design: feedingKnown ? "heuristic_proposal_not_simulated" : "not_computed",
+      gating_design: feedingKnown && feeding.gate ? "heuristic_proposal_not_simulated" : "not_computed",
       thermal_stress_distortion: "not_computed",
       message: "Cette couche prépare et explique l'analyse; elle ne remplace pas un solveur de fonderie.",
     },
