@@ -36,7 +36,17 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   principal axes; ranked by undercut area, then a planar line, then the faces without
   draft), each face classified by lines of sight along the direction (upper half, lower
   half, undercut for a core or slide), and the parting line, planar or stepped/warped with
-  its height range. Shown on the 3D view; another candidate, the normal of a face, a typed
+  its height range. Shown on the 3D view: the parting line as a thick red line drawn over
+  everything, the undercuts in yellow, the other faces in light grey (lighter without
+  draft), and the two halves of the mould ("chapes") as translucent blocks round the part,
+  the upper one blue and the lower one green, a margin of the larger of 5 mm and 15 % of
+  the part round it (*Mould halves* hides them). The blocks meet flat at the level of a
+  planar line; for a stepped or warped line, on a surface interpolated from the points of
+  the line (a height field of at most 48 × 48 cells, inverse distance weighting), so the
+  interface follows the line near it and goes from one level to the other between its
+  runs. While the parting line or the risers of a body are shown, the other bodies of the
+  model are faded, and a click picks the card's body even through another one in front of
+  it (two versions of a part). Another candidate, the normal of a face, a typed
   direction, or faces moved by a click to the upper or lower half define it by hand (kept
   per part in the browser). The semantic contract, the foundry screen and the AI context
   carry it, marked proposed or manual.
