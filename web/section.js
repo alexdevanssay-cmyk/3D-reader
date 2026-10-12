@@ -1,9 +1,9 @@
 // Section view: what closes the solids the section plane cuts (app.js).
 // The plane keeps the points p with n·p + c >= 0 (three.js Plane: normal n,
 // constant c). A solid it cuts gets a cap: a rectangle lying in the plane,
-// over the solid's box seen along n, drawn where the plane is inside the
-// solid (stencil buffer). Arrays [x, y, z]; boxes {min, max}. No three.js
-// here: run by the unit tests.
+// over the boxes of the solids cut seen along n (the same for all of them),
+// drawn where the plane is inside the solid (stencil buffer). Arrays
+// [x, y, z]; boxes {min, max}. No three.js here: run by the unit tests.
 
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
