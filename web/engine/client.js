@@ -259,7 +259,11 @@ async function readFromNetwork(key, onProgress) {
   const controller = new AbortController();
   networkReads.add(controller);
   try {
-    return await readShared(key, { signal: controller.signal, onProgress });
+    const result = await readShared(key, { signal: controller.signal, onProgress });
+    // Stopped while the folder or the file was looked for (a network slow to
+    // answer): not analysed after it either, the next file would wait behind it.
+    if (controller.signal.aborted) throw Object.assign(new Error('Cancelled'), { cancelled: true });
+    return result;
   } finally {
     networkReads.delete(controller);
   }

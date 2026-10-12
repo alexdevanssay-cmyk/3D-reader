@@ -350,6 +350,30 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     await context.close();
   });
 
+  test('a network slow to answer: Cancel while the part is looked for in the folder, nothing analysed after it', { timeout: TIMEOUT }, async () => {
+    const { context, page, errors } = await newPage();
+    await page.goto(`${base}?lang=fr`);
+    await chooseFolder(page);
+    await page.waitForFunction(() => /lu à/.test(document.getElementById('cnetwork')?.textContent));
+    await page.click('.tab[data-page="viewer"]');
+    await page.evaluate(() => localStorage.setItem('test.slow', '1500'));
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => window.__slow.waiting > 0);
+    await page.click('#cancel');
+    // The lookup over (the folder found, no file of this part in it): no analysis started for a file cancelled.
+    await page.waitForFunction(() => window.__slow.done >= 2 && window.__slow.waiting === 0, null, { timeout: 20_000 });
+    await page.waitForTimeout(1000);
+    assert.deepEqual((await page.evaluate(() => window.__posted)).filter((type) => type === 'analyze'), []);
+    assert.notEqual(await page.evaluate(() => document.body.dataset.status), 'analysing');
+    // Opened again, the network back: analysed.
+    await page.evaluate(() => localStorage.removeItem('test.slow'));
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
+    assert.deepEqual((await page.evaluate(() => window.__posted)).filter((type) => type === 'analyze'), ['analyze']);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
   test('the browser restarted: the access to grant said; a real time saved meanwhile waits, written once the access is granted', { timeout: TIMEOUT }, async () => {
     const { context, page, errors } = await newPage();
     await page.goto(`${base}?lang=fr`);
