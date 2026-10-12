@@ -165,6 +165,8 @@ function feedingEvidence(body) {
   const gate = f.gate ?? null;
   return {
     status: f.status,
+    // The risers by hand or proposed (an ingate placed by hand alone leaves them proposed).
+    risers_status: f.risers_status === "manual" || f.risers_status === "proposed" ? f.risers_status : f.status,
     zone_count: zones.length,
     zones_needing_riser: zones.filter(z => z.needs_riser).length,
     small_isolated_hot_spots: zones.filter(z => z.small && !z.needs_riser).length,
@@ -322,7 +324,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
   // hand: a starting point, to be validated; a hot spot needing a riser left
   // without one is a likely shrinkage.
   if (feedingKnown) {
-    confirmedEvidence.push(feeding.status === "manual" ? "risers_placed_manually" : "risers_proposed_from_geometry");
+    confirmedEvidence.push(feeding.risers_status === "manual" ? "risers_placed_manually" : "risers_proposed_from_geometry");
     if (feeding.gate?.on_parting_line) confirmedEvidence.push("gate_on_parting_line");
     if (feeding.hot_spots_without_riser.length) {
       risks.push(issue(
@@ -362,7 +364,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
       : cylindricalFaces.size + pocketCount > 0 ? "undetermined_without_concavity_test" : "not_detected",
     hot_spots: feedingKnown ? "located_by_inscribed_sphere_feeding_zones" : thickness.status === "measured" ? "screened_by_thickness_distribution" : "not_available",
     directional_solidification: feedingKnown ? "screened_by_section_necks_not_simulated" : "not_simulated",
-    risering: !feedingKnown ? "not_sized" : feeding.status === "manual" ? "placed_manually" : "proposed_by_modulus_heuristic",
+    risering: !feedingKnown ? "not_sized" : feeding.risers_status === "manual" ? "placed_manually" : "proposed_by_modulus_heuristic",
     gating: !feedingKnown || !feeding.gate ? "not_sized" : feeding.gate.source === "manual" ? "placed_manually" : "proposed_on_parting_line",
     filling: "not_simulated",
     porosity: "not_simulated",

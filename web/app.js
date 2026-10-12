@@ -2475,6 +2475,8 @@ function feedingField(i, r = state.result) {
   const gate = manual?.gate ?? placed.placement.gate;
   return {
     manual: !!(manual?.risers || manual?.gate),
+    // The risers by hand (added, moved, resized or deleted), apart from the ingate.
+    manualRisers: !!manual?.risers,
     risers,
     gate,
     yield: feedingYield(res.body.volume_mm3, risers, gate),
@@ -2876,6 +2878,8 @@ function feedingExport(r, i) {
   return {
     feeding: {
       status: field.manual ? "manual" : "proposed",
+      // The risers by hand or proposed, apart from the ingate (its own source).
+      risers_status: field.manualRisers ? "manual" : "proposed",
       version: res.version ?? FEEDING_VERSION,
       method: FEEDING_METHOD,
       draw_direction: placement.direction,

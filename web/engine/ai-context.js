@@ -77,6 +77,8 @@ function feedingSummary(f) {
   const gate = f.gate ?? null;
   return {
     status: f.status ?? null,
+    // Only the ingate placed by hand: the risers still proposed.
+    ...(f.risers_status && f.risers_status !== f.status ? { risers_status: f.risers_status } : {}),
     risers: (f.risers ?? []).map((r) => ({
       position_mm: point(r.position_mm),
       type: r.type ?? null,

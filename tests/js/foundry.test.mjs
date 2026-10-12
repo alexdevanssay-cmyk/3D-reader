@@ -309,6 +309,23 @@ test("risers and an ingate proposed from the geometry: located, sized by a heuri
   assert.deepEqual(compactAIContext(context, { maxChars: 1e6 }).bodies[0].feeding, context.bodies[0].feeding);
 });
 
+test("only the ingate placed by hand: the risers still proposed, the gating by hand", () => {
+  const semantic = buildSemantic3D({
+    file: "casting.step", kind: "cad", engine: "browser",
+    summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 },
+    bodies: [body({ feeding: feeding({ status: "manual", risers_status: "proposed", gate: { ...feeding().gate, source: "manual" } }) })],
+  });
+  const { rules, evidence } = semantic.bodies[0].foundry;
+  assert.equal(rules.risering, "proposed_by_modulus_heuristic");
+  assert.equal(rules.gating, "placed_manually");
+  assert.equal(evidence.feeding.risers_status, "proposed");
+  assert.ok(evidence.confirmed.includes("risers_proposed_from_geometry") && !evidence.confirmed.includes("risers_placed_manually"));
+  // The AI context: the definition by hand (the ingate), its risers proposed.
+  const context = buildAIContext(semantic, { task: "general" });
+  assert.equal(context.bodies[0].feeding.status, "manual");
+  assert.equal(context.bodies[0].feeding.risers_status, "proposed");
+});
+
 test("a riser deleted by hand: the hot spot left without one is a risk; an ingate off the parting line too", () => {
   const semantic = buildSemantic3D({
     file: "casting.step", kind: "cad", engine: "browser",
