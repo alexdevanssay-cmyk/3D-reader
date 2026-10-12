@@ -102,7 +102,7 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
 
     // The normal of a face picked on the 3D view: the front face, outwards (-Y).
     await page.click('#parting-pick');
-    assert.match(await page.textContent('#parting-hint'), /Cliquez une face/);
+    assert.match(await page.textContent('#parting-hint'), /Cliquez sur une face/);
     await clickFrontFace();
     await waitFor('-Y', 'manuel');
     assert.equal(await page.isVisible('#parting-hint'), false);
