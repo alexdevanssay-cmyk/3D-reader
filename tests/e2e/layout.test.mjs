@@ -2,11 +2,13 @@
 // (dist/): each card folds to its title (the chevron, a click on the title, the
 // keyboard), the controls of its head still at hand and never folding it, its
 // key value beside the title; kept after a reload, shown folded after the next
-// analysis; "Collapse all" / "Expand all"; English and French. The panel's
-// width set by dragging the splitter, the 3D view following as it goes, within
-// limits; back to the default width on a double-click; from the keyboard; kept
-// after a reload and fitted to a smaller window; no splitter on a narrow window
-// (the panel under the view).
+// analysis; "Collapse all" / "Expand all"; English and French. Folding a card
+// stops a mode of the 3D view started from it; the folded thickness shows the
+// thinnest wall the quote uses; the warning of an open body stays in sight. The
+// panel's width set by dragging the splitter, the 3D view following as it goes,
+// within limits; back to the default width on a double-click; from the
+// keyboard; kept after a reload and fitted to a smaller window; no splitter on a
+// narrow window (the panel under the view).
 //
 //   npm run build && node --test tests/e2e/layout.test.mjs
 
@@ -23,6 +25,25 @@ import { ROOT, fixturePath } from '../js/helpers.mjs';
 const DIST = join(ROOT, 'dist');
 const TIMEOUT = 120_000;
 const CARDS = ['summary-card', 'mass-card', 'thickness-card', 'bodies-card', 'parting-card', 'feeding-card', 'memory-card'];
+
+/** An OBJ of two bodies: a closed cube of 20 mm (material a) and an open square sheet above it (material b). */
+function cubeAndSheetObj() {
+  const lines = [];
+  const faces = [];
+  let count = 0;
+  const vertex = (x, y, z) => {
+    lines.push(`v ${x} ${y} ${z}`);
+    return ++count;
+  };
+  const v = [];
+  for (let i = 0; i < 8; i++) v.push(vertex(i & 1 ? 20 : 0, i & 2 ? 20 : 0, i & 4 ? 20 : 0));
+  faces.push('usemtl a');
+  // Counter-clockwise seen from outside.
+  for (const q of [[0, 4, 6, 2], [1, 3, 7, 5], [0, 1, 5, 4], [2, 6, 7, 3], [0, 2, 3, 1], [4, 5, 7, 6]]) faces.push(`f ${q.map((k) => v[k]).join(' ')}`);
+  const sheet = [[0, 0], [20, 0], [20, 20], [0, 20]].map(([x, y]) => vertex(x, y, 40));
+  faces.push('usemtl b', `f ${sheet.join(' ')}`);
+  return Buffer.from([...lines, ...faces, ''].join('\n'));
+}
 
 describe('3D analysis panel: folded cards, width (dist/)', { skip: !existsSync(join(DIST, 'index.html')) && 'run `npm run build` first' }, () => {
   let server;
@@ -147,6 +168,87 @@ describe('3D analysis panel: folded cards, width (dist/)', { skip: !existsSync(j
     await page.click('[data-page="parametres"]');
     assert.equal(await page.isVisible('.panel-splitter'), false);
     assert.equal(await page.locator('#page-parametres .card-toggle').count(), 0);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
+  test('folded: a mode of the 3D view stops, the thinnest wall used is shown, an open body\'s warning stays', { timeout: 3 * TIMEOUT }, async () => {
+    const { page, errors } = await newPage();
+    await page.goto(base);
+    await analyse(page);
+    await page.waitForSelector('#parting-main:not([hidden])', { timeout: TIMEOUT });
+    await page.waitForSelector('#feeding-main:not([hidden])', { timeout: TIMEOUT });
+    const active = (id) => page.evaluate((button) => document.getElementById(button).classList.contains('active'), id);
+    const selected = () => page.$$eval('#bodies tr.selected', (trs) => trs.length);
+    const clickPart = async () => {
+      const box = await page.locator('#viewport canvas').boundingBox();
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    };
+    assert.equal(await page.textContent('#parting-origin'), 'proposed');
+    const risers = await page.textContent('#feeding-count');
+    const feedingOrigin = await page.textContent('#feeding-origin');
+
+    // Reassigning faces, then the card folded by its chevron: the mode stops with its button and its hint out of
+    // sight, and a click on the part selects it, the parting line as proposed.
+    await page.click('#parting-assign');
+    assert.equal(await page.isVisible('#parting-hint'), true);
+    await page.click('#parting-card .card-toggle');
+    assert.equal(await active('parting-assign'), false);
+    await clickPart();
+    assert.equal(await selected(), 1);
+    assert.equal(await page.textContent('#parting-origin'), 'proposed');
+    assert.equal(await page.isDisabled('#parting-reset'), true);
+    await page.click('#parting-card .card-toggle');
+    assert.equal(await page.isVisible('#parting-hint'), false);
+    assert.equal(await active('parting-assign'), false);
+    // Adding a riser, then "Collapse all": no riser added by the next click.
+    await page.click('#feeding-add');
+    assert.equal(await active('feeding-add'), true);
+    await page.click('.panel-fold-all');
+    assert.equal(await active('feeding-add'), false);
+    await clickPart();
+    assert.equal(await page.textContent('#feeding-count'), risers);
+    assert.equal(await page.textContent('#feeding-origin'), feedingOrigin);
+    await page.click('.panel-fold-all');
+
+    // The thinnest wall typed in for the quote: beside the folded title in place of the one detected.
+    await page.click('#thick-compute');
+    await page.waitForSelector('#thick-body:not([hidden])', { timeout: TIMEOUT });
+    const detected = await page.textContent('#thick-min');
+    assert.match(detected, /^\d+(\.\d+)? mm$/);
+    await page.fill('#thick-min-used', '2.5');
+    await page.press('#thick-min-used', 'Tab');
+    await page.waitForFunction(() => document.getElementById('thick-min').classList.contains('overridden'));
+    await page.click('#thickness-card .card-toggle');
+    const peek = () => page.evaluate(() => {
+      const el = document.querySelector('#thickness-card .card-peek');
+      return { text: el.textContent, title: el.title, shown: !el.hidden };
+    });
+    assert.deepEqual(await peek(), { text: '2.5 mm', title: 'Thinnest wall used', shown: true });
+    await page.selectOption('#language', 'fr');
+    assert.deepEqual(await peek(), { text: '2,5 mm', title: 'Toile mini prise en compte', shown: true });
+    await page.selectOption('#language', 'en');
+    // Back to the one detected.
+    await page.click('#thickness-card .card-toggle');
+    await page.fill('#thick-min-used', '');
+    await page.press('#thick-min-used', 'Tab');
+    await page.waitForFunction(() => !document.getElementById('thick-min').classList.contains('overridden'));
+    await page.click('#thickness-card .card-toggle');
+    assert.deepEqual(await peek(), { text: detected, title: '', shown: true });
+
+    // The summary folded: no warning for a part whose bodies are all closed...
+    await page.click('#summary-card .card-toggle');
+    assert.equal(await page.isVisible('#method'), false);
+    // ... the one of a part with an open body left out of the volume, kept under the folded title.
+    await page.setInputFiles('#file-input', { name: 'cube_and_sheet.obj', mimeType: 'text/plain', buffer: cubeAndSheetObj() });
+    await page.waitForFunction(() => document.body.dataset.status === 'done' && document.getElementById('body-count').textContent.includes('open'), null, { timeout: TIMEOUT });
+    assert.equal(await folded(page, 'summary-card'), true);
+    assert.equal(await page.isVisible('#summary-card .card-peek'), true);
+    assert.equal(await page.isVisible('#total-volume'), false);
+    assert.equal(await page.isVisible('#method.warn'), true);
+    assert.match(await page.textContent('#method'), /1 open body\/bodies excluded from the volume/);
+    const height = await page.evaluate(() => document.getElementById('summary-card').getBoundingClientRect().height);
+    assert.ok(height < 110, `folded card with its warning ${height} px high`);
     assert.deepEqual(errors, []);
     await page.context().close();
   });

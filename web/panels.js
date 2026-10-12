@@ -5,7 +5,7 @@
 // app.js keeps showing, hiding and filling the cards as before, and a card
 // shown later (after an analysis) keeps the state it was left in.
 
-import { t } from "./i18n.js";
+import { locale, t } from "./i18n.js";
 
 const COLLAPSED_KEY = "reader3d.panel.collapsed"; // ids of the cards folded
 const WIDTH_KEY = "reader3d.panel.width"; // width of the panel chosen by dragging (px)
@@ -118,6 +118,11 @@ function enhance(card) {
 
 function setCollapsed(card, on, remember = true) {
   const { toggle } = parts(card);
+  // Folded: a mode of the 3D view started from the card's body (a face to pick or
+  // reassign, a riser or the ingate to place) stops, as its button and its hint
+  // go out of sight; a click on the view then selects again. Its button clicked
+  // once more is what turns it off (app.js).
+  if (on) for (const button of card.querySelectorAll(":scope > :not(.card-head) button.toggle.active")) button.click();
   card.classList.toggle("is-collapsed", on);
   toggle.setAttribute("aria-expanded", String(!on));
   toggle.dataset.i18nTitle = on ? "panel.expand" : "panel.collapse";
@@ -131,13 +136,26 @@ function setCollapsed(card, on, remember = true) {
   refreshTools();
 }
 
+/** The value beside the title, and what it is when the card says so in another way (its tooltip). */
+function peekOf(card) {
+  const source = document.getElementById(PEEKS[card.id]);
+  if (!source || source.closest("[hidden]")) return { text: "" };
+  // The thinnest wall typed in for the quote (the one detected is then greyed in
+  // the card): the one the costing uses.
+  if (card.id === "thickness-card" && source.classList.contains("overridden")) {
+    const used = parseFloat(document.getElementById("thick-min-used")?.value);
+    if (used > 0) return { text: `${used.toLocaleString(locale(), { maximumFractionDigits: 2 })} mm`, title: t("thick.minUsed") };
+  }
+  return { text: source.textContent.trim() };
+}
+
 function refreshPeek(card) {
   const { head, peek } = parts(card);
   if (!peek) return;
-  const source = document.getElementById(PEEKS[card.id]);
-  const text = source && !source.closest("[hidden]") ? source.textContent.trim() : "";
+  const { text, title = "" } = peekOf(card);
   const shown = card.classList.contains("is-collapsed") && text !== "" && text !== "—";
   setText(peek, text);
+  if (peek.title !== title) peek.title = title;
   setHidden(peek, !shown);
   head.classList.toggle("has-peek", shown);
 }
@@ -284,6 +302,7 @@ function label() {
   for (const card of cards()) {
     const { toggle } = parts(card);
     if (toggle) toggle.title = t(toggle.dataset.i18nTitle);
+    refreshPeek(card);
   }
   setText(foldAll, t(foldAll.dataset.i18n || "panel.collapseAll"));
 }
