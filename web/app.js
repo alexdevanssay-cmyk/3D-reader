@@ -9,6 +9,10 @@ import {
   PARTING_VERSION, REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_NONE, SIDE_UPPER, ZERO_DRAFT,
   applyOverrides, faceRegions, lineMesh, lineSummary, parseDirection, partingLine, sameDirection, snapDirection,
 } from "./engine/parting.js";
+import {
+  FEEDING_VERSION, METHOD as FEEDING_METHOD, feedingContext, feedingYield, feeds, gateFromPoint, hotSpotsWithoutRiser,
+  resizeRiser, riserFromPoint,
+} from "./engine/feeding.js";
 
 // ---------------------------------------------------------------- units
 
@@ -538,6 +542,7 @@ function showModel(data) {
   renderPanel();
   thicknessNewModel(data.cachedThickness?.length === data.bodies.length ? data.cachedThickness : null);
   partingNewModel(data);
+  feedingNewModel(data);
 }
 
 /** The loading box of the tab shown: its analysis in progress, if any. */
@@ -656,6 +661,8 @@ function setIncluded(indices) {
   renderPanel();
   renderParting();
   applyParting();
+  renderFeeding();
+  applyFeeding();
   // The wall thickness card: the values of the bodies checked, on a scale fitted to them.
   if (thick.results) {
     if (!thick.userMax) thick.max = niceCeil((thickQuantiles([0.99]) ?? [thick.max])[0]);
@@ -677,6 +684,7 @@ function updateMass() {
   all.checked = state.included.size === r.bodies.length;
   all.indeterminate = state.included.size > 0 && state.included.size < r.bodies.length;
   renderBodyDetail();
+  renderFeeding(); // the masses of the risers
 }
 
 function renderBodies() {
@@ -768,11 +776,13 @@ function select(i) {
   });
   document.querySelectorAll("#bodies tr").forEach((tr) => tr.classList.toggle("selected", +tr.dataset.index === i));
   renderBodyDetail();
-  // The parting line card is the body selected's (a message about the body before it, gone).
+  // The parting line card is the body selected's (a message about the body before it, gone), and the risers card.
   const p = partingOf();
   if (p) p.message = null;
   renderParting();
   applyParting();
+  renderFeeding();
+  applyFeeding();
   document.querySelector("#bodies tr.selected")?.scrollIntoView({ block: "nearest" });
 }
 
@@ -792,7 +802,7 @@ function exportableResult(r, indices = includedIndices()) {
     summary: { ...(currentSummary(indices) ?? r.summary), mass: mass((currentSummary(indices) ?? r.summary).volume) },
     bodies: indices.map((i) => {
       const { mesh, ...b } = r.bodies[i];
-      return { ...b, mass: mass(b.volume), ...thicknessExport(r, [i]), ...partingExport(r, i) };
+      return { ...b, mass: mass(b.volume), ...thicknessExport(r, [i]), ...partingExport(r, i), ...feedingExport(r, i) };
     }),
     ...thicknessExport(r, indices),
     elapsed_s: r.elapsed_s,
@@ -1106,7 +1116,7 @@ renderer.domElement.addEventListener("pointerup", (e) => {
   const hits = raycaster
     .intersectObjects(state.meshes.filter((m) => m.visible), false)
     .filter((h) => !sectionOn || sectionPlane.distanceToPoint(h.point) >= 0);
-  if (partingClick(hits)) return;
+  if (feedingClick(hits) || partingClick(hits)) return;
   select(hits.length ? hits[0].object.userData.index : -1);
 });
 
@@ -1882,8 +1892,9 @@ function computePartings(r) {
       if (p.results) {
         restoreParting();
         applyParting();
-        updatePublished(r);
       }
+      // The risers and the ingate placed for this parting line (or along +Z without one).
+      refreshFeeding();
     });
 }
 
@@ -1961,7 +1972,8 @@ function setPartingDefinition(i, { base, source, overrides = {}, candidate = nul
   }
   applyParting();
   renderParting();
-  updatePublished(r);
+  // The risers and the ingate placed again for it (those placed by hand stay).
+  refreshFeeding();
 }
 
 /** Back to the proposal for body i. */
@@ -1974,7 +1986,7 @@ function resetParting(i) {
   savePartingDef(partIdOf(state.result), i, null);
   applyParting();
   renderParting();
-  updatePublished(state.result);
+  refreshFeeding();
 }
 
 /** The definitions by hand kept for the part shown, once its proposals are known. */
@@ -2222,7 +2234,8 @@ function renderParting() {
   const card = $("parting-card");
   const r = state.result;
   card.hidden = !r;
-  renderer.domElement.style.cursor = "";
+  // A crosshair while placing on the 3D view (here, or a riser or the ingate).
+  renderer.domElement.style.cursor = feedingOf(r)?.mode ? "crosshair" : "";
   if (!r) return;
   const p = partingOf(r);
   const i = partingBody();
@@ -2343,6 +2356,11 @@ function setPartingMode(mode) {
   if (!p) return;
   p.mode = p.mode === mode ? null : mode;
   p.message = null;
+  const f = feedingOf();
+  if (p.mode && f?.mode) {
+    f.mode = null;
+    renderFeeding();
+  }
   if (p.mode === "assign" && !p.show) {
     p.show = true;
     if (thick.colors || thick.highlight) {
@@ -2383,6 +2401,697 @@ $("parting-vector").addEventListener("keydown", (e) => {
 $("parting-reset").addEventListener("click", () => {
   const i = partingBody();
   if (i >= 0) resetParting(i);
+});
+
+// ---------------------------------------------------------------- risers and gating
+
+// Risers ("masselottes") and the ingate ("attaque de coulée") of a cast part
+// (engine/feeding.js): the feeding zones of the closed bodies are found once
+// the model is shown, in a worker of their own (engine/feedclient.js), and
+// kept with the results of the file in this browser; the risers and the
+// ingate are placed for the parting line of the body (proposed or by hand) in
+// a second worker, and placed again when it changes. They can be placed by hand: a
+// riser added, moved, resized or deleted, the ingate placed (brought onto the
+// parting line). That definition is kept per part (the SHA-256 of its file)
+// in this browser, for the body as it was read (its triangles, its size: not
+// put back in another unit nor at another quality); the risers placed by hand
+// stay when the parting changes.
+const FEEDING_KEY = "reader3d.feeding.v1";
+const FEEDING_PARTS = 200; // parts whose definition by hand is kept, the latest
+const RISER_COLOR = 0xf08a24;
+const RISER_SELECTED = 0xffd23f;
+const GATE_COLOR = 0xc040d0;
+
+const feedClient = () => (feedClient.module ??= import("./engine/feedclient.js"));
+
+// Per result: {results (per body {zones, body, zone, sphere, …} or null),
+// pending, percent, error, manual (body -> {risers: [...] or null (the
+// proposal's), gate: {...} or null (the proposal's)}), placed (body -> the
+// placement for a parting: {key, placement, error}), placing (body -> the
+// parting key being placed in the worker), queued (body -> {key, parting},
+// to send), outward (body -> 1, or -1 when its triangles turn inwards), show,
+// mode ("add" | "move" | "gate" | null), selected (a riser id), body (the
+// card's, for the selection), message, restored}.
+const feedings = new WeakMap();
+
+function feedingOf(r = state.result) {
+  if (!r) return null;
+  let f = feedings.get(r);
+  if (!f) {
+    f = { results: null, pending: null, percent: null, error: null, manual: new Map(), placed: new Map(), placing: new Map(), queued: new Map(), outward: new Map(), show: false, mode: null, selected: null, body: -1, message: null, restored: false };
+    feedings.set(r, f);
+  }
+  return f;
+}
+
+/** The body of the card: that of the parting line card. */
+const feedingBody = () => partingBody();
+
+/** The parting of body i as feeding.js takes it ({direction, side, segments}, or null) and what identifies it. */
+function feedingParting(i, r = state.result) {
+  const p = partingOf(r);
+  const field = partingField(i, r);
+  return {
+    // The definition by hand, or the proposal.
+    key: field ? (field.manual ? p.current.get(i) : p.results[i]) : null,
+    parting: field ? { direction: field.direction, side: field.side, segments: field.segments } : null,
+  };
+}
+
+/**
+ * The risers and the ingate of body i proposed for its parting line as shown
+ * (proposed or by hand; +Z without one), placed once per parting in the
+ * worker (seconds on a large body: never on the page): {key, placement
+ * (placeFeeding), error}, or null while it is placed, or without zones. Its
+ * placement is asked for here (the model shown); the card and the exports
+ * follow when it comes.
+ */
+function feedingPlacement(i, r = state.result) {
+  const f = feedingOf(r);
+  const res = f?.results?.[i];
+  if (!res) return null;
+  const { key, parting } = feedingParting(i, r);
+  const kept = f.placed.get(i);
+  if (kept && kept.key === key) return kept;
+  if (r === state.result && f.placing.get(i) !== key && f.queued.get(i)?.key !== key) {
+    // Asked for in one go with the others asked for now (the bodies of an export), sent at the end of this task.
+    if (!f.queued.size) queueMicrotask(() => placeQueued(r));
+    f.queued.set(i, { key, parting });
+  }
+  return null;
+}
+
+/**
+ * The bodies queued sent to the worker: the card's body first, on its own,
+ * then the others together; each answer kept when its parting is still the
+ * one shown, then the card, the view and the published results once.
+ */
+function placeQueued(r) {
+  const f = feedingOf(r);
+  const queued = [...f.queued];
+  f.queued.clear();
+  if (r !== state.result || !queued.length) return;
+  const card = feedingBody();
+  const batches = [queued.filter(([i]) => i === card), queued.filter(([i]) => i !== card)].filter((b) => b.length);
+  for (const batch of batches) {
+    const bodies = batch.map(([i, { key, parting }]) => {
+      f.placing.set(i, key);
+      const res = f.results[i];
+      return { ...bodyArrays(i), zones: { zone: res.zone, sphere: res.sphere, zones: res.zones, body: res.body }, parting };
+    });
+    const done = (each) => {
+      batch.forEach(([i, { key }], n) => {
+        if (f.placing.get(i) !== key) return; // asked for again since, for another parting
+        f.placing.delete(i);
+        if (feedingParting(i, r).key === key) f.placed.set(i, { key, ...each(n) });
+      });
+      if (r === state.result) refreshFeeding();
+    };
+    feedClient()
+      .then((client) => client.placeFeedings(bodies))
+      .then((placements) => done((n) => ({ placement: placements[n], error: null })))
+      .catch((err) => done(() => ({ placement: null, error: err.message || String(err) })));
+  }
+}
+
+const densityShown = () => {
+  const d = parseFloat($("density").value);
+  return d > 0 ? d : null;
+};
+const massOfVolume = (mm3, density = densityShown()) => (density && Number.isFinite(mm3) ? Math.round((mm3 / 1000) * density * 10) / 10 : null);
+
+/**
+ * What body i shows: {manual, risers, gate, yield, without (zones needing a
+ * riser without one), placement, res}, or null (no zones yet, the parting
+ * line still being computed, the risers being placed).
+ */
+function feedingField(i, r = state.result) {
+  const f = feedingOf(r);
+  const res = f?.results?.[i];
+  if (!res || partingOf(r)?.pending) return null;
+  const placed = feedingPlacement(i, r);
+  if (!placed?.placement) return null;
+  const manual = f.manual.get(i) ?? null;
+  const risers = (manual?.risers ?? placed.placement.risers).map((x) => ({ ...x, mass_g: massOfVolume(x.volume_mm3) }));
+  const gate = manual?.gate ?? placed.placement.gate;
+  return {
+    manual: !!(manual?.risers || manual?.gate),
+    // The risers by hand (added, moved, resized or deleted), apart from the ingate.
+    manualRisers: !!manual?.risers,
+    risers,
+    gate,
+    yield: feedingYield(res.body.volume_mm3, risers, gate),
+    without: hotSpotsWithoutRiser(res.zones, risers),
+    placement: placed.placement,
+    res,
+  };
+}
+
+// ---- definitions kept in this browser: {part id: {savedAt, bodies: {index: {risers, gate}}}}
+
+function feedingSaved() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FEEDING_KEY));
+    return saved && typeof saved === "object" ? saved : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * What a definition by hand of body i of the model shown is of: its
+ * triangles and the size of its box. The same file read in another unit, or
+ * tessellated at another quality, has the same part id: its risers (in mm,
+ * on zones of these triangles) are not put back on it.
+ */
+function feedingMeshTag(i) {
+  const size = state.result.bodies[i].bbox?.size ?? [];
+  return `${bodyArrays(i).indices.length / 3}|${size.map((x) => Number(x).toFixed(3)).join(",")}`;
+}
+
+function saveFeedingDef(partId, body, def) {
+  if (!partId) return;
+  const all = feedingSaved();
+  const entry = all[partId] ?? { bodies: {} };
+  if (def?.risers || def?.gate) entry.bodies[body] = { risers: def.risers ?? null, gate: def.gate ?? null, mesh: def.mesh ?? null };
+  else delete entry.bodies[body];
+  if (Object.keys(entry.bodies).length) all[partId] = { ...entry, savedAt: Date.now() };
+  else delete all[partId];
+  // The latest parts only.
+  const ids = Object.keys(all).sort((a, b) => (all[b].savedAt ?? 0) - (all[a].savedAt ?? 0));
+  for (const id of ids.slice(FEEDING_PARTS)) delete all[id];
+  try {
+    localStorage.setItem(FEEDING_KEY, JSON.stringify(all));
+  } catch {
+    // kept for this visit only
+  }
+}
+
+const isPoint = (p) => Array.isArray(p) && p.length === 3 && p.every(Number.isFinite);
+const validRiser = (x) => x && typeof x === "object" && typeof x.id === "string" && isPoint(x.position_mm) && isPoint(x.axis) && x.diameter_mm > 0 && x.height_mm > 0;
+const validGate = (x) => x && typeof x === "object" && isPoint(x.position_mm) && isPoint(x.direction);
+
+// ---- computation
+
+/** A new model is shown: its feeding zones, kept from an earlier opening, else computed in the background. */
+function feedingNewModel(data) {
+  const f = feedingOf(data);
+  const kept = data.cachedFeeding;
+  if (!f.results && kept?.version === FEEDING_VERSION && kept.bodies?.length === data.bodies.length) f.results = kept.bodies;
+  if (f.results) restoreFeeding();
+  else computeFeedings(data);
+  renderFeeding();
+}
+
+/** Find the feeding zones of the closed bodies of the model shown, in the background. */
+function computeFeedings(r) {
+  const f = feedingOf(r);
+  if (f.results || f.pending || r !== state.result) return;
+  // The inscribed spheres of the wall thickness when computed now (the same values, on every
+  // core); not those kept from an earlier opening, maybe by an older engine.
+  const spheres = thick.results && thick.results !== r.cachedThickness ? thick.results : null;
+  const bodies = r.bodies.map((b, i) => (b.closed ? { ...bodyArrays(i), sphere: spheres?.[i]?.sphere ?? null } : null));
+  if (!bodies.some(Boolean)) {
+    f.results = r.bodies.map(() => null);
+    return;
+  }
+  f.error = null;
+  f.percent = 0;
+  f.pending = feedClient()
+    .then((client) => client.computeFeeding(bodies, {
+      onProgress: ({ percent }) => {
+        f.percent = percent;
+        if (r === state.result) renderFeeding();
+      },
+    }).then((results) => {
+      f.results = results.bodies;
+      client.saveFeeding(r.cacheKey, results);
+    }))
+    .catch((err) => {
+      f.error = err.message || String(err);
+    })
+    .finally(() => {
+      f.pending = null;
+      if (r !== state.result) return;
+      if (f.results) restoreFeeding();
+      refreshFeeding();
+    });
+}
+
+/** The definitions by hand kept for the part shown, once its zones are known. */
+function restoreFeeding() {
+  const r = state.result;
+  const f = feedingOf(r);
+  if (!f?.results || f.restored) return;
+  f.restored = true;
+  const defs = feedingSaved()[partIdOf(r)]?.bodies ?? {};
+  for (const [key, def] of Object.entries(defs)) {
+    const i = Number(key);
+    if (!f.results[i] || !state.meshes[i]) continue;
+    // Of this body as read now (not in another unit, nor at another quality).
+    if (def?.mesh !== feedingMeshTag(i)) continue;
+    const risers = Array.isArray(def?.risers) ? def.risers.filter(validRiser) : null;
+    const gate = validGate(def?.gate) ? def.gate : null;
+    if (risers || gate) f.manual.set(i, { risers, gate });
+  }
+}
+
+/** The card and the markers again, and the published results: the parting, the zones or a definition changed. */
+function refreshFeeding() {
+  renderFeeding();
+  applyFeeding();
+  if (state.result) updatePublished(state.result);
+}
+
+// ---- edits by hand
+
+/** The definition by hand of body i, changed by `edit({risers, gate})` (the risers: a copy of those shown). */
+function editFeeding(i, edit) {
+  const f = feedingOf();
+  const field = feedingField(i);
+  if (!field) return;
+  const manual = f.manual.get(i) ?? { risers: null, gate: null };
+  const next = { risers: manual.risers, gate: manual.gate };
+  edit(next, field);
+  if (next.risers || next.gate) f.manual.set(i, next);
+  else f.manual.delete(i);
+  saveFeedingDef(partIdOf(state.result), i, { ...next, mesh: feedingMeshTag(i) });
+  refreshFeeding();
+}
+
+/** The risers shown, as a definition by hand to change (without the masses of the density shown). */
+const manualRisers = (field) => field.risers.map(({ mass_g, ...x }) => x);
+
+/** A new id for a riser placed by hand: M1, M2… */
+function nextRiserId(risers) {
+  let n = 1;
+  while (risers.some((x) => x.id === `M${n}`)) n++;
+  return `M${n}`;
+}
+
+/** Back to the proposal for body i. */
+function resetFeeding(i) {
+  const f = feedingOf();
+  f.manual.delete(i);
+  f.mode = null;
+  f.selected = null;
+  f.message = null;
+  saveFeedingDef(partIdOf(state.result), i, null);
+  refreshFeeding();
+}
+
+/**
+ * 1, or -1 when the triangles of body i turn inwards (a mirrored CAD
+ * instance, an inside-out mesh: shown as they are, only the sign of their
+ * volume corrected): by the sign of its enclosed volume, once.
+ */
+function feedingOutward(i) {
+  const f = feedingOf();
+  let sign = f.outward.get(i);
+  if (sign == null) {
+    const { positions: P, indices: I } = bodyArrays(i);
+    let volume = 0;
+    for (let t = 0; t < I.length / 3; t++) {
+      const a = 3 * I[3 * t], b = 3 * I[3 * t + 1], c = 3 * I[3 * t + 2];
+      const u = [P[b] - P[a], P[b + 1] - P[a + 1], P[b + 2] - P[a + 2]];
+      const v = [P[c] - P[a], P[c + 1] - P[a + 1], P[c + 2] - P[a + 2]];
+      volume += P[a] * (u[1] * v[2] - u[2] * v[1]) + P[a + 1] * (u[2] * v[0] - u[0] * v[2]) + P[a + 2] * (u[0] * v[1] - u[1] * v[0]);
+    }
+    sign = volume < 0 ? -1 : 1;
+    f.outward.set(i, sign);
+  }
+  return sign;
+}
+
+/**
+ * The point clicked in the frame of the mesh, its triangle and its outward
+ * normal there (the normal of three.js follows the winding of the triangle:
+ * turned outwards by the sign of the body).
+ */
+function feedingHit(hit, sign = 1) {
+  const point = hit.object.worldToLocal(hit.point.clone());
+  const n = hit.face?.normal;
+  return { point: [point.x, point.y, point.z], triangle: hit.faceIndex ?? -1, normal: n ? [sign * n.x + 0, sign * n.y + 0, sign * n.z + 0] : null };
+}
+
+/** A click on the 3D view while placing a riser or the ingate: handled here (true), the selection unchanged. */
+function feedingClick(hits) {
+  const f = feedingOf();
+  if (!f?.mode) return false;
+  const i = feedingBody();
+  const hit = hits[0];
+  if (!hit) return true;
+  if (hit.object.userData.index !== i) {
+    f.message = t("feeding.otherBody");
+    renderFeeding();
+    return true;
+  }
+  const { point, triangle, normal } = feedingHit(hit, feedingOutward(i));
+  const mode = f.mode;
+  const field = feedingField(i);
+  if (!field) return true;
+  let riser = null;
+  if (mode === "add" || mode === "move") {
+    const moved = mode === "move" ? field.risers.find((x) => x.id === f.selected) : null;
+    if (mode === "move" && !moved) {
+      // The riser to move is no longer shown (another parting line, another body): nothing changed.
+      f.mode = null;
+      f.message = null;
+      renderFeeding();
+      return true;
+    }
+    // Moved: sized again from the zone it now touches, unless its D and H were typed in.
+    const sized = moved?.sized_by_hand ? { diameter: moved.diameter_mm, height: moved.height_mm } : {};
+    riser = riserFromPoint(point, { triangle, normal, zones: field.res, direction: field.placement.direction, id: moved?.id ?? nextRiserId(field.risers), ...sized });
+    if (!riser) {
+      // A face turned down: no riser under the part; another face to click.
+      f.message = t("feeding.faceDown");
+      renderFeeding();
+      return true;
+    }
+  }
+  f.mode = null;
+  f.message = null;
+  editFeeding(i, (next, field) => {
+    if (mode === "gate") {
+      const { positions, indices } = bodyArrays(i);
+      const ctx = feedingContext(positions, indices, field.res, { parting: feedingParting(i).parting });
+      next.gate = gateFromPoint(point, ctx, { triangle, normal });
+      return;
+    }
+    const risers = manualRisers(field);
+    if (mode === "add") {
+      next.risers = [...risers, riser];
+      f.selected = riser.id;
+    } else next.risers = risers.map((x) => (x.id === riser.id ? riser : x));
+  });
+  return true;
+}
+
+/** Start or stop placing on the 3D view (a riser, a riser moved, the ingate); the parting line's modes stop. */
+function setFeedingMode(mode) {
+  const f = feedingOf();
+  if (!f) return;
+  f.mode = f.mode === mode ? null : mode;
+  f.message = null;
+  const p = partingOf();
+  if (f.mode && p?.mode) {
+    p.mode = null;
+    renderParting();
+  }
+  // Placed on the 3D view: shown there.
+  if (f.mode && !f.show) {
+    f.show = true;
+    applyFeeding();
+  }
+  renderFeeding();
+}
+
+// ---- 3D view
+
+function removeFeedingOverlay(mesh) {
+  const group = mesh.userData.feedingOverlay;
+  if (!group) return;
+  mesh.remove(group);
+  group.traverse((o) => {
+    if (o.userData.own) o.geometry?.dispose();
+    o.material?.dispose();
+  });
+  mesh.userData.feedingOverlay = null;
+}
+
+/**
+ * The risers and the ingate of the card's body on the 3D view ("Show"): a
+ * cylinder for each riser (standing on the part, or beside it at the parting
+ * line), the one selected lighter, and an arrow into the part for the
+ * ingate; over whatever colours the view shows (the parting line, the
+ * thickness).
+ */
+function applyFeeding() {
+  state.meshes.forEach(removeFeedingOverlay);
+  const f = feedingOf();
+  const i = feedingBody();
+  const field = f?.show && i >= 0 && state.meshes[i] ? feedingField(i) : null;
+  $("feeding-card").dataset.markers = field ? String(field.risers.length + (field.gate ? 1 : 0)) : "0";
+  if (!field) return;
+  const mesh = state.meshes[i];
+  const group = new THREE.Group();
+  const up = new THREE.Vector3(0, 1, 0);
+  for (const riser of field.risers) {
+    const radius = riser.diameter_mm / 2;
+    const geometry = new THREE.CylinderGeometry(radius, radius, riser.height_mm, 40);
+    const material = new THREE.MeshStandardMaterial({
+      color: riser.id === f.selected ? RISER_SELECTED : RISER_COLOR,
+      transparent: true, opacity: 0.6, depthWrite: false, clippingPlanes: [sectionPlane],
+    });
+    const cylinder = new THREE.Mesh(geometry, material);
+    const axis = new THREE.Vector3(...riser.axis).normalize();
+    cylinder.quaternion.setFromUnitVectors(up, axis);
+    // Its base on the part (beside it for a side riser), its height along the axis.
+    const base = new THREE.Vector3(...riser.position_mm);
+    if (riser.offset) base.addScaledVector(new THREE.Vector3(...riser.offset), radius);
+    cylinder.position.copy(base).addScaledVector(axis, riser.height_mm / 2);
+    cylinder.userData.own = true;
+    cylinder.userData.riser = riser.id;
+    group.add(cylinder);
+  }
+  if (field.gate) {
+    // A solid arrow from outside the part, its tip at the ingate: the shaft as thick as the ingate, the cone as wide.
+    const size = Math.max(...state.result.bodies[i].bbox.size);
+    const length = Math.max(2 * (field.gate.width_mm ?? 0), 0.15 * size);
+    const head = 0.35 * length;
+    const coneRadius = Math.max((field.gate.width_mm ?? 0) / 2, 0.02 * size);
+    const shaftRadius = Math.max((field.gate.thickness_mm ?? 0) / 2, 0.008 * size);
+    const dir = new THREE.Vector3(...field.gate.direction).normalize();
+    const tip = new THREE.Vector3(...field.gate.position_mm);
+    const material = new THREE.MeshStandardMaterial({ color: GATE_COLOR, clippingPlanes: [sectionPlane] });
+    const cone = new THREE.Mesh(new THREE.ConeGeometry(coneRadius, head, 32), material);
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftRadius, shaftRadius, length - head, 16), material.clone());
+    for (const [part, along] of [[cone, head / 2], [shaft, head + (length - head) / 2]]) {
+      // Cone and cylinder along +Y: turned to point along the ingate's direction, back from the tip.
+      part.quaternion.setFromUnitVectors(up, dir);
+      part.position.copy(tip).addScaledVector(dir, -along);
+      part.userData.own = true;
+      group.add(part);
+    }
+  }
+  mesh.add(group);
+  mesh.userData.feedingOverlay = group;
+}
+
+// ---- card
+
+const RISER_TYPES = { top: "feeding.type.top", side: "feeding.type.side" };
+
+/** Why a riser or the ingate is there, in the language shown (the engine's `why` is French, for the exports). */
+function feedingWhy(x) {
+  const away = x.near_undercut == null ? "none" : !x.near_undercut && !x.near_riser ? "both" : !x.near_undercut ? "undercut" : !x.near_riser ? "riser" : "none";
+  const params = {
+    sphere: fmtNum(x.zone_sphere_mm, 1), modulus: fmtNum(x.modulus_mm, 2), riser: fmtNum(x.riser_modulus_mm, 2),
+    // A riser's modulus over its zone's; under 1.2 (made smaller by hand), the zone is counted without a riser.
+    ratio: x.modulus_mm > 0 ? fmtNum(x.riser_modulus_mm / x.modulus_mm, 2) : "—",
+    short: x.riser_modulus_mm != null && !feeds(x) ? t("feeding.why.short") : "",
+    wall: fmtNum(x.wall_sphere_mm, 1), thickness: fmtNum(x.thickness_mm, 1), width: fmtNum(x.width_mm, 1),
+    away: t(`feeding.why.away.${away}`),
+  };
+  const key = `feeding.why.${x.reason}`;
+  const text = t(key, params);
+  return text === key ? x.why ?? "" : text;
+}
+
+function renderFeeding() {
+  const card = $("feeding-card");
+  const r = state.result;
+  card.hidden = !r;
+  if (!r) return;
+  const f = feedingOf(r);
+  const p = partingOf(r);
+  // A crosshair while placing on the 3D view (here, or faces of the parting line).
+  renderer.domElement.style.cursor = f.mode || p?.mode ? "crosshair" : "";
+  const i = feedingBody();
+  const field = i >= 0 ? feedingField(i) : null;
+  const named = r.bodies.length > 1 && i >= 0;
+  $("feeding-body").hidden = !named;
+  if (named) $("feeding-body").textContent = t("parting.body", { name: r.bodies[i].name });
+  let status = "";
+  if (i < 0) status = t("feeding.none");
+  else if (!r.bodies[i].closed) status = t("feeding.open");
+  else if (f.pending) status = t("feeding.computing", { percent: f.percent != null ? `${f.percent} %` : "" });
+  else if (f.error) status = t("feeding.error", { message: tMessage(f.error) });
+  else if (p?.pending) status = t("feeding.waitParting");
+  else if (f.results?.[i] && !field) {
+    // Being placed in the worker, or not placed.
+    const placed = f.placed.get(i);
+    status = placed?.error && placed.key === feedingParting(i).key ? t("feeding.error", { message: tMessage(placed.error) }) : t("feeding.placing");
+  }
+  $("feeding-status").hidden = !status;
+  $("feeding-status").textContent = status;
+  $("feeding-retry").hidden = !((f.error && !f.pending) || (i >= 0 && f.placed.get(i)?.error));
+  $("feeding-show").checked = f.show && !!field;
+  $("feeding-show").disabled = !field;
+  $("feeding-main").hidden = !field;
+  card.dataset.status = !field ? "" : field.manual ? "manual" : "proposed";
+  if (!field) return;
+
+  const origin = $("feeding-origin");
+  origin.textContent = t(field.manual ? "parting.manual" : "parting.proposed");
+  origin.classList.toggle("manual", field.manual);
+  $("feeding-count").textContent = String(field.risers.length);
+  // The riser selected gone (another parting line, deleted) or another body: no selection, nothing to move.
+  if (f.body !== i || (f.selected && !field.risers.some((x) => x.id === f.selected))) {
+    f.body = i;
+    f.selected = null;
+    if (f.mode === "move") {
+      f.mode = null;
+      f.message = null;
+      renderer.domElement.style.cursor = p?.mode ? "crosshair" : "";
+    }
+  }
+
+  // The risers: a click selects one (to move, resize or delete it).
+  const zones = field.res.zones;
+  setHtml($("feeding-risers").tBodies[0], field.risers.map((x) => {
+    const zone = zones[x.zone];
+    const weight = x.mass_g == null ? fmtVol(x.volume_mm3) : x.mass_g >= 1000 ? `${fmtNum(x.mass_g / 1000, 2)} kg` : `${fmtNum(x.mass_g, 0)} g`;
+    return `<tr class="${x.id === f.selected ? "selected" : ""}" data-riser="${escapeHtml(x.id)}" title="${escapeHtml(t("feeding.select.title"))}">` +
+      `<td>${escapeHtml(x.id)}<br><span class="muted">${escapeHtml(t(RISER_TYPES[x.type] ?? x.type))}</span></td>` +
+      `<td class="num">${zone ? `${zone.id + 1}<br><span class="muted">Ø ${fmtNum(zone.sphere_mm, 1)}</span>` : "—"}</td>` +
+      `<td class="num">${fmtNum(x.modulus_mm, 2)}</td>` +
+      `<td class="num">${fmtNum(x.diameter_mm, 1)} × ${fmtNum(x.height_mm, 1)}</td>` +
+      `<td class="num">${escapeHtml(weight)}</td></tr>`;
+  }).join("") || `<tr><td colspan="5" class="muted">${escapeHtml(t("feeding.noRiser"))}</td></tr>`);
+
+  const selected = field.risers.find((x) => x.id === f.selected) ?? null;
+  $("feeding-editor").hidden = !selected;
+  $("feeding-why").hidden = !selected;
+  if (selected) {
+    if (document.activeElement !== $("feeding-d")) $("feeding-d").value = selected.diameter_mm;
+    if (document.activeElement !== $("feeding-h")) $("feeding-h").value = selected.height_mm;
+    $("feeding-why").textContent = feedingWhy(selected);
+  }
+  $("feeding-move").classList.toggle("active", f.mode === "move");
+  $("feeding-add").classList.toggle("active", f.mode === "add");
+  $("feeding-gate").classList.toggle("active", f.mode === "gate");
+
+  const g = field.gate;
+  const rows = [
+    // None: no parting line, or no point of it reached from outside the mould.
+    [t("feeding.gate"), g ? `${fmtPoint(g.position_mm)} mm` : t(feedingParting(i).parting?.segments?.length ? "feeding.gate.noneFree" : "feeding.gate.none")],
+    ...(g ? [
+      [t("feeding.gate.section"), t("feeding.gate.sectionValue", { thickness: fmtNum(g.thickness_mm, 1), width: fmtNum(g.width_mm, 1), area: fmtNum(g.section_mm2, 1) })],
+      [t("feeding.gate.wall"), `Ø ${fmtNum(g.wall_sphere_mm, 1)} mm`],
+    ] : []),
+    [t("feeding.yield"), field.yield.value != null ? `${fmtNum(field.yield.value * 100, 1)} %` : "—"],
+    ...(field.without.length ? [[t("feeding.without"), field.without.map((z) => z + 1).join(", ")]] : []),
+  ];
+  setHtml($("feeding-stats"), rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join(""));
+  $("feeding-gate-why").hidden = !g;
+  if (g) $("feeding-gate-why").textContent = feedingWhy(g);
+  const sampled = field.res.sampled;
+  $("feeding-sampled").hidden = !sampled;
+  if (sampled) $("feeding-sampled").textContent = t("feeding.sampled", { samples: fmtNum(sampled.samples, 0), triangles: fmtNum(sampled.triangles, 0) });
+  const hint = f.message ?? (f.mode ? t(`feeding.hint.${f.mode}`) : "");
+  $("feeding-hint").hidden = !hint;
+  $("feeding-hint").textContent = hint;
+  $("feeding-reset").disabled = !field.manual;
+  $("feeding-legend").innerHTML = t("feeding.legend");
+}
+
+/** The risers and ingate of body i of the result shown, for the exports and the semantic contract: {feeding} or {}. */
+function feedingExport(r, i) {
+  if (r !== state.result) return {};
+  const field = feedingOf(r)?.results?.[i] ? feedingField(i, r) : null;
+  if (!field) return {};
+  const { res, placement } = field;
+  return {
+    feeding: {
+      status: field.manual ? "manual" : "proposed",
+      // The risers by hand or proposed, apart from the ingate (its own source).
+      risers_status: field.manualRisers ? "manual" : "proposed",
+      version: res.version ?? FEEDING_VERSION,
+      method: FEEDING_METHOD,
+      draw_direction: placement.direction,
+      parting_known: placement.parting_known,
+      risers: field.risers,
+      gate: field.gate,
+      yield: field.yield,
+      hot_spots_without_riser: field.without,
+      zones: res.zones.map(({ id, sphere_mm, modulus_mm, volume_share, needs_riser, small, hot_spot_mm, necks }) => ({ id, sphere_mm, modulus_mm, volume_share, needs_riser, small, hot_spot_mm, necks: necks.slice(0, 4) })),
+      ...(field.manual ? { proposed: { risers: placement.risers.length, gate_position_mm: placement.gate?.position_mm ?? null } } : {}),
+      neck_ratio: res.neck_ratio ?? null,
+      sphere_source: res.sphere_source ?? null,
+      sampled: res.sampled ?? null,
+      body: res.body,
+    },
+  };
+}
+
+$("feeding-show").addEventListener("change", (e) => {
+  const f = feedingOf();
+  if (!f) return;
+  f.show = e.target.checked;
+  if (!f.show) f.mode = null;
+  applyFeeding();
+  renderFeeding();
+});
+$("feeding-retry").addEventListener("click", () => {
+  const f = feedingOf();
+  if (!f) return;
+  f.error = null;
+  // The placements that failed, asked for again.
+  for (const [i, placed] of f.placed) if (placed.error) f.placed.delete(i);
+  computeFeedings(state.result);
+  refreshFeeding();
+});
+$("feeding-risers").addEventListener("click", (e) => {
+  const row = e.target.closest("[data-riser]");
+  const f = feedingOf();
+  if (!row || !f) return;
+  f.selected = f.selected === row.dataset.riser ? null : row.dataset.riser;
+  if (f.mode === "move") f.mode = null;
+  renderFeeding();
+  applyFeeding();
+});
+$("feeding-add").addEventListener("click", () => setFeedingMode("add"));
+$("feeding-gate").addEventListener("click", () => setFeedingMode("gate"));
+$("feeding-move").addEventListener("click", () => setFeedingMode("move"));
+$("feeding-delete").addEventListener("click", () => {
+  const f = feedingOf();
+  const i = feedingBody();
+  if (!f?.selected || i < 0) return;
+  const id = f.selected;
+  f.selected = null;
+  if (f.mode === "move") f.mode = null;
+  editFeeding(i, (next, field) => {
+    next.risers = manualRisers(field).filter((x) => x.id !== id);
+  });
+});
+/** D or H of the selected riser typed in: its volume, modulus and mass follow. */
+function resizeSelected() {
+  const f = feedingOf();
+  const i = feedingBody();
+  if (!f?.selected || i < 0) return;
+  const diameter = parseFloat($("feeding-d").value);
+  const height = parseFloat($("feeding-h").value);
+  if (!(diameter > 0) || !(height > 0)) return;
+  editFeeding(i, (next, field) => {
+    next.risers = manualRisers(field).map((x) => (x.id === f.selected && (x.diameter_mm !== diameter || x.height_mm !== height) ? resizeRiser(x, { diameter, height }) : x));
+  });
+}
+$("feeding-d").addEventListener("change", resizeSelected);
+$("feeding-h").addEventListener("change", resizeSelected);
+$("feeding-reset").addEventListener("click", () => {
+  const i = feedingBody();
+  if (i >= 0) resetFeeding(i);
+});
+// Esc stops placing on the 3D view.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const f = feedingOf();
+  if (!f?.mode) return;
+  f.mode = null;
+  f.message = null;
+  renderFeeding();
 });
 
 // ---------------------------------------------------------------- tabs
@@ -2485,6 +3194,9 @@ function showTab(tab) {
     renderThickness();
     renderParting();
     restoreParting();
+    restoreFeeding();
+    renderFeeding();
+    applyFeeding();
   } else if (tab.result) {
     showModel(tab.result);
   } else {
@@ -2496,6 +3208,7 @@ function showTab(tab) {
     $("refresh").disabled = true;
     thicknessNewModel();
     renderParting();
+    renderFeeding();
   }
   renderLoading();
   setStatus(tab.loading && !tab.result ? "analysing" : tab.result ? "done" : "idle");
@@ -3078,6 +3791,7 @@ function applyLanguage() {
   renderMemory();
   renderThickness();
   renderParting();
+  renderFeeding();
 }
 
 $("language").addEventListener("change", (e) => {

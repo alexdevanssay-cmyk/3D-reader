@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { before, describe, test } from 'node:test';
 
-import { ballPass, coverPass, engravingMask, mergeMax, prepareMesh, thicknessHistogram, thicknessStats, valueRange, wallOf, wallThickness } from '../../web/engine/thickness.js';
+import { THICKNESS_VERSION, ballPass, coverPass, currentThickness, engravingMask, mergeMax, prepareMesh, thicknessHistogram, thicknessStats, valueRange, wallOf, wallThickness } from '../../web/engine/thickness.js';
 import { approx } from './helpers.mjs';
 
 /** Closed mesh of an extruded polygon (counter-clockwise, star-shaped from `kernel`), z from 0 to h. */
@@ -153,6 +153,36 @@ describe('wall thickness', () => {
     // Largest circle in the junction: through the top of the bar and the two
     // inner corners: diameter 7.5 (3^2 + (6 - r)^2 = r^2 -> r = 3.75).
     near(max, 7.5, 0.15, 'hot spot');
+  });
+
+  test('a rib across a plate: the end faces of the plate read the plate, not its length', () => {
+    // Plate 100 x 10 with a rib 15 wide and 25 high in its middle, extruded 60
+    // mm; the end face x = 0 in two strips, one 1.5 mm under the top. From
+    // there the ray crosses the whole plate (100): the first ball is centred
+    // under the rib, the foot of the rib seen close to the end face from its
+    // centre (8°); it is no edge of the end face, the ball shrinks to the plate.
+    const profile = [[0, 0], [100, 0], [100, 10], [60, 10], [60, 35], [45, 35], [45, 10], [0, 10], [0, 8.5]];
+    const mesh = extrude(profile, 60, [52.5, 5], { divisions: 6 });
+    const { sphere } = wallThickness(mesh.positions, mesh.indices);
+    const [, max] = valueRange(sphere);
+    assert.ok(max < 16, `largest ball ${max}: no larger than the rib and its junction`);
+    const P = mesh.positions, I = mesh.indices;
+    for (let f = 0; f < I.length / 3; f++) {
+      const xs = [0, 1, 2].map((k) => P[3 * I[3 * f + k]]);
+      // At most the plate (a ball tangent off the middle of the end face is smaller).
+      if (xs.every((x) => x === 0)) assert.ok(sphere[f] > 5 && sphere[f] <= 10.2, `end face of the plate: ${sphere[f]}`);
+    }
+  });
+
+  test('kept thickness of another version of the computation (or of none) is not served: computed again', () => {
+    // Version 1 read the end faces of the plate above as long as the plate (100 mm).
+    assert.ok(THICKNESS_VERSION >= 2);
+    const body = { ray: new Float32Array(2), sphere: new Float32Array(2), wall: new Float32Array(2) };
+    assert.equal(currentThickness([{ ...body, version: THICKNESS_VERSION }, null]), true);
+    assert.equal(currentThickness([null]), true, 'open bodies only: nothing computed');
+    assert.equal(currentThickness([body, null]), false, 'kept before the version');
+    assert.equal(currentThickness([{ ...body, version: 1 }]), false, 'by version 1');
+    assert.equal(currentThickness(null), false);
   });
 
   test('thinnest wall: the ends of a bar do not count as thin walls', () => {

@@ -16,6 +16,17 @@
 // Both use a bounding volume hierarchy of the triangles (N log N in all).
 // Plain JavaScript without imports: it runs in the engine worker.
 
+// Version of the values, kept with them (in this browser and on the network
+// folder): a thickness of another version, or of none, is computed again.
+// 2: the separation angle of the shrinking ball at its new centre (version 1
+// read the end faces of a plate with a boss or a rib as long as the part).
+export const THICKNESS_VERSION = 2;
+
+/** Whether kept thickness results (per body {ray, sphere, wall, version} or null) are of this version. */
+export function currentThickness(results) {
+  return Array.isArray(results) && results.every((t) => t === null || t?.version === THICKNESS_VERSION);
+}
+
 const LEAF_SIZE = 8;
 const EDGE_MARGIN = 1e-7;
 const MAX_ITERATIONS = 40;
@@ -126,8 +137,10 @@ export function edgeNeighbours(nv, indices, alloc = (Type, n) => new Type(n)) {
  * Returns {ray, sphere} (Float32Array of all the triangles, NaN outside the
  * range; sphere can also be set on a neighbour) and the balls found, for the
  * second pass: samples, Float32Array of [x, y, z, outward nx, ny, nz, diameter].
+ * list -- optional: the triangles list[from..to-1] instead (a sample of a
+ *         large mesh, feeding.js), each with all its smooth edges.
  */
-export function ballPass(mesh, from, to, onProgress = null, store = null) {
+export function ballPass(mesh, from, to, onProgress = null, store = null, list = null) {
   const { positions, indices, normals, neighbours, query, diag } = mesh;
   const nt = indices.length / 3;
   // Where the values go: arrays of this range, or the arrays shared by the workers.
@@ -157,10 +170,13 @@ export function ballPass(mesh, from, to, onProgress = null, store = null) {
       const pq2 = ux * ux + uy * uy + uz * uz;
       const along = ux * n[0] + uy * n[1] + uz * n[2];
       if (along <= 0 || pq2 <= eps * eps) break;
-      // Angle p-c-q: a contact point next to p is p's own edge, not the opposite wall.
-      const cos = ((p[0] - c[0]) * (q[0] - c[0]) + (p[1] - c[1]) * (q[1] - c[1]) + (p[2] - c[2]) * (q[2] - c[2])) / (r * Math.max(Math.sqrt(d2), eps));
-      if (Math.acos(Math.max(-1, Math.min(1, cos))) < MIN_SEPARATION) break;
       const next = pq2 / (2 * along); // ball tangent at p through q
+      // Angle p-c'-q at the centre c' of that ball (Ma et al.): a contact point
+      // next to p is p's own edge, not the opposite wall. q is on that ball, so
+      // cos = 1 - along / next (twice the elevation of q over the tangent plane
+      // at p). Not at the centre of the ball before: seen from far, a concave
+      // edge across the part looks next to p, and the ball would not shrink.
+      if (Math.acos(Math.max(-1, Math.min(1, 1 - along / next))) < MIN_SEPARATION) break;
       if (!(next < r)) break;
       r = next;
     }
@@ -193,8 +209,9 @@ export function ballPass(mesh, from, to, onProgress = null, store = null) {
   // than 30° (the edges of a CAD face belong to one triangle of its vertices).
 
   const every = Math.max(1, Math.floor((to - from) / 100));
-  for (let f = from; f < to; f++) {
-    if (onProgress && (f - from) % every === 0) onProgress((f - from) / (to - from));
+  for (let s = from; s < to; s++) {
+    if (onProgress && (s - from) % every === 0) onProgress((s - from) / (to - from));
+    const f = list ? list[s] : s;
     n[0] = -normals[3 * f];
     n[1] = -normals[3 * f + 1];
     n[2] = -normals[3 * f + 2];
@@ -210,7 +227,8 @@ export function ballPass(mesh, from, to, onProgress = null, store = null) {
     for (let e = 0; e < 3; e++) {
       const i = indices[3 * f + e], j = indices[3 * f + ((e + 1) % 3)];
       const second = neighbours[3 * f + e];
-      if (second < f) continue; // free or shared by more than two triangles (< 0), or done from the other triangle
+      // Free or shared by more than two triangles (< 0), or done from the other triangle (not in a list: its neighbour may not be in it).
+      if (second < 0 || (!list && second < f)) continue;
       const g = 3 * second;
       let dot = 0;
       for (let k = 0; k < 3; k++) dot += normals[3 * f + k] * normals[g + k];

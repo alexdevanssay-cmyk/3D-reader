@@ -284,6 +284,20 @@ table.parting-candidates input { margin: 0; }
 #parting-status, #parting-body { margin: 2px 0 6px; }
 .parting-legend { margin: 8px 0 0; line-height: 1.9; }
 .parting-legend .swatch { margin-left: 4px; margin-right: 3px; }
+/* Risers and gating: the same look as the parting line card. */
+table.feeding-risers { table-layout: fixed; }
+table.feeding-risers th:first-child, table.feeding-risers td:first-child { width: 28%; }
+table.feeding-risers td .muted { font-size: 11px; }
+table.feeding-risers tr.selected td { background: color-mix(in srgb, var(--select) 22%, transparent); }
+.feeding-editor { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.feeding-editor label { display: inline-flex; align-items: center; gap: 4px; }
+.feeding-editor input { width: 64px; }
+#feeding-stats { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+#feeding-stats dd { overflow-wrap: anywhere; }
+#feeding-reset { margin-top: 8px; }
+#feeding-hint { margin: 6px 0 0; color: var(--accent); }
+#feeding-why, #feeding-gate-why { margin: 6px 0 0; }
+#feeding-status, #feeding-body { margin: 2px 0 6px; }
 .linklike { background: none; border: 0; padding: 0; color: inherit; font: inherit; text-decoration: underline dotted; cursor: pointer; }
 .linklike:hover { color: var(--accent, #4f8cff); }
 
