@@ -141,6 +141,8 @@ function partingEvidence(body) {
   if (!p || (p.status !== "proposed" && p.status !== "manual") || !finite(p.undercut_area_mm2)) return { status: "not_evaluated" };
   return {
     status: p.status,
+    // How a manual one was defined: a candidate, a face, a direction typed, or "drawn" (the line drawn by hand on the part).
+    source: p.source ?? null,
     axis: p.axis ?? null,
     direction: p.direction ?? null,
     draft_angle_deg: p.draft_angle_deg ?? null,
@@ -285,6 +287,8 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
 
   if (partingKnown) {
     confirmedEvidence.push(parting.status === "manual" ? "parting_line_defined_manually" : "parting_line_proposed_from_geometry");
+    // Its points placed on the part by hand, the halves given by part (not classified by lines of sight).
+    if (parting.source === "drawn") confirmedEvidence.push("parting_line_drawn_by_hand");
     if (undercut) {
       risks.push(issue(
         "undercut_requires_core_or_slide",
