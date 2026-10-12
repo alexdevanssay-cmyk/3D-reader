@@ -131,8 +131,10 @@ function partingEvidence(body) {
   };
 }
 
-const pct = (share) => `${(Math.round(share * 1000) / 10).toLocaleString("fr-FR")} %`;
+// A share above 0 but below 0,05 %: not "0 %" (a risk raised for it would contradict itself).
+const pct = (share) => (share > 0 && share < 0.0005 ? "< 0,1 %" : `${(Math.round(share * 1000) / 10).toLocaleString("fr-FR")} %`);
 const mm = (v) => `${(Math.round(v * 10) / 10).toLocaleString("fr-FR")} mm`;
+const mm2 = (v) => `${(Math.round(v * 10) / 10).toLocaleString("fr-FR")} mm²`;
 
 function issue(code, severity, basis, message, source_ids = [], extra = {}) {
   return { code, severity, basis, message, source_ids, ...extra };
@@ -228,7 +230,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
         "undercut_requires_core_or_slide",
         "review",
         "measured_line_of_sight_along_draw_direction",
-        `${pct(parting.undercut_share ?? 0)} de la surface ne se démoule par aucun des deux demi-moules selon la direction ${parting.axis ?? "choisie"} : noyaux ou tiroirs, ou une autre direction; à confirmer avec l'outillage.`,
+        `${pct(parting.undercut_share ?? 0)} de la surface (${mm2(parting.undercut_area_mm2)}) ne se démoule par aucun des deux demi-moules selon la direction ${parting.axis ?? "choisie"} : noyaux ou tiroirs, ou une autre direction ; à confirmer avec l'outillage.`,
         ["sfsa_design_steps","sfsa_handbook_supplement_1"],
         { undercut_area_mm2: parting.undercut_area_mm2 },
       ));
@@ -238,7 +240,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
         "zero_draft_faces",
         "review",
         "measured_face_angle_to_draw_direction",
-        `${pct(parting.zero_draft_share ?? 0)} de la surface est à moins de ${parting.draft_angle_deg ?? 1}° de la direction de démoulage : dépouille à ajouter ou à confirmer avec la fonderie.`,
+        `${pct(parting.zero_draft_share ?? 0)} de la surface (${mm2(parting.zero_draft_area_mm2)}) est à moins de ${parting.draft_angle_deg ?? 1}° de la direction de démoulage : dépouille à ajouter ou à confirmer avec la fonderie.`,
         ["sfsa_design_steps"],
         { zero_draft_area_mm2: parting.zero_draft_area_mm2 },
       ));

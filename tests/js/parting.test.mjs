@@ -5,8 +5,8 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import {
-  SIDE_LOWER, SIDE_UPPER, applyOverrides, axisLabel, canonicalAxis, evaluateParting, faceRegions,
-  lineMesh, lineSummary, partingLine, proposeParting, sampleByArea,
+  REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_UPPER, applyOverrides, axisLabel, canonicalAxis, evaluateParting, faceRegions,
+  lineMesh, lineSummary, parseDirection, partingLine, proposeParting, sameDirection, sampleByArea,
 } from '../../web/engine/parting.js';
 import { approx } from './helpers.mjs';
 
@@ -241,6 +241,53 @@ describe('draw direction proposed from the geometry', () => {
     approx(counts[1] / counts[0], 9, 0.15, 0, 'draws by area');
   });
 
+  test('a large mesh: a candidate whose line was never classified does not rank as planar', () => {
+    // Two blocks apart: the two candidates with the least zero-draft surface
+    // have a stepped or warped line, those not classified on every triangle
+    // must not win as if theirs were planar.
+    const mesh = voxels((x, y, z) => (x === 3 && y < 3 && z < 3) || (x === 0 && y === 3 && z === 2), [4, 4, 3], { size: 5 });
+    const nt = mesh.indices.length / 3;
+    const full = proposeParting(mesh.positions, mesh.indices).proposal;
+    assert.deepEqual([full.axis, full.parting.kind, full.undercut_area_mm2], ['Z', 'planar', 0]);
+    const { proposal } = proposeParting(mesh.positions, mesh.indices, { fullLimit: 10, samples: 30 * nt });
+    assert.ok(proposal.sampled);
+    assert.deepEqual([proposal.axis, proposal.parting.kind, proposal.undercut_area_mm2], ['Z', 'planar', 0]);
+    // Its principal axis (0, -0.447, 0.894) has the least zero-draft surface, but a warped line.
+    const oblique = proposal.candidates.find((c) => c.source === 'principal_axis' && c.zero_draft_area_mm2 < proposal.zero_draft_area_mm2 && c.undercut_area_mm2 === 0);
+    assert.equal(oblique?.parting?.kind, 'warped', JSON.stringify(proposal.candidates.map((c) => c.axis)));
+  });
+
+  test('a large mesh: the direction chosen shows the areas of its faces classified on every triangle', () => {
+    // A plate 200 × 200 × 15 mm with a pocket 5 mm square in its side: 125 mm²
+    // of undercut along Z, missed by 300 triangles drawn by area.
+    const mesh = voxels((x, y, z) => !(x === 0 && y === 20 && z === 1), [40, 40, 3], { size: 5, subdivide: 2 });
+    const { proposal, flags } = proposeParting(mesh.positions, mesh.indices, { fullLimit: 10, samples: 300 });
+    assert.ok(proposal.sampled);
+    assert.equal(proposal.axis, 'Z');
+    approx(proposal.undercut_area_mm2, 125, 1e-9, 0, 'undercut');
+    // The area of the triangles flagged undercut (shown in red), the same.
+    const P = mesh.positions, I = mesh.indices;
+    let red = 0;
+    flags.forEach((flag, f) => {
+      if (flag & (REACH_UP | REACH_DOWN)) return;
+      const [a, b, c] = [0, 1, 2].map((k) => 3 * I[3 * f + k]);
+      const u = [0, 1, 2].map((k) => P[b + k] - P[a + k]), v = [0, 1, 2].map((k) => P[c + k] - P[a + k]);
+      red += Math.hypot(u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]) / 2;
+    });
+    approx(red, 125, 1e-9, 0, 'undercut triangles');
+    assert.equal(proposal.undercut_share, proposal.candidates[proposal.candidate_index].undercut_share);
+  });
+
+  test('a planar line with a short detour: at the height most of it is at', () => {
+    // A plate 800 × 800 × 10 mm, a post 20 mm square on its edge and a lip on
+    // top of it, at z = 30, overhanging the edge by 10 mm: 3180 of the 3280 mm
+    // of its line at z = 0, the rest round the lip.
+    const mesh = voxels((x, y, z) => (z === 0 && x < 80) || (x >= 78 && x < 80 && y < 2 && (z === 1 || z === 2)) || (x >= 78 && y < 2 && z === 3), [81, 80, 4], { size: 10 });
+    const { summary } = evaluateParting(mesh.positions, mesh.indices, [0, 0, 1]);
+    assert.deepEqual([summary.parting.planar, summary.parting.height_range_mm, summary.parting.length_mm], [true, 30, 3280]);
+    assert.equal(summary.parting.level_mm, 0);
+  });
+
   test('a direction given by hand: its undercuts and its line', () => {
     const mesh = voxels((x, y, z) => !(x >= 4 && x < 6 && z >= 1 && z < 3), [10, 6, 4], { size: 5 });
     const { summary, side, flags } = evaluateParting(mesh.positions, mesh.indices, [0, 0, -2]);
@@ -286,6 +333,39 @@ describe('faces reassigned by hand', () => {
     // Back to the proposal: no face moved.
     const back = partingLine(lineMesh(mesh.positions, mesh.indices), applyOverrides(side, region, {}), proposal.direction, { flags, plane, height: 20 });
     assert.deepEqual(lineSummary(back), proposal.parting);
+  });
+
+  test('directions typed in: components (a decimal point or comma), as axisLabel writes them, or an axis', () => {
+    assert.deepEqual(parseDirection('0 0 1'), [0, 0, 1]);
+    assert.deepEqual(parseDirection('-z'), [0, 0, -1]);
+    assert.deepEqual(parseDirection('1,0,0'), [1, 0, 0]);
+    assert.deepEqual(parseDirection('1, 0, 0'), [1, 0, 0]);
+    for (const text of ['0.6, 0, 0.8', '0.6,0,0.8', '(0.6, 0, 0.8)', '0,6 0 0,8', '0,6; 0; 0,8', '0,6, 0, 0,8', '0.6 0 0.8']) {
+      const d = parseDirection(text);
+      assert.ok(d, text);
+      approx(d[0], 0.6, 0, 1e-12, text);
+      approx(d[2], 0.8, 0, 1e-12, text);
+    }
+    // The card's own label of an oblique axis, typed back in.
+    const tilted = canonicalAxis([0.458, -0.296, 0.838]);
+    assert.ok(sameDirection(parseDirection(axisLabel(tilted)), tilted));
+    for (const text of ['', '0 0', '1 2 3 4', 'a b c', '0.5.1 0 0']) assert.equal(parseDirection(text), null, text);
+  });
+
+  test('the same direction: whatever the length of the vectors (rounded to 6 decimals)', () => {
+    const r = [0.267261, 0.534522, 0.801784]; // (1, 2, 3) rounded: |r|² = 0.99999979
+    assert.ok(sameDirection(r, r));
+    const d = canonicalAxis([1, 2, 3]);
+    assert.ok(sameDirection(d, r) && sameDirection(r, d));
+    assert.ok(!sameDirection(r, r.map((x) => -x)));
+    assert.ok(!sameDirection([0, 0, 1], [0, Math.sin(1e-3), Math.cos(1e-3)]));
+    // Every unit vector, rounded as the JSON gives it, is its own direction.
+    let seed = 1;
+    const next = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 2 - 1;
+    for (let k = 0; k < 2000; k++) {
+      const v = canonicalAxis([next(), next(), next()]);
+      if (v) assert.ok(sameDirection(v.map((x) => Math.round(x * 1e6) / 1e6), v), v.join());
+    }
   });
 
   test('axes: one sense, the frame axes by name', () => {
