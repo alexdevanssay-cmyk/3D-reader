@@ -310,4 +310,78 @@ describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html
     assert.deepEqual(errors, []);
     await context.close();
   });
+
+  test('two identical bodies, one over the other: the risers of the card\'s body shown with the parting line, a click places them on it', { timeout: CAD_TIMEOUT }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 } });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    // Two versions of a block 80 × 40 × 20 mm, in the same place: an ASCII STL of two solids.
+    const facets = [];
+    const v = (i) => [i & 1 ? 80 : 0, i & 2 ? 40 : 0, i & 4 ? 20 : 0];
+    for (const q of [[0, 4, 6, 2], [1, 3, 7, 5], [0, 1, 5, 4], [2, 6, 7, 3], [0, 2, 3, 1], [4, 5, 7, 6]]) {
+      for (const t of [[q[0], q[1], q[2]], [q[0], q[2], q[3]]]) facets.push(`facet normal 0 0 0\nouter loop\n${t.map((k) => `vertex ${v(k).join(' ')}`).join('\n')}\nendloop\nendfacet`);
+    }
+    const stl = ['first', 'second'].map((name) => `solid ${name}\n${facets.join('\n')}\nendsolid ${name}`).join('\n');
+    await page.setInputFiles('#file-input', { name: 'two_versions.stl', mimeType: 'text/plain', buffer: Buffer.from(stl) });
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    assert.equal(await page.evaluate(() => window.reader3d.result.bodies.length), 2);
+    // The card on the second one (under the first one, for the ray of a click).
+    await page.click('#bodies tr[data-index="1"] td.name');
+    await page.waitForFunction(() => document.getElementById('feeding-card').dataset.status === 'proposed', null, { timeout: 60_000 });
+    await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
+    const faded = () => page.evaluate(() => document.getElementById('viewport').dataset.faded);
+    // Orange pixels of the 3D view: the risers.
+    const orange = async () => {
+      await page.waitForTimeout(300);
+      const png = await page.locator('#viewport canvas').screenshot();
+      return page.evaluate(async (b64) => {
+        const img = new Image();
+        img.src = `data:image/png;base64,${b64}`;
+        await img.decode();
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const g = canvas.getContext('2d');
+        g.drawImage(img, 0, 0);
+        const { data } = g.getImageData(0, 0, canvas.width, canvas.height);
+        let n = 0;
+        for (let i = 0; i < data.length; i += 4) if (data[i] > 170 && data[i] - data[i + 2] > 70 && data[i] - data[i + 1] > 35 && data[i + 1] > 90) n++;
+        return n;
+      }, png.toString('base64'));
+    };
+
+    // Both displays on: the markers on the card's body, visible inside the upper half of the mould; the other body faded.
+    await page.check('#parting-show');
+    assert.equal(await page.evaluate(() => document.getElementById('parting-card').dataset.overlay), 'lower upper line');
+    const before = await orange();
+    await page.check('#feeding-show');
+    assert.equal((await page.evaluate(() => document.getElementById('feeding-card').dataset.markers)), '2');
+    assert.equal(await faded(), '1');
+    const shown = await orange();
+    assert.ok(shown > before + 2000, `the riser seen through the upper half: ${before} -> ${shown} orange pixels`);
+    // The parting line hidden: the risers still shown, the other body still faded.
+    await page.uncheck('#parting-show');
+    assert.equal(await faded(), '1');
+    await page.check('#parting-show');
+
+    // A riser added by a click on the front face: on the card's body, though the ray meets the other one first.
+    await page.click('#feeding-add');
+    await page.click('[data-view="front"]');
+    const view = await page.locator('#viewport canvas').boundingBox();
+    await page.mouse.click(view.x + view.width / 2, view.y + view.height / 2);
+    await page.waitForFunction(() => document.getElementById('feeding-card').dataset.status === 'manual', null, { timeout: 30_000 });
+    assert.equal(await page.isVisible('#feeding-hint'), false);
+    const risers = await page.evaluate(() => window.reader3d.semantic.bodies.map((b) => (b.feeding?.risers ?? []).map((r) => r.id)));
+    assert.ok(risers[1].includes('M1') && !risers[0].includes('M1'), JSON.stringify(risers));
+    assert.equal(await page.evaluate(() => document.getElementById('feeding-card').dataset.markers), '3');
+
+    // Both displays off: no body faded.
+    await page.uncheck('#parting-show');
+    await page.uncheck('#feeding-show');
+    assert.equal(await faded(), '0');
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
 });

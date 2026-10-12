@@ -879,9 +879,213 @@ export function applyOverrides(side, region, overrides) {
   return out;
 }
 
+// ------------------------------------------------------------------ mould halves
+
+// Margin of the halves of the mould shown round a body: the larger of these.
+const BLOCK_MARGIN_MM = 5;
+const BLOCK_MARGIN_SHARE = 0.15; // of its largest size
+// Interface of a line that is not planar: heights at the nodes of a grid of
+// at most this many cells a side, from at most this many points of the line.
+export const BLOCK_GRID = 48;
+export const BLOCK_POINTS = 2048;
+
+/**
+ * At most `max` points spread evenly along segments (xyz of both ends of
+ * each piece; a long straight edge of a CAD body is one piece), as xyz.
+ */
+function pointsAlong(segments, max) {
+  const m = segments ? Math.floor(segments.length / 6) : 0;
+  let total = 0;
+  for (let k = 0; k < m; k++) {
+    const s = 6 * k;
+    total += Math.hypot(segments[s + 3] - segments[s], segments[s + 4] - segments[s + 1], segments[s + 5] - segments[s + 2]);
+  }
+  if (!m || !(total > 0)) return new Float64Array(m ? 3 : 0).map((_, c) => segments[c]);
+  const step = total / max;
+  const out = new Float64Array(3 * max);
+  let n = 0;
+  let next = step / 2; // the middle of each step
+  let walked = 0;
+  for (let k = 0; k < m && n < max; k++) {
+    const s = 6 * k;
+    const len = Math.hypot(segments[s + 3] - segments[s], segments[s + 4] - segments[s + 1], segments[s + 5] - segments[s + 2]);
+    while (next <= walked + len && n < max) {
+      const t = len > 0 ? (next - walked) / len : 0;
+      for (let c = 0; c < 3; c++) out[3 * n + c] = segments[s + c] + t * (segments[s + 3 + c] - segments[s + c]);
+      n++;
+      next += step;
+    }
+    walked += len;
+  }
+  return out.subarray(0, 3 * n);
+}
+
+/**
+ * The two halves of the mould round a body, to show: two closed triangle
+ * meshes (blocks), the lower one under the parting surface, the upper one
+ * over it. In the frame of the draw direction d and two axes u, v square to
+ * it: their footprint is the extent of the body across d plus a margin (the
+ * larger of 5 mm and 15 % of its largest size); the lower block goes from
+ * the margin under the body up to the parting surface, the upper one from it
+ * to the margin over the body. The parting surface is flat at the height of
+ * a planar line (`level`, clamped to the extent of the body along d: -/+
+ * Infinity under or over it); else a height field over a grid of at most 48
+ * cells a side, interpolated from points spread along the line (inverse
+ * distance weighting, at most 2048 points; the height of a node follows the
+ * points nearest to it), within the extent of the body along d. Without a
+ * line nor a level: under the body.
+ *
+ * positions -- of the body (xyz, mm); only its extent is used
+ * direction -- the draw direction (the upper half leaves along it)
+ * segments -- of its parting line (xyz of both ends of each piece), or null
+ * level -- height along d of a planar line (in the frame of the positions), or null
+ * Returns {lower, upper: {positions (Float32Array), indices (Uint32Array),
+ * edges (Float32Array, xyz of both ends of each: the outlines of its two
+ * faces, its vertical corners)}, frame: {d, u, v}, cells: [nu, nv], heights (Float64Array, along d, of the
+ * (nu + 1) × (nv + 1) nodes of the interface, node (i, j) at i × (nv + 1) +
+ * j), extent: {u, v, w: [min, max] of the body}, margin}; null for a body
+ * without vertices or a direction of no length.
+ */
+export function mouldBlocks(positions, direction, { segments = null, level = null, grid = BLOCK_GRID, points = BLOCK_POINTS } = {}) {
+  const d = normalize(direction);
+  const nv = Math.floor(positions.length / 3);
+  if (!d || !nv) return null;
+  const [u, v] = basis(d);
+  let umin = Infinity, umax = -Infinity, vmin = Infinity, vmax = -Infinity, wmin = Infinity, wmax = -Infinity;
+  for (let i = 0; i < nv; i++) {
+    const x = positions[3 * i], y = positions[3 * i + 1], z = positions[3 * i + 2];
+    const a = x * u[0] + y * u[1] + z * u[2], b = x * v[0] + y * v[1] + z * v[2], w = x * d[0] + y * d[1] + z * d[2];
+    if (a < umin) umin = a;
+    if (a > umax) umax = a;
+    if (b < vmin) vmin = b;
+    if (b > vmax) vmax = b;
+    if (w < wmin) wmin = w;
+    if (w > wmax) wmax = w;
+  }
+  const margin = Math.max(BLOCK_MARGIN_MM, BLOCK_MARGIN_SHARE * Math.max(umax - umin, vmax - vmin, wmax - wmin));
+  const u0 = umin - margin, v0 = vmin - margin;
+  const W = umax - umin + 2 * margin, H = vmax - vmin + 2 * margin;
+  const bottom = wmin - margin, top = wmax + margin;
+  const clamp = (h) => (h > wmax ? wmax : h >= wmin ? h : wmin); // NaN: under the body
+
+  // The interface: flat (one cell), or heights from the points of the line.
+  const along = level == null ? pointsAlong(segments, Math.max(1, points)) : null;
+  let nu = 1, nvv = 1;
+  let heights;
+  if (!along?.length) {
+    heights = new Float64Array(4).fill(clamp(level ?? -Infinity));
+  } else {
+    // Cells about square: `grid` along the longer side of the footprint.
+    const g = Math.max(2, Math.floor(grid));
+    nu = W >= H ? g : Math.max(2, Math.round((g * W) / H));
+    nvv = H >= W ? g : Math.max(2, Math.round((g * H) / W));
+    const n = along.length / 3;
+    const pa = new Float64Array(n), pb = new Float64Array(n), pw = new Float64Array(n);
+    for (let k = 0; k < n; k++) {
+      const x = along[3 * k], y = along[3 * k + 1], z = along[3 * k + 2];
+      pa[k] = x * u[0] + y * u[1] + z * u[2];
+      pb[k] = x * v[0] + y * v[1] + z * v[2];
+      pw[k] = x * d[0] + y * d[1] + z * d[2];
+    }
+    // Weights 1 / r⁶: a node near the line takes its height there (flat by a
+    // level run of it), between two runs the surface goes from one height to
+    // the other.
+    const eps = (1e-3 * Math.max(W / nu, H / nvv)) ** 2;
+    heights = new Float64Array((nu + 1) * (nvv + 1));
+    for (let i = 0; i <= nu; i++) {
+      const a = u0 + (W * i) / nu;
+      for (let j = 0; j <= nvv; j++) {
+        const b = v0 + (H * j) / nvv;
+        let sum = 0, weights = 0;
+        for (let k = 0; k < n; k++) {
+          const da = a - pa[k], db = b - pb[k];
+          const r2 = da * da + db * db + eps;
+          const weight = 1 / (r2 * r2 * r2);
+          weights += weight;
+          sum += weight * pw[k];
+        }
+        heights[i * (nvv + 1) + j] = clamp(sum / weights);
+      }
+    }
+  }
+
+  // Each block: the interface nodes, then the same nodes on its flat face
+  // (under the body for the lower one, over it for the upper one), the walls
+  // between their outlines. Triangles turned outwards ((u, v, d) is right-handed).
+  const nodes = (nu + 1) * (nvv + 1);
+  const at = (i, j) => i * (nvv + 1) + j;
+  const outline = [];
+  for (let i = 0; i < nu; i++) outline.push(at(i, 0));
+  for (let j = 0; j < nvv; j++) outline.push(at(nu, j));
+  for (let i = nu; i > 0; i--) outline.push(at(i, nvv));
+  for (let j = nvv; j > 0; j--) outline.push(at(0, j));
+  const block = (flat, interfaceOnTop) => {
+    const P = new Float32Array(6 * nodes);
+    for (let i = 0; i <= nu; i++) {
+      const a = u0 + (W * i) / nu;
+      for (let j = 0; j <= nvv; j++) {
+        const b = v0 + (H * j) / nvv;
+        const k = at(i, j);
+        for (const [node, w] of [[k, heights[k]], [k + nodes, flat]]) {
+          for (let c = 0; c < 3; c++) P[3 * node + c] = a * u[c] + b * v[c] + w * d[c];
+        }
+      }
+    }
+    const I = new Uint32Array(3 * (4 * nu * nvv + 2 * outline.length));
+    let t = 0;
+    const tri = (a, b, c) => {
+      I[t++] = a;
+      I[t++] = b;
+      I[t++] = c;
+    };
+    for (let i = 0; i < nu; i++) {
+      for (let j = 0; j < nvv; j++) {
+        const p00 = at(i, j), p10 = at(i + 1, j), p11 = at(i + 1, j + 1), p01 = at(i, j + 1);
+        // Seen from +d, (p00, p10, p11) turns counter-clockwise: its normal is +d.
+        const [top, under] = interfaceOnTop ? [0, nodes] : [nodes, 0];
+        tri(p00 + top, p10 + top, p11 + top);
+        tri(p00 + top, p11 + top, p01 + top);
+        tri(p00 + under, p11 + under, p10 + under);
+        tri(p00 + under, p01 + under, p11 + under);
+      }
+    }
+    // The outline turns counter-clockwise seen from +d: (q - p) × d points outwards.
+    for (let k = 0; k < outline.length; k++) {
+      const p = outline[k], q = outline[(k + 1) % outline.length];
+      const [lo, hi] = interfaceOnTop ? [nodes, 0] : [0, nodes];
+      tri(p + lo, q + lo, q + hi);
+      tri(p + lo, q + hi, p + hi);
+    }
+    // Its edges, to draw: the outlines of its two faces and its four vertical corners.
+    const E = new Float32Array(6 * (2 * outline.length + 4));
+    let e = 0;
+    const edge = (a, b) => {
+      E.set(P.subarray(3 * a, 3 * a + 3), e);
+      E.set(P.subarray(3 * b, 3 * b + 3), e + 3);
+      e += 6;
+    };
+    for (let k = 0; k < outline.length; k++) {
+      const p = outline[k], q = outline[(k + 1) % outline.length];
+      edge(p, q);
+      edge(p + nodes, q + nodes);
+    }
+    for (const c of [at(0, 0), at(nu, 0), at(nu, nvv), at(0, nvv)]) edge(c, c + nodes);
+    return { positions: P, indices: I, edges: E };
+  };
+  return {
+    lower: block(bottom, true),
+    upper: block(top, false),
+    frame: { d, u, v },
+    cells: [nu, nvv],
+    heights,
+    extent: { u: [umin, umax], v: [vmin, vmax], w: [wmin, wmax] },
+    margin,
+  };
+}
+
 // ------------------------------------------------------------------ directions
 
-const round = (v, digits = 3) => (Number.isFinite(v) ? Math.round(v * 10 ** digits) / 10 ** digits : v ?? null);
+const round =(v, digits = 3) => (Number.isFinite(v) ? Math.round(v * 10 ** digits) / 10 ** digits : v ?? null);
 
 /** The JSON of a parting line (without its segments). */
 export function lineSummary(l) {

@@ -48,6 +48,79 @@ function blocksObj() {
   return Buffer.from([...lines, ...faces, ''].join('\n'));
 }
 
+/**
+ * An OBJ of the union of cubes `size` mm (cells x, y, z of an nx × ny × nz
+ * grid where filled(x, y, z)), each body a material: bodies [[material,
+ * filled, [dx, dy, dz] (its offset in mm)], …]; each square face counter-clockwise seen from outside.
+ */
+function voxelsObj(bodies, [nx, ny, nz], size) {
+  const lines = [];
+  const faces = [];
+  let count = 0;
+  for (const [material, filled, offset = [0, 0, 0]] of bodies) {
+    const at = (x, y, z) => x >= 0 && y >= 0 && z >= 0 && x < nx && y < ny && z < nz && filled(x, y, z);
+    const ids = new Map();
+    const vertex = (p) => {
+      const key = p.join(',');
+      if (!ids.has(key)) {
+        lines.push(`v ${p.map((c, k) => c * size + offset[k]).join(' ')}`);
+        ids.set(key, ++count);
+      }
+      return ids.get(key);
+    };
+    faces.push(`usemtl ${material}`);
+    for (let x = 0; x < nx; x++) for (let y = 0; y < ny; y++) for (let z = 0; z < nz; z++) {
+      if (!at(x, y, z)) continue;
+      for (let k = 0; k < 3; k++) for (const s of [-1, 1]) {
+        const q = [x, y, z];
+        q[k] += s;
+        if (at(...q)) continue;
+        const a = (k + 1) % 3, b = (k + 2) % 3;
+        const base = [x, y, z];
+        if (s > 0) base[k] += 1;
+        const corner = (da, db) => {
+          const p = [...base];
+          p[a] += da;
+          p[b] += db;
+          return vertex(p);
+        };
+        const quad = [corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1)];
+        faces.push(`f ${(s > 0 ? quad : quad.reverse()).join(' ')}`);
+      }
+    }
+  }
+  return Buffer.from([...lines, ...faces, ''].join('\n'));
+}
+
+/**
+ * Pixels of the 3D view by colour: red (the parting line), yellow (the
+ * undercuts), bluish and greenish (the halves of the mould over the page).
+ */
+async function viewColours(page) {
+  await page.waitForTimeout(300); // a frame drawn
+  const png = await page.locator('#viewport canvas').screenshot();
+  return page.evaluate(async (b64) => {
+    const img = new Image();
+    img.src = `data:image/png;base64,${b64}`;
+    await img.decode();
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const g = canvas.getContext('2d');
+    g.drawImage(img, 0, 0);
+    const { data } = g.getImageData(0, 0, canvas.width, canvas.height);
+    const n = { red: 0, yellow: 0, blue: 0, green: 0 };
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i], gr = data[i + 1], b = data[i + 2];
+      if (r > 170 && gr < 80 && b < 80) n.red++;
+      else if (r > 150 && gr > 120 && b < 80 && r - b > 100) n.yellow++;
+      else if (b > r + 25 && b > gr + 10) n.blue++;
+      else if (gr > r + 15 && gr > b + 5) n.green++;
+    }
+    return n;
+  }, png.toString('base64'));
+}
+
 describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) && 'run `npm run build` first' }, () => {
   let server;
   let base;
@@ -278,6 +351,143 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     await page.waitForFunction(() => window.reader3d.tab.file === 'blocks.obj', null, { timeout: 10_000 });
     assert.equal(await page.evaluate(() => document.getElementById('toggle-thickness').classList.contains('active')), true);
     assert.equal(await page.isChecked('#parting-show'), false);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('shown: the halves of the mould as translucent blocks, the line thick and red, the undercuts yellow; "Mould halves" hides the blocks', { timeout: CAD_TIMEOUT }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 } });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    // A block 60 × 40 × 40 mm with a slot 40 wide, 20 deep and 10 high in its front face (y = 0): drawn along Z, the slot is an undercut.
+    const slotted = voxelsObj([['a', (x, y, z) => !(x >= 2 && x < 10 && y < 4 && z >= 3 && z < 5)]], [12, 8, 8], 5);
+    await page.setInputFiles('#file-input', { name: 'slotted.obj', mimeType: 'text/plain', buffer: slotted });
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
+    await page.click('#parting-candidates tr[data-candidate] >> text=Z');
+    await page.waitForFunction(() => document.getElementById('parting-axis').textContent === 'Z', null, { timeout: 30_000 });
+    const overlay = () => page.evaluate(() => {
+      const card = document.getElementById('parting-card');
+      return { overlay: card.dataset.overlay ?? '', undercuts: Number(card.dataset.undercuts || 0), faded: document.getElementById('viewport').dataset.faded ?? '0' };
+    });
+    assert.deepEqual(await overlay(), { overlay: '', undercuts: 0, faded: '0' });
+    // The "Mould halves" checkbox: on by default, next to "Show".
+    assert.equal(await page.isChecked('#parting-blocks'), true);
+    assert.equal(await page.textContent('label:has(#parting-blocks)'), ' Chapes');
+
+    await page.check('#parting-show');
+    await page.click('[data-view="front"]');
+    let shown = await overlay();
+    assert.equal(shown.overlay, 'lower upper line');
+    assert.ok(shown.undercuts > 0, 'the walls of the slot coloured as undercuts');
+    const withBlocks = await viewColours(page);
+    assert.ok(withBlocks.red > 200, `the line, thick and red: ${JSON.stringify(withBlocks)}`);
+
+    // Without the blocks: the line and the colours stay; the walls of the slot in yellow.
+    await page.uncheck('#parting-blocks');
+    shown = await overlay();
+    assert.equal(shown.overlay, 'line');
+    assert.ok(shown.undercuts > 0);
+    const without = await viewColours(page);
+    assert.ok(without.red > 200, JSON.stringify(without));
+    assert.ok(without.yellow > 500, `the undercuts in yellow: ${JSON.stringify(without)}`);
+    // The blocks: blue above the line, green under it, over the page.
+    assert.ok(withBlocks.blue > without.blue + 5000 && withBlocks.green > without.green + 5000, `${JSON.stringify(withBlocks)} / ${JSON.stringify(without)}`);
+    await page.check('#parting-blocks');
+    assert.equal((await overlay()).overlay, 'lower upper line');
+    assert.match(await page.textContent('#parting-legend'), /^ligne de joint contre-dépouille faces de la pièce \(plus clair : sans dépouille\) chape supérieure chape inférieure/);
+
+    // Not shown: no overlay, the part in its own colour.
+    await page.uncheck('#parting-show');
+    assert.deepEqual(await overlay(), { overlay: '', undercuts: 0, faded: '0' });
+    // (The axes of the frame: a few red and orange pixels.)
+    const plain = await viewColours(page);
+    assert.ok(plain.red < 0.1 * without.red && plain.yellow < 0.05 * without.yellow, `${JSON.stringify(plain)} / ${JSON.stringify(without)}`);
+    // In English.
+    await page.selectOption('#language', 'en');
+    assert.equal(await page.textContent('label:has(#parting-blocks)'), ' Mould halves');
+    assert.match(await page.textContent('#parting-legend'), /^parting line undercut faces of the part \(lighter: no draft\) upper half lower half/);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('two bodies, one in front of the other: a click through the faded front one acts on the body of the card behind it, never through an opaque one', { timeout: CAD_TIMEOUT }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 } });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    // Two blocks 60 × 20 × 20 mm: A at y -40..-20, in front of B at y 20..40 seen from the front.
+    const box = () => true;
+    const obj = voxelsObj([['a', box, [-30, -40, 0]], ['b', box, [-30, 20, 0]]], [12, 4, 4], 5);
+    await page.setInputFiles('#file-input', { name: 'front_back.obj', mimeType: 'text/plain', buffer: obj });
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
+    const bodies = await page.evaluate(() => window.reader3d.result.bodies.map((b) => b.bbox.min[1]));
+    const A = bodies.findIndex((y) => y < 0), B = bodies.findIndex((y) => y > 0);
+    assert.deepEqual([A, B].sort(), [0, 1]);
+    const parting = (i) => page.evaluate((k) => window.reader3d.semantic.bodies.find((b) => b.source_index === k).parting, i);
+    const faded = () => page.evaluate(() => document.getElementById('viewport').dataset.faded ?? '0');
+    const overlay = () => page.evaluate(() => document.getElementById('parting-card').dataset.overlay ?? '');
+    const selected = () => page.$$eval('#bodies tr.selected', (trs) => trs.map((tr) => Number(tr.dataset.index)));
+    // A click in the middle of the 3D view, seen from the front: on A, B behind it.
+    const clickMiddle = async () => {
+      const view = await page.locator('#viewport canvas').boundingBox();
+      await page.mouse.click(view.x + view.width / 2, view.y + view.height / 2);
+    };
+
+    // The card on B, nothing shown: A opaque in front of it. A face picked
+    // there is A's: B's direction unchanged, the hint says so.
+    await page.click(`#bodies tr[data-index="${B}"] td.name`);
+    await page.click('[data-view="front"]');
+    assert.equal(await faded(), '0');
+    const proposed = (await parting(B)).direction;
+    await page.click('#parting-pick');
+    await clickMiddle();
+    assert.match(await page.textContent('#parting-hint'), /autre corps/);
+    assert.deepEqual([(await parting(B)).status, (await parting(B)).direction], ['proposed', proposed]);
+    await page.click('#parting-pick');
+
+    // Its faces reassigned by clicks: A drawn faded, the click goes through it.
+    await page.click('#parting-assign');
+    assert.equal(await faded(), '1');
+    await clickMiddle();
+    // The front face of B (y = 20), not of A, moved to the lower half.
+    await page.waitForFunction(() => document.getElementById('parting-origin').textContent === 'manuel', null, { timeout: 30_000 });
+    assert.doesNotMatch(await page.textContent('#parting-hint'), /autre corps/);
+    const b = await parting(B);
+    assert.deepEqual([b.status, b.reassigned_faces], ['manual', 1]);
+    assert.equal((await parting(A)).status, 'proposed');
+    // B still selected.
+    assert.deepEqual(await selected(), [B]);
+
+    // No mode, the parting still shown: a click through the faded A selects B, seen behind it.
+    await page.click('#parting-assign');
+    assert.equal(await overlay(), 'lower upper line');
+    await clickMiddle();
+    assert.deepEqual(await selected(), [B]);
+    assert.equal(await faded(), '1');
+
+    // B unchecked in the list: hidden with its overlays, A in its own look again; checked again, A faded.
+    await page.uncheck(`#bodies tr[data-index="${B}"] input`);
+    assert.equal(await faded(), '0');
+    await page.check(`#bodies tr[data-index="${B}"] input`);
+    assert.equal(await faded(), '1');
+
+    // The thickness colours instead: the parting no longer shown, nor said to be.
+    await page.click('#toggle-thickness');
+    assert.equal(await page.isChecked('#parting-show'), false);
+    assert.equal(await overlay(), '');
+    await page.waitForFunction(() => document.getElementById('toggle-thickness').classList.contains('active') && document.getElementById('viewport').dataset.faded === '0', null, { timeout: 60_000 });
+
+    // Shown again, then another file of one body opened in this tab: nothing faded, nothing shown.
+    await page.check('#parting-show');
+    assert.deepEqual([await overlay(), await faded()], ['lower upper line', '1']);
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done' && window.reader3d.tab.file === 'box.stl', null, { timeout: CAD_TIMEOUT });
+    assert.deepEqual([await overlay(), await faded()], ['', '0']);
     assert.deepEqual(errors, []);
     await context.close();
   });

@@ -5,8 +5,8 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import {
-  REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_UPPER, applyOverrides, axisLabel, canonicalAxis, evaluateParting, faceRegions,
-  lineMesh, lineSummary, parseDirection, partingLine, proposeParting, sameDirection, sampleByArea,
+  BLOCK_GRID, REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_UPPER, applyOverrides, axisLabel, canonicalAxis, evaluateParting, faceRegions,
+  lineMesh, lineSummary, mouldBlocks, parseDirection, partingLine, proposeParting, sameDirection, sampleByArea,
 } from '../../web/engine/parting.js';
 import { approx } from './helpers.mjs';
 
@@ -377,5 +377,165 @@ describe('faces reassigned by hand', () => {
     assert.equal(axisLabel([0, 0, -1]), '-Z');
     assert.equal(axisLabel([1, 0, 0]), 'X');
     assert.equal(axisLabel([Math.SQRT1_2, 0, Math.SQRT1_2]), '(0.707, 0, 0.707)');
+  });
+});
+
+/**
+ * A closed mesh, consistently turned outwards: every edge shared by exactly
+ * two triangles, once each way. Returns its enclosed volume.
+ */
+function closedVolume({ positions: P, indices: I }, label) {
+  const directed = new Map();
+  for (let t = 0; t < I.length; t += 3) {
+    for (let e = 0; e < 3; e++) {
+      const a = I[t + e], b = I[t + ((e + 1) % 3)];
+      assert.notEqual(a, b, `${label}: a degenerate edge`);
+      const key = `${a},${b}`;
+      directed.set(key, (directed.get(key) ?? 0) + 1);
+    }
+  }
+  for (const [key, count] of directed) {
+    const [a, b] = key.split(',');
+    assert.equal(count, 1, `${label}: edge ${key} used ${count} times the same way`);
+    assert.equal(directed.get(`${b},${a}`), 1, `${label}: edge ${key} on one triangle only`);
+  }
+  let volume = 0;
+  for (let t = 0; t < I.length; t += 3) {
+    const [a, b, c] = [0, 1, 2].map((k) => 3 * I[t + k]);
+    volume += (P[a] * (P[b + 1] * P[c + 2] - P[b + 2] * P[c + 1]) + P[a + 1] * (P[b + 2] * P[c] - P[b] * P[c + 2]) + P[a + 2] * (P[b] * P[c + 1] - P[b + 1] * P[c])) / 6;
+  }
+  return volume;
+}
+
+/** Range of the vertices of a block along d. */
+function rangeAlong({ positions: P }, d) {
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < P.length; i += 3) {
+    const w = P[i] * d[0] + P[i + 1] * d[1] + P[i + 2] * d[2];
+    lo = Math.min(lo, w);
+    hi = Math.max(hi, w);
+  }
+  return [lo, hi];
+}
+
+describe('halves of the mould shown round the body', () => {
+  test('a planar line: two boxes meeting flat at its level, a margin round the body', () => {
+    // A box 100 × 60 × 20 drawn along Z, its line round its bottom edge (z = 0); a T, its line at the underside of its bar (z = 10).
+    const box = voxels(() => true, [10, 6, 2], { size: 10 });
+    const t = prism([[12.5, 0], [17.5, 0], [17.5, 10], [30, 10], [30, 15], [0, 15], [0, 10], [12.5, 10]], 20, [15, 11]);
+    for (const [mesh, level, size, height] of [[box, 0, [100, 60], 20], [t, 10, [30, 20], 15]]) {
+      const { proposal, segments } = proposeParting(mesh.positions, mesh.indices);
+      assert.deepEqual([proposal.axis, proposal.parting.level_mm], ['Z', level]);
+      const blocks = mouldBlocks(mesh.positions, proposal.direction, { segments, level: proposal.parting.level_mm });
+      const margin = Math.max(5, 0.15 * Math.max(...size, height));
+      assert.equal(blocks.margin, margin);
+      assert.deepEqual(blocks.cells, [1, 1]);
+      assert.deepEqual([...blocks.heights], [level, level, level, level]);
+      const d = blocks.frame.d;
+      assert.deepEqual(rangeAlong(blocks.lower, d), [-margin, level]);
+      assert.deepEqual(rangeAlong(blocks.upper, d), [level, height + margin]);
+      // Closed boxes over the footprint of the body and its margin.
+      const footprint = (size[0] + 2 * margin) * (size[1] + 2 * margin);
+      approx(closedVolume(blocks.lower, 'lower'), footprint * (level + margin), 1e-6, 0, 'lower block');
+      approx(closedVolume(blocks.upper, 'upper'), footprint * (height + margin - level), 1e-6, 0, 'upper block');
+      assert.equal(blocks.lower.indices.length / 3, 12);
+    }
+    // An oblique direction: the blocks in its frame, a level clamped to the body.
+    const blocks = mouldBlocks(box.positions, [0.6, 0, 0.8], { level: 1e6 });
+    const [lo, hi] = blocks.extent.w;
+    assert.deepEqual([...blocks.heights], [hi, hi, hi, hi]);
+    approx(rangeAlong(blocks.upper, [0.6, 0, 0.8])[0], hi, 0, 1e-3, 'upper block from the top of the body');
+    approx(rangeAlong(blocks.lower, [0.6, 0, 0.8])[0], lo - blocks.margin, 0, 1e-3, 'lower block from under the body');
+    approx(closedVolume(blocks.lower, 'oblique lower') + closedVolume(blocks.upper, 'oblique upper'),
+      (blocks.extent.u[1] - blocks.extent.u[0] + 2 * blocks.margin) * (blocks.extent.v[1] - blocks.extent.v[0] + 2 * blocks.margin) * (hi - lo + 2 * blocks.margin), 1e-5, 0, 'both blocks');
+    // Without a line nor a level: under the body. Nothing to show without vertices.
+    assert.deepEqual([...mouldBlocks(box.positions, [0, 0, 1]).heights], [0, 0, 0, 0]);
+    assert.equal(mouldBlocks(new Float32Array(0), [0, 0, 1]), null);
+    assert.equal(mouldBlocks(box.positions, [0, 0, 0]), null);
+  });
+
+  test('a stepped line: the interface follows the line near it, from one level to the other', () => {
+    // The Z profile of the stepped part (its line at z = 0 round the bottom flange, at z = 20 round the top one).
+    const mesh = voxels((x, y, z) => {
+      const bottom = z < 1 && x < 4, web = x === 3, top = z >= 4 && x >= 3;
+      const hole = y >= 3 && y < 5 && ((x === 1 && z < 1) || (x === 5 && z >= 4));
+      return (bottom || web || top) && !hole;
+    }, [7, 8, 5], { size: 5 });
+    const { proposal, segments } = proposeParting(mesh.positions, mesh.indices);
+    assert.deepEqual([proposal.parting.kind, proposal.parting.levels_mm], ['stepped', [0, 20]]);
+    const blocks = mouldBlocks(mesh.positions, proposal.direction, { segments });
+    const [nu, nv] = blocks.cells;
+    // 35 × 40 mm and a margin of 6 mm: 48 cells along y (u, for d = Z), 43 along x.
+    assert.deepEqual([nu, nv], [BLOCK_GRID, 43]);
+    assert.equal(blocks.heights.length, (nu + 1) * (nv + 1));
+    const heights = [...blocks.heights];
+    assert.ok(Math.min(...heights) >= 0 && Math.max(...heights) <= 25);
+    assert.ok(Math.max(...heights) - Math.min(...heights) > 15, 'not flat');
+    // Points of the line, every 0.25 mm.
+    const line = [];
+    for (let s = 0; s < segments.length; s += 6) {
+      const len = Math.hypot(segments[s + 3] - segments[s], segments[s + 4] - segments[s + 1], segments[s + 5] - segments[s + 2]);
+      for (let k = 0, n = Math.max(1, Math.ceil(len / 0.25)); k <= n; k++) line.push([0, 1, 2].map((c) => segments[s + c] + (k / n) * (segments[s + 3 + c] - segments[s + c])));
+    }
+    // A node within half a cell of the line, the line at another height more than 4 cells away: its height.
+    const [x0, x1] = blocks.extent.u, [y0, y1] = blocks.extent.v;
+    const m = blocks.margin;
+    assert.deepEqual(blocks.frame.d, [0, 0, 1]);
+    const cell = (x1 - x0 + 2 * m) / nu;
+    const followed = { 0: 0, 20: 0 };
+    for (let i = 0; i <= nu; i++) {
+      for (let j = 0; j <= nv; j++) {
+        // Node (i, j) at (a, b) in the frame (u, v) square to d.
+        const a = x0 - m + ((x1 - x0 + 2 * m) * i) / nu, b = y0 - m + ((y1 - y0 + 2 * m) * j) / nv;
+        const at = (p) => Math.hypot(blocks.frame.u[0] * p[0] + blocks.frame.u[1] * p[1] - a, blocks.frame.v[0] * p[0] + blocks.frame.v[1] * p[1] - b);
+        let near = null, r = Infinity;
+        for (const p of line) if (at(p) < r) [near, r] = [p, at(p)];
+        if (r > cell / 2) continue;
+        const other = Math.min(...line.filter((p) => Math.abs(p[2] - near[2]) > 1).map(at));
+        if (other < 4 * cell) continue;
+        approx(blocks.heights[i * (nv + 1) + j], near[2], 0, 0.5, `node ${i}, ${j} by the line at ${near[2]}`);
+        if (near[2] in followed) followed[near[2]]++;
+      }
+    }
+    assert.ok(followed[0] > 50 && followed[20] > 50, JSON.stringify(followed));
+    // Both blocks closed, on either side of the interface: together, the whole box.
+    const volume = closedVolume(blocks.lower, 'lower') + closedVolume(blocks.upper, 'upper');
+    approx(volume, (x1 - x0 + 2 * m) * (y1 - y0 + 2 * m) * (25 + 2 * m), 1e-5, 0, 'both blocks');
+    assert.ok(closedVolume(blocks.lower, 'lower') > 0 && closedVolume(blocks.upper, 'upper') > 0);
+  });
+
+  test('bounded: a body of 2M triangles, a line of 100k pieces', () => {
+    // The vertices of a body of 2M triangles (only its extent is read), a wavy line of 100k pieces round it.
+    let seed = 7;
+    const next = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    const positions = new Float32Array(3 * 1_000_000);
+    for (let i = 0; i < positions.length; i += 3) {
+      positions[i] = 400 * next();
+      positions[i + 1] = 150 * next();
+      positions[i + 2] = 80 * next();
+    }
+    const pieces = 100_000;
+    const segments = new Float32Array(6 * pieces);
+    const point = (k) => {
+      const t = (2 * Math.PI * k) / pieces;
+      return [200 + 200 * Math.cos(t), 75 + 75 * Math.sin(t), 40 + 30 * Math.sin(5 * t)];
+    };
+    for (let k = 0; k < pieces; k++) {
+      segments.set(point(k), 6 * k);
+      segments.set(point(k + 1), 6 * k + 3);
+    }
+    const blocks = mouldBlocks(positions, [0, 0, 1], { segments });
+    const [nu, nv] = blocks.cells;
+    assert.ok(Math.max(nu, nv) === BLOCK_GRID && Math.min(nu, nv) >= 2);
+    for (const block of [blocks.lower, blocks.upper]) {
+      assert.ok(block.positions.length / 3 <= 2 * (BLOCK_GRID + 1) ** 2);
+      assert.ok(block.indices.length / 3 <= 4 * BLOCK_GRID ** 2 + 8 * BLOCK_GRID);
+    }
+    closedVolume(blocks.lower, 'lower');
+    closedVolume(blocks.upper, 'upper');
+    // Warped: the interface goes up and down with the line, within the body.
+    const heights = [...blocks.heights];
+    assert.ok(Math.min(...heights) >= blocks.extent.w[0] && Math.max(...heights) <= blocks.extent.w[1]);
+    assert.ok(Math.max(...heights) - Math.min(...heights) > 30);
   });
 });
