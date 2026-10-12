@@ -1073,14 +1073,14 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
       ? inputs.finition
       : ranked.find((r) => r.process === code && r.feasible)?.finition ?? ranked.find((r) => r.process === code)?.finition ?? process.finitions[0];
   const finalRates = chosen && inputs.mode ? centreRates(base, { modes: { ...settings.modes, [code]: inputs.mode }, energy }) : rates;
-  // The cavities typed in: the cycle estimated for their cluster, the tool priced for them (routes.js).
-  const route = buildRoute(code, finition, part, settings, finalRates, chosen && inputs.empreintes > 0 ? { empreintes: inputs.empreintes } : {});
-  out.estimated = { cycle: route.cycle, parCycle: route.parCycleEstime, miseAuMille: route.miseAuMille, miseAuMilleDetail: route.miseAuMilleDetail };
-  if (chosen) {
-    const casting = route.operations.find((o) => o.code === code);
-    if (inputs.miseAuMille > 0) route.miseAuMille = inputs.miseAuMille;
-    if (inputs.cycle > 0) casting.cycle = inputs.cycle;
-  }
+  // The cavities typed in: the cycle estimated for their cluster, the tool priced for them; the mise
+  // au mille typed in: the metal of that cluster (routes.js).
+  const route = buildRoute(code, finition, part, settings, finalRates, {
+    ...(chosen && inputs.empreintes > 0 ? { empreintes: inputs.empreintes } : {}),
+    ...(chosen && inputs.miseAuMille > 0 ? { miseAuMille: inputs.miseAuMille } : {}),
+  });
+  out.estimated = { cycle: route.cycle, parCycle: route.parCycleEstime, miseAuMille: route.miseAuMilleDetail.value, miseAuMilleDetail: route.miseAuMilleDetail };
+  if (chosen && inputs.cycle > 0) route.operations.find((o) => o.code === code).cycle = inputs.cycle;
   // The tool estimated for the cavities retained; or the price typed in.
   route.outillageEstime = route.outillage;
   if (inputs.outillagePrix > 0) route.outillage = inputs.outillagePrix;
@@ -1198,19 +1198,24 @@ export function costingSnapshot({ tab } = {}) {
   }
   const routes = (r) => {
     const best = r.best ?? [];
-    // The island retained when it was chosen in the page outside the three best.
-    const shown = r.route && !best.some((b) => b.process === r.route.process) ? [...best, r.route] : best;
-    return shown.map((x, i) => ({
-      rang: best.includes(x) ? i + 1 : null,
+    const entry = (x, rang, prix) => ({
+      rang,
       ilot: x.process,
       famille: x.famille,
       finition: x.finition,
-      retenue: x.process === r.route?.process,
+      retenue: x === r.route,
       faisable: x.feasible,
       qualite: x.qualite,
-      prix: Number.isFinite(x.prix) ? x.prix : null, // PRI + tooling per piece (€): the ranking is by quality / price
+      empreintes: x.parCycle,
+      prix: Number.isFinite(prix) ? prix : null, // PRI + tooling per piece (€): the ranking is by quality / price
       raisons: [...x.reasons, ...x.warnings],
-    }));
+    });
+    // The island retained: its own route (cavities, cycle and mode retained, their alerts; the PRI of the
+    // quote and, as in the ranking, the tool estimated for its cavities), in its rank in place of its
+    // estimate, or after the three best when chosen outside them.
+    const at = r.route ? best.findIndex((b) => b.process === r.route.process) : -1;
+    const own = r.route ? entry(r.route, at >= 0 ? at + 1 : null, r.final.pri + r.route.outillagePiece) : null;
+    return [...best.map((b, i) => (i === at ? own : entry(b, i + 1, b.prix))), ...(own && at < 0 ? [own] : [])];
   };
   const name = pieceNames(c.results.map((r) => r.piece));
   const sections = [{ piece: null, trace: c.trace ?? {} }, ...c.results.map((r) => ({ piece: name.get(r.piece), trace: r.trace ?? {} }))];
@@ -1553,14 +1558,17 @@ function toolingCard(r) {
 /**
  * The piece costed with 1, 2... cavities on the island retained: each row is
  * the quote as "Retenir" makes it (the island imposed, these cavities, the
- * cycle and the tool estimated for them), the row retained the quote as it is.
+ * cycle and the tool estimated for them; an island not chosen yet without a
+ * mode or a mise au mille typed for another one), the row retained the quote
+ * as it is.
  * `c`: compute(), `r`: one of its results. Nothing is saved.
  */
 export function cavityRows(c, r) {
   const route = r.route;
+  const override = { procede: route.process, finition: route.finition, cycle: null, outillagePrix: null, ...(r.chosen ? {} : { mode: null, miseAuMille: null }) };
   return cavityChoices(settings.processes[route.process], route.parCycleEstime, route.parCycle).map((n) => ({
     n,
-    r: n === route.parCycle ? r : computePiece(r.piece, c, null, { procede: route.process, finition: route.finition, empreintes: n, cycle: null, outillagePrix: null }),
+    r: n === route.parCycle ? r : computePiece(r.piece, c, null, { ...override, empreintes: n }),
   }));
 }
 
@@ -1962,20 +1970,26 @@ function aiChoice() {
 /**
  * "Retenir" in the card "Empreintes par coulée": `n` cavities for the piece
  * shown (null: back to the estimate), on the island of its route, imposed with
- * them (a number of cavities is that of its island). The cycle and the price
+ * them (a number of cavities is that of its island; the mode and the mise au
+ * mille typed for another island do not apply to it). The cycle and the price
  * of the tool typed in for other cavities give way to their estimate.
+ * Exported for the tests.
  */
-function retainCavities(n) {
+export function retainCavities(n) {
   const c = compute();
   const r = c?.results.find((x) => x.piece.key === c.selected);
   if (!r?.route) return;
   const piece = pieceStore(r.piece.key);
   const imposed = r.inputs.procede !== r.route.process;
-  if (imposed) [piece.procede, piece.finition] = [r.route.process, r.route.finition];
+  if (imposed) {
+    [piece.procede, piece.finition] = [r.route.process, r.route.finition];
+    piece.mode = piece.miseAuMille = null;
+  }
   const replaced = n === null ? [] : [piece.cycle > 0 ? `temps de cycle saisi (${piece.cycle} s)` : "", piece.outillagePrix > 0 ? `prix d'outillage saisi (${eur(piece.outillagePrix, 0)})` : ""].filter(Boolean);
   piece.empreintes = n;
   if (n !== null) piece.cycle = piece.outillagePrix = null;
   forgetAdoption(piece);
+  forgetAIValues(piece);
   store.saveQuote(q);
   const after = compute()?.results.find((x) => x.piece.key === r.piece.key)?.route;
   const casting = after?.operations.find((o) => o.code === after.process);

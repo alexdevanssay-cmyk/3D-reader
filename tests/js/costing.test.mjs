@@ -21,6 +21,7 @@ import { DEMANDE, QUOTE_KEYS, SOURCES, demandeComparee, derive, missing, pieceKe
 import { MASQUE, checkNumbers, isInternal, maskNumbers, numbersOf, traceForAI } from '../../web/chiffrage/ai-trace.js';
 import { anonymizer } from '../../web/engine/ai-context.js';
 import { checkProposals, readProposals, sameValue } from '../../web/chiffrage/ai-apply.js';
+import { cycleData } from '../../web/chiffrage/ai-cycle.js';
 import {
   seriesOrderWorkbook,
   CENTRES, CORPORATE, DEFAULT_MODES, DIRECT_TRI, EXP_HOURS, HOURS, KG_SOLD, TRI_HOURS, TRI_INVEST,
@@ -323,6 +324,30 @@ describe('manufacturing routes', () => {
     assert.deepEqual(cavityChoices(p, 1), [1, 2, 3, 4]);
     assert.deepEqual(cavityChoices(DEFAULT_PROCESSES.SSP, 4, 6), [1, 2, 3, 4, 5, 6]);
     assert.deepEqual(cavityChoices({ ...p, empreintesMax: 12 }, 1).length, 8);
+  });
+
+  test('a mise au mille typed in: the kg cast per cycle, the cycle and the cluster alert weighed with it; the cavities and the tool still estimated', () => {
+    // CG1: cluster of 50 kg at most; 13 kg, no wall thickness: mise au mille 1.6 of the island, 20.8 kg cast, 2 cavities estimated.
+    const p = DEFAULT_PROCESSES.CG1;
+    const heavy = { ...part, poids: 13, toileMini: 0, epaisseurMax: 0, dimMax: 300 };
+    const estimate = buildRoute('CG1', 'FTR', heavy, settings, rates);
+    assert.deepEqual([estimate.miseAuMille, estimate.parCycleEstime, estimate.alertesEmpreintes], [1.6, 2, []]);
+    close(estimate.cycle, castingCycle(p, 13 * 1.6, 2, part.moduleMm), 1e-12, 'cycle of the estimate');
+    // 2.0 typed in: 26 kg cast per piece, 52 kg for the 2 cavities estimated, past the cluster: said.
+    const typed = buildRoute('CG1', 'FTR', heavy, settings, rates, { miseAuMille: 2 });
+    assert.deepEqual([typed.miseAuMille, typed.miseAuMilleDetail.value, typed.parCycleEstime, typed.parCycle], [2, 1.6, 2, 2]);
+    close(typed.cycle, castingCycle(p, 26, 2, part.moduleMm), 1e-12, 'cycle with the mise au mille typed in');
+    assert.deepEqual(typed.alertesEmpreintes, ['grappe 52 kg > 50 kg maxi']);
+    // 3 cavities: the cluster of the alert is the one of the cycle.
+    const three = buildRoute('CG1', 'FTR', heavy, settings, rates, { empreintes: 3, miseAuMille: 2 });
+    close(three.cycle, castingCycle(p, 26, 3, part.moduleMm), 1e-12, 'cycle, 3 cavities');
+    assert.deepEqual(three.alertesEmpreintes, ['3 empreintes > 2 maxi de l\'îlot', 'grappe 78 kg > 50 kg maxi']);
+    // Without it, the same as before: the estimated mise au mille.
+    assert.deepEqual(buildRoute('CG1', 'FTR', heavy, settings, rates, { empreintes: 3 }).alertesEmpreintes, ['3 empreintes > 2 maxi de l\'îlot', 'grappe 62,4 kg > 50 kg maxi']);
+    // The tool is priced from the cavities estimated with the estimated mise au mille, typed in or not.
+    for (const n of [null, 1, 3]) assert.equal(buildRoute('CG1', 'FTR', heavy, settings, rates, { empreintes: n, miseAuMille: 2 }).outillage, buildRoute('CG1', 'FTR', heavy, settings, rates, { empreintes: n }).outillage, String(n));
+    // One piece alone heavier than the cluster is cast alone: no alert.
+    assert.deepEqual(buildRoute('CG1', 'FTR', { ...heavy, poids: 24 }, settings, rates, { miseAuMille: 2.5 }).alertesEmpreintes, []);
   });
 });
 
@@ -1136,6 +1161,39 @@ describe('traced values of a quote (provenance.js)', () => {
     assert.equal(autoRows.find(({ n }) => n === best.parCycle).r, auto.results[0]);
   });
 
+  test('more cavities with a mise au mille typed in: each row cast, cycled and alerted with the same kg; the traces say which mise au mille', () => {
+    // CG1 imposed (cluster of 50 kg at most), 13 kg, mise au mille 2.0 typed in (1.6 estimated): 2 cavities estimated.
+    const heavy = { poids: 13, moduleMm: 3, dimMax: 300, procede: 'CG1' };
+    const p = DEFAULT_PROCESSES.CG1;
+    const c = computed({ quote: { pieces: { manuel: { ...heavy, miseAuMille: 2 } } } });
+    const r = c.results[0];
+    assert.deepEqual([r.route.miseAuMille, r.estimated.miseAuMille, r.estimated.parCycle], [2, 1.6, 2]);
+    for (const { n, r: x } of ui.cavityRows(c, r)) {
+      const casting = x.route.operations.find((o) => o.code === 'CG1');
+      const kg = x.final.kgCast * n; // the "Kg coulés / cycle" of the card
+      close(kg, 26 * n, 1e-12, `kg cast per cycle, ${n} cavities`);
+      close(casting.cycle, castingCycle(p, x.final.kgCast, n, 3), 1e-12, `cycle, ${n} cavities`);
+      const grappe = x.route.alertesEmpreintes.find((a) => a.startsWith('grappe'));
+      assert.equal(grappe, kg > p.grappeMax ? `grappe ${kg.toLocaleString('fr-FR', { maximumFractionDigits: 1 })} kg > 50 kg maxi` : undefined, `${n} cavities`);
+    }
+    // The traces: the cycle estimated with the mise au mille retained; the estimated one only for the cavities.
+    const T = r.trace;
+    assert.ok(T['piece.cycle'].source.entrees.includes('piece.miseAuMille') && !T['piece.cycle'].source.entrees.includes('piece.miseAuMille.estimee'));
+    assert.match(T['piece.cycle'].hypotheses.join(), /kg coulés avec la mise au mille saisie \(2\)/);
+    assert.ok(T['piece.empreintes'].source.entrees.includes('piece.miseAuMille.estimee'));
+    assert.match(T['piece.miseAuMille.estimee'].hypotheses.join(), /non retenue : sert à estimer les empreintes$/);
+    assert.deepEqual(T['piece.empreintes'].alertes.map((a) => a.message), ['grappe 52 kg > 50 kg maxi']);
+    const mould = r.route.outillageEstime;
+    // Without a mise au mille typed in: the cycle of the estimate, the same tool.
+    const plain = computed({ quote: { pieces: { manuel: heavy } } }).results[0];
+    close(plain.route.operations.find((o) => o.code === 'CG1').cycle, castingCycle(p, 13 * 1.6, 2, 3), 1e-12, 'cycle without a typed mise au mille');
+    assert.deepEqual([plain.route.alertesEmpreintes, plain.route.outillageEstime], [[], mould]);
+    // The data of the AI cycle estimate: the formula of the cycle retained, its terms adding up to it.
+    const data = cycleData(r, { settings: loadSettings(base) });
+    assert.equal(data.formule.kg_coules_par_cycle, 52);
+    close(data.formule.termes_s.base + data.formule.termes_s.poids + data.formule.termes_s.module, data.formule.valeur_s, 1e-3, 'terms of the formula');
+  });
+
   test('the traces describe the values computed and change none of them', () => {
     for (const c of [computed(), computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', cycle: 300, empreintes: 2, miseAuMille: 1.5, outillagePrix: 15000 } } } }), computed({ p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0, 1] } })]) {
       const T = c.trace;
@@ -1161,6 +1219,34 @@ describe('traced values of a quote (provenance.js)', () => {
       }
       if (c.ensemble) assert.equal(T['ensemble.prix.vente'].valeur, c.ensemble.years[0].prixVente);
     }
+  });
+
+  test('"Retenir" a number of cavities: the island imposed without the mode and mise au mille typed for another island; the rows priced the same way', () => {
+    // A piece back on the automatic island (an undo, another workbook) with a mode and a mise au mille typed for another one: not applied.
+    const stale = computed({ quote: { pieces: { manuel: { ...PART, mode: '1*8', miseAuMille: 1.9 } } } });
+    const r = stale.results[0];
+    const island = r.route.process;
+    assert.deepEqual([r.chosen, r.route.miseAuMille], [false, r.estimated.miseAuMille]);
+    // Each row: [cavities, mode and mise au mille of its inputs (the row retained: the quote as it is), those applied, PRI].
+    const rowOf = (c) => ui.cavityRows(c, c.results[0]).map(({ n, r: x }) => [n, x === c.results[0] ? 'retenue' : [x.inputs.mode ?? null, x.inputs.miseAuMille ?? null], x.finalRates.get(island).mode, x.route.miseAuMille, x.final.pri]);
+    const rows = rowOf(stale);
+    const n = r.route.parCycle + 1;
+    const clean = computed();
+    const cleanRows = rowOf(clean);
+    assert.deepEqual(rows.map((x) => x.slice(0, 4)), cleanRows.map((x) => x.slice(0, 4)));
+    rows.forEach((x, i) => close(x[4], cleanRows[i][4], 1e-12, `PRI, ${x[0]} cavities`));
+    assert.ok(rows.every(([k, inputs]) => (k === r.route.parCycle ? inputs === 'retenue' : inputs[0] === null && inputs[1] === null)));
+    // "Retenir": the island imposed with these cavities, its mode and mise au mille those of the island; the price of the row.
+    computed({ quote: { pieces: { manuel: { ...PART, mode: '1*8', miseAuMille: 1.9 } } } });
+    ui.retainCavities(n);
+    const piece = loadQuote(base, indices).pieces.manuel;
+    assert.deepEqual([piece.procede, piece.empreintes, piece.mode, piece.miseAuMille], [island, n, null, null]);
+    close(ui.compute().results[0].final.pri, rows.find(([k]) => k === n)[4], 1e-12, 'PRI of the row retained');
+    // The island already imposed: its own mode and mise au mille stay, in the rows too.
+    const own = computed({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', mode: '1*8', miseAuMille: 1.9 } } } });
+    assert.ok(ui.cavityRows(own, own.results[0]).every(({ r: x }) => x.finalRates.get('CG3').mode === '1*8' && x.route.miseAuMille === 1.9));
+    ui.retainCavities(2);
+    assert.deepEqual(pick(loadQuote(base, indices).pieces.manuel, ['procede', 'empreintes', 'mode', 'miseAuMille']), { procede: 'CG3', empreintes: 2, mode: '1*8', miseAuMille: 1.9 });
   });
 
   test('non-regression: the prices of the fixture are those computed before the traces', () => {
@@ -1557,6 +1643,40 @@ describe('the costing read by the AI page (read only)', () => {
     const [set, cs] = snapshotOf({ p3d: { file: 'asm.step', parts: PARTS_3D, selected: [0, 1, 2] } });
     assert.deepEqual([set.devis.ensemble, set.pieces.map((x) => x.nom)], [true, ['A', 'B', 'C']]);
     assert.equal(set.devis.trace['ensemble.prix.vente'].valeur, cs.ensemble.years[0].prixVente);
+  });
+
+  test('costingSnapshot: the island retained as it is quoted, in its rank: its cavities, their alerts, its price; the alerts in the trace', () => {
+    // Nothing typed in: the first route, at the price of the ranking.
+    const [auto, ca] = snapshotOf();
+    const best = ca.results[0].best;
+    assert.deepEqual(auto.pieces[0].routes.map((x) => [x.rang, x.ilot, x.retenue, x.empreintes]), best.map((b, i) => [i + 1, b.process, i === 0, b.parCycle]));
+    close(auto.pieces[0].routes[0].prix, best[0].prix, 1e-9, 'price of the route retained, nothing typed in');
+    // CG4, among the three best, imposed with 4 cavities (2 at most).
+    const [s, c] = snapshotOf({ quote: { pieces: { manuel: { ...PART, procede: 'CG4', empreintes: 4 } } } });
+    const r = c.results[0];
+    const at = r.best.findIndex((b) => b.process === 'CG4');
+    assert.ok(at >= 0, 'CG4 among the three best');
+    const routes = s.pieces[0].routes;
+    assert.equal(routes.length, r.best.length);
+    const own = routes[at];
+    assert.deepEqual([own.rang, own.ilot, own.finition, own.retenue, own.empreintes], [at + 1, 'CG4', r.route.finition, true, 4]);
+    assert.ok(own.raisons.includes('4 empreintes > 2 maxi de l\'îlot'), String(own.raisons));
+    close(own.prix, r.final.pri + r.route.outillagePiece, 1e-12, 'price of the route retained');
+    assert.ok(Math.abs(own.prix - r.best[at].prix) > 0.01, 'not the price of the estimate');
+    // The others: their estimate in the ranking.
+    routes.forEach((x, i) => i !== at && assert.deepEqual([x.rang, x.ilot, x.retenue, x.empreintes, x.prix], [i + 1, r.best[i].process, false, r.best[i].parCycle, r.best[i].prix]));
+    // The trace: the cavities past the island, to validate; in the alerts of the snapshot and of what the AI is sent.
+    const T = s.pieces[0].trace['piece.empreintes'];
+    assert.deepEqual(T.alertes, [{ type: 'hors_limites', message: '4 empreintes > 2 maxi de l\'îlot' }]);
+    assert.equal(T.validation_requise, true);
+    assert.equal(s.pieces[0].trace['piece.prix.vente'].validation_requise, true);
+    assert.ok(s.alertes.some((a) => a.cle === 'piece.empreintes' && a.type === 'hors_limites'));
+    assert.ok(traceForAI(s).alertes.some((a) => a.cle === 'piece.empreintes' && a.type === 'au-delà des limites de l\'îlot' && a.message === '4 empreintes > 2 maxi de l\'îlot'));
+    // An island imposed outside the three best: after them, without a rank, with its own alerts too.
+    const [out] = snapshotOf({ quote: { pieces: { manuel: { ...PART, procede: 'CG3', empreintes: 3 } } } });
+    const last = out.pieces[0].routes.at(-1);
+    assert.deepEqual([last.rang, last.ilot, last.retenue, last.empreintes, Number.isFinite(last.prix)], [null, 'CG3', true, 3, true]);
+    assert.deepEqual(out.pieces[0].trace['piece.empreintes'].alertes.map((a) => a.message), ['3 empreintes > 1 maxi de l\'îlot']);
   });
 
   test('costingSnapshot: a frozen copy, computed without saving anything; null without a costing workbook', () => {
@@ -1965,5 +2085,30 @@ describe('values of a piece proposed by the AI, applied once accepted', () => {
     // The quote of another 3D file: the model of the tab changed since the answer.
     assert.match(ui.applyAIValues({ ...target, file: 'autre.step' }, [{ cle: 'piece.poids', valeur: 1.35 }]).error, /Le modèle 3D de l'onglet a changé/);
     assert.match(ui.applyAIValues({ ...target, key: '0:Absente' }, [{ cle: 'piece.poids', valeur: 1.35 }]).error, /n'est plus chiffrée/);
+  });
+
+  test('"Retenir" in the cavities card is a person\'s choice: no longer traced as the AI\'s, kept when the application is undone', () => {
+    const n0 = computed().results[0].trace['piece.empreintes'].valeur;
+    const target = { tab: 1, file: null, key: 'manuel' };
+    ui.applyAIValues(target, [{ cle: 'piece.empreintes', valeur: n0 + 1 }, { cle: 'piece.cycle', valeur: 150 }], { provider: 'Groq', message: 'm3' });
+    assert.deepEqual(Object.keys(loadQuote(base, indices).pieces.manuel.valeursIA).sort(), ['cycle', 'empreintes', 'finition', 'procede']);
+    // Compared, then the AI's number of cavities retained again: the person's; the cycle typed in gave way to its estimate.
+    ui.retainCavities(n0 + 2);
+    ui.retainCavities(n0 + 1);
+    const piece = loadQuote(base, indices).pieces.manuel;
+    assert.deepEqual([piece.empreintes, piece.cycle, Object.keys(piece.valeursIA).sort()], [n0 + 1, null, ['finition', 'procede']]);
+    const T = ui.compute().results[0].trace['piece.empreintes'];
+    assert.deepEqual([T.valeur, T.source.type], [n0 + 1, 'saisie']);
+    // Undone: the cavities the person retained stay, and the island the AI imposed with them (they were chosen on it).
+    const procede = piece.procede;
+    const undone = ui.undoAIValues({ ...target, name: 'Pièce' }, { message: 'm3' });
+    assert.deepEqual([undone.undone, undone.kept.length], [[], 2]);
+    const after = loadQuote(base, indices).pieces.manuel;
+    assert.deepEqual([after.empreintes, after.procede, after.valeursIA], [n0 + 1, procede, undefined]);
+    // "Revenir aux empreintes estimées" after an application: the AI's cavities forgotten too.
+    computed();
+    ui.applyAIValues(target, [{ cle: 'piece.empreintes', valeur: n0 + 1 }], { message: 'm4' });
+    ui.retainCavities(null);
+    assert.deepEqual(Object.keys(loadQuote(base, indices).pieces.manuel.valeursIA).sort(), ['finition', 'procede']);
   });
 });
