@@ -63,7 +63,7 @@ const OCCT_OUT = join(WEB, 'vendor', 'opencascade');
  * engine/occt.js loads it by URL (gunzip fallback without DecompressionStream).
  */
 const REQUIRED_ADDONS = [
-  'controls/OrbitControls.js',
+  'controls/TrackballControls.js',
   'loaders/GLTFLoader.js',
   'math/ConvexHull.js',
   'libs/fflate.module.js',
