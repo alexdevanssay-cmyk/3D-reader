@@ -285,6 +285,107 @@ table.parting-candidates input { margin: 0; }
 #parting-status, #parting-body { margin: 2px 0 6px; }
 .parting-legend { margin: 8px 0 0; line-height: 1.9; }
 .parting-legend .swatch { margin-left: 4px; margin-right: 3px; }
+/* The parting line drawn by hand: its panel in the card (the plane, the actions, the segments, the halves). */
+.parting-controls button:disabled, .parting-vector input:disabled, table.parting-candidates.locked { opacity: 0.55; cursor: not-allowed; }
+.parting-draw-panel { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.parting-draw-plane { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+.parting-draw-plane select { min-width: 0; max-width: 100%; }
+#parting-draw-axis { margin: 6px 0 0; }
+#parting-draw-kept { margin: 6px 0 0; }
+table.parting-segments { table-layout: fixed; }
+table.parting-segments th:first-child { width: 22%; }
+table.parting-segments th:nth-child(2) { width: 30%; }
+table.parting-segments th:last-child { width: 64px; }
+table.parting-segments tr { cursor: default; }
+table.parting-segments select { max-width: 100%; font-size: 12px; padding: 1px 2px; }
+table.parting-segments td.seg-actions { text-align: right; white-space: nowrap; }
+table.parting-segments td[colspan] { white-space: normal; }
+table.parting-segments td button { font-size: 12px; padding: 1px 6px; min-width: 24px; }
+table.parting-segments tr.selected td, table.parting-segments tr.hovered td { background: color-mix(in srgb, var(--select) 22%, transparent); }
+table.parting-segments tr.inactive td { color: var(--muted); }
+table.parting-segments tr.loop-head td { font-weight: 600; color: var(--muted); background: var(--bg); }
+table.parting-segments tr.seg-arc td { border-bottom: none; }
+table.parting-segments .seg-failed { color: var(--error-text); font-weight: 600; }
+table.parting-segments .seg-edit { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+table.parting-segments .seg-edit label { display: inline-flex; align-items: center; gap: 4px; }
+table.parting-segments .seg-edit input { font-size: 12px; padding: 2px 4px; }
+table.parting-segments .seg-edit input[type="number"] { width: 70px; }
+table.parting-segments .seg-edit .seg-centre { width: 150px; max-width: 100%; }
+table.parting-segments input[aria-invalid="true"] { border-color: var(--error-text); }
+table.parting-segments .parting-seg-error td { color: var(--error-text); font-size: 11px; }
+#parting-draw-halves .parting-controls > span:first-child { color: var(--muted); }
+#parting-draw-parts { margin: 6px 0 0; }
+.parting-draw-level input { width: 80px; }
+
+/* The 3D view while drawing by hand: the arrows that turn the part about the axis, at mid-height on the left and
+   right edges; the step (1/4 … 1/32 of a turn) at the bottom right; the essential actions at the bottom left; the
+   hint at the top; the numbers of the points. Right-side controls at 16 px: clear of the splitter of the panel. */
+.draw-overlay { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+.draw-overlay button { pointer-events: auto; }
+.draw-overlay button:focus-visible, .turn-step button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.turn {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 52px; height: 52px; padding: 0; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--panel) 85%, transparent);
+  border: 1px solid var(--border); color: var(--text);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.15);
+}
+.turn:hover { border-color: var(--accent); color: var(--accent); }
+.turn:active { transform: translateY(-50%) scale(0.94); }
+.turn-left { left: 16px; }
+.turn-right { right: 16px; }
+.turn-step, .draw-actions {
+  position: absolute; bottom: 16px;
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  padding: 4px 6px; border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 85%, transparent);
+  pointer-events: auto;
+}
+/* The frame of the step: the red frame at the bottom right of the user's sketch. */
+.turn-step { right: 16px; border: 2px solid #d23c3c; max-width: calc(100% - 32px); justify-content: flex-end; }
+.turn-step-label { font-size: 12px; color: var(--muted); margin-right: 2px; }
+.turn-step button { font-size: 12px; padding: 3px 6px; min-width: 40px; font-variant-numeric: tabular-nums; }
+.turn-step button[aria-checked="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+.turn-angle { font-size: 12px; color: var(--muted); margin-left: 4px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.draw-actions { left: 16px; border: 1px solid var(--border); }
+.draw-actions button { font-size: 12px; padding: 3px 8px; display: inline-flex; align-items: center; gap: 4px; }
+.draw-actions .draw-icon { font-size: 14px; line-height: 1; }
+.draw-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+.draw-hint {
+  position: absolute; left: 50%; transform: translateX(-50%);
+  top: calc(var(--toolbar-h, 44px) + 8px);
+  margin: 0; max-width: min(70%, 520px); width: max-content;
+  padding: 4px 12px; border-radius: 999px; font-size: 12px; text-align: center;
+  background: color-mix(in srgb, var(--panel) 90%, transparent); color: var(--text);
+  border: 1px solid var(--border); box-shadow: 0 1px 4px rgb(0 0 0 / 0.12);
+}
+.draw-hint:empty { display: none; }
+.draw-labels { position: absolute; inset: 0; overflow: hidden; }
+.draw-labels span {
+  position: absolute; transform: translate(6px, -100%);
+  font: 600 11px/1 system-ui, sans-serif; color: #fff; background: #b8141b;
+  padding: 2px 4px; border-radius: 4px; white-space: nowrap;
+}
+.draw-labels span.first { background: #1d2330; }
+.draw-labels span.selected { background: #c79a00; }
+.draw-labels span.behind { opacity: 0.35; }
+@media (max-width: 900px) {
+  .turn { width: 44px; height: 44px; }
+}
+/* A phone: the arrows smaller, the step without its label, readout and reset (aria-label kept), the actions as icons. */
+@media (max-width: 520px) {
+  .turn { width: 44px; height: 44px; }
+  .turn svg { width: 30px; height: 30px; }
+  .turn-step { padding: 3px 4px; gap: 3px; }
+  .turn-step-label, .turn-angle, .turn-reset { display: none; }
+  .draw-hint { max-width: calc(100% - 136px); font-size: 11px; padding: 3px 10px; border-radius: 12px; }
+  .turn-step button { min-width: 40px; min-height: 36px; padding: 2px 4px; }
+  .draw-actions { padding: 3px 4px; gap: 3px; }
+  .draw-actions button { width: 40px; height: 40px; justify-content: center; padding: 0; }
+  .draw-actions .draw-label { display: none; }
+  .draw-actions .draw-icon { font-size: 18px; }
+}
 /* Risers and gating: the same look as the parting line card. */
 table.feeding-risers { table-layout: fixed; }
 table.feeding-risers th:first-child, table.feeding-risers td:first-child { width: 28%; }
