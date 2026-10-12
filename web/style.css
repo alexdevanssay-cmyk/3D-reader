@@ -533,14 +533,25 @@ table.feeding-risers tr.selected td { background: color-mix(in srgb, var(--selec
 @media (max-width: 900px) { .panel-splitter { display: none; } }
 /* The bodies' names as wide as the panel lets them be. */
 #page-viewer table.bodies .name { max-width: clamp(48px, calc(100cqw - 200px), 100cqw); }
-/* A narrow panel: the lists go to a line of their own, the values wrap, a table too wide for it scrolls. */
-@container viewer-panel (max-width: 320px) {
+/* The statistics, whatever the panel's width: each value whole on one line where it fits (up to 60 % of the width),
+   the labels wrapping first; no short word left alone on a last line. */
+#page-viewer .card .stats { grid-template-columns: minmax(min-content, 1fr) fit-content(calc(60% - 6px)); }
+#page-viewer .card .stats > :is(dt, dd) { text-wrap: pretty; }
+/* The risers' columns as wide as their content, whatever the panel's width (of fixed widths, a heading or a value
+   wider than its column would stick out of the table). */
+#page-viewer .card table.feeding-risers { table-layout: auto; }
+/* The panel at its default width or narrower (up to about 405 px): the lists go to a line of their own when they do
+   not fit, the values of the statistics and the tables' headings wrap. */
+@container viewer-panel (max-width: 380px) {
   #page-viewer .card .row { flex-wrap: wrap; }
   #page-viewer .card .row > select { flex: 1 1 140px; }
   #page-viewer .card .field { min-width: 0; flex-wrap: wrap; }
   #page-viewer .card .field select { min-width: 0; max-width: 100%; }
-  #page-viewer .card .stats { grid-template-columns: minmax(min-content, 1fr) minmax(0, 1fr); }
   #page-viewer .card .stats dd { white-space: normal; overflow-wrap: break-word; }
+  #page-viewer .card table.parting-candidates th { white-space: normal; }
+}
+/* A narrow panel: a table too wide for it scrolls. */
+@container viewer-panel (max-width: 320px) {
   #page-viewer .card table.bodies, #page-viewer .card table.parting-candidates { display: block; overflow-x: auto; }
   #page-viewer .card table.parting-candidates td { overflow-wrap: normal; }
 }

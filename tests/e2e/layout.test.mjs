@@ -10,7 +10,8 @@
 // computing the thicknesses again; back to the default width on a double-click;
 // from the keyboard, its focus seen in high contrast too; kept after a reload
 // and fitted to a smaller window, a click without a drag changing nothing; no
-// splitter on a narrow window (the panel under the view).
+// splitter on a narrow window (the panel under the view). At any width, nothing
+// sticks out of the cards and the statistics' values stay whole.
 //
 //   npm run build && node --test tests/e2e/layout.test.mjs
 
@@ -407,6 +408,42 @@ describe('3D analysis panel: folded cards, width (dist/)', { skip: !existsSync(j
     await page.setViewportSize({ width: 1280, height: 800 });
     assert.equal(await splitter.isVisible(), true);
     await page.waitForFunction(() => Math.round(document.querySelector('#page-viewer > .panel').getBoundingClientRect().width) === 700);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
+  test('any width of the panel: nothing sticks out of the cards, the values of the statistics kept whole', { timeout: 2 * TIMEOUT }, async () => {
+    const { page, errors } = await newPage();
+    await page.goto(`${base}?lang=fr`);
+    await analyse(page);
+    await page.waitForSelector('#parting-main:not([hidden])', { timeout: TIMEOUT });
+    await page.waitForSelector('#feeding-main:not([hidden])', { timeout: TIMEOUT });
+    await page.click('#thick-compute');
+    await page.waitForSelector('#thick-body:not([hidden])', { timeout: TIMEOUT });
+    // Every width from the narrowest to well past the default one (as the splitter sets it), the cards in French; a
+    // value on three lines only in the narrowest panels.
+    const faults = await page.evaluate(() => {
+      const layout = document.getElementById('page-viewer');
+      const panel = layout.querySelector(':scope > .panel');
+      const lines = (el) => {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        return new Set([...range.getClientRects()].filter((r) => r.width > 0).map((r) => Math.round(r.bottom))).size;
+      };
+      const found = [];
+      for (let w = 260; w <= 520; w += 2) {
+        layout.style.setProperty('--panel-width', `${w}px`);
+        for (const card of panel.querySelectorAll(':scope > section.card:not([hidden])')) {
+          if (card.scrollWidth > card.clientWidth) found.push(`${w}px: ${card.id} ${card.scrollWidth - card.clientWidth} px too wide`);
+        }
+        for (const dd of panel.querySelectorAll('.stats dd')) {
+          if (w >= 300 && dd.offsetParent && lines(dd) > 2) found.push(`${w}px: ${dd.previousElementSibling.textContent} = ${dd.textContent} on ${lines(dd)} lines`);
+        }
+      }
+      layout.style.removeProperty('--panel-width');
+      return found;
+    });
+    assert.deepEqual(faults, []);
     assert.deepEqual(errors, []);
     await page.context().close();
   });
