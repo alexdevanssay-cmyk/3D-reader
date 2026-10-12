@@ -45,6 +45,8 @@ export const MAX_NODES = 500_000;
 // A drawing: loops and points at most.
 export const MAX_LOOPS = 32;
 export const MAX_POINTS = 2000;
+// A saved arc's radius under half its chord by at most this (mm: the rounding of the saved points and radius): a half circle.
+const REVIVE_SLACK = 1e-3;
 // Regions of fewer triangles than this and less than this share of the surface: dissolved in their neighbours.
 const SMALL_TRIANGLES = 3;
 const SMALL_SHARE = 1e-4;
@@ -1923,15 +1925,25 @@ export function parseDrawing(json) {
  * their triangles when the mesh has the same number of triangles, else
  * brought back onto the surface (reprojectPoint: one scan per point; a seed
  * finds its triangle again from its point). The segments keep their specs
- * (an arc its radius and toward).
+ * (an arc its radius and toward; a half circle, its radius and ends rounded
+ * when saved, its radius at least half its chord again).
  */
 export function reviveDrawing(dm, parsed) {
   const same = parsed.nt === dm.nt;
   const place = (s) => (same && s.t < dm.nt ? surfacePoint(dm, s.t, s.p) : reprojectPoint(dm, s.p));
+  const revive = (loop) => {
+    const points = loop.points.map(place);
+    const segs = loop.segs.map((s, K) => {
+      if (s.kind !== "arc") return { ...s };
+      const half = dist(points[K].p, points[(K + 1) % points.length].p) / 2;
+      return { ...s, radius: s.radius < half && s.radius >= half - REVIVE_SLACK ? half : s.radius };
+    });
+    return { closed: loop.closed, points, segs };
+  };
   return {
     plane: parsed.plane,
     axis: parsed.axis.slice(),
-    loops: parsed.loops.map((loop) => ({ closed: loop.closed, points: loop.points.map(place), segs: loop.segs.map((s) => ({ ...s })) })),
+    loops: parsed.loops.map(revive),
     seeds: parsed.seeds.map((s) => {
       const sp = place(s);
       return { p: sp.p, t: sp.t, side: s.side };

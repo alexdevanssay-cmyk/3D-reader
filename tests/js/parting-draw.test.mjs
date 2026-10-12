@@ -740,6 +740,28 @@ describe('helpers', () => {
     assert.equal(after.side[fine.at([30, 20, 20]).t], SIDE_LOWER);
     assert.equal(after.side[fine.at([30, 20, 0]).t], SIDE_UPPER);
   });
+
+  test('a half circle (its centre on the chord) read back: still an arc, whatever the rounding of its radius and ends', () => {
+    const box = body(boxMesh());
+    let seed = 7;
+    const random = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    for (let k = 0; k < 100; k++) {
+      const A = box.at([5 + 50 * random(), 0, 8 + 4 * random()]), B = box.at([5 + 50 * random(), 0, 8 + 4 * random()]);
+      const arc = arcFromCentre(A.p, B.p, A.p.map((v, i) => (v + B.p[i]) / 2), Z);
+      approx(arc.radius, dist(A.p, B.p) / 2, 0, 1e-12, `arc ${k}: radius half the chord`);
+      const drawing = { plane: 'Z', axis: Z, loops: [{ closed: false, points: [A, B], segs: [{ kind: 'arc', radius: arc.radius, toward: arc.toward }] }], seeds: [] };
+      const revived = reviveDrawing(box.dm, parseDrawing(JSON.stringify(serializeDrawing(drawing, box.dm.nt))));
+      const [a, b] = revived.loops[0].points;
+      const geo = arcGeometry(a.p, b.p, revived.loops[0].segs[0]);
+      assert.equal(geo.error, undefined, `arc ${k}`);
+      approx(geo.radius, arc.radius, 0, 1e-3, `arc ${k}: its radius`);
+    }
+    // A radius well under half the chord stays too small (not made a half circle).
+    const A = box.at([10, 0, 10]), B = box.at([30, 0, 10]);
+    const drawing = { plane: 'Z', axis: Z, loops: [{ closed: false, points: [A, B], segs: [{ kind: 'arc', radius: 9.9, toward: Z }] }], seeds: [] };
+    const revived = reviveDrawing(box.dm, parseDrawing(JSON.stringify(serializeDrawing(drawing, box.dm.nt))));
+    assert.equal(revived.loops[0].segs[0].radius, 9.9);
+  });
 });
 
 describe('bounded', () => {
