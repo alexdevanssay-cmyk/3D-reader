@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import {
-  FEEDING_VERSION, NECK_RATIO, RISER_ASPECT, RISER_MODULUS_FACTOR, feedingContext, feedingYield, feedingZones,
+  FEEDING_VERSION, MAX_RISERS, NECK_RATIO, RISER_ASPECT, RISER_MODULUS_FACTOR, feedingContext, feedingYield, feedingZones,
   gateFromPoint, hotSpotsWithoutRiser, placeFeeding, proposeFeeding, resizeRiser, riserFromPoint, sizeGate,
   sizeRiser, snapToPartingLine, watershed,
 } from '../../web/engine/feeding.js';
@@ -170,6 +170,20 @@ describe('feeding zones', () => {
     assert.notEqual(f.risers[0].zone, f.risers[1].zone);
     // No mass without a density: the volume only.
     assert.ok(f.risers.every((r) => r.mass_g === null && r.volume_mm3 > 0));
+  });
+
+  test('ten bosses on a thin plate: eight risers at most, the two zones left listed without one', () => {
+    // A plate 175 × 70 × 5 with two rows of five bosses 15 × 15 × 15, 20 mm apart: ten zones, none small.
+    const boss = (x, y) => x % 7 >= 2 && x % 7 <= 4 && ((y >= 2 && y <= 4) || (y >= 9 && y <= 11));
+    const mesh = voxels((x, y, z) => z < 1 || (boss(x, y) && z < 4), [35, 14, 4], { size: 5, subdivide: 2 });
+    const f = proposeFeeding(mesh.positions, mesh.indices, { parting: partingOf(mesh) });
+    assert.equal(f.zones.length, 10);
+    assert.ok(f.zones.every((z) => z.needs_riser && !z.small));
+    assert.equal(f.risers.length, MAX_RISERS);
+    const fed = new Set(f.risers.map((r) => r.zone));
+    assert.equal(fed.size, MAX_RISERS);
+    assert.deepEqual(f.hot_spots_without_riser, f.zones.map((z) => z.id).filter((id) => !fed.has(id)));
+    assert.equal(f.hot_spots_without_riser.length, 2);
   });
 
   test('a plate of one thickness: one zone, one riser at most', () => {

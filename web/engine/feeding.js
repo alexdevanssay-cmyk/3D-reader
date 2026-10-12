@@ -58,7 +58,8 @@
 import { SIDE_NONE, sampleByArea } from './parting.js';
 import { ballPass, coverPass, edgeNeighbours, prepareMesh, weld } from './thickness.js';
 
-export const FEEDING_VERSION = 1;
+// 2: every zone but the small ones needs a riser (MAX_RISERS caps the risers proposed, not the zones).
+export const FEEDING_VERSION = 2;
 
 // Two zones are one when the section between them is at least this share of
 // the hot spot of the smaller one (heuristic: directional solidification,
@@ -76,7 +77,8 @@ export const HOT_SPOT_MODULUS = 1 / 5;
 // A zone under this share of the volume of the body gets no riser: a small
 // isolated hot spot, for a local cooling of the die or a chill (heuristic).
 export const SMALL_ZONE_SHARE = 0.01;
-// At most this many risers proposed, the zones of the largest modulus first (heuristic).
+// At most this many risers proposed, the zones of the largest modulus first;
+// the others are listed as hot spots without a riser (heuristic).
 export const MAX_RISERS = 8;
 // Ingate: thickness a share of the wall it enters (it breaks off without
 // tearing the part), width a multiple of its thickness, length along the flow
@@ -556,13 +558,14 @@ export function feedingZones(positions, indices, { sphere = null, fullLimit = FU
     zones[a].necks.push({ zone: b, sphere_mm: round(s, 2) });
     zones[b].necks.push({ zone: a, sphere_mm: round(s, 2) });
   }
-  // A riser for each zone but the small ones, the largest modulus first, MAX_RISERS at most;
-  // the zone of the largest modulus always (a casting is fed somewhere).
+  // A riser for each zone but the small ones; the zone of the largest modulus always (a casting
+  // is fed somewhere). MAX_RISERS of them at most are proposed (placeFeeding): the others are
+  // hot spots without a riser.
   const byModulus = zones.map((z) => z.id).sort((a, b) => zones[b].modulus_mm - zones[a].modulus_mm || a - b);
   byModulus.forEach((id, rank) => {
     const z = zones[id];
     z.small = z.volume_share < SMALL_ZONE_SHARE;
-    z.needs_riser = rank === 0 || (!z.small && rank < MAX_RISERS);
+    z.needs_riser = rank === 0 || !z.small;
   });
   for (const z of zones) z.necks.sort((x, y) => y.sphere_mm - x.sphere_mm || x.zone - y.zone);
   onProgress?.(1);
@@ -1290,6 +1293,8 @@ export function placeFeeding(positions, indices, zones, { parting = null, densit
   const risers = [];
   const order = zones.zones.filter((z) => z.needs_riser).sort((a, b) => b.modulus_mm - a.modulus_mm || a.id - b.id);
   for (const z of order) {
+    // MAX_RISERS at most: the zones left are listed without a riser.
+    if (risers.length >= MAX_RISERS) break;
     const r = placeRiser(ctx, z, patches.get(z.id), tops.get(z.id), risers.length + 1);
     if (r) risers.push(r);
   }

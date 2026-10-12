@@ -110,7 +110,8 @@ closed mesh, in a worker after the analysis (`feedworker.js`), kept with the res
   at least 1.2 × the zone's (Wlodawer); open on top over the hot spot (on a face of it
   turned up, its footprint held by the part, along the draw direction, +Z without a parting
   line), or blind on the side at the parting line when the hot spot is closer to the joint.
-  Zones under 1 % of the volume get none (a local cooling or a chill); 8 risers at most.
+  Zones under 1 % of the volume get none (a local cooling or a chill); 8 risers at most,
+  the largest moduli first, the zones left listed as hot spots without a riser.
 - **Ingate**: on the outer outline of the parting line, not next to an undercut, the lowest
   along the draw direction (bottom filling), not under a riser, in the thickest wall
   there, by the shortest way into the part; thickness 0.7 × that wall, width 3 × the
