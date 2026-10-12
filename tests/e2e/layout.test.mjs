@@ -8,9 +8,9 @@
 // panel's width set by dragging the splitter, the 3D view following as it goes
 // (never a blank frame), within limits, the thickness scale drawn again without
 // computing the thicknesses again; back to the default width on a double-click;
-// from the keyboard; kept after a reload and fitted to a smaller window, a click
-// without a drag changing nothing; no splitter on a narrow window (the panel
-// under the view).
+// from the keyboard, its focus seen in high contrast too; kept after a reload
+// and fitted to a smaller window, a click without a drag changing nothing; no
+// splitter on a narrow window (the panel under the view).
 //
 //   npm run build && node --test tests/e2e/layout.test.mjs
 
@@ -365,6 +365,17 @@ describe('3D analysis panel: folded cards, width (dist/)', { skip: !existsSync(j
       assert.equal(await width(), expected, key);
       assert.equal((await value())[1], expected, key);
     }
+    // Reached by the keyboard, its focus seen in high contrast too (forced colours: an outline, a grip of their own).
+    await page.focus('.panel-fold-all');
+    await page.keyboard.press('Shift+Tab');
+    assert.equal(await splitter.evaluate((el) => document.activeElement === el && el.matches(':focus-visible')), true);
+    await page.emulateMedia({ forcedColors: 'active' });
+    assert.deepEqual(await splitter.evaluate((el) => {
+      const style = getComputedStyle(el);
+      const grip = getComputedStyle(el, '::after');
+      return { outline: `${style.outlineStyle} ${style.outlineWidth}`, grip: grip.backgroundColor !== 'rgba(0, 0, 0, 0)' && grip.backgroundColor !== getComputedStyle(document.body).backgroundColor };
+    }), { outline: 'solid 2px', grip: true });
+    await page.emulateMedia({ forcedColors: 'none' });
 
     // Kept after a reload.
     await drag(-340);

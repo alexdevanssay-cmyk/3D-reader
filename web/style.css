@@ -522,6 +522,14 @@ table.feeding-risers tr.selected td { background: color-mix(in srgb, var(--selec
 .panel-splitter:hover::after, .panel-splitter:focus-visible::after, .panel-resizing .panel-splitter::after { background: var(--accent); }
 .panel-splitter:focus-visible::after { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
 .panel-resizing, .panel-resizing * { cursor: col-resize !important; user-select: none !important; }
+/* High contrast (forced colours): the grip and the lit edge in the system's colours, the focus as an outline. */
+@media (forced-colors: active) {
+  .panel-splitter::before, .panel-splitter::after { forced-color-adjust: none; }
+  .panel-splitter::after { background: CanvasText; }
+  .panel-splitter:hover::before, .panel-splitter:focus-visible::before, .panel-resizing .panel-splitter::before,
+  .panel-splitter:hover::after, .panel-splitter:focus-visible::after, .panel-resizing .panel-splitter::after { background: Highlight; box-shadow: none; }
+  .panel-splitter:focus-visible { outline: 2px solid Highlight; outline-offset: -2px; }
+}
 @media (max-width: 900px) { .panel-splitter { display: none; } }
 /* The bodies' names as wide as the panel lets them be. */
 #page-viewer table.bodies .name { max-width: clamp(48px, calc(100cqw - 200px), 100cqw); }
