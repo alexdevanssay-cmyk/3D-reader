@@ -2239,6 +2239,13 @@ function partingOff() {
   renderParting();
 }
 
+/**
+ * The point clicked on body i: the first of the ray on it, whatever bodies
+ * the ray met before (another in front of it, two versions of a part one
+ * over the other); null when the ray does not meet it.
+ */
+const cardHit = (hits, i) => hits.find((h) => h.object.userData.index === i) ?? null;
+
 /** A click on the 3D view while picking a face or reassigning faces: handled here (true), the selection unchanged. */
 function partingClick(hits) {
   const p = partingOf();
@@ -2252,9 +2259,9 @@ function partingClick(hits) {
     renderParting();
     return false;
   }
-  const hit = hits[0];
-  if (!hit) return true;
-  if (hit.object.userData.index !== i) {
+  if (!hits.length) return true;
+  const hit = cardHit(hits, i);
+  if (!hit) {
     p.message = t("parting.otherBody");
     renderParting();
     return true;
@@ -2859,9 +2866,9 @@ function feedingClick(hits) {
   const f = feedingOf();
   if (!f?.mode) return false;
   const i = feedingBody();
-  const hit = hits[0];
-  if (!hit) return true;
-  if (hit.object.userData.index !== i) {
+  if (!hits.length) return true;
+  const hit = cardHit(hits, i);
+  if (!hit) {
     f.message = t("feeding.otherBody");
     renderFeeding();
     return true;
