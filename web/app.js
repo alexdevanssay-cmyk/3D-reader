@@ -1,13 +1,16 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { LineMaterial } from "three/addons/lines/LineMaterial.js";
+import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
 import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.js";
 import { engravingMask, thicknessHistogram, thicknessStats } from "./engine/thickness.js";
 import { summarize } from "./engine/summary.js";
 import { buildSemantic3D, SEMANTIC_VERSION } from "./engine/semantic.js";
 import { buildAIContext, AI_CONTEXT_VERSION } from "./engine/ai-context.js";
 import {
-  PARTING_VERSION, REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_NONE, SIDE_UPPER, ZERO_DRAFT,
-  applyOverrides, faceRegions, lineMesh, lineSummary, parseDirection, partingLine, sameDirection, snapDirection,
+  PARTING_VERSION, REACH_DOWN, REACH_UP, SIDE_UPPER, ZERO_DRAFT,
+  applyOverrides, faceRegions, lineMesh, lineSummary, mouldBlocks, parseDirection, partingLine, sameDirection, snapDirection,
 } from "./engine/parting.js";
 import {
   FEEDING_VERSION, METHOD as FEEDING_METHOD, feedingContext, feedingYield, feeds, gateFromPoint, hotSpotsWithoutRiser,
@@ -95,6 +98,8 @@ function resize() {
   renderer.setSize(w, h, false);
   camera.aspect = w / Math.max(h, 1);
   camera.updateProjectionMatrix();
+  // The parting line as wide in pixels at any size of the view.
+  for (const mesh of state.meshes) mesh.userData.partingOverlay?.userData.line?.material.resolution.set(w, h);
 }
 new ResizeObserver(resize).observe(viewport);
 resize();
@@ -696,7 +701,8 @@ function renderBodies() {
     const tr = document.createElement("tr");
     tr.dataset.index = i;
     if (i === state.selected) tr.classList.add("selected");
-    const color = state.meshes[i].material.color.getHexString();
+    // Its own colour (the material's is grey when faded, white when coloured by triangle).
+    const color = (state.meshes[i].userData.color ?? state.meshes[i].material.color).getHexString();
 
     const vis = document.createElement("input");
     vis.type = "checkbox";
@@ -1398,23 +1404,61 @@ async function ensureThickness() {
 // through, even those inside or behind.
 const HIGHLIGHT_FADE = 0.15;
 
-/** Opaque or translucent material: its own look back, or see-through for a highlight. */
+// A body other than the card's while the parting line or the risers of that
+// body are shown: translucent light grey, so that its overlays read through.
+const FADED = new THREE.Color(0xd3d6da);
+const FADED_LOOK = { transparent: true, opacity: 0.2, depthWrite: false };
+
+/**
+ * Opaque or translucent material: its own look back, see-through for a
+ * highlight, or faded ("faded": behind a body that coincides with it, two
+ * versions of a part, it gives way).
+ */
 function setSeeThrough(mesh, on) {
   const m = mesh.material;
   const look = mesh.userData.look;
-  const want = on ? { transparent: true, opacity: 1, depthWrite: false } : look;
+  const want = on === "faded" ? FADED_LOOK : on ? { transparent: true, opacity: 1, depthWrite: false } : look;
+  mesh.userData.faded = on === "faded";
+  m.polygonOffsetFactor = m.polygonOffsetUnits = on === "faded" ? 4 : 1;
   if (m.transparent === want.transparent && m.opacity === want.opacity && m.depthWrite === want.depthWrite) return;
   Object.assign(m, want);
   m.needsUpdate = true;
 }
 
-/** A mesh in its own colour: its indexed geometry back. */
+/** A body faded: its own geometry, translucent light grey. */
+function fadeBody(mesh) {
+  plainColors(mesh);
+  mesh.material.color.copy(FADED);
+  setSeeThrough(mesh, "faded");
+}
+
+/** The body whose overlays are shown (its parting line, or its risers and ingate), the others faded; -1: none. */
+function overlayBody() {
+  const i = partingBody();
+  if (i < 0 || !state.meshes[i]) return -1;
+  if (partingShown()) return i;
+  const f = feedingOf();
+  return f?.show && feedingField(i) ? i : -1;
+}
+
+/** How many bodies are faded, on the 3D view (for scripts and tests). */
+const noteFaded = () => (viewport.dataset.faded = String(state.meshes.filter((mesh) => mesh.userData.faded).length));
+
+/** The bodies not faded as they should be (the overlays shown or hidden, another body on the card). */
+function fadeStale() {
+  const i = overlayBody();
+  return state.meshes.some((mesh, j) => !!mesh.userData.faded !== (i >= 0 && j !== i));
+}
+
+/** A mesh in its own colour: its indexed geometry back (and its colour, after being faded). */
 function plainColors(mesh) {
-  if (!mesh.userData.indexed) return;
-  mesh.geometry = mesh.userData.indexed;
-  mesh.material.vertexColors = false;
-  mesh.material.color.copy(mesh.userData.color);
-  mesh.material.needsUpdate = true;
+  const m = mesh.material;
+  if (mesh.userData.indexed) mesh.geometry = mesh.userData.indexed;
+  m.color.copy(mesh.userData.color);
+  if (m.vertexColors) {
+    m.vertexColors = false;
+    m.needsUpdate = true;
+  }
 }
 
 /**
@@ -1447,7 +1491,10 @@ function applyThickness() {
   const active = (thick.colors || thick.highlight) && thick.results;
   // Not by thickness: the parting line when it is shown.
   if (!active && partingShown()) return applyParting();
+  // The risers of a body shown: the other bodies faded.
+  const overlay = overlayBody();
   state.meshes.forEach((mesh, i) => {
+    if (overlay >= 0 && i !== overlay) return fadeBody(mesh);
     const values = thickValues(i);
     setSeeThrough(mesh, active && thick.highlight);
     if (!active) return plainColors(mesh);
@@ -1476,6 +1523,7 @@ function applyThickness() {
     }
     showFlat(mesh, geom);
   });
+  noteFaded();
 }
 
 /** Lettering / fine details below the floor, in brackets: "(0,6 mm : écritures…)". */
@@ -1749,14 +1797,23 @@ new ResizeObserver(() => thick.results && renderThickness()).observe($("thick-sc
 // definition is kept per part (the SHA-256 of its file) in this browser.
 const PARTING_KEY = "reader3d.parting.v1";
 const PARTING_PARTS = 200; // parts whose definition by hand is kept, the latest
-const PARTING_COLORS = {
-  [SIDE_UPPER]: new THREE.Color(0x4f86d9),
-  [SIDE_LOWER]: new THREE.Color(0x52a861),
-  [SIDE_NONE]: new THREE.Color(0xe0302a), // undercut
-};
-const PARTING_LINE = 0xffc400;
+// On the 3D view: the halves of the mould are translucent blocks round the
+// body (the upper one blue, the lower one green) and its faces a neutral
+// light grey (lighter without draft), the undercuts yellow, the parting line
+// red and a few pixels wide over everything.
+const PARTING_FACE = new THREE.Color(0xaeb3b9);
+const PARTING_UNDERCUT = new THREE.Color(0xffcf00);
+const PARTING_LINE = 0xe8141b;
+const PARTING_LINE_PX = 4;
+const PARTING_UPPER = 0x2f6fde;
+const PARTING_LOWER = 0x2c9c4c;
+const PARTING_BLOCK_OPACITY = 0.2;
 const PARTING_ARROW = 0x1f5fd0;
 const WHITE = new THREE.Color(0xffffff);
+// Order of the translucent overlays (after the bodies faded): the blocks, then the risers and the ingate (inside the upper block), the parting line last.
+const ORDER_BLOCKS = 1;
+const ORDER_MARKERS = 2;
+const ORDER_LINE = 3;
 
 const partClient = () => (partClient.module ??= import("./engine/partclient.js"));
 
@@ -2053,10 +2110,53 @@ function removePartingOverlay(mesh) {
   mesh.userData.partingOverlay = null;
 }
 
+// The halves of the mould of a parting line (mouldBlocks), by its segments: computed once.
+const blocksKept = new WeakMap();
+
+/** The halves of the mould round body i for its parting `field` (null: none). */
+function partingBlocks(i, field) {
+  let blocks = blocksKept.get(field.segments);
+  if (blocks === undefined) {
+    const line = field.summary.parting;
+    // A planar line: flat at its level. Without a line, the body is in one
+    // half: under it (the upper half forms it), else over it.
+    const level = line?.planar ? line.level_mm : line?.kind ? null : field.side.includes(SIDE_UPPER) ? -Infinity : Infinity;
+    blocks = mouldBlocks(bodyArrays(i).positions, field.direction, { segments: field.segments, level });
+    blocksKept.set(field.segments, blocks);
+  }
+  return blocks;
+}
+
+/** A translucent block of a half of the mould, with faint edges so that it reads as a block. */
+function blockMeshes({ positions, indices, edges: outline }, color, half) {
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geom.setIndex(new THREE.BufferAttribute(indices, 1));
+  geom.computeVertexNormals();
+  const block = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
+    color, transparent: true, opacity: PARTING_BLOCK_OPACITY, depthWrite: false, side: THREE.DoubleSide,
+    flatShading: true, roughness: 0.9, clippingPlanes: [sectionPlane],
+  }));
+  const lines = new THREE.BufferGeometry();
+  lines.setAttribute("position", new THREE.BufferAttribute(outline, 3));
+  const edges = new THREE.LineSegments(lines, new THREE.LineBasicMaterial({
+    color, transparent: true, opacity: 0.5, depthWrite: false, clippingPlanes: [sectionPlane],
+  }));
+  for (const o of [block, edges]) {
+    o.renderOrder = ORDER_BLOCKS;
+    o.userData.own = true;
+    o.userData.half = half;
+  }
+  return [block, edges];
+}
+
 /**
- * The parting of the card's body on the 3D view ("Show"): the two halves
- * tinted, lighter where the faces have no draft, the undercuts in red, the
- * parting line, and an arrow along the draw direction of the upper half.
+ * The parting of the card's body on the 3D view ("Show"): the halves of the
+ * mould as translucent blocks round it (the upper one blue, the lower one
+ * green; "Mould halves" unchecked: none), their interface along the parting
+ * surface; its faces in light grey, lighter where they have no draft, the
+ * undercuts in yellow; the parting line in red, thick, over everything; an
+ * arrow along the draw direction of the upper half. The other bodies faded.
  */
 function applyParting() {
   // Shown before: its colours to take back (else the view is left as it is).
@@ -2065,24 +2165,28 @@ function applyParting() {
   const p = partingOf();
   const i = partingBody();
   const field = p?.show && i >= 0 ? partingField(i) : null;
+  const card = $("parting-card");
+  card.dataset.overlay = card.dataset.undercuts = "";
   if (!field) {
     if (!shown) return;
     state.meshes.forEach((mesh) => (mesh.userData.parting = false));
     return applyThickness(); // its own colours back, or the thickness
   }
   const color = new THREE.Color();
+  let undercuts = 0;
   state.meshes.forEach((mesh, j) => {
-    setSeeThrough(mesh, false);
     mesh.userData.parting = j === i;
-    if (j !== i) return plainColors(mesh);
+    if (j !== i) return fadeBody(mesh);
+    setSeeThrough(mesh, false);
     const geom = flatGeometry(mesh);
     const colors = geom.attributes.color.array;
     const triangles = colors.length / 12;
     for (let f = 0; f < triangles; f++) {
-      // Undercuts in red, unless moved to a half by hand.
+      // Undercuts in yellow, unless moved to a half by hand.
       const undercut = !(field.flags[f] & (REACH_UP | REACH_DOWN)) && !field.fixed?.[f];
-      color.copy(PARTING_COLORS[undercut ? SIDE_NONE : field.side[f]] ?? PARTING_COLORS[SIDE_NONE]);
-      if (field.flags[f] & ZERO_DRAFT && !undercut) color.lerp(WHITE, 0.45);
+      if (undercut) undercuts++;
+      color.copy(undercut ? PARTING_UNDERCUT : PARTING_FACE);
+      if (field.flags[f] & ZERO_DRAFT && !undercut) color.lerp(WHITE, 0.5);
       for (let k = 0; k < 3; k++) {
         colors[12 * f + 4 * k] = color.r;
         colors[12 * f + 4 * k + 1] = color.g;
@@ -2092,23 +2196,34 @@ function applyParting() {
     }
     showFlat(mesh, geom);
   });
+  noteFaded();
   const mesh = state.meshes[i];
   const group = new THREE.Group();
-  const lineGeom = new THREE.BufferGeometry();
-  lineGeom.setAttribute("position", new THREE.BufferAttribute(field.segments, 3));
-  const lines = new THREE.LineSegments(lineGeom, new THREE.LineBasicMaterial({ color: PARTING_LINE, clippingPlanes: [sectionPlane] }));
-  lines.userData.own = true;
-  group.add(lines);
-  // The arrow above the body, along the direction.
+  const blocks = $("parting-blocks").checked ? partingBlocks(i, field) : null;
+  if (blocks) group.add(...blockMeshes(blocks.lower, PARTING_LOWER, "lower"), ...blockMeshes(blocks.upper, PARTING_UPPER, "upper"));
+  if (field.segments.length) {
+    // Width in pixels (the resolution: the size of the view, kept by resize()); drawn last, over the blocks.
+    const material = new LineMaterial({ color: PARTING_LINE, linewidth: PARTING_LINE_PX, transparent: true, clippingPlanes: [sectionPlane] });
+    material.resolution.set(viewport.clientWidth, viewport.clientHeight);
+    const line = new LineSegments2(new LineSegmentsGeometry().setPositions(field.segments), material);
+    line.renderOrder = ORDER_LINE;
+    line.userData.own = true;
+    group.add(line);
+    group.userData.line = line;
+  }
+  // The arrow above the body (above the upper block), along the direction.
   const { min, max, size } = state.result.bodies[i].bbox;
   const centre = new THREE.Vector3(...min.map((v, k) => (v + max[k]) / 2));
   const d = new THREE.Vector3(...field.direction);
   const reach = Math.max(...size);
   const along = Math.abs(d.x) * size[0] + Math.abs(d.y) * size[1] + Math.abs(d.z) * size[2];
   const length = 0.35 * reach;
-  group.add(new THREE.ArrowHelper(d, centre.clone().addScaledVector(d, along / 2 + 0.05 * reach), length, PARTING_ARROW, 0.3 * length, 0.15 * length));
+  group.add(new THREE.ArrowHelper(d, centre.clone().addScaledVector(d, along / 2 + (blocks?.margin ?? 0) + 0.05 * reach), length, PARTING_ARROW, 0.3 * length, 0.15 * length));
   mesh.add(group);
   mesh.userData.partingOverlay = group;
+  // What the view shows, for scripts and tests: "line", "lower", "upper"; the triangles in yellow.
+  card.dataset.overlay = group.children.flatMap((o) => (o.isLineSegments2 ? ["line"] : o.isMesh && o.userData.half ? [o.userData.half] : [])).join(" ");
+  card.dataset.undercuts = String(undercuts);
 }
 
 /** The parting line no longer shown (the thickness is coloured instead). */
@@ -2254,6 +2369,7 @@ function renderParting() {
   $("parting-retry").hidden = !(p.error && !p.pending);
   $("parting-show").checked = p.show && !!field;
   $("parting-show").disabled = !field;
+  $("parting-blocks").disabled = !field;
   $("parting-main").hidden = !field;
   if (!field) return;
   if (p.mode) renderer.domElement.style.cursor = "crosshair";
@@ -2313,6 +2429,10 @@ $("parting-show").addEventListener("change", (e) => {
   }
   applyParting();
   renderParting();
+});
+// The halves of the mould shown or not (the line and the colours stay); for every part of this page.
+$("parting-blocks").addEventListener("change", () => {
+  if (partingShown()) applyParting();
 });
 $("parting-retry").addEventListener("click", () => {
   const p = partingOf();
@@ -2825,7 +2945,8 @@ function removeFeedingOverlay(mesh) {
  * cylinder for each riser (standing on the part, or beside it at the parting
  * line), the one selected lighter, and an arrow into the part for the
  * ingate; over whatever colours the view shows (the parting line, the
- * thickness).
+ * thickness), drawn after the halves of the mould (inside the upper one).
+ * The other bodies faded while they are shown.
  */
 function applyFeeding() {
   state.meshes.forEach(removeFeedingOverlay);
@@ -2833,6 +2954,8 @@ function applyFeeding() {
   const i = feedingBody();
   const field = f?.show && i >= 0 && state.meshes[i] ? feedingField(i) : null;
   $("feeding-card").dataset.markers = field ? String(field.risers.length + (field.gate ? 1 : 0)) : "0";
+  // The other bodies faded, or given back (the colours of the view again).
+  if (fadeStale()) applyThickness();
   if (!field) return;
   const mesh = state.meshes[i];
   const group = new THREE.Group();
@@ -2851,6 +2974,7 @@ function applyFeeding() {
     const base = new THREE.Vector3(...riser.position_mm);
     if (riser.offset) base.addScaledVector(new THREE.Vector3(...riser.offset), radius);
     cylinder.position.copy(base).addScaledVector(axis, riser.height_mm / 2);
+    cylinder.renderOrder = ORDER_MARKERS;
     cylinder.userData.own = true;
     cylinder.userData.riser = riser.id;
     group.add(cylinder);
@@ -2864,13 +2988,15 @@ function applyFeeding() {
     const shaftRadius = Math.max((field.gate.thickness_mm ?? 0) / 2, 0.008 * size);
     const dir = new THREE.Vector3(...field.gate.direction).normalize();
     const tip = new THREE.Vector3(...field.gate.position_mm);
-    const material = new THREE.MeshStandardMaterial({ color: GATE_COLOR, clippingPlanes: [sectionPlane] });
+    // Opaque, but drawn with the translucent overlays: after the halves of the mould, not tinted by them.
+    const material = new THREE.MeshStandardMaterial({ color: GATE_COLOR, transparent: true, opacity: 1, clippingPlanes: [sectionPlane] });
     const cone = new THREE.Mesh(new THREE.ConeGeometry(coneRadius, head, 32), material);
     const shaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftRadius, shaftRadius, length - head, 16), material.clone());
     for (const [part, along] of [[cone, head / 2], [shaft, head + (length - head) / 2]]) {
       // Cone and cylinder along +Y: turned to point along the ingate's direction, back from the tip.
       part.quaternion.setFromUnitVectors(up, dir);
       part.position.copy(tip).addScaledVector(dir, -along);
+      part.renderOrder = ORDER_MARKERS;
       part.userData.own = true;
       group.add(part);
     }

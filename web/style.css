@@ -262,6 +262,7 @@ table.bodies .open { color: var(--warn); }
 .thick-min strong.overridden { color: var(--muted); font-weight: 400; }
 .thick-min-used label { color: var(--text); font-weight: 600; }
 /* Parting line */
+.card-checks { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px 12px; flex-wrap: wrap; }
 .parting-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
 .parting-head > span:first-child { color: var(--muted); }
 .parting-head strong { font-size: 20px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }

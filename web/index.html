@@ -255,7 +255,10 @@
       <section class="card" id="parting-card" hidden>
         <div class="card-head">
           <h3 data-i18n="parting.title">Parting line</h3>
-          <label class="check" data-i18n-title="parting.show.title" title="Show on the 3D view: the two halves of the mould, the undercuts in red, the parting line and the draw direction"><input type="checkbox" id="parting-show"> <span data-i18n="parting.show">Show</span></label>
+          <span class="card-checks">
+            <label class="check" data-i18n-title="parting.show.title" title="Show on the 3D view: the parting line in red, the undercuts in yellow, the halves of the mould as translucent blocks (the upper one blue, the lower one green) and the draw direction; the other bodies faded"><input type="checkbox" id="parting-show"> <span data-i18n="parting.show">Show</span></label>
+            <label class="check" data-i18n-title="parting.blocks.title" title="The halves of the mould as translucent blocks round the part: the upper one blue, the lower one green; they meet along the parting surface"><input type="checkbox" id="parting-blocks" checked> <span data-i18n="parting.blocks">Mould halves</span></label>
+          </span>
         </div>
         <p class="small muted" id="parting-body" hidden></p>
         <p class="small" id="parting-status" hidden></p>
@@ -297,7 +300,7 @@
       <section class="card" id="feeding-card" hidden>
         <div class="card-head">
           <h3 data-i18n="feeding.title">Risers and gating</h3>
-          <label class="check" data-i18n-title="feeding.show.title" title="Show on the 3D view: a cylinder for each riser, an arrow for the ingate"><input type="checkbox" id="feeding-show"> <span data-i18n="feeding.show">Show</span></label>
+          <label class="check" data-i18n-title="feeding.show.title" title="Show on the 3D view: a cylinder for each riser, an arrow for the ingate; the other bodies faded"><input type="checkbox" id="feeding-show"> <span data-i18n="feeding.show">Show</span></label>
         </div>
         <p class="small muted" id="feeding-body" hidden></p>
         <p class="small" id="feeding-status" hidden></p>
