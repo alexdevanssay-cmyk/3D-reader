@@ -255,6 +255,39 @@ test("a stepped parting line defined by hand, with undercuts: marked manual, its
   assert.deepEqual(context.bodies[0].parting, { status: "manual", axis: "X", direction: [1, 0, 0], undercut_share: 0.05, zero_draft_share: 0.3478, planar: false, kind: "stepped", height_range_mm: 20 });
 });
 
+test("a parting line drawn by hand: marked manual and drawn, its loops and arcs in the AI context", () => {
+  const segment = (name, type) => ({ name, type, method: type === "curved" ? "arc" : "level", length_mm: 20, on_parting_line: true, ...(type === "curved" ? { radius_mm: 15, centre_mm: [30, 0, -1.2] } : {}) });
+  const drawn = {
+    loops: 2, points: 8, rotation_axis: [0, 0, 1],
+    segments: [segment("1-2", "curved"), segment("2-3", "straight"), segment("3-4", "straight"), segment("4-1", "straight"), segment("5-6", "straight"), segment("6-7", "straight"), segment("7-8", "curved"), segment("8-5", "straight")],
+    parts: 2, upper_parts: 1, lower_parts: 1, seam_area_mm2: 120, core_excluded: false,
+  };
+  const semantic = buildSemantic3D({
+    file: "casting.step", kind: "cad", engine: "browser",
+    summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 },
+    bodies: [body({ parting: parting({
+      status: "manual", source: "drawn", undercut_basis: "drawn_halves", drawn,
+      parting: { planar: false, kind: "warped", height_range_mm: 3.8, length_mm: 263, loops: 2 },
+    }) })],
+  });
+  const b = semantic.bodies[0];
+  assert.deepEqual([b.parting.source, b.parting.drawn.segments.length], ["drawn", 8]);
+  const { rules, required_checks: checks, evidence } = b.foundry;
+  assert.equal(rules.parting_line, "manual");
+  assert.equal(evidence.parting.source, "drawn");
+  assert.ok(evidence.confirmed.includes("parting_line_defined_manually") && evidence.confirmed.includes("parting_line_drawn_by_hand"));
+  assert.ok(checks.includes("validate_manual_parting_line_with_tooling"));
+  const context = buildAIContext(semantic, { task: "manufacturing_analysis" });
+  assert.deepEqual(context.bodies[0].parting, {
+    status: "manual", axis: "Z", direction: [0, 0, 1], undercut_share: 0, zero_draft_share: 0.3478, planar: false, kind: "warped", height_range_mm: 3.8,
+    source: "drawn", drawn_loops: 2, curved_segments: 2,
+  });
+  // Another manual one: not said drawn.
+  const typed = buildSemantic3D({ file: "casting.step", kind: "cad", engine: "browser", summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 }, bodies: [body({ parting: parting({ status: "manual", source: "vector" }) })] });
+  assert.ok(!typed.bodies[0].foundry.evidence.confirmed.includes("parting_line_drawn_by_hand"));
+  assert.equal(buildAIContext(typed, { task: "general" }).bodies[0].parting.source, undefined);
+});
+
 /** The risers and ingate of a body as the Reader gives them (web/engine/feeding.js, app.js), with these changes. */
 function feeding(overrides = {}) {
   const riser = (id, zone, position, d, h, sphere, modulus) => ({

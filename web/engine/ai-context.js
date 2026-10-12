@@ -63,6 +63,10 @@ function partingContext(p) {
     zero_draft_share: p.zero_draft_share ?? null,
     planar: line?.planar ?? null,
     ...(line?.planar === false ? { kind: line.kind, height_range_mm: line.height_range_mm } : {}),
+    // Drawn by hand on the part: how many loops, how many of its segments are arcs (not the list of its segments).
+    ...(p.source === "drawn"
+      ? { source: "drawn", drawn_loops: p.drawn?.loops ?? null, curved_segments: (p.drawn?.segments ?? []).filter((s) => s.type === "curved").length }
+      : {}),
   };
 }
 
