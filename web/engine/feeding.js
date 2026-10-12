@@ -107,6 +107,8 @@ const NOISE_TRIANGLES = 3;
 // points of its footprint tested: [share of the radius, count] per circle.
 const TOP_TRIES = 256;
 const FOOTPRINT_RINGS = [[1 / 3, 8], [2 / 3, 12], [1, 16]];
+// A large triangle of the top of a hot spot cut into at most this many parts a side, for the places tried.
+const FACE_SPLIT = 8;
 // Parting line points looked at (spread along it), ingate candidates tested for a free way out.
 const PARTING_POINTS = 4096;
 const GATE_TRIES = 64;
@@ -804,12 +806,25 @@ function topPlace(ctx, zoneId, patch, tops, diameter) {
     }
     return first;
   };
-  // The faces of the hot spot turned up (a boss: its top), nothing above them.
-  const faces = spread(tops.map((p) => ({ f: p.f, c: p.c, r: across(centreAt(g, p.f)) })));
-  let best = pick(faces, (p) => {
-    const c = centreAt(g, p.f);
-    if (grid.crossings(addScaled(c, d, lift), 1).length) return null;
-    return { contact: c, triangle: p.f, depth: length(sub(c, p.c)), centre: p.c };
+  // The faces of the hot spot turned up (a boss: its top), nothing above them: points
+  // about R/2 apart inside each (a CAD face is a few long triangles), FACE_POINTS at most.
+  const points = [];
+  const P = g.positions, I = g.indices;
+  for (const p of tops) {
+    const [a, b, c] = [0, 1, 2].map((k) => [P[3 * I[3 * p.f + k]], P[3 * I[3 * p.f + k] + 1], P[3 * I[3 * p.f + k] + 2]]);
+    const longest = Math.max(length(sub(b, a)), length(sub(c, b)), length(sub(a, c)));
+    const n = Math.min(FACE_SPLIT, Math.max(1, Math.ceil(longest / Math.max(R / 2, 1e-9))));
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; i + j < n; j++) {
+        const s = (i + 1 / 3) / n, t = (j + 1 / 3) / n;
+        const at = [0, 1, 2].map((k) => a[k] + s * (b[k] - a[k]) + t * (c[k] - a[k]));
+        points.push({ f: p.f, c: p.c, at, r: across(at) });
+      }
+    }
+  }
+  let best = pick(spread(points), (p) => {
+    if (grid.crossings(addScaled(p.at, d, lift), 1).length) return null;
+    return { contact: p.at, triangle: p.f, depth: length(sub(p.at, p.c)), centre: p.c };
   });
   // From the balls of the hot spot (a hot spot inside the part): where the line along d leaves it.
   best ??= pick(spread(patch.map((p) => ({ ...p, r: length(sub(p.c, mean)) }))), (p) => {
@@ -880,7 +895,6 @@ function placeRiser(ctx, z, patch, tops, n) {
       position_mm: roundVec(side.point.at),
       offset: roundVec(side.out, 6),
       reason: 'hot_spot_at_parting_line',
-      params,
       why: `Point chaud Ø ${params.sphere} mm (module ${params.modulus} mm) plus près du plan de joint que du dessus : masselotte latérale borgne sur la ligne de joint ; module ${params.riser} mm ≥ 1,2 × module de la zone (Chvorinov, Wlodawer).`,
     };
   }
@@ -894,7 +908,6 @@ function placeRiser(ctx, z, patch, tops, n) {
     position_mm: roundVec(top.contact),
     offset: null,
     reason,
-    params,
     why: top.highest
       ? `Point chaud Ø ${params.sphere} mm (module ${params.modulus} mm) sans surface libre juste au-dessus : masselotte ouverte sur la face la plus haute de la zone ; module ${params.riser} mm ≥ 1,2 × module de la zone (Chvorinov, Wlodawer).`
       : `Point chaud Ø ${params.sphere} mm (module ${params.modulus} mm) qu'aucune section plus épaisse n'alimente : masselotte ouverte sur le dessus, au-dessus du point chaud ; module ${params.riser} mm ≥ 1,2 × module de la zone (Chvorinov, Wlodawer).`,
@@ -1119,7 +1132,6 @@ function placeGate(ctx, risers) {
     near_undercut: chosen.undercut,
     near_riser: chosen.nearRiser,
     reason: planar ? 'thickest_wall_on_parting_line' : 'bottom_fill_on_parting_line',
-    params,
     why: `${where}${away.length ? `, loin ${away.join(' et ')}` : ''} ; attaque ${params.thickness} × ${params.width} mm (épaisseur 0,7 × paroi, largeur 3 × épaisseur : heuristique).`,
     source: 'proposed',
   };
@@ -1251,7 +1263,6 @@ export function riserFromPoint(point, { triangle = -1, zones, normal = null, dir
     source: 'manual',
     sized_by_hand: byHand,
     reason: byHand ? 'manual_sized' : 'manual',
-    params: { modulus: fr(modulus, 2) },
     why: byHand
       ? 'Placée et dimensionnée à la main.'
       : `Placée à la main ; dimensionnée sur le module de la zone touchée (${fr(modulus, 2)} mm × 1,2).`,
@@ -1326,7 +1337,6 @@ export function gateFromPoint(point, ctx, { triangle = -1, normal = null } = {})
       near_undercut: null,
       near_riser: null,
       reason: 'manual_on_parting_line',
-      params: { wall: fr(wall), thickness: fr(gate.thickness_mm), width: fr(gate.width_mm) },
       why: `Placée à la main, ramenée au point le plus proche de la ligne de joint ; attaque ${fr(gate.thickness_mm)} × ${fr(gate.width_mm)} mm (paroi Ø inscrit ${fr(wall)} mm).`,
       source: 'manual',
     };
@@ -1347,7 +1357,6 @@ export function gateFromPoint(point, ctx, { triangle = -1, normal = null } = {})
     near_undercut: null,
     near_riser: null,
     reason: 'manual_without_parting_line',
-    params: { wall: fr(wall), thickness: fr(gate.thickness_mm), width: fr(gate.width_mm) },
     why: `Placée à la main (pas de ligne de joint connue) ; attaque ${fr(gate.thickness_mm)} × ${fr(gate.width_mm)} mm.`,
     source: 'manual',
   };

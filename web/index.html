@@ -293,6 +293,46 @@
         </div>
       </section>
 
+      <!-- Risers and ingate of the body of the parting line card. -->
+      <section class="card" id="feeding-card" hidden>
+        <div class="card-head">
+          <h3 data-i18n="feeding.title">Risers and gating</h3>
+          <label class="check" data-i18n-title="feeding.show.title" title="Show on the 3D view: a cylinder for each riser, an arrow for the ingate"><input type="checkbox" id="feeding-show"> <span data-i18n="feeding.show">Show</span></label>
+        </div>
+        <p class="small muted" id="feeding-body" hidden></p>
+        <p class="small" id="feeding-status" hidden></p>
+        <button id="feeding-retry" class="small" type="button" hidden data-i18n="feeding.retry">Retry</button>
+        <div id="feeding-main" hidden>
+          <div class="parting-head">
+            <span data-i18n="feeding.risers">Risers</span>
+            <strong id="feeding-count">—</strong>
+            <span id="feeding-origin" class="parting-origin"></span>
+          </div>
+          <table class="parting-candidates feeding-risers" id="feeding-risers">
+            <thead><tr><th data-i18n="feeding.col.riser">Riser</th><th class="num" data-i18n="feeding.col.zone" data-i18n-title="feeding.col.zone.title" title="Feeding zone and the inscribed diameter of its hot spot">Zone</th><th class="num" data-i18n="feeding.col.modulus" data-i18n-title="feeding.col.modulus.title" title="Modulus of the zone (V/A, mm)">Modulus</th><th class="num" data-i18n="feeding.col.size">D × H</th><th class="num" data-i18n="feeding.col.weight">Volume</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div id="feeding-editor" class="feeding-editor" hidden>
+            <label>D <input id="feeding-d" type="number" min="1" step="1"> mm</label>
+            <label>H <input id="feeding-h" type="number" min="1" step="1"> mm</label>
+            <button id="feeding-move" class="small toggle" type="button" data-i18n="feeding.move" data-i18n-title="feeding.move.title" title="Click a new place on the part">Move</button>
+            <button id="feeding-delete" class="small" type="button" data-i18n="feeding.delete">Delete</button>
+          </div>
+          <p class="small" id="feeding-why" hidden></p>
+          <div class="parting-controls">
+            <button id="feeding-add" class="small toggle" type="button" data-i18n="feeding.add" data-i18n-title="feeding.add.title" title="Click the part on the 3D view where the riser stands">Add a riser</button>
+            <button id="feeding-gate" class="small toggle" type="button" data-i18n="feeding.placeGate" data-i18n-title="feeding.placeGate.title" title="Click the part on the 3D view: the ingate goes to the nearest point of the parting line">Place the ingate</button>
+          </div>
+          <p class="small" id="feeding-hint" hidden></p>
+          <dl class="stats" id="feeding-stats"></dl>
+          <p class="small" id="feeding-gate-why" hidden></p>
+          <button id="feeding-reset" class="small" type="button" data-i18n="feeding.reset">Back to the proposal</button>
+          <p class="parting-legend small" id="feeding-legend"></p>
+          <p class="muted small" id="feeding-sampled" hidden></p>
+          <p class="muted small" data-i18n="feeding.note">Proposed from the geometry (inscribed spheres, moduli): an aid to the running and feeding system, not a simulation of filling or solidification. Risers and ingate placed by hand are kept in this browser for this part.</p>
+        </div>
+      </section>
+
       <section class="card" id="memory-card" hidden>
         <div class="card-head">
           <h3 data-i18n="memory.title">Memory load</h3>
