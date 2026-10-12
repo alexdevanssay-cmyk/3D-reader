@@ -9,7 +9,8 @@
 //          toile_mini_mm?, epaisseur_max_mm?, estimation_ia?: {temps_cycle_s,
 //          fournisseur?, modele?, date?, adoptee?}}
 // A reference to compare the estimates with: nothing of it is applied to a
-// quote or to the settings, and nothing is sent anywhere.
+// quote or to the settings, and nothing is sent anywhere but to the shared
+// folder of the company network (the times measured, feedback.js).
 
 import { castingCycle, estimateMiseAuMille, piecesPerCycle } from "./routes.js";
 
@@ -124,20 +125,34 @@ export function validateHistory(json) {
 /** The key that merges two records: same reference and same source (none without a reference). */
 const keyOf = (r) => (r.ref ? `${r.source}\u0000${r.ref}` : null);
 
+/** The date of a record in ms, -Infinity without one: older than any dated record. */
+const dateOf = (r) => {
+  const t = Date.parse(r.date ?? "");
+  return Number.isFinite(t) ? t : -Infinity;
+};
+
 /**
  * `incoming` records merged into `existing` (neither changed): a record of
  * the same reference and source replaces the one in place; a record without a
- * reference is added unless the same one is there. Returns {pieces, added, replaced}.
+ * reference is added unless the same one is there. `newer`: a record replaces
+ * the one in place only when its date is later (the records of the shared
+ * network folder, read again and again: those this PC wrote change nothing).
+ * Returns {pieces, added, replaced, unchanged}.
  */
-export function mergeHistory(existing, incoming) {
+export function mergeHistory(existing, incoming, { newer = false } = {}) {
   const pieces = [...existing];
   const index = new Map(pieces.map((r, i) => [keyOf(r), i]).filter(([k]) => k));
   let added = 0;
   let replaced = 0;
+  let unchanged = 0;
   for (const r of incoming) {
     const k = keyOf(r);
     const at = k ? index.get(k) : pieces.findIndex((x) => !x.ref && JSON.stringify(x) === JSON.stringify(r));
     if (at !== undefined && at >= 0) {
+      if (newer && !(dateOf(r) > dateOf(pieces[at]))) {
+        unchanged++;
+        continue;
+      }
       pieces[at] = r;
       replaced++;
     } else {
@@ -146,7 +161,7 @@ export function mergeHistory(existing, incoming) {
       added++;
     }
   }
-  return { pieces, added, replaced };
+  return { pieces, added, replaced, unchanged };
 }
 
 /**

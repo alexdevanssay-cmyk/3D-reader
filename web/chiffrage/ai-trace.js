@@ -3,8 +3,9 @@
 // each traced value reduced to what a model needs to explain it, made
 // smaller to fit the window of a local model, its internal amounts masked
 // for a model on the Internet (unless the user agrees); and the check of the
-// numbers of an answer against what the model was given. The model explains,
-// it never sets a value: nothing here leads back to the quote or the
+// numbers of an answer against what the model was given. The model explains
+// and may propose values of the inputs of a piece (ai-apply.js), applied only
+// once a person accepts them: nothing here leads back to the quote or the
 // settings. Pure functions, no DOM.
 
 import { ALERTES, SOURCES, label, pieceKeys } from "./provenance.js";
@@ -135,7 +136,7 @@ export function traceForAI(snapshot, { mask = false, maxChars = Infinity } = {})
       schema: "3d-reader-costing-trace",
       schema_version: "1.0",
       lecture_seule: true,
-      note: "Valeurs du devis en cours, chacune avec sa trace (source, autorité, confiance, écart à la tendance, validation requise). Unité « % » : valeur en pourcentage, non en fraction. Aucune valeur n'est appliquée depuis l'IA.",
+      note: "Valeurs du devis en cours, chacune avec sa trace (source, autorité, confiance, écart à la tendance, validation requise). Unité « % » : valeur en pourcentage, non en fraction. Le modèle ne modifie rien : une valeur qu'il propose n'est appliquée aux saisies d'une pièce qu'une fois acceptée par une personne.",
       ...(mask ? { masque: "montants internes masqués (taux, coûts, prix, marges, pertes au feu, TRS) : seuls leurs sources et leurs écarts relatifs sont donnés" } : {}),
       resume: snapshot.resume,
       fichiers: snapshot.fichiers,

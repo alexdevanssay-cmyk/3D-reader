@@ -40,6 +40,7 @@
 // conversation (onlineMessages): it was given the real names and amounts.
 
 import { anonymizer, buildAIContext, checkContextNumbers, compactAIContext, partNames, summaryAIContext } from "./engine/ai-context.js";
+import { PROPOSAL_FIELDS, checkProposals, readProposals, valueLabel } from "./chiffrage/ai-apply.js";
 import * as archives from "./ai-history.js";
 
 const PROVIDERS = [
@@ -58,25 +59,37 @@ const MAX_WINDOW = 16384; // largest window (tokens) asked of Ollama
 const GATEWAY_CONTEXT_CHARS = 9000;
 const GATEWAY_EXAMPLE = "https://<projet>.vercel.app/api/ai";
 
+// The tasks of the IA page: [value, label, what the AI is given for it, a question it answers]. The task
+// chooses what of the analysis goes with the question (engine/ai-context.js) and the instructions.
 const TASKS = [
-  ["general", "Analyse générale"],
-  ["feature_analysis", "Features"],
-  ["manufacturing_analysis", "Fabrication"],
-  ["dfm", "DFM"],
-  ["planning", "Planification"],
-  ["costing", "Chiffrage"],
+  ["general", "Analyse générale", "Questions libres : la pièce, ses features et son criblage fonderie.",
+    "Fais l'analyse de la pièce : ce qui est mesuré, les features principales avec leurs cotes, le criblage fonderie, et ce qui reste à valider."],
+  ["feature_analysis", "Features", "Les features détectées (trous, alésages, poches, congés, motifs, relations coaxiales) avec leurs cotes et leurs identifiants.",
+    "Liste les features de la pièce par type, avec leurs cotes et leurs identifiants ; distingue celles qui sont établies des provisoires."],
+  ["manufacturing_analysis", "Fabrication", "Les pistes de procédés et d'opérations, les épaisseurs fonctionnelles et le criblage fonderie.",
+    "Quels procédés et quelles opérations pour fabriquer cette pièce ? Avec le besoin en noyaux, les contre-dépouilles et les épaisseurs à surveiller."],
+  ["dfm", "DFM", "La conception pour la fabrication : recommandations, contre-dépouilles, épaisseurs, risques fonderie.",
+    "Quelles modifications de conception faciliteraient la fabrication de cette pièce ? Classe-les par impact."],
+  ["planning", "Planification", "Une gamme indicative : mises en position et opérations (une piste, pas une gamme exécutable).",
+    "Propose une gamme d'usinage indicative : mises en position, opérations et outils, avec les points à valider."],
+  ["costing", "Chiffrage", "Le devis en cours et sa trace : la réponse explique ses valeurs, chaque nombre vérifié ; les saisies qu'elle propose ne sont appliquées qu'avec votre accord.",
+    "Explique le chiffrage de cette pièce : les postes principaux, les écarts signalés et les valeurs à valider."],
 ];
+const TASK_NOTE = "Un clic sur une tâche pose sa question ; vos questions suivantes gardent la tâche choisie.";
 
 const KEYS = {
   gateway: "reader3d.ai.gateway", code: "reader3d.ai.gatewayCode", ollama: "reader3d.ai.ollama", model: "reader3d.ai.model", provider: "reader3d.ai.provider",
   messages: "reader3d.ai.messages", think: "reader3d.ai.think", amounts: "reader3d.ai.costingAmounts", anonymize: "reader3d.ai.anonymize", fallback: "reader3d.ai.fallback",
   codeRequired: "reader3d.ai.gatewayCodeRequired", // the gateway asked for an access code: its field shown at once
-  quota: "reader3d.ai.quota", // what is left of the free quota of the gateway, from its last answer
+  quota: "reader3d.ai.quota", // what is left of the free quota of the gateway, from its last answer in any tab of this browser
+  tokens: "reader3d.ai.tokens", // the tokens of the latest answers of the gateway: {questions, all} (questions left estimated with them)
   historyTab: "reader3d.ai.historyTab", // the history shown on the right: "local" or "reseau"
 };
 // Sent on window when an answer of the gateway tells what is left of its free quota (the IA page shows it).
 const QUOTA_EVENT = "reader3d-ai-quota";
-const COSTING_LABEL = "Raisonnement IA — aucune valeur n'est appliquée";
+const COSTING_LABEL = "Raisonnement IA — rien n'est appliqué sans votre accord";
+// The reply suggested after a costing answer that proposes values (Tab or its button): applied here, never sent.
+const APPLY_TEXT = "Appliquer les valeurs au chiffrage";
 // HTTP statuses of the gateway when the free quota of its provider is reached (api/ai.js): the local model may answer instead.
 const QUOTA_STATUSES = [413, 429];
 
@@ -167,9 +180,58 @@ function writeConversation(key, conversation) {
   }
 }
 
+// The block of proposals of an answer of the local model (task "Chiffrage"): closed, or still being written at its end.
+const PROPOSALS_BLOCK = /```(?:json)?\s*(\{\s*"propositions"[\s\S]*?\})\s*```/;
+const OPEN_BLOCK = /```(?:json)?\s*(\{\s*"propositions"(?![\s\S]*```)[\s\S]*)$/;
+
+/** The block of proposals of an answer when it can be read: {list, start, end}; null otherwise. */
+function proposalsBlock(text) {
+  const m = PROPOSALS_BLOCK.exec(text) ?? OPEN_BLOCK.exec(text);
+  if (!m) return null;
+  try {
+    const parsed = JSON.parse(m[1]);
+    return Array.isArray(parsed?.propositions) ? { list: parsed.propositions, start: m.index, end: m.index + m[0].length } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * An answer without its block of proposals, shown apart under it: the block
+ * read taken out, the text after it kept; one still being written at the end
+ * hidden. One that cannot be read stays in the answer, as it was written.
+ */
+function withoutProposals(text) {
+  const s = String(text ?? "");
+  const block = proposalsBlock(s);
+  if (block) return `${s.slice(0, block.start).trimEnd()}${s.slice(block.end).trim() ? `\n\n${s.slice(block.end).trim()}` : ""}`;
+  return PROPOSALS_BLOCK.test(s) ? s : s.replace(/\n*```(?:json)?\s*\{\s*"propositions"(?![\s\S]*```)[\s\S]*$/, "").trimEnd();
+}
+
+/**
+ * The values an answer of the task "Chiffrage" proposes for the inputs of a
+ * piece, as the model wrote them (chiffrage/ai-apply.js reads and checks
+ * them): analyse_chiffrage.propositions of an answer of the gateway, the
+ * block that ends one of the local model; [] without them.
+ */
+export function proposalsOf(content) {
+  const text = withoutThinking(content);
+  let parsed = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return proposalsBlock(text)?.list ?? [];
+  }
+  const list = parsed?.analyse_chiffrage?.propositions;
+  return Array.isArray(list) ? list : [];
+}
+
+/** An answer of the local model that ends with proposals that cannot be read (JSON not valid). */
+export const unreadableProposals = (content) => /```(?:json)?\s*\{\s*"propositions"/.test(withoutThinking(content)) && !proposalsBlock(withoutThinking(content));
+
 /** The text of an answer: the JSON of the structured contract laid out, or the raw text. */
 export function formatAnswer(content) {
-  const text = withoutThinking(content);
+  const text = withoutProposals(withoutThinking(content));
   let parsed = null;
   try {
     parsed = JSON.parse(text);
@@ -222,7 +284,8 @@ function jsonText(content, pick) {
  * else the whole text (the plain text of Ollama).
  */
 export function costingText(content) {
-  return jsonText(content, (parsed) => parsed.analyse_chiffrage) ?? withoutThinking(content);
+  // The proposals apart: their numbers may come from the user's messages (ai-apply.js checks them).
+  return jsonText(content, (parsed) => (parsed.analyse_chiffrage ? { ...parsed.analyse_chiffrage, propositions: undefined } : null)) ?? withoutProposals(withoutThinking(content));
 }
 
 /** The text of an answer whose numbers are checked against the data sent: every string of its JSON, or its plain text. */
@@ -430,17 +493,67 @@ export function gatewayLabel({ provider, model } = {}) {
   return [provider, model].filter(Boolean).join(" · ");
 }
 
-/** What is left of the free quota of the day: "998 questions restantes aujourd'hui"; "" when the provider does not say. */
-export function quotaLabel(quota) {
-  const left = quota?.requests_remaining_day;
-  return Number.isFinite(left) ? `${left.toLocaleString("fr-FR")} question${left > 1 ? "s restantes" : " restante"} aujourd'hui` : "";
+const mean = (list) => list.reduce((a, b) => a + b, 0) / list.length;
+
+/**
+ * The questions left today, from the tokens: those of a day (`quota`
+ * tokens_limit_day), less those of the requests already made today with the
+ * key of the gateway, from any PC (requests_limit_day − requests_remaining_day,
+ * at the mean tokens of a request), at the mean tokens of a question of this
+ * browser (`tokens`: {questions, all}, the total tokens of its latest answers);
+ * never more than the requests left. Null when the provider or the gateway
+ * does not tell enough.
+ */
+export function questionsLeft(quota, tokens) {
+  const { tokens_limit_day: perDay, requests_limit_day: limit, requests_remaining_day: remaining } = quota ?? {};
+  const questions = (tokens?.questions ?? []).filter((n) => n > 0);
+  const all = (tokens?.all ?? []).filter((n) => n > 0);
+  if (!(perDay > 0 && Number.isFinite(limit) && Number.isFinite(remaining) && (questions.length || all.length))) return null;
+  const perQuestion = Math.round(mean(questions.length ? questions : all));
+  const perRequest = Math.round(mean(all.length ? all : questions));
+  const requests = Math.max(0, limit - remaining);
+  const used = requests * perRequest;
+  const left = Math.max(0, Math.min(remaining, Math.floor((perDay - used) / perQuestion)));
+  return { left, perQuestion, measured: questions.length || all.length, requests, used, perDay };
 }
 
-/** Keeps what is left of the free quota of a gateway answer, for the badge of the IA page (also after the Chiffrage page asked). */
-function noteQuota({ provider, quota } = {}) {
+/**
+ * What is left of the free quota of the day: "≈ 36 questions restantes
+ * aujourd'hui" from the tokens (questionsLeft), else from the requests left
+ * "998 questions restantes aujourd'hui"; "" when the provider does not say.
+ */
+export function quotaLabel(quota, tokens) {
+  const estimate = questionsLeft(quota, tokens);
+  const left = estimate ? estimate.left : quota?.requests_remaining_day;
+  return Number.isFinite(left) ? `${estimate ? "≈ " : ""}${left.toLocaleString("fr-FR")} question${left > 1 ? "s restantes" : " restante"} aujourd'hui` : "";
+}
+
+/** The tokens of the latest answers of the gateway kept in this browser: {questions, all}. */
+function readTokens() {
+  try {
+    const kept = JSON.parse(store.get(localStorage, KEYS.tokens) || "null");
+    return { questions: Array.isArray(kept?.questions) ? kept.questions : [], all: Array.isArray(kept?.all) ? kept.all : [] };
+  } catch {
+    return { questions: [], all: [] };
+  }
+}
+
+/**
+ * Keeps what is left of the free quota of a gateway answer, for the badge of
+ * the IA page (also after the Chiffrage page asked), and the tokens it took:
+ * those of the latest 20 questions of the IA page (`question`), of the latest
+ * 50 requests of any kind.
+ */
+function noteQuota({ provider, quota, usage } = {}, question = false) {
+  const total = usage?.total_tokens;
+  if (typeof localStorage !== "undefined" && Number.isFinite(total) && total > 0) {
+    const kept = readTokens();
+    store.set(localStorage, KEYS.tokens, JSON.stringify({ questions: question ? [...kept.questions, total].slice(-20) : kept.questions.slice(-20), all: [...kept.all, total].slice(-50) }));
+  }
   if (!Number.isFinite(quota?.requests_remaining_day)) return;
-  const kept = { provider: provider ?? null, ...quota };
-  if (typeof sessionStorage !== "undefined") store.set(sessionStorage, KEYS.quota, JSON.stringify(kept));
+  // For every tab of this browser (the quota is the account's, whatever the tab that asked): the latest answer's.
+  const kept = { provider: provider ?? null, ...quota, at: new Date().toISOString() };
+  if (typeof localStorage !== "undefined") store.set(localStorage, KEYS.quota, JSON.stringify(kept));
   globalThis.dispatchEvent?.(new CustomEvent(QUOTA_EVENT, { detail: kept })); // the page, not the unit tests
 }
 
@@ -494,13 +607,15 @@ function contextWindow(chars, reserve = 2048) {
 
 const seconds = (ns) => Math.round((ns ?? 0) / 1e9);
 
-// Rules of the task "Chiffrage" for the local model: it explains the traced values, it never sets one.
-const COSTING_RULES = `Tâche « Chiffrage » : le contexte contient costing_trace, les valeurs du devis en cours (devis, pièces, îlots classés), chacune avec sa trace : valeur, unité, source, autorité, confiance, écart à la tendance, autres sources, validation requise ; et les alertes. Elles sont en lecture seule : ta réponse est un raisonnement, aucune valeur n'est appliquée au devis ni aux paramètres.
+// Rules of the task "Chiffrage" for the local model: it explains the traced values, and may propose values of the
+// inputs of a piece (as the gateway, api/ai.js PROPOSAL_RULES), in a JSON block that ends its answer.
+const COSTING_RULES = `Tâche « Chiffrage » : le contexte contient costing_trace, les valeurs du devis en cours (devis, pièces, îlots classés), chacune avec sa trace : valeur, unité, source, autorité, confiance, écart à la tendance, autres sources, validation requise ; et les alertes. Tu ne les modifies pas toi-même : ta réponse est un raisonnement.
 Explique les valeurs et leurs sources, signale les écarts et les valeurs à valider, pose les questions utiles, énonce tes hypothèses. Cite la clé de chaque valeur dont tu parles (par exemple piece.prix.vente).
 N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux. Ne cite que des nombres présents dans costing_trace, tels quels ou arrondis, sans en calculer de nouveaux : une réponse qui contient un autre nombre est marquée « non vérifiée ».
+Propositions : quand l'utilisateur demande de changer une saisie d'une pièce ou en donne la bonne valeur, ou quand costing_trace ou l'analyse de la pièce donnent une valeur plus juste d'une saisie, termine ta réponse par un seul bloc \`\`\`json {"propositions": [{"piece": "nom de la pièce dans costing_trace.pieces", "cle": "piece.poids", "valeur": 1.35, "unite": "kg", "source": "question", "justification": "une phrase"}]} \`\`\` ; cle : piece.poids, piece.toileMini, piece.epaisseurMax, piece.module, piece.dimMax, piece.ilot, piece.finition, piece.miseAuMille, piece.empreintes, piece.cycle, piece.mode, piece.tth, piece.tthMode, piece.noyaux, piece.tribo, piece.redressage, piece.outillage.tiroirs ou piece.outillage.complexite ; valeur dans l'unité de la saisie (kg, mm, s) ; source : question (le nombre que l'utilisateur a écrit), trace (la valeur de cette même clé pour cette pièce dans costing_trace) ou analyse_3d (la cote mesurée de la pièce : plus grande dimension, module, épaisseurs) ; un nombre absent de la source indiquée est refusé. Jamais un prix, un taux, une marge, un paramètre ni un nombre que tu calcules : seulement un nombre écrit par l'utilisateur, dans costing_trace ou dans l'analyse de la pièce. Une personne accepte chaque proposition avant qu'elle soit appliquée. Sans proposition, pas de bloc.
 Si costing_trace est null, aucun classeur de chiffrage n'est importé : dis-le et propose de l'importer dans la page Chiffrage.`;
 
-// As the gateway's text tasks (api/ai.js TEXT_RULES): not in the task « Chiffrage », which proposes nothing.
+// As the gateway's text tasks (api/ai.js TEXT_RULES): not in the task « Chiffrage », which proposes values in its own block.
 const PROPOSALS = "Paramètres de fonderie et de chiffrage (nombre de noyaux, de tiroirs, de chapes, îlot de coulée, coefficient de difficulté…) : quand on te les demande, propose-les en fondeur à partir des features et du criblage fonderie du contexte. Présente chaque valeur comme « Proposition IA — à valider », avec sa justification (identifiants des features) et ta confiance. N'invente jamais de prix, de taux horaires ni de mesures.";
 
 /** Instructions of the local model: plain French text, laid out only when the question is about the part. */
@@ -676,14 +791,16 @@ export function mount({ page, reader }) {
           <button id="ai-test" class="btn" type="button">Tester la connexion</button>
         </div>
         <div class="ai-row ai-tasks" role="group" aria-label="Type d'analyse">
-          ${TASKS.map(([v, l]) => `<button type="button" class="small ai-task" data-task="${v}" aria-pressed="${v === "general"}">${l}</button>`).join("")}
+          ${TASKS.map(([v, l, help, question]) => `<button type="button" class="small ai-task" data-task="${v}" aria-pressed="${v === "general"}" title="${escapeHtml(`${help} Question posée : « ${question} »`)}">${l}</button>`).join("")}
         </div>
+        <p id="ai-task-help" class="ai-scope">${escapeHtml(`${TASKS[0][2]} ${TASK_NOTE}`)}</p>
         <p id="ai-scope" class="ai-scope"></p>
       </section>
 
       <section class="card ai-convo">
         <div id="ai-chat" class="ai-chat" aria-live="polite"></div>
         <form id="ai-form" class="ai-form">
+          <div id="ai-suggest" class="ai-suggest" hidden><button id="ai-suggest-apply" type="button" class="small ai-suggest-btn" aria-describedby="ai-suggest-help">${APPLY_TEXT}</button><span id="ai-suggest-help" class="ai-scope"></span></div>
           <textarea id="ai-input" rows="4" placeholder="Posez une question sur la pièce, les features, la fabrication ou le coût… (Entrée pour envoyer, Maj+Entrée pour aller à la ligne)"></textarea>
           <div class="ai-actions">
             <button id="ai-send" class="btn primary" type="submit">Envoyer</button>
@@ -712,6 +829,9 @@ export function mount({ page, reader }) {
   const $ = (id) => page.querySelector("#" + id);
   let task = "general";
   let busy = null; // AbortController of the question in progress
+  let suggestion = null; // the reply suggested after values proposed: {key, message (id of the answer), target: {tab, file}, pieces: [{key, name, proposals, changes}]}
+  let suggesting = 0; // only the latest evaluation of it is used
+  const placeholder = $("ai-input").placeholder; // the box's own, in place of the suggestion
   let shown = null; // {key, file}: the conversation on screen, the one of the tab shown and of its part
   let pending = null; // the question in progress: {key, nodes (its two messages, shown again with their conversation), dropped}
   // The history on the right (ai-history.js): the list shown, the network folder ({handle, name, permission}),
@@ -722,6 +842,12 @@ export function mount({ page, reader }) {
   let networkList = [];
   let networkBehind = true; // conversations of this PC may not be in the folder yet (written at the first write that works)
   let historyRead = 0;
+  // The shared folder chosen or forgotten (here or in Paramètres): read again, what this PC has written there anew.
+  document.addEventListener(archives.FOLDER_CHANGED, () => {
+    networkList = [];
+    networkNote = "";
+    networkBehind = true;
+  });
 
   const provider = () => $("ai-provider").value;
   const isLocal = () => provider() === "ollama";
@@ -782,19 +908,35 @@ export function mount({ page, reader }) {
   function showQuota() {
     let kept = null;
     try {
-      kept = JSON.parse(store.get(sessionStorage, KEYS.quota) || "null");
+      kept = JSON.parse(store.get(localStorage, KEYS.quota) || "null");
     } catch {
       kept = null;
     }
-    const text = isLocal() ? "" : quotaLabel(kept);
+    // A day old: the quota of the day has been given back since.
+    const at = Date.parse(kept?.at ?? "");
+    if (Number.isFinite(at) && Date.now() - at > 24 * 3600 * 1000) kept = null;
+    const tokens = readTokens();
+    const text = isLocal() ? "" : quotaLabel(kept, tokens);
     $("ai-quota").hidden = !text;
     $("ai-quota").textContent = text;
     const limit = kept?.requests_limit_day;
-    $("ai-quota").title = text
-      ? `Quota gratuit${kept.provider ? ` de ${kept.provider}` : ""} : ${text}${Number.isFinite(limit) ? ` sur ${limit.toLocaleString("fr-FR")}` : ""}, d'après sa dernière réponse.`
-      : "";
+    const when = Number.isFinite(at) ? new Date(at).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : "";
+    const fr = (n) => n.toLocaleString("fr-FR");
+    const plural = (n, word) => `${fr(n)} ${word}${n > 1 ? "s" : ""}`;
+    const estimate = questionsLeft(kept, tokens);
+    const perMinute = estimate && kept.tokens_limit_minute > 0 ? Math.max(1, Math.floor(kept.tokens_limit_minute / estimate.perQuestion)) : 0;
+    const of = kept?.provider ? ` de ${kept.provider}` : "";
+    $("ai-quota").title = !text
+      ? ""
+      : estimate
+        ? `Estimation d'après la dernière réponse${when ? ` (${when})` : ""} : ${fr(estimate.perDay)} tokens par jour${of} ; une question en prend ${fr(estimate.perQuestion)} en moyenne (${plural(estimate.measured, "réponse")} de ce navigateur) ; ${plural(estimate.requests, "requête")} déjà faite${estimate.requests > 1 ? "s" : ""} aujourd'hui avec la clé de la passerelle, depuis tous les PC (≈ ${fr(estimate.used)} tokens) ; ${plural(kept.requests_remaining_day, "requête")} restante${kept.requests_remaining_day > 1 ? "s" : ""}${Number.isFinite(limit) ? ` sur ${fr(limit)}` : ""}.${perMinute ? ` Au plus ${plural(perMinute, "question")} par minute (${fr(kept.tokens_limit_minute)} tokens par minute).` : ""}`
+        : `Quota gratuit${of} : ${text}${Number.isFinite(limit) ? ` sur ${fr(limit)}` : ""}, d'après sa dernière réponse${when ? ` (${when})` : ""}, dans n'importe quel onglet de ce navigateur. Les questions posées depuis un autre PC ne comptent qu'à la réponse suivante.`;
   }
   window.addEventListener(QUOTA_EVENT, showQuota);
+  // An answer in another tab of this browser: its quota, here too.
+  window.addEventListener("storage", (event) => {
+    if (event.key === KEYS.quota || event.key === KEYS.tokens) showQuota();
+  });
   {
     $("ai-code").value = store.get(localStorage, KEYS.code) || "";
     const saved = store.get(localStorage, KEYS.provider);
@@ -869,8 +1011,41 @@ export function mount({ page, reader }) {
    */
   function decorate(body, m) {
     if (Array.isArray(m.costing?.inconnus)) showCheck(body, m.costing);
+    if (Array.isArray(m.proposals) && m.proposals.length) showProposals(body, m.proposals);
+    if (m.application && !m.application.undone) {
+      // Its undo, until done (a later message says so).
+      const conversation = shown ? readConversation(shown.key) : null;
+      const undone = (conversation?.messages ?? []).some((x) => x.application?.undone && x.application.message === m.application.message);
+      if (!undone) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "small ai-undo-apply";
+        button.dataset.message = m.application.message;
+        button.textContent = "Annuler l'application";
+        body.append(button);
+      }
+    }
     if (Array.isArray(m.numbers) && m.numbers.length) line(body, "ai-numbers", numbersLabel(m.numbers)).title = m.numbers.join(" ; ");
     if (Array.isArray(m.names) && m.names.length) line(body, "ai-names", namesLine(m.names));
+  }
+
+  /** Under a costing answer: the values it proposes for the inputs of a piece, those that cannot be applied with why. */
+  function showProposals(body, proposals) {
+    const box = document.createElement("div");
+    box.className = "ai-proposals";
+    const title = document.createElement("strong");
+    title.textContent = "Saisies proposées pour le chiffrage (appliquées seulement avec votre accord) :";
+    const list = document.createElement("ul");
+    const from = { question: "votre message", trace: "trace du chiffrage", analyse_3d: "analyse de la pièce" };
+    for (const p of proposals) {
+      const li = document.createElement("li");
+      const label = PROPOSAL_FIELDS[p.cle]?.label ?? p.cle;
+      li.textContent = `${label}${p.piece ? ` de « ${p.piece} »` : ""} : ${valueLabel(p.valeur, p.unite)}${p.source ? ` (${from[p.source] ?? p.source})` : ""}${p.justification ? ` — ${p.justification}` : ""}${p.refus ? ` — non applicable : ${p.refus}` : ""}`;
+      if (p.refus) li.className = "refused";
+      list.append(li);
+    }
+    box.append(title, list);
+    body.append(box);
   }
 
   /** A message kept in a conversation, on screen. */
@@ -933,6 +1108,7 @@ export function mount({ page, reader }) {
     if (pending?.key === key && !pending.dropped) $("ai-chat").append(...pending.nodes);
     toEnd(true);
     showHistory();
+    updateSuggestion();
   }
 
   let loading = 0; // the history read for the part of a tab: only the latest read is used
@@ -1201,6 +1377,7 @@ export function mount({ page, reader }) {
     const conv = shown;
     const tabId = reader.tab?.id;
     const tabPart = reader.tab?.part ?? null;
+    const tabFile = reader.part?.()?.file ?? null; // the 3D file of the quote: the values proposed are for its pieces
     const askedAt = new Date().toISOString(); // the date of the question and of its answer in the history
     const part = readPart();
     const snapshot = costing ? (async () => reader.costing?.())() : null;
@@ -1355,6 +1532,21 @@ export function mount({ page, reader }) {
         const { checkNumbers } = await import("./chiffrage/ai-trace.js");
         check = checkNumbers(costingText(output), sent.costing_trace);
       }
+      // Costing: the values proposed for the inputs of a piece, each number from the data sent or the questions;
+      // the piece by its rank in the trace sent (its labels online), its key and real name from the snapshot.
+      let proposals = [];
+      if (costing && unreadableProposals(output)) {
+        // Said now and kept with the answer (shown with it again).
+        const unreadable = "Propositions de l'IA illisibles (JSON non valide) : rien à appliquer.";
+        line(answerBox, "ai-notice", unreadable, true);
+        notice = [notice, unreadable].filter(Boolean).join(" ");
+      }
+      if (costing && sent.costing_trace && read?.snapshot && tabId !== undefined) {
+        proposals = checkProposals(readProposals(proposalsOf(output), sent.costing_trace), sent, asked).map(({ index, ...p }) => {
+          const piece = read.snapshot.pieces[index];
+          return piece ? { ...p, piece: piece.nom, cle_piece: piece.cle } : p;
+        });
+      }
       // Every task with a part: the numbers that come from none of the data sent (informative).
       const numbers = sent.no_model_loaded ? [] : checkContextNumbers(answerText(output), sent, asked).inconnus;
       const legend = names ? names.legend(formatAnswer(output)) : [];
@@ -1366,6 +1558,7 @@ export function mount({ page, reader }) {
         ...(source.provider ? { provider: source.provider } : {}), ...(source.model ? { model: source.model } : {}),
         ...(localModel ? { local: true } : {}), ...(amountsSent !== null && !localModel ? { amounts: true, gateway: amountsSent } : {}),
         ...(check ? { costing: check } : {}), ...(numbers.length ? { numbers } : {}), ...(notice ? { notice } : {}), ...(legend.length ? { names: legend } : {}),
+        ...(proposals.length ? { proposals, target: { tab: tabId, file: tabFile } } : {}),
       };
       signal.throwIfAborted();
       decorate(answerBox, message);
@@ -1394,7 +1587,7 @@ export function mount({ page, reader }) {
         const text = [formatAnswer(output), legend.length ? namesLine(legend) : ""].filter(Boolean).join("\n\n");
         addAIAnalysis({ date: new Date().toISOString(), provider: source.provider ?? null, model: source.model ?? null, question, answer: text, verified: check.verifiee }, { tab: tabId });
       }
-      if (answer) noteQuota(answer);
+      if (answer) noteQuota(answer, true);
       const label = answer ? gatewayLabel(answer) : fallback ? `repli local : Ollama · ${fallback.model}` : "";
       setStatus(`Réponse en ${Math.round((performance.now() - start) / 1000)} s${(local || fallback) && timing ? ` (${timing})` : ""}${label ? ` · ${label}` : ""}`);
       timing = "";
@@ -1415,6 +1608,7 @@ export function mount({ page, reader }) {
       pending = null;
       $("ai-cancel").hidden = true;
       $("ai-send").disabled = false;
+      updateSuggestion();
     }
   }
 
@@ -1476,8 +1670,14 @@ export function mount({ page, reader }) {
       task = button.dataset.task;
       page.querySelectorAll(".ai-task").forEach((b) => b.setAttribute("aria-pressed", String(b === button)));
       $("ai-amounts-field").hidden = isLocal() || task !== "costing";
-      setStatus(`Tâche : ${button.textContent}`);
-      $("ai-input").focus();
+      const [, label, help, question] = TASKS.find(([v]) => v === task);
+      $("ai-task-help").textContent = `${help} ${TASK_NOTE}`;
+      // The click asks its question (a question being written stays in the box), when it can be answered.
+      if (busy) return setStatus(`Tâche « ${label} » choisie : une question est déjà en cours, cliquez de nouveau une fois la réponse écrite`);
+      if (reader.status === "analysing") return setStatus(`Tâche « ${label} » choisie : la pièce est encore en cours d'analyse, cliquez de nouveau une fois l'analyse finie`);
+      // The costing reads the quote of the tab, the other tasks the part.
+      if (task !== "costing" && !readPart({ withSemantic: false })) return setStatus(`Tâche « ${label} » choisie : ouvrez une pièce dans le lecteur 3D pour son analyse`);
+      ask(question);
     });
   });
 
@@ -1495,6 +1695,7 @@ export function mount({ page, reader }) {
     $("ai-chat").replaceChildren();
     setStatus("Nouvelle conversation");
     showHistory();
+    updateSuggestion();
   });
 
   // ------------------------------------------------------------------ history (ai-history.js), on the right
@@ -1667,20 +1868,23 @@ export function mount({ page, reader }) {
       return;
     }
     if (!network) {
-      box.innerHTML = `<p class="ai-hist-note">Aucun dossier réseau choisi. Les discussions des pièces y seront écrites, un fichier par pièce, pour les retrouver depuis les autres postes.</p><div class="ai-hist-actions">${button("choose", "Choisir le dossier…")}</div>${note}`;
+      box.innerHTML = `<p class="ai-hist-note">Aucun dossier réseau choisi. Le dossier réseau partagé de l'entreprise (aussi dans Paramètres) : les discussions des pièces y seront écrites (sous-dossier « historique-ia », un fichier par discussion) pour les retrouver depuis les autres postes, avec les analyses 3D et les retours d'expérience.</p><div class="ai-hist-actions">${button("choose", "Choisir le dossier…")}</div>${note}`;
       $("ai-hist-list-reseau").replaceChildren();
       refocus();
       return;
     }
+    // The shared folder of the company (network-folder.js), else the folder chosen in this page before it.
+    const where = `${network.shared ? "Dossier réseau partagé" : "Dossier"} « ${escapeHtml(network.name)} »`;
     if (!handle) {
-      box.innerHTML = `<p class="ai-hist-note">Dossier « ${escapeHtml(network.name)} » : accès à autoriser (le navigateur le demande après chaque redémarrage).</p><div class="ai-hist-actions">${button("grant", "Autoriser l'accès")}${button("choose", "Changer de dossier…")}</div>${note}`;
+      box.innerHTML = `<p class="ai-hist-note">${where} : ${network.error ? `injoignable (${escapeHtml(network.error)})` : "accès à autoriser (le navigateur le demande après chaque redémarrage)"}.</p><div class="ai-hist-actions">${button("grant", "Autoriser l'accès")}${button("choose", "Changer de dossier…")}</div>${note}`;
       $("ai-hist-list-reseau").replaceChildren();
       refocus();
       return;
     }
     const drawFolder = () => {
       const note = networkNote ? `<p class="ai-hist-error">${escapeHtml(networkNote)}</p>` : "";
-      box.innerHTML = `<p class="ai-hist-note">Dossier « ${escapeHtml(network.name)} » : les discussions des pièces y sont écrites après chaque réponse.</p><div class="ai-hist-actions">${button("refresh", "Actualiser")}${button("choose", "Changer de dossier…")}</div>${note}`;
+      const legacy = network.legacy == null ? "" : `<p class="ai-hist-note">Les discussions du dossier « ${escapeHtml(network.legacy)} », choisi avant dans cette page, sont à recopier ici.</p><div class="ai-hist-actions">${button("move-legacy", "Recopier ces discussions")}</div>`;
+      box.innerHTML = `<p class="ai-hist-note">${where}${network.shared ? ", sous-dossier « historique-ia »" : ""} : les discussions des pièces y sont écrites après chaque réponse.</p><div class="ai-hist-actions">${button("refresh", "Actualiser")}${button("choose", "Changer de dossier…")}</div>${legacy}${note}`;
     };
     drawFolder();
     if (folder || !networkList.length) {
@@ -1725,8 +1929,18 @@ export function mount({ page, reader }) {
     const { synced, ...kept } = conversation;
     if (!reader.openPartTab) return;
     const file = kept.file ?? kept.part?.file ?? null; // the name the part was last opened under
-    reader.openPartTab(kept.part ? { ...kept.part, file } : { id: null, file: null }, (tabId) => writeConversation(conversationKey(tabId), { ...kept, file }));
-    setStatus(kept.part ? "Discussion ouverte dans un nouvel onglet : ouvrez le fichier de la pièce pour la voir en 3D" : "Discussion ouverte dans un nouvel onglet");
+    // The tab shown, when it is empty (no part, no conversation, no question under way): it takes the conversation.
+    const shownTab = reader.tab;
+    const shownKey = shownTab ? conversationKey(shownTab.id) : null;
+    const reuse = !!shownTab && !shownTab.file && !shownTab.part && !readConversation(shownKey).messages.length && pending?.key !== shownKey;
+    const tabId = reader.openPartTab(kept.part ? { ...kept.part, file } : { id: null, file: null }, (id) => writeConversation(conversationKey(id), { ...kept, file }), { reuse });
+    if (tabId === shownTab?.id) {
+      // The same tab (a conversation without part does not change it): shown again.
+      shown = null;
+      showConversation();
+    }
+    const where = tabId === shownTab?.id ? "dans cet onglet" : "dans un nouvel onglet";
+    setStatus(kept.part ? `Discussion ouverte ${where} : ouvrez le fichier de la pièce pour la voir en 3D` : `Discussion ouverte ${where}`);
     $("ai-input").focus();
   }
 
@@ -1779,7 +1993,13 @@ export function mount({ page, reader }) {
         const all = !before || confirm(`Écrire aussi dans ce dossier les ${before} discussion${before > 1 ? "s" : ""} de pièces déjà gardée${before > 1 ? "s" : ""} sur ce PC ?`);
         await sync(handle, { all, force: !same });
       } else if (action === "grant") {
-        if (network && (await archives.grantNetworkFolder(network.handle))) await sync(network.handle);
+        // Granted: the folder of the conversations (in the shared folder: its subfolder), not the one asked.
+        if (network && (await archives.grantNetworkFolder(network.handle)) && (await networkReady())) await sync(network.handle);
+      } else if (action === "move-legacy") {
+        // The conversations of the folder chosen here before the shared folder: copied into it (its access asked again if need be).
+        const moved = await inTurn(async () => archives.moveLegacyFolder(await networkReady(), { ask: true }));
+        networkList = [];
+        networkNote = !moved ? "Ancien dossier non lu : accès refusé, ou dossier partagé inaccessible." : moved.failed ? `${moved.failed} discussion${moved.failed > 1 ? "s" : ""} non recopiée${moved.failed > 1 ? "s" : ""} : réessayez.` : "";
       } else if (action === "refresh" && (await networkReady())) {
         await sync(network.handle);
       }
@@ -1795,7 +2015,151 @@ export function mount({ page, reader }) {
       event.preventDefault();
       $("ai-form").requestSubmit();
     }
+    // The suggested reply taken with Tab (the box empty), as in a terminal; else Tab moves on.
+    if (event.key === "Tab" && !event.shiftKey && suggestion && !$("ai-input").value) {
+      event.preventDefault();
+      $("ai-input").value = APPLY_TEXT;
+      showSuggestion();
+    }
   });
+  $("ai-input").addEventListener("input", () => showSuggestion());
+
+  // ------------------------------------------------------------------ the values proposed, applied to the costing
+
+  /** The suggested reply, by the box: its button, and in the empty box what Tab writes. */
+  function showSuggestion() {
+    $("ai-suggest").hidden = !suggestion;
+    const n = suggestion ? suggestion.pieces.reduce((k, p) => k + p.changes.length, 0) : 0;
+    $("ai-suggest-help").textContent = suggestion
+      ? `${n} saisie${n > 1 ? "s" : ""} de ${suggestion.pieces.map((p) => `« ${p.name} »`).join(", ")} : Tab dans la zone de saisie, puis Entrée (une confirmation suit).`
+      : "";
+    $("ai-input").placeholder = suggestion ? `${APPLY_TEXT} (Tab pour l'écrire, puis Entrée)` : placeholder;
+  }
+
+  /**
+   * The reply suggested now: when the last answer of the conversation shown
+   * proposes values that would change the costing of its tab (a dry run of
+   * ui.js applyAIValues, the quote as it is now), "Appliquer les valeurs au
+   * chiffrage".
+   */
+  async function updateSuggestion() {
+    const token = ++suggesting;
+    let found = null;
+    const key = shown?.key ?? null;
+    const last = key ? readConversation(key).messages.at(-1) : null;
+    const valid = last?.role === "assistant" && last.target && Array.isArray(last.proposals) ? last.proposals.filter((p) => !p.refus && p.cle_piece) : [];
+    if (valid.length && !busy && last.target.tab === reader.tab?.id) {
+      try {
+        const { applyAIValues } = await import("./chiffrage/ui.js");
+        const pieces = [];
+        for (const piece of new Set(valid.map((p) => p.cle_piece))) {
+          const proposals = valid.filter((p) => p.cle_piece === piece);
+          const dry = applyAIValues({ ...last.target, key: piece }, proposals, {}, { dryRun: true });
+          if (!dry.error && dry.applied.length) pieces.push({ key: piece, name: dry.piece, proposals, changes: dry.applied });
+        }
+        if (pieces.length) found = { key, message: last.id, target: last.target, pieces };
+      } catch (err) {
+        console.warn("Values proposed not evaluated", err);
+      }
+    }
+    if (token !== suggesting) return;
+    suggestion = found;
+    showSuggestion();
+  }
+
+  /** The conversation shown, with `messages` added (the reply accepted and what was done), kept and archived. */
+  function appendMessages(messages) {
+    const kept = readConversation(shown.key);
+    const now = new Date().toISOString();
+    const record = archives.normalizeConversation({
+      ...kept, id: kept.id ?? archives.newId(), part: kept.part ?? reader.tab?.part ?? null, started: kept.started ?? now, updated: now,
+      messages: [...kept.messages, ...messages.map((m) => ({ id: archives.newId(), date: now, ...m }))],
+    });
+    writeConversation(shown.key, record);
+    archive(record);
+    shown = null;
+    showConversation();
+  }
+
+  const changeLine = (x) => `${x.label} : ${valueLabel(x.avant, x.unite)} → ${valueLabel(x.apres, x.unite)}`;
+
+  /**
+   * "Appliquer les valeurs au chiffrage": the values of the suggestion that
+   * still change the costing, confirmed by the person, written as the inputs
+   * of their pieces (ui.js applyAIValues). Nothing is sent to the AI.
+   */
+  async function applySuggestion() {
+    const s = suggestion;
+    if (!s || busy) return;
+    const { applyAIValues } = await import("./chiffrage/ui.js");
+    const plans = s.pieces.map((p) => ({ ...p, dry: applyAIValues({ ...s.target, key: p.key }, p.proposals, {}, { dryRun: true }) }));
+    const todo = plans.filter((p) => !p.dry.error && p.dry.applied.length);
+    if (!todo.length) {
+      setStatus(plans.find((p) => p.dry.error)?.dry.error ?? "Les valeurs proposées sont déjà celles du chiffrage.");
+      return updateSuggestion();
+    }
+    const lines = todo.flatMap((p) => [
+      `« ${p.dry.piece} » :`, ...p.dry.applied.map((x) => `  ${changeLine(x)}`),
+      ...(p.dry.consequences ?? []).map((x) => `  et par conséquent, ${changeLine(x)}`),
+      ...p.dry.refused.map((x) => `  non appliqué, ${x.label} : ${x.refus}`),
+    ]);
+    if (!confirm(`Appliquer ces valeurs au chiffrage de cet onglet ?\n\n${lines.join("\n")}\n\nElles deviennent des saisies de la pièce, tracées « proposition IA appliquée » ; « Annuler l'application » remet les valeurs d'avant.`)) {
+      setStatus("Valeurs non appliquées");
+      return;
+    }
+    const answer = readConversation(s.key).messages.find((m) => m.id === s.message);
+    const origin = { date: new Date().toISOString(), provider: answer?.provider ?? null, model: answer?.model ?? null, message: s.message };
+    const done = todo.map((p) => applyAIValues({ ...s.target, key: p.key }, p.proposals, origin));
+    const changes = done.flatMap((r) => (r.error ? [] : [...r.applied, ...(r.consequences ?? [])].map((x) => ({ ...x, label: `${x.label} de « ${r.piece} »` }))));
+    const failed = done.filter((r) => r.error).map((r) => r.error);
+    const unsaved = done.some((r) => r.saved === false);
+    const content = [
+      changes.length ? `Valeurs appliquées au chiffrage :\n- ${changes.map(changeLine).join("\n- ")}` : "Aucune valeur appliquée.",
+      failed.length ? `Non appliqué : ${failed.join(" ")}` : "",
+      unsaved ? "Le stockage de ce navigateur est plein ou bloqué : ces saisies ne sont gardées que pendant cette visite." : "",
+    ].filter(Boolean).join("\n\n");
+    appendMessages([
+      { role: "user", content: APPLY_TEXT },
+      { role: "assistant", content, ...(changes.length ? { application: { message: s.message, undone: false, changes } } : {}) },
+    ]);
+    setStatus(changes.length ? `Valeurs appliquées au chiffrage (${changes.length}) : voir la page Chiffrage` : "Aucune valeur appliquée");
+    $("ai-input").focus(); // its button gone with the suggestion
+    updateSuggestion();
+  }
+
+  /** "Annuler l'application": the values applied from the answer `answerId` back to what was there before (ui.js undoAIValues). */
+  async function undoApplication(answerId) {
+    if (busy || !shown) return;
+    const answer = readConversation(shown.key).messages.find((m) => m.id === answerId);
+    if (!answer?.target) return;
+    if (!confirm("Annuler l'application des valeurs de l'IA ?\n\nLes saisies d'avant reviennent ; une valeur modifiée depuis dans la page Chiffrage est gardée.")) return;
+    const { undoAIValues } = await import("./chiffrage/ui.js");
+    const pieces = new Map((answer.proposals ?? []).filter((p) => p.cle_piece).map((p) => [p.cle_piece, p.piece]));
+    const results = [...pieces].map(([key, name]) => undoAIValues({ ...answer.target, key, name }, { message: answerId }));
+    const changes = results.flatMap((r) => (r.error ? [] : r.undone.map((x) => ({ ...x, label: `${x.label} de « ${r.piece} »` }))));
+    const kept = results.flatMap((r) => r.kept ?? []);
+    // Nothing undone, nothing kept (no workbook, another tab shown): said, the button left to try again.
+    if (results.every((r) => r.error)) {
+      setStatus(results[0]?.error ?? "Rien à annuler");
+      return;
+    }
+    const content = [
+      changes.length ? `Application annulée :\n- ${changes.map(changeLine).join("\n- ")}` : "Rien à annuler : les valeurs ont été modifiées depuis.",
+      kept.length ? `Modifiées depuis, gardées : ${kept.join(", ")}.` : "",
+    ].filter(Boolean).join("\n\n");
+    appendMessages([{ role: "assistant", content, application: { message: answerId, undone: true, changes } }]);
+    setStatus(changes.length ? "Application des valeurs de l'IA annulée" : "Rien à annuler");
+    $("ai-input").focus(); // its button gone with the message redrawn
+    updateSuggestion();
+  }
+
+  $("ai-suggest-apply").addEventListener("click", () => applySuggestion());
+  $("ai-chat").addEventListener("click", (event) => {
+    const undo = event.target.closest(".ai-undo-apply");
+    if (undo) undoApplication(undo.dataset.message);
+  });
+  // Another part, body or tab: the suggestion evaluated again.
+  document.addEventListener("reader3d-part", () => updateSuggestion());
 
   $("ai-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1803,6 +2167,11 @@ export function mount({ page, reader }) {
     const input = $("ai-input");
     const question = input.value.trim();
     if (!question) return;
+    // The suggested reply: applied here, not asked.
+    if (suggestion && question === APPLY_TEXT) {
+      input.value = "";
+      return applySuggestion();
+    }
     // A question about the part while it is analysed: it would be answered without it.
     if (reader.status === "analysing" && task !== "general") {
       setStatus("La pièce est encore en cours d'analyse : attendez la fin, puis reposez la question.");
@@ -1810,9 +2179,14 @@ export function mount({ page, reader }) {
       return;
     }
     input.value = "";
+    await ask(question);
+  });
+
+  /** Asks `question` under the task chosen: its answer, or its error, in the conversation. */
+  async function ask(question) {
     await send(question).catch((err) => bubble("error", err?.message || String(err)));
     showScope();
-  });
+  }
 
   /** The status line when no question is asked: is there a part, is it still analysed. */
   function showReady() {
@@ -1832,6 +2206,7 @@ export function mount({ page, reader }) {
       showScope();
       showReady();
       showHistory();
+      updateSuggestion(); // the costing may have changed in its page
     },
     /** The tab `id` of the 3D page was closed (app.js): its conversation is forgotten, its question dropped. */
     forgetTab(id) {
