@@ -598,7 +598,7 @@ function columnGrid(g, d) {
     if (pv[i] < vmin) vmin = pv[i];
     if (pv[i] > vmax) vmax = pv[i];
   }
-  const box = new Float64Array(4 * nt);
+  let box = new Float64Array(4 * nt); // released once the grid is built
   const sizes = [];
   for (let f = 0; f < nt; f++) {
     const a = I[3 * f], b = I[3 * f + 1], c = I[3 * f + 2];
@@ -629,6 +629,7 @@ function columnGrid(g, d) {
   const items = new Int32Array(start[nu * nw]);
   const fill = start.slice(0, nu * nw);
   for (let f = 0; f < nt; f++) each(f, (k) => (items[fill[k]++] = f));
+  box = null;
   const stamp = new Int32Array(nt);
   let query = 0;
   const tEps = 1e-7 * (g.diag || 1);

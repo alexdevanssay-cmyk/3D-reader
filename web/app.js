@@ -2423,25 +2423,33 @@ function feedingOf(r = state.result) {
 /** The body of the card: that of the parting line card. */
 const feedingBody = () => partingBody();
 
+/** The parting of body i as feeding.js takes it ({direction, side, segments}, or null) and what identifies it. */
+function feedingParting(i, r = state.result) {
+  const p = partingOf(r);
+  const field = partingField(i, r);
+  return {
+    // The definition by hand, or the proposal.
+    key: field ? (field.manual ? p.current.get(i) : p.results[i]) : null,
+    parting: field ? { direction: field.direction, side: field.side, segments: field.segments } : null,
+  };
+}
+
 /**
  * The risers and the ingate of body i proposed for its parting line as shown
  * (proposed or by hand; +Z without one), placed once per parting:
- * {key, ctx (feedingContext), placement (placeFeeding)}, or null without zones.
+ * {key, placement (placeFeeding)}, or null without zones. The context of
+ * the placement (a grid of the triangles) is not kept: large on a large
+ * body, it is made again for an ingate placed by hand.
  */
 function feedingPlacement(i, r = state.result) {
   const f = feedingOf(r);
   const res = f?.results?.[i];
   if (!res) return null;
-  const p = partingOf(r);
-  const field = partingField(i, r);
-  // The parting it was placed for: the definition by hand, or the proposal.
-  const key = field ? (field.manual ? p.current.get(i) : p.results[i]) : null;
+  const { key, parting } = feedingParting(i, r);
   const kept = f.placed.get(i);
   if (kept && kept.key === key) return kept;
   const { positions, indices } = bodyArrays(i);
-  const parting = field ? { direction: field.direction, side: field.side, segments: field.segments } : null;
-  const ctx = feedingContext(positions, indices, res, { parting });
-  const placed = { key, ctx, placement: placeFeeding(positions, indices, res, { parting, ctx }) };
+  const placed = { key, placement: placeFeeding(positions, indices, res, { parting }) };
   f.placed.set(i, placed);
   return placed;
 }
@@ -2454,7 +2462,7 @@ const massOfVolume = (mm3, density = densityShown()) => (density && Number.isFin
 
 /**
  * What body i shows: {manual, risers, gate, yield, without (zones needing a
- * riser without one), placement, ctx, res}, or null (no zones yet, or the
+ * riser without one), placement, res}, or null (no zones yet, or the
  * parting line still being computed).
  */
 function feedingField(i, r = state.result) {
@@ -2472,7 +2480,6 @@ function feedingField(i, r = state.result) {
     yield: feedingYield(res.body.volume_mm3, risers, gate),
     without: hotSpotsWithoutRiser(res.zones, risers),
     placement: placed.placement,
-    ctx: placed.ctx,
     res,
   };
 }
@@ -2526,8 +2533,10 @@ function feedingNewModel(data) {
 function computeFeedings(r) {
   const f = feedingOf(r);
   if (f.results || f.pending || r !== state.result) return;
-  // The inscribed spheres of the wall thickness when they are known (the same values, on every core).
-  const bodies = r.bodies.map((b, i) => (b.closed ? { ...bodyArrays(i), sphere: thick.results?.[i]?.sphere ?? null } : null));
+  // The inscribed spheres of the wall thickness when computed now (the same values, on every
+  // core); not those kept from an earlier opening, maybe by an older engine.
+  const spheres = thick.results && thick.results !== r.cachedThickness ? thick.results : null;
+  const bodies = r.bodies.map((b, i) => (b.closed ? { ...bodyArrays(i), sphere: spheres?.[i]?.sphere ?? null } : null));
   if (!bodies.some(Boolean)) {
     f.results = r.bodies.map(() => null);
     return;
@@ -2641,7 +2650,9 @@ function feedingClick(hits) {
   editFeeding(i, (next, field) => {
     const direction = field.placement.direction;
     if (mode === "gate") {
-      next.gate = gateFromPoint(point, field.ctx, { triangle, normal });
+      const { positions, indices } = bodyArrays(i);
+      const ctx = feedingContext(positions, indices, field.res, { parting: feedingParting(i).parting });
+      next.gate = gateFromPoint(point, ctx, { triangle, normal });
       return;
     }
     const risers = manualRisers(field);
