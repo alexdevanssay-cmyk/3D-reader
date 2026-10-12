@@ -2653,13 +2653,19 @@ let netFolder = null; // {state, name, error} (checkSharedFolder); null: being c
 let netSync = null; // the last reading (syncFeedback), with the records it brought since the page was opened: {..., total: {added, replaced}}
 let netFeedback = null; // {ref, state: "writing" | "written" | "pending", name, error}
 let netChecking = null;
+let netAgain = false; // asked again while checking (a button of the row, the folder changed): once more after it
 
 /** The folder checked again, its retours d'expérience read and merged when it is accessible; the rows that show them drawn again. */
 function refreshNetwork() {
-  netChecking ??= (async () => {
+  if (netChecking) {
+    netAgain = true;
+    return netChecking;
+  }
+  netChecking = (async () => {
     netFolder = await network.checkSharedFolder().catch((err) => ({ state: "unreadable", name: null, error: err?.message || String(err) }));
-    // Its access to grant: the real times of this PC waiting for it said.
+    // Its access to grant: the real times of this PC waiting for it said; no folder: no reading to say.
     if (["prompt", "denied"].includes(netFolder.state)) netSync = { state: "prompt", total: netSync?.total ?? { added: 0, replaced: 0 } };
+    else if (netFolder.state === "none") netSync = null;
     drawNetwork();
     if (netFolder.state !== "accessible") return;
     // A network that stops answering midway: said, read again at the next showing of the page.
@@ -2672,6 +2678,10 @@ function refreshNetwork() {
     drawNetwork();
   })().finally(() => {
     netChecking = null;
+    if (netAgain) {
+      netAgain = false;
+      refreshNetwork();
+    }
   });
   return netChecking;
 }

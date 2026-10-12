@@ -64,6 +64,21 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
         localStorage.removeItem('test.prompt');
         return 'granted';
       };
+      // A network slow to answer (the flag "test.slow": ms): each folder or file looked for waits that long (window.__slow counts them).
+      window.__slow = { waiting: 0, done: 0 };
+      for (const method of ['getDirectoryHandle', 'getFileHandle']) {
+        const real = FileSystemDirectoryHandle.prototype[method];
+        FileSystemDirectoryHandle.prototype[method] = async function (...args) {
+          const ms = Number(localStorage.getItem('test.slow'));
+          if (ms) {
+            window.__slow.waiting++;
+            await new Promise((resolve) => setTimeout(resolve, ms));
+            window.__slow.waiting--;
+            window.__slow.done++;
+          }
+          return real.apply(this, args);
+        };
+      }
       window.__posted = [];
       const post = Worker.prototype.postMessage;
       Worker.prototype.postMessage = function (message, ...rest) {
@@ -269,6 +284,68 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     await page.click('#cnetwork [data-action="network-forget"]');
     await page.waitForFunction(() => /Dossier réseau partagé :\s*aucun/.test(document.querySelector('#cnetwork .crow')?.textContent));
     assert.equal(Object.keys(await folderFiles(page, 'retours-experience')).length, 5);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('a network slow to answer: a history imported and "Actualiser" clicked while the folder is read, kept and read again; "Ne plus utiliser" meanwhile', { timeout: TIMEOUT }, async () => {
+    const { context, page, errors } = await newPage();
+    await page.goto(`${base}?lang=fr`);
+    await chooseFolder(page);
+    await page.waitForFunction(() => /lu à/.test(document.getElementById('cnetwork')?.textContent));
+    // A real time of another PC in the folder; a history of quotes to import on this PC.
+    const record = (over) => ({ ref: 'AUTRE-PC', source: 'production', ilot: 'CG3', temps_cycle_s: 300, poids_kg: 2.5, date: '2026-06-01T10:00:00.000Z', ...over });
+    const historyFile = (pieces) => JSON.stringify({ schema: 'reader3d-historique-cycles', version: 1, pieces });
+    await page.evaluate(async (text) => {
+      const folder = await (await navigator.storage.getDirectory()).getDirectoryHandle('retours-experience');
+      const writable = await (await folder.getFileHandle('AUTRE-PC__CG3__2026-06-01T10-00-00__aaaaaaaa.json', { create: true })).createWritable();
+      await writable.write(text);
+      await writable.close();
+    }, historyFile([record()]));
+    writeFileSync(join(dir, 'historique.json'), historyFile([record({ ref: 'DEVIS-PC', source: 'devis', temps_cycle_s: 200 })]));
+    const row = () => page.evaluate(() => {
+      const el = document.getElementById('cnetwork');
+      return { state: el.querySelector('.crow strong').textContent, buttons: [...el.querySelectorAll('button')].map((b) => b.textContent), text: el.textContent };
+    });
+
+    // Read again, its file opened slowly: meanwhile a history imported, and "Actualiser" clicked again.
+    await page.evaluate(() => localStorage.setItem('test.slow', '3000'));
+    await page.click('#cnetwork [data-action="network-refresh"]');
+    await page.waitForFunction(() => window.__slow.done >= 1 && window.__slow.waiting > 0); // the folder found, its file being opened
+    await page.setInputFiles('#page-parametres input[data-file="historique"]', join(dir, 'historique.json'));
+    await page.waitForFunction(() => /Historique « historique\.json » importé/.test(document.querySelector('#page-parametres .cmsg')?.textContent));
+    assert.ok(await page.evaluate(() => {
+      if (!window.__slow.waiting) return false;
+      document.querySelector('#cnetwork [data-action="network-refresh"]').click();
+      return true;
+    }), '"Actualiser" clicked while the folder is read');
+    await page.evaluate(() => localStorage.removeItem('test.slow'));
+    // The reading over, the folder checked and read again: the row with its buttons, what the reading brought.
+    await page.waitForFunction(() => /— accessible/.test(document.querySelector('#cnetwork .crow')?.textContent) && /lu à/.test(document.getElementById('cnetwork').textContent), null, { timeout: 20_000 });
+    const after = await row();
+    assert.deepEqual(after.buttons, ['Actualiser', 'Changer de dossier…', 'Ne plus utiliser']);
+    assert.match(after.text, /1 temps mesuré ajouté à l'historique, 0 mis à jour depuis l'ouverture de la page/);
+    // The history imported meanwhile kept, with the record of the other PC.
+    await page.waitForFunction(() => window.__slow.waiting === 0);
+    const kept = await page.evaluate(() => JSON.parse(localStorage.getItem('reader3d.chiffrage.historique.v1')).pieces);
+    assert.deepEqual(kept.map((r) => [r.ref, r.source]).sort(), [['AUTRE-PC', 'production'], ['DEVIS-PC', 'devis']]);
+
+    // "Ne plus utiliser" while the folder is read: no reading said for a folder no longer used.
+    await page.evaluate(() => localStorage.setItem('test.slow', '3000'));
+    await page.click('#cnetwork [data-action="network-refresh"]');
+    await page.waitForFunction(() => window.__slow.waiting > 0);
+    assert.ok(await page.evaluate(() => {
+      if (!window.__slow.waiting) return false;
+      setTimeout(() => document.querySelector('#cnetwork [data-action="network-forget"]').click()); // its confirm() accepted out of this evaluate
+      return true;
+    }), '"Ne plus utiliser" clicked while the folder is read');
+    await page.evaluate(() => localStorage.removeItem('test.slow'));
+    await page.waitForFunction(() => /Dossier réseau partagé :\s*aucun/.test(document.querySelector('#cnetwork .crow')?.textContent), null, { timeout: 20_000 });
+    await page.waitForFunction(() => window.__slow.waiting === 0);
+    await page.waitForTimeout(300);
+    const forgotten = await row();
+    assert.deepEqual([forgotten.state, forgotten.buttons], ['aucun', ['Choisir le dossier…']]);
+    assert.doesNotMatch(forgotten.text, /lu à/);
     assert.deepEqual(errors, []);
     await context.close();
   });
