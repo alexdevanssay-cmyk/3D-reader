@@ -45,6 +45,28 @@ export const FOUNDRY_SOURCES = [
     url: "https://dl.asminternational.org/handbooks/edited-volume/27/chapter-abstract/376603/Casting-Design-and-Geometry-1",
     scope: "casting_design_geometry_junctions_shrinkage_secondary_operations",
   },
+  // The rules of the risers and gating proposed by feeding.js (books and an article: no link).
+  {
+    id: "chvorinov_1940",
+    title: "Theorie der Erstarrung von Gußstücken (N. Chvorinov)",
+    publisher: "Die Giesserei, vol. 27, 1940",
+    url: null,
+    scope: "solidification_time_proportional_to_squared_modulus_volume_over_cooling_surface",
+  },
+  {
+    id: "wlodawer_1966",
+    title: "Directional Solidification of Steel Castings (R. Wlodawer)",
+    publisher: "Pergamon Press, 1966",
+    url: null,
+    scope: "modulus_method_feeding_zones_riser_modulus_1_2_times_casting_section",
+  },
+  {
+    id: "campbell_casting_handbook",
+    title: "Complete Casting Handbook: Metal Casting Processes, Metallurgy, Techniques and Design (J. Campbell)",
+    publisher: "Butterworth-Heinemann, 2nd edition, 2015",
+    url: null,
+    scope: "feeding_rules_directional_solidification_inscribed_circles_gating_bottom_filling",
+  },
 ];
 
 export const FOUNDRY_PROFILES = {
