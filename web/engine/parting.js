@@ -650,7 +650,8 @@ export function lineMesh(positions, indices, merged = weld(positions, indices)) 
  * Returns {segments (Float32Array, xyz of both ends of each piece),
  * length_mm, loops, planar, kind ("planar", "stepped", "warped", or null
  * without a line), height_range_mm, heights_mm [lowest, highest] along d,
- * levels (heights of its level runs)}.
+ * level (the height most of its length is at: the median), levels (heights
+ * of its level runs)}.
  */
 export function partingLine(line, side, d, { flags = null, plane = null, fixed = null, height = null } = {}) {
   const { positions: P, indices: I, welded, neighbours } = line;
@@ -676,12 +677,9 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
   };
   const at = (r) => [P[3 * r], P[3 * r + 1], P[3 * r + 2]];
   const edgeKey = (wa, wb) => (wa < wb ? `e${wa},${wb}` : `e${wb},${wa}`);
-  const splitCache = new Map();
-  const isSplit = (f) => {
-    let s = splitCache.get(f);
-    if (s === undefined) splitCache.set(f, (s = split(f)));
-    return s;
-  };
+  // Per triangle: 0 not known yet, 1 not cut, 2 cut (a typed array: every triangle of a large mesh).
+  const splitState = new Uint8Array(nt);
+  const isSplit = (f) => (splitState[f] ||= split(f) ? 2 : 1) === 2;
 
   for (let f = 0; f < nt; f++) {
     for (let e = 0; e < 3; e++) {
@@ -711,8 +709,8 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
     }
   }
   // Across the faces cut by the plane.
-  for (const [f, s] of splitCache) {
-    if (!s) continue;
+  for (let f = 0; f < nt; f++) {
+    if (splitState[f] !== 2) continue;
     const ends = [];
     for (let e = 0; e < 3; e++) {
       const ra = I[3 * f + e], rb = I[3 * f + ((e + 1) % 3)];
@@ -725,7 +723,7 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
 
   const m = pieces.length;
   const segments = new Float32Array(6 * m);
-  if (!m) return { segments, length_mm: 0, loops: 0, planar: null, kind: null, height_range_mm: null, heights_mm: null, levels: [] };
+  if (!m) return { segments, length_mm: 0, loops: 0, planar: null, kind: null, height_range_mm: null, heights_mm: null, level: null, levels: [] };
   const hOf = (p) => p[0] * d[0] + p[1] * d[1] + p[2] * d[2];
   let length = 0, lo = Infinity, hi = -Infinity;
   const lengths = new Float64Array(m);
@@ -803,7 +801,7 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
   // Levels of at least 5 % of the line (a few level pieces of a warped line are not steps).
   const kept = levels.filter((l) => l.length >= 0.05 * length).map((l) => l.sum / l.length);
   const kind = planar ? "planar" : levelLength >= 0.6 * length && kept.length >= 2 ? "stepped" : "warped";
-  return { segments, length_mm: length, loops, planar, kind, height_range_mm: span, heights_mm: [lo, hi], levels: kept };
+  return { segments, length_mm: length, loops, planar, kind, height_range_mm: span, heights_mm: [lo, hi], level: median, levels: kept };
 }
 
 // ------------------------------------------------------------------ faces
@@ -893,8 +891,9 @@ export function lineSummary(l) {
     height_range_mm: round(l.height_range_mm),
     length_mm: round(l.length_mm, 1),
     loops: l.loops,
-    // Height of a planar line along d (in the frame of the model); the levels of a stepped one.
-    ...(l.planar ? { level_mm: round((l.heights_mm[0] + l.heights_mm[1]) / 2, 2) } : {}),
+    // Height of a planar line along d (in the frame of the model): the one it is
+    // planar at (a short detour off it does not move it); the levels of a stepped one.
+    ...(l.planar ? { level_mm: round(l.level, 2) } : {}),
     ...(l.kind === "stepped" ? { levels_mm: l.levels.map((h) => round(h, 2)) } : {}),
   };
 }
@@ -1020,14 +1019,23 @@ export function proposeParting(positions, indices, { draftDeg = DEFAULT_DRAFT_DE
     const least = Math.min(...evaluated.map((e) => e.areas.undercut));
     const tied = evaluated.filter((e) => e.areas.undercut - least <= UNDERCUT_TIE * total).sort((a, b) => better(key(a), key(b), total)).slice(0, 2);
     for (const e of tied) {
+      // Its exact areas too: the figures shown are those of the faces coloured.
       const full = fullDirection(mesh, e.d, sinDraft, getLine);
-      Object.assign(e, { side: full.side, flags: full.flags, plane: full.plane, line: full.line });
+      Object.assign(e, { areas: full.areas, side: full.side, flags: full.flags, plane: full.plane, line: full.line });
       progress();
     }
   }
-  const order = evaluated.map((e, i) => i).sort((i, j) => better(key(evaluated[i]), key(evaluated[j]), total) || i - j);
+  // A candidate without its line ranks as if it were planar: the best one
+  // classified on every triangle until it has one, and ranked again (six
+  // rounds at most).
+  let order;
+  for (;;) {
+    order = evaluated.map((e, i) => i).sort((i, j) => better(key(evaluated[i]), key(evaluated[j]), total) || i - j);
+    const top = evaluated[order[0]];
+    if (top.side) break;
+    Object.assign(top, fullDirection(mesh, top.d, sinDraft, getLine));
+  }
   const best = evaluated[order[0]];
-  if (!best.side) Object.assign(best, fullDirection(mesh, best.d, sinDraft, getLine));
   onProgress?.(1);
 
   const candidates = evaluated.map((e) => directionSummary(mesh, e.d, e.areas, e.height, e.line, e.source));
