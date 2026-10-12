@@ -6,9 +6,10 @@
 //   <reference>__<island>__<date>__<random id>.json
 //   {schema: "reader3d-historique-cycles", version: 1, pieces: [record]}  (history.js)
 // The files of that folder are read when the Chiffrage or Paramètres page is
-// shown (and on "Actualiser"), their records merged into the history of this
-// browser: a record of the same reference and source replaces the one kept
-// only when it is newer, so those this PC wrote, read back, change nothing.
+// shown (and on "Actualiser"), those not read yet during this visit only,
+// their records merged into the history of this browser: a record of the same
+// reference and source replaces the one kept only when it is newer, so those
+// this PC wrote, read back, change nothing.
 // A record that could not be written (the access to the folder to grant, the
 // network down) waits in this browser, written at the next reading.
 
@@ -91,39 +92,41 @@ export async function writeFeedback(record) {
 
 // --------------------------------------------------------------------------- reading
 
-// The files merged during this visit (name -> "size|date"): read again only when they change.
-const seen = new Map();
+// The names of the files merged during this visit: never written over (a name of their own), not read again.
+const seen = new Set();
 
 /** Read every file of the folder again at the next reading (the history of this browser erased). */
 export const forgetRead = () => seen.clear();
 
 /**
  * The records of the files of the folder `dir` merged into `existing`
- * (mergeHistory, the newer only); a file already merged and unchanged since
- * (`read`: name -> stamp) is not read again. Resolves to {pieces, files (read),
- * records, added, replaced, unreadable (names: being written, or not a history)}.
+ * (mergeHistory, the newer only); a file already merged (`read`: its name) is
+ * not opened again, over the network, as the folder grows. Resolves to
+ * {pieces, incoming (the records read, in order), files (read), records,
+ * added, replaced, unreadable (names: being written, or not a history)}.
  */
-export async function mergeFolder(dir, existing, read = new Map()) {
+export async function mergeFolder(dir, existing, read = new Set()) {
   let pieces = existing;
+  const incoming = [];
   const out = { files: 0, records: 0, added: 0, replaced: 0, unreadable: [] };
   for (const name of await fileNames(dir, (n) => n.endsWith(".json"))) {
+    if (read.has(name)) continue;
     try {
       const file = await (await dir.getFileHandle(name)).getFile();
-      const stamp = `${file.size}|${file.lastModified}`;
-      if (read.get(name) === stamp) continue;
       const { pieces: records } = validateHistory(JSON.parse(await file.text()));
       const merged = mergeHistory(pieces, records, { newer: true });
       pieces = merged.pieces;
+      incoming.push(...records);
       out.files++;
       out.records += records.length;
       out.added += merged.added;
       out.replaced += merged.replaced;
-      read.set(name, stamp);
+      read.add(name);
     } catch (err) {
       if (!notFound(err)) out.unreadable.push(name); // removed since: nothing to say
     }
   }
-  return { pieces, ...out };
+  return { pieces, incoming, ...out };
 }
 
 let syncing = null;
@@ -155,10 +158,13 @@ export function syncFeedback({ load, save }) {
       const left = pending().filter((r) => !done.has(JSON.stringify(r)));
       setPending(left);
       const written = done.size;
-      const merged = await mergeFolder(dir, load(), seen);
-      if (merged.added || merged.replaced) save(merged.pieces);
-      const { pieces, ...report } = merged;
-      return { state: "done", at: new Date().toISOString(), written, waiting: left.length, ...report };
+      // Merged into the history as it is once read, not as it was before (an
+      // import, a clear or a real time saved meanwhile kept): nothing awaited
+      // between load() and save().
+      const { pieces, incoming, ...report } = await mergeFolder(dir, [], seen);
+      const now = mergeHistory(load(), incoming, { newer: true });
+      if (now.added || now.replaced) save(now.pieces);
+      return { state: "done", at: new Date().toISOString(), written, waiting: left.length, ...report, added: now.added, replaced: now.replaced };
     } catch (err) {
       return { state: "error", error: err?.message || String(err), waiting: pendingCount() };
     }

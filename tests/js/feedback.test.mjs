@@ -10,9 +10,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { FileExistsError, fileNames, writeFile } from '../../web/network-folder.js';
-import { feedbackFile, feedbackFileName, mergeFolder, writeRecord } from '../../web/chiffrage/feedback.js';
-import { SCHEMA, checkRecord, importHistory } from '../../web/chiffrage/history.js';
-import { fakeFolder } from './fake-folder.mjs';
+import { feedbackFile, feedbackFileName, forgetRead, mergeFolder, syncFeedback, writeRecord } from '../../web/chiffrage/feedback.js';
+import { SCHEMA, checkRecord, importHistory, mergeHistory } from '../../web/chiffrage/history.js';
+import { chooseFakeFolder, fakeFolder } from './fake-folder.mjs';
 
 const record = (over = {}) => checkRecord({
   ref: 'REF-A', fichier_3d: 'piece_a.stp', source: 'production', ilot: 'CG3', temps_cycle_s: 250, pieces_par_cycle: 1, trs: 0.8,
@@ -69,7 +69,7 @@ test('a real time written in a file of its own, never over another one', async (
   assert.equal(dir.files.size, 2);
 });
 
-test('the files of the folder merged into the history: the newer record only, this PC\'s own not twice, those read already not read again', async () => {
+test('the files of the folder merged into the history: the newer record only, this PC\'s own not twice, those read already not opened again', async () => {
   const mine = record();
   const dir = fakeFolder({
     'REF-A__CG3__mine.json': feedbackFile(mine),
@@ -79,17 +79,70 @@ test('the files of the folder merged into the history: the newer record only, th
     'EN-COURS__x.json': '{"schema": "reader3d-histo',
     'notes.txt': 'not read',
   });
-  const read = new Map();
+  // The files opened, over the network: those not merged yet only, however many the folder holds.
+  const opened = [];
+  const open = dir.getFileHandle;
+  dir.getFileHandle = (name, options) => (opened.push(name), open(name, options));
+  const read = new Set();
   const first = await mergeFolder(dir, [mine], read);
   assert.deepEqual([first.files, first.records, first.added, first.replaced], [4, 4, 1, 1]);
   assert.deepEqual(first.unreadable, ['EN-COURS__x.json']);
   assert.deepEqual(first.pieces.map((r) => [r.ref, r.temps_cycle_s]), [['REF-A', 260], ['AUTRE', 40]]);
-  // Read again: only the file being written, and a file written since.
+  assert.deepEqual(first.incoming.map((r) => r.temps_cycle_s).sort(), [250, 260, 40, 999]);
+  assert.equal(opened.length, 5);
+  // Read again: only the file being written, now written; those merged not even opened.
+  opened.length = 0;
   dir.files.set('EN-COURS__x.json', { bytes: new TextEncoder().encode(feedbackFile(record({ ref: 'EN-COURS' }))), lastModified: 99 });
   const again = await mergeFolder(dir, first.pieces, read);
   assert.deepEqual([again.files, again.added, again.replaced, again.unreadable], [1, 1, 0, []]);
   assert.equal(again.pieces.length, 3);
+  assert.deepEqual(opened, ['EN-COURS__x.json']);
+  opened.length = 0;
   const nothing = await mergeFolder(dir, again.pieces, read);
-  assert.deepEqual([nothing.files, nothing.added, nothing.replaced], [0, 0, 0]);
+  assert.deepEqual([nothing.files, nothing.added, nothing.replaced, nothing.incoming], [0, 0, 0, []]);
   assert.equal(nothing.pieces, again.pieces);
+  assert.deepEqual(opened, []);
+});
+
+test('a reading of the shared folder merged into the history as it is once read: an import, a clear made while it reads kept', async () => {
+  const retours = fakeFolder({ 'AUTRE__CG3__1.json': feedbackFile(record({ ref: 'AUTRE' })) }, { name: 'retours-experience' });
+  chooseFakeFolder(fakeFolder({ 'retours-experience': retours }, { name: 'reseau' }));
+  // The history of this browser (store.js), and what the user does while a file is opened over the network.
+  let history = [record({ ref: 'LOCAL' })];
+  const load = () => history;
+  const save = (pieces) => {
+    history = pieces;
+  };
+  let meanwhile = null;
+  const open = retours.getFileHandle;
+  retours.getFileHandle = async (name, options) => {
+    const handle = await open(name, options);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    meanwhile?.();
+    meanwhile = null;
+    return handle;
+  };
+  const refs = () => history.map((r) => r.ref).sort();
+
+  // A history file imported meanwhile (times of quotes, on this PC only): kept, with the record of the other PC.
+  meanwhile = () => {
+    history = mergeHistory(history, [record({ ref: 'IMPORTE', source: 'devis' })]).pieces;
+  };
+  const first = await syncFeedback({ load, save });
+  assert.deepEqual([first.state, first.files, first.added, first.replaced], ['done', 1, 1, 0]);
+  assert.deepEqual(refs(), ['AUTRE', 'IMPORTE', 'LOCAL']);
+
+  // The history cleared meanwhile: the records of the folder come back, never those of this PC only.
+  retours.files.set('TROISIEME__CG3__2.json', { bytes: new TextEncoder().encode(feedbackFile(record({ ref: 'TROISIEME' }))), lastModified: 5 });
+  meanwhile = () => {
+    history = [];
+    forgetRead();
+  };
+  const second = await syncFeedback({ load, save });
+  assert.deepEqual([second.state, second.files, second.added], ['done', 1, 1]);
+  assert.deepEqual(refs(), ['TROISIEME']);
+  // The file read before the clear: back at the next reading.
+  const third = await syncFeedback({ load, save });
+  assert.deepEqual([third.files, third.added], [1, 1]);
+  assert.deepEqual(refs(), ['AUTRE', 'TROISIEME']);
 });
