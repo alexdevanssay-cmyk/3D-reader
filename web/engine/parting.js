@@ -1379,7 +1379,8 @@ export function evaluateParting(positions, indices, direction, { draftDeg = DEFA
   const d = normalize(direction);
   if (!d) throw new Error("Invalid draw direction");
   const mesh = prepareMesh(positions, indices);
-  const full = fullDirection(mesh, d, Math.sin((draftDeg * Math.PI) / 180), () => lineMesh(positions, indices, mesh.merged));
+  let line = null;
+  const full = fullDirection(mesh, d, Math.sin((draftDeg * Math.PI) / 180), () => (line ??= lineMesh(positions, indices, mesh.merged)));
   return {
     summary: { ...directionSummary(mesh, d, full.areas, full.height, full.line, "manual"), draft_angle_deg: draftDeg, surface_area_mm2: round(mesh.totalArea, 1), triangles: mesh.nt },
     side: full.side,
