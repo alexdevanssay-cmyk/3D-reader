@@ -137,6 +137,40 @@ export function axisLabel(d) {
   return `(${d.map((x) => Math.round(x * 1000) / 1000).join(", ")})`;
 }
 
+/**
+ * Two directions the same, the same sense: within about 0.003°. Not unit
+ * vectors: the directions of the JSON are rounded to 6 decimals.
+ */
+export const sameDirection = (a, b) => dot(a, b) > (1 - 1e-9) * Math.hypot(a[0], a[1], a[2]) * Math.hypot(b[0], b[1], b[2]);
+
+/** A unit direction with the sense given; within 1° of an axis of the frame, that axis. */
+export function snapDirection(v) {
+  const c = canonicalAxis(v);
+  if (!c) return null;
+  return v[0] * c[0] + v[1] * c[1] + v[2] * c[2] < 0 ? c.map((x) => -x + 0) : c;
+}
+
+/** "0 0 1", "0;0;1", "0,5 0 1", "0.6, 0, 0.8", "(0.6, 0, 0.8)" (as axisLabel writes it), "X", "-z"… as a direction, or null. */
+export function parseDirection(text) {
+  const s = String(text ?? "").replace(/[()]/g, "").trim();
+  const axis = /^([+-]?)([xyz])$/i.exec(s);
+  if (axis) {
+    const v = [0, 0, 0];
+    v["xyz".indexOf(axis[2].toLowerCase())] = axis[1] === "-" ? -1 : 1;
+    return v;
+  }
+  // With a decimal point, commas are separators too; else spaces or semicolons
+  // between the components (then a comma is a decimal comma, a comma at the
+  // end of a component a separator), else commas.
+  const parts = /\./.test(s)
+    ? s.split(/[\s,;]+/)
+    : /[\s;]/.test(s)
+      ? s.split(/[\s;]+/).map((x) => x.replace(/,$/, "").replace(",", "."))
+      : s.split(",");
+  if (parts.length !== 3 || parts.some((x) => !/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(x))) return null;
+  return snapDirection(parts.map(Number));
+}
+
 // ------------------------------------------------------------------ candidates
 
 /** Eigenvectors of a symmetric 3×3 matrix (Jacobi), largest eigenvalue first. */

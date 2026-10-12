@@ -7,7 +7,7 @@ import { buildSemantic3D, SEMANTIC_VERSION } from "./engine/semantic.js";
 import { buildAIContext, AI_CONTEXT_VERSION } from "./engine/ai-context.js";
 import {
   PARTING_VERSION, REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_NONE, SIDE_UPPER, ZERO_DRAFT,
-  applyOverrides, canonicalAxis, faceRegions, lineMesh, lineSummary, partingLine,
+  applyOverrides, faceRegions, lineMesh, lineSummary, parseDirection, partingLine, sameDirection, snapDirection,
 } from "./engine/parting.js";
 
 // ---------------------------------------------------------------- units
@@ -1785,8 +1785,6 @@ function bodyArrays(i) {
   return { positions: geom.attributes.position.array, indices: geom.index.array };
 }
 
-const sameDirection = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2] > 1 - 1e-9;
-
 /** The proposal of a body as a classification: {direction, summary, side, flags, plane, segments}. */
 function proposalBase(res) {
   return { direction: res.proposal.direction, summary: res.proposal, side: res.side, flags: res.flags, plane: res.plane, segments: res.segments };
@@ -2164,29 +2162,6 @@ function assignPartingFace(i, f, target) {
   const overrides = { ...field.overrides, [face]: target };
   const base = field.manual ? field.base : proposalBase(partingOf().results[i]);
   setPartingDefinition(i, { base, source: field.manual ? field.source : "proposal", overrides, candidate: field.candidate });
-}
-
-/** A unit direction with the sense given; within 1° of an axis of the frame, that axis. */
-function snapDirection(v) {
-  const c = canonicalAxis(v);
-  if (!c) return null;
-  return v[0] * c[0] + v[1] * c[1] + v[2] * c[2] < 0 ? c.map((x) => -x + 0) : c;
-}
-
-/** "0 0 1", "0;0;1", "0,5 0 1", "X", "-z"… as a direction, or null. */
-function parseDirection(text) {
-  const s = String(text ?? "").trim();
-  const axis = /^([+-]?)([xyz])$/i.exec(s);
-  if (axis) {
-    const v = [0, 0, 0];
-    v["xyz".indexOf(axis[2].toLowerCase())] = axis[1] === "-" ? -1 : 1;
-    return v;
-  }
-  // Spaces or semicolons between the components (then a comma is a decimal comma), else commas.
-  const parts = /[\s;]/.test(s) ? s.split(/[\s;]+/).map((x) => x.replace(",", ".")) : s.split(",");
-  if (parts.length !== 3 || parts.some((x) => !/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(x))) return null;
-  const v = parts.map(Number);
-  return snapDirection(v);
 }
 
 // ---- card

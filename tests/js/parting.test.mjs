@@ -5,8 +5,8 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import {
-  SIDE_LOWER, SIDE_UPPER, applyOverrides, axisLabel, canonicalAxis, evaluateParting, faceRegions,
-  lineMesh, lineSummary, partingLine, proposeParting, sampleByArea,
+  REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_UPPER, applyOverrides, axisLabel, canonicalAxis, evaluateParting, faceRegions,
+  lineMesh, lineSummary, parseDirection, partingLine, proposeParting, sameDirection, sampleByArea,
 } from '../../web/engine/parting.js';
 import { approx } from './helpers.mjs';
 
@@ -286,6 +286,39 @@ describe('faces reassigned by hand', () => {
     // Back to the proposal: no face moved.
     const back = partingLine(lineMesh(mesh.positions, mesh.indices), applyOverrides(side, region, {}), proposal.direction, { flags, plane, height: 20 });
     assert.deepEqual(lineSummary(back), proposal.parting);
+  });
+
+  test('directions typed in: components (a decimal point or comma), as axisLabel writes them, or an axis', () => {
+    assert.deepEqual(parseDirection('0 0 1'), [0, 0, 1]);
+    assert.deepEqual(parseDirection('-z'), [0, 0, -1]);
+    assert.deepEqual(parseDirection('1,0,0'), [1, 0, 0]);
+    assert.deepEqual(parseDirection('1, 0, 0'), [1, 0, 0]);
+    for (const text of ['0.6, 0, 0.8', '0.6,0,0.8', '(0.6, 0, 0.8)', '0,6 0 0,8', '0,6; 0; 0,8', '0,6, 0, 0,8', '0.6 0 0.8']) {
+      const d = parseDirection(text);
+      assert.ok(d, text);
+      approx(d[0], 0.6, 0, 1e-12, text);
+      approx(d[2], 0.8, 0, 1e-12, text);
+    }
+    // The card's own label of an oblique axis, typed back in.
+    const tilted = canonicalAxis([0.458, -0.296, 0.838]);
+    assert.ok(sameDirection(parseDirection(axisLabel(tilted)), tilted));
+    for (const text of ['', '0 0', '1 2 3 4', 'a b c', '0.5.1 0 0']) assert.equal(parseDirection(text), null, text);
+  });
+
+  test('the same direction: whatever the length of the vectors (rounded to 6 decimals)', () => {
+    const r = [0.267261, 0.534522, 0.801784]; // (1, 2, 3) rounded: |r|² = 0.99999979
+    assert.ok(sameDirection(r, r));
+    const d = canonicalAxis([1, 2, 3]);
+    assert.ok(sameDirection(d, r) && sameDirection(r, d));
+    assert.ok(!sameDirection(r, r.map((x) => -x)));
+    assert.ok(!sameDirection([0, 0, 1], [0, Math.sin(1e-3), Math.cos(1e-3)]));
+    // Every unit vector, rounded as the JSON gives it, is its own direction.
+    let seed = 1;
+    const next = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 2 - 1;
+    for (let k = 0; k < 2000; k++) {
+      const v = canonicalAxis([next(), next(), next()]);
+      if (v) assert.ok(sameDirection(v.map((x) => Math.round(x * 1e6) / 1e6), v), v.join());
+    }
   });
 
   test('axes: one sense, the frame axes by name', () => {
