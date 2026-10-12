@@ -212,13 +212,26 @@ test("a parting line proposed from the geometry: draft and cores evaluated, the 
   assert.ok(checks.includes("confirm_proposed_parting_direction"));
   assert.ok(checks.includes("add_or_confirm_draft_on_zero_draft_faces"));
   const draft = risks.find(r => r.code === "zero_draft_faces");
-  assert.match(draft.message, /^34,8 % de la surface est à moins de 1°/);
+  assert.match(draft.message, /^34,8 % de la surface \(6\s400 mm²\) est à moins de 1°/);
   assert.ok(!risks.some(r => r.code === "undercut_requires_core_or_slide" || r.code === "non_planar_parting_line"));
   for (const r of risks) assert.ok(r.source_ids.every(id => FOUNDRY_SOURCES.some(src => src.id === id)), r.code);
   // The AI context: compact, in every task and compacted.
   const context = buildAIContext(semantic, { task: "general" });
   assert.deepEqual(context.bodies[0].parting, { status: "proposed", axis: "Z", direction: [0, 0, 1], undercut_share: 0, zero_draft_share: 0.3478, planar: true });
   assert.deepEqual(compactAIContext(context, { maxChars: 1 }).bodies[0].parting, context.bodies[0].parting);
+});
+
+test("a small undercut: its share not written 0 %, its area given", () => {
+  const semantic = buildSemantic3D({
+    file: "casting.step", kind: "cad", engine: "browser",
+    summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 },
+    bodies: [body({ parting: parting({ undercut_area_mm2: 3, undercut_share: 0.0001, zero_draft_area_mm2: 7, zero_draft_share: 0.0003 }) })],
+  });
+  const { risks } = semantic.bodies[0].foundry;
+  const undercut = risks.find(r => r.code === "undercut_requires_core_or_slide");
+  assert.match(undercut.message, /^< 0,1 % de la surface \(3 mm²\) ne se démoule par aucun des deux demi-moules selon la direction Z/);
+  assert.match(undercut.message, /une autre direction ; à confirmer/);
+  assert.match(risks.find(r => r.code === "zero_draft_faces").message, /^< 0,1 % de la surface \(7 mm²\) est à moins de 1°/);
 });
 
 test("a stepped parting line defined by hand, with undercuts: marked manual, its cores and its line to review", () => {
