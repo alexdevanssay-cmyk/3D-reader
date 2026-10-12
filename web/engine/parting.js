@@ -22,7 +22,8 @@
 //   splits, the line is planar at the level that leaves the least surface
 //   with draft on the wrong side: the faces along d on the side of the
 //   plane, cut by it, and the faces with draft that only the other half
-//   could form kept in theirs, trapped: undercuts (slides).
+//   could form kept in theirs, trapped: undercuts (slides); of a face with
+//   draft the plane cuts, its part on that side.
 //
 // The lines along d are tested against a uniform grid of the triangles
 // projected on the plane normal to d (one grid per direction): a line meets
@@ -706,23 +707,49 @@ function splitFlatArea(mesh, neighbours, flags, side) {
 }
 
 /**
+ * Share of a triangle on the positive side of a height linear over it, g0,
+ * g1, g2 at its corners (the side of a plane it is cut by).
+ */
+function positiveShare(g0, g1, g2) {
+  const n = (g0 > 0) + (g1 > 0) + (g2 > 0);
+  if (n === 0 || n === 3) return n / 3;
+  // The corner alone on its side (the positive one, else the other), the share of the triangle on its side: the product of the parts of its two edges.
+  const odd = n === 1;
+  let alone;
+  if ((g0 > 0) === odd) alone = (g0 * g0) / ((g0 - g1) * (g0 - g2));
+  else if ((g1 > 0) === odd) alone = (g1 * g1) / ((g1 - g0) * (g1 - g2));
+  else alone = (g2 * g2) / ((g2 - g0) * (g2 - g1));
+  return odd ? alone : 1 - alone;
+}
+
+/**
  * Height along d (centred frame) of the plane of a planar line across
  * halves that interleave: the one that leaves the least area of faces with
- * draft that only one half can form on the other side of it (by their
- * centres). Of the ranges of heights as good, the widest (then the lowest),
- * at its middle: halfway between the details on either side. The faces
- * without draft only one half can form do not count (see trapAtLevel), but
- * when there are no others.
+ * draft that only one half can form on the other side of it (of a face it
+ * cuts, its part on that side, as trapAtLevel counts it). Of the ranges of
+ * heights as good that no such face spans, the widest (then the lowest), at
+ * its middle: halfway between the details on either side; else the lowest
+ * height where it is least. The faces without draft only one half can form
+ * do not count (see trapAtLevel), but when there are no others.
+ *
+ * That area at height L: the faces only the lower half can form (σ = -1)
+ * all, plus σ times the area under L of each face (0 below its lowest
+ * corner, all of it above its highest, a quadratic of L between: one from
+ * its lowest corner to its middle one, another to its highest), summed in a
+ * sweep over the heights of the vertices. A part of a face less than 1e-5
+ * of the diagonal high (or a face as flat): its change at one end, the end
+ * that counts it the more (exact at its corners, never less than it is).
  */
 function bestLevel(mesh, flags, d) {
-  const { positions: P, centres, areas, nt, nv, sliver, totalArea } = mesh;
-  let lo = Infinity, hi = -Infinity;
-  for (let i = 0; i < nv; i++) {
-    const w = P[3 * i] * d[0] + P[3 * i + 1] * d[1] + P[3 * i + 2] * d[2];
-    if (w < lo) lo = w;
-    if (w > hi) hi = w;
-  }
-  // The faces that count: their heights, and their areas (negative: those only the lower half can form).
+  const { positions: P, indices: I, areas, nt, nv, sliver, totalArea, diag } = mesh;
+  // The heights of the vertices; ascending, each once; the rank of each vertex among them.
+  const hv = new Float64Array(nv);
+  for (let i = 0; i < nv; i++) hv[i] = P[3 * i] * d[0] + P[3 * i + 1] * d[1] + P[3 * i + 2] * d[2];
+  const levels = Float64Array.from(hv).sort();
+  let m = 0;
+  for (let i = 0; i < nv; i++) if (!m || levels[i] !== levels[m - 1]) levels[m++] = levels[i];
+  const lo = levels[0], hi = levels[m - 1];
+  // The faces that count.
   const counted = (f, withDraft) => {
     const reach = flags[f] & (REACH_UP | REACH_DOWN);
     return (reach === REACH_UP || reach === REACH_DOWN) && areas[f] >= sliver && !(withDraft && flags[f] & ZERO_DRAFT);
@@ -735,57 +762,154 @@ function bestLevel(mesh, flags, d) {
     for (let f = 0; f < nt; f++) if (counted(f, false)) n++;
   }
   if (!n || !(hi > lo)) return (lo + hi) / 2 || 0;
-  const height = new Float64Array(n), area = new Float64Array(n);
-  for (let f = 0, k = 0; f < nt; f++) {
-    if (!counted(f, withDraft)) continue;
-    height[k] = centres[3 * f] * d[0] + centres[3 * f + 1] * d[1] + centres[3 * f + 2] * d[2];
-    area[k++] = flags[f] & REACH_UP ? areas[f] : -areas[f];
-  }
-  const order = new Uint32Array(n).map((_, k) => k).sort((a, b) => height[a] - height[b]);
-  // Below every centre: the lower faces all on the wrong side; each centre passed moves its face.
-  let wrong = 0;
-  for (let k = 0; k < n; k++) if (area[k] < 0) wrong -= area[k];
-  // The ranges between successive heights, the least wrong (ties within a part in 1e9 of the surface: the widest, then the lowest).
-  let best = null;
-  let from = lo;
-  for (let k = 0; k <= n;) {
-    const to = k < n ? Math.min(hi, Math.max(lo, height[order[k]])) : hi;
-    if (to > from && (!best || wrong < best.wrong - 1e-9 * totalArea || (wrong <= best.wrong + 1e-9 * totalArea && to - from > best.to - best.from))) {
-      best = { from, to, wrong: Math.min(wrong, best?.wrong ?? Infinity) };
+  const rank = new Uint32Array(nv);
+  for (let i = 0; i < nv; i++) {
+    let a = 0, b = m - 1;
+    while (a < b) {
+      const mid = (a + b) >> 1;
+      if (levels[mid] < hv[i]) a = mid + 1;
+      else b = mid;
     }
-    if (k === n) break;
-    const h = height[order[k]];
-    for (; k < n && height[order[k]] === h; k++) wrong += area[order[k]];
-    from = Math.max(from, Math.min(hi, h));
+    rank[i] = a;
   }
-  return best ? (best.from + best.to) / 2 : (lo + hi) / 2;
+  // The corners of face f, lowest first (ties by their order in it): in `cs`.
+  const cs = new Uint32Array(3);
+  const corners = (f) => {
+    let a = I[3 * f], b = I[3 * f + 1], c = I[3 * f + 2];
+    if (hv[b] < hv[a]) [a, b] = [b, a];
+    if (hv[c] < hv[b]) [b, c] = [c, b];
+    if (hv[b] < hv[a]) [a, b] = [b, a];
+    cs[0] = a;
+    cs[1] = b;
+    cs[2] = c;
+  };
+  // The events at each height: 3 f + k, the k-th corner of face f from the lowest.
+  const start = new Uint32Array(m + 1);
+  const events = new Uint32Array(3 * n);
+  let wrong0 = 0; // below every vertex: the faces only the lower half can form, all on the wrong side
+  for (let f = 0; f < nt; f++) {
+    if (!counted(f, withDraft)) continue;
+    if (!(flags[f] & REACH_UP)) wrong0 += areas[f];
+    for (let k = 0; k < 3; k++) start[rank[I[3 * f + k]] + 1]++;
+  }
+  for (let r = 0; r < m; r++) start[r + 1] += start[r];
+  const fill = start.slice(0, m);
+  for (let f = 0; f < nt; f++) {
+    if (!counted(f, withDraft)) continue;
+    corners(f);
+    for (let k = 0; k < 3; k++) events[fill[rank[cs[k]]]++] = 3 * f + k;
+  }
+  const thin = 1e-5 * diag;
+  const tol = 1e-9 * totalArea;
+  // The area at L: base + (qa L + qb) L + qc; the quadratic of the faces spanning L (`active` parts of faces), exactly 0 without any.
+  let base = wrong0, qa = 0, qb = 0, qc = 0, active = 0;
+  const at = (L) => base + (qa * L + qb) * L + qc;
+  let flat = null; // the best range no face spans: {from, to, wrong}
+  let point = null; // the least area at one height: {at, wrong}
+  const range = (from, to) => {
+    if (!(to > from)) return;
+    if (!active) {
+      // Ties within a part in 1e9 of the surface: the widest, then the lowest.
+      if (!flat || base < flat.wrong - tol || (base <= flat.wrong + tol && to - from > flat.to - flat.from)) flat = { from, to, wrong: Math.min(base, flat?.wrong ?? Infinity) };
+    } else if (qa > 0) {
+      const L = -qb / (2 * qa);
+      if (L > from && L < to && (!point || at(L) < point.wrong - tol)) point = { at: L, wrong: at(L) };
+    }
+  };
+  // At a height x: `rise`, how much more than the area at x the sum counts once the faces with a corner there are passed (a change at one end, up).
+  let rise = 0;
+  const step = (dA, up = 0) => {
+    base += dA;
+    rise += up;
+  };
+  // σ k (L - h)², σ (A - k (h - L)²): the quadratic of a part of a face, added (sign 1) or taken away (-1).
+  const lower = (sign, k1, h0) => {
+    qa += sign * k1;
+    qb -= sign * 2 * k1 * h0;
+    qc += sign * k1 * h0 * h0;
+    active += sign;
+  };
+  const upper = (sign, A, k2, h2) => {
+    qa -= sign * k2;
+    qb += sign * 2 * k2 * h2;
+    qc += sign * (A - k2 * h2 * h2);
+    active += sign;
+  };
+  let from = lo;
+  for (let r = 0; r < m; r++) {
+    if (start[r] === start[r + 1]) continue; // no face that counts has a corner there
+    const x = levels[r];
+    range(from, x);
+    rise = 0;
+    for (let e = start[r]; e < start[r + 1]; e++) {
+      const f = Math.floor(events[e] / 3), k = events[e] % 3;
+      const s = flags[f] & REACH_UP ? 1 : -1, A = s * areas[f]; // σ × its area
+      corners(f);
+      const h0 = hv[cs[0]], h1 = hv[cs[1]], h2 = hv[cs[2]];
+      const span = h2 - h0;
+      if (!(span > thin)) {
+        // As flat as a plane square to d: all of it at once, at its lowest corner up (at its highest, down).
+        if (s > 0 && k === 0) step(A, A);
+        else if (s < 0 && k === 2) step(A);
+        continue;
+      }
+      const low = h1 - h0 > thin, high = h2 - h1 > thin;
+      const J = (A * (h1 - h0)) / span; // σ × its area under its middle corner
+      if (k === 0) {
+        if (low) lower(1, A / ((h1 - h0) * span), h0);
+        else if (s > 0) step(J, J);
+      } else if (k === 1) {
+        if (low) lower(-1, A / ((h1 - h0) * span), h0);
+        else if (s > 0) step(-J);
+        if (high) upper(1, A, A / ((h2 - h1) * span), h2);
+        else if (s > 0) step(A, A - J);
+        else step(J);
+      } else if (high) {
+        upper(-1, A, A / ((h2 - h1) * span), h2);
+        step(A);
+      } else if (s < 0) step(A - J);
+    }
+    if (!active) qa = qb = qc = 0;
+    const here = at(x) - rise;
+    if (!point || here < point.wrong - tol) point = { at: x, wrong: here };
+    from = x;
+  }
+  range(from, hi);
+  // A range as good as the least (within a part in a million of the surface: the rounding of the sums of the quadratics), else that height.
+  if (flat && (!point || flat.wrong <= point.wrong + 1e-6 * totalArea)) return (flat.from + flat.to) / 2;
+  return point ? point.at : (lo + hi) / 2;
 }
 
 /**
  * The flags of the halves split by a plane at height `level` (centred frame)
- * along d: every triangle on its side (LEVEL); a face with draft only one
- * half can form whose centre is on the other side: TRAPPED there (an
- * undercut, its REACH_* cleared). The faces without draft keep their reach:
- * on the side of the plane, cut straight by it; what keeps a half from
- * forming one on the wrong side is the shadow of a detail standing on it,
- * whose faces with draft are trapped (the slide that forms them forms that
- * strip of flat face too: not counted, it would follow the triangles of the
- * face). A new array, and the area trapped.
+ * along d: every triangle on its side (LEVEL); of a face with draft only one
+ * half can form, its part on the other side is trapped (the area of a face
+ * the plane cuts, from the heights of its corners): TRAPPED when that is
+ * more than half of it (an undercut, its REACH_* cleared). The faces without
+ * draft keep their reach: on the side of the plane, cut straight by it; what
+ * keeps a half from forming one on the wrong side is the shadow of a detail
+ * standing on it, whose faces with draft are trapped (the slide that forms
+ * them forms that strip of flat face too: not counted, it would follow the
+ * triangles of the face). A new array, and the area trapped.
  */
 function trapAtLevel(mesh, flags, d, level) {
-  const { centres, nt, areas, sliver } = mesh;
+  const { positions: P, indices: I, nt, areas, sliver } = mesh;
   const tiny = 1e-9 * Math.max(1, mesh.diag);
   const out = new Uint8Array(nt);
   let trapped = 0;
+  // Height of a corner on the wrong side of the plane (positive there); on it within `tiny`: 0.
+  const wrongSide = (v, s) => {
+    const h = P[3 * v] * d[0] + P[3 * v + 1] * d[1] + P[3 * v + 2] * d[2] - level;
+    return Math.abs(h) <= tiny ? 0 : s * h;
+  };
   for (let f = 0; f < nt; f++) {
     out[f] = flags[f] | LEVEL;
     const reach = flags[f] & (REACH_UP | REACH_DOWN);
     if ((reach !== REACH_UP && reach !== REACH_DOWN) || flags[f] & ZERO_DRAFT || !(areas[f] >= sliver)) continue;
-    const w = centres[3 * f] * d[0] + centres[3 * f + 1] * d[1] + centres[3 * f + 2] * d[2] - level;
-    if (reach === REACH_UP ? w < -tiny : w > tiny) {
-      out[f] = (out[f] & ~(REACH_UP | REACH_DOWN)) | TRAPPED;
-      trapped += areas[f];
-    }
+    const s = reach === REACH_UP ? -1 : 1; // only the upper half can form it: below the plane is wrong
+    const share = positiveShare(wrongSide(I[3 * f], s), wrongSide(I[3 * f + 1], s), wrongSide(I[3 * f + 2], s));
+    trapped += share * areas[f];
+    if (share > 0.5) out[f] = (out[f] & ~(REACH_UP | REACH_DOWN)) | TRAPPED;
   }
   return { flags: out, trapped };
 }
@@ -1195,7 +1319,7 @@ function directionSummary(mesh, d, areas, height, parting, source) {
     source,
     undercut_area_mm2: round(areas.undercut, 1),
     undercut_share: round(areas.undercut / total, 4),
-    // Of it, faces only one half could form, kept in the other by the planar line (slides).
+    // Of it, faces only one half could form, kept in the other by the planar line (slides): of those it cuts, their parts there.
     trapped_area_mm2: round(areas.trapped ?? 0, 1),
     zero_draft_area_mm2: round(areas.zeroDraft, 1),
     zero_draft_share: round(areas.zeroDraft / total, 4),
@@ -1272,6 +1396,7 @@ function fullDirection(mesh, d, sinDraft, getLine) {
     return { side, line: partingLine(getLine(), side, d, { flags, plane, height: grid.height }) };
   };
   let halves;
+  let trapped = null;
   if (plane != null) {
     levelFree(flags);
     halves = split(plane);
@@ -1283,12 +1408,19 @@ function fullDirection(mesh, d, sinDraft, getLine) {
       const trap = trapAtLevel(mesh, flags, d, level);
       if (trap.trapped <= across) {
         flags = trap.flags;
+        trapped = trap.trapped;
         plane = level + dot(mesh.centre, d);
         halves = split(plane);
       }
     }
   }
-  return { areas: areasOf(mesh, d, flags, null), side: halves.side, flags, plane, line: halves.line, height: grid.height };
+  const areas = areasOf(mesh, d, flags, null);
+  if (trapped != null) {
+    // What the plane leaves on the wrong side, the parts of the faces it cuts too (not their triangles flagged TRAPPED, more than half there).
+    areas.undercut += trapped - areas.trapped;
+    areas.trapped = trapped;
+  }
+  return { areas, side: halves.side, flags, plane, line: halves.line, height: grid.height };
 }
 
 /**

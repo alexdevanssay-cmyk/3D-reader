@@ -340,6 +340,25 @@ function clippedArea(triangle, halfPlanes) {
   return Math.abs(s) / 2;
 }
 
+/** Area of the part of a triangle (xyz) where h(p) > 0, h linear (clipped by its plane). */
+function areaWhere(triangle, h) {
+  const poly = [];
+  triangle.forEach((p, i) => {
+    const q = triangle[(i + 1) % 3];
+    const a = h(p), b = h(q);
+    if (a > 0) poly.push(p);
+    if (a > 0 !== b > 0) poly.push(p.map((x, k) => x + (a / (a - b)) * (q[k] - x)));
+  });
+  const s = [0, 0, 0];
+  for (let i = 1; i + 1 < poly.length; i++) {
+    const u = [0, 1, 2].map((k) => poly[i][k] - poly[0][k]), v = [0, 1, 2].map((k) => poly[i + 1][k] - poly[0][k]);
+    s[0] += u[1] * v[2] - u[2] * v[1];
+    s[1] += u[2] * v[0] - u[0] * v[2];
+    s[2] += u[0] * v[1] - u[1] * v[0];
+  }
+  return Math.hypot(...s) / 2;
+}
+
 describe('flat faces along the draw direction (a CAD body: flat faces cut into long triangles round their holes)', () => {
   test('a plate drawn along its length: one planar line across it, closed; its flat faces cut straight, not along their triangles', () => {
     // Its pillars, letters and boss cast shadows along Y on its top face: no
@@ -409,6 +428,59 @@ describe('flat faces along the draw direction (a CAD body: flat faces cut into l
     const { summary } = evaluateParting(mesh.positions, mesh.indices, [0, 0, 1]);
     assert.deepEqual([summary.parting.kind, summary.undercut_area_mm2, summary.trapped_area_mm2], ['stepped', 0, 0]);
     assert.deepEqual(summary.parting.levels_mm, [0, 10, 20]);
+  });
+
+  test('a planar line across faces with draft: their parts on the side their half cannot reach trapped, as the plane cuts them', () => {
+    // Drawn obliquely in its plane, the plate has no plane that leaves every
+    // face on its side, and the warped line would split its top face: the
+    // planar line. Any plane across the plate cuts its ±X walls (two long
+    // triangles each, with draft: only the half each looks to can form it);
+    // the part of each on the other side is trapped, whichever side of the
+    // plane its centre is on.
+    const plate = castPlate();
+    const tris = triangleGeometry(plate.positions, plate.indices);
+    const P = plate.positions, I = plate.indices;
+    for (const d of [[0.6, 0.8, 0], [Math.SQRT1_2, Math.SQRT1_2, 0]]) {
+      const { summary, flags, plane } = evaluateParting(plate.positions, plate.indices, d);
+      assert.equal(summary.parting.kind, 'planar', String(d));
+      const height = (p) => p[0] * d[0] + p[1] * d[1] + p[2] * d[2];
+      let trapped = 0, unflagged = 0, cut = 0, undercut = 0;
+      tris.forEach(({ area }, f) => {
+        const reach = flags[f] & (REACH_UP | REACH_DOWN);
+        if (!reach && !(flags[f] & TRAPPED)) undercut += area;
+        if (!(flags[f] & TRAPPED) && ((reach !== REACH_UP && reach !== REACH_DOWN) || flags[f] & ZERO_DRAFT)) return;
+        const corners = [0, 1, 2].map((k) => [0, 1, 2].map((c) => P[3 * I[3 * f + k] + c]));
+        const below = areaWhere(corners, (p) => plane - height(p)), above = areaWhere(corners, (p) => height(p) - plane);
+        approx(below + above, area, 1e-9, 1e-9);
+        // Its part on the side its half cannot reach (below the plane for the upper half); flagged TRAPPED
+        // (an undercut in the view, its reach cleared) when that is most of it.
+        const wrong = flags[f] & TRAPPED ? Math.max(below, above) : reach === REACH_UP ? below : above;
+        if (!(flags[f] & TRAPPED)) assert.ok(wrong <= area / 2, `triangle ${f}: ${wrong} of ${area} mm² on the wrong side`);
+        trapped += wrong;
+        if (wrong > 1e-9 && wrong < area - 1e-9) cut++;
+        if (!(flags[f] & TRAPPED)) unflagged += wrong;
+      });
+      approx(summary.trapped_area_mm2, trapped, 0, 0.05, `${d}: trapped`);
+      approx(summary.undercut_area_mm2, undercut + trapped, 0, 0.1, `${d}: undercut`);
+      // Faces cut by the plane, with parts on the wrong side not flagged: counted too (a count by centres left them out).
+      assert.ok(cut >= 4, `${d}: ${cut} faces cut`);
+      assert.ok(unflagged > 50, `${d}: ${unflagged} mm²`);
+    }
+  });
+
+  test('a planar line that would trap more than the warped line splits, counted to the plane: the warped line kept', () => {
+    // 6° off Y, a plane at its best level would leave about 1230 mm² on the
+    // side the halves cannot reach: 805 of it in the ±X walls it cuts (about
+    // half of each wall on the side only the other half reaches; counted by
+    // the centres of their two triangles, a wall was all or nothing), the
+    // rest in whole faces; more than the 1000 mm² of flat faces the warped
+    // line splits.
+    const plate = castPlate();
+    const d = [-0.105, 0.995, 0];
+    const { summary, plane } = evaluateParting(plate.positions, plate.indices, d);
+    assert.equal(plane, null);
+    assert.notEqual(summary.parting.kind, 'planar');
+    assert.equal(summary.trapped_area_mm2, 0);
   });
 
   test('the same triangles with their corners in another order, or wound the other way: the same halves and figures', () => {
