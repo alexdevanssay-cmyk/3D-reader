@@ -329,7 +329,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
         "hot_spot_without_riser",
         "review",
         "measured_feeding_zones_inscribed_spheres",
-        `${feeding.hot_spots_without_riser.length} zone(s) d'alimentation isolée(s) par une section plus mince (zones ${feeding.hot_spots_without_riser.map(z => z + 1).join(", ")}) sans masselotte : retassure probable sans masselotte, refroidisseur ou refroidissement local; à confirmer par une simulation ou avec la fonderie.`,
+        `${feeding.hot_spots_without_riser.length} zone(s) d'alimentation isolée(s) par une section plus mince (zones ${feeding.hot_spots_without_riser.map(z => z + 1).join(", ")}) sans masselotte (ou d'un module inférieur à 1,2 × celui de la zone) : retassure probable sans masselotte, refroidisseur ou refroidissement local; à confirmer par une simulation ou avec la fonderie.`,
         ["wlodawer_1966","chvorinov_1940","sfsa_design_steps"],
         { zones: feeding.hot_spots_without_riser },
       ));

@@ -337,6 +337,31 @@ describe('risers and ingate by hand', () => {
     approx(resized.mass_g, Math.PI * 400 * 50 * 2.7 / 1000, 1e-3, 0.1, 'mass');
   });
 
+  test('a proposed riser resized: its why from the new numbers, once; made too small, its zone counted without a riser', () => {
+    const [proposed] = placeFeeding(mesh.positions, mesh.indices, zones, { parting, ctx }).risers;
+    const zone = zones.zones[proposed.zone];
+    // D then H typed in: resized twice, the why said once, with the ratio of the moduli.
+    const once = resizeRiser(proposed, { diameter: 30, height: proposed.height_mm });
+    const twice = resizeRiser(once, { diameter: 30, height: 50 });
+    assert.deepEqual([twice.reason, twice.sized_by_hand, twice.source], ['resized', true, 'proposed']);
+    assert.equal(twice.why.match(/à la main/g).length, 1, twice.why);
+    const ratio = twice.riser_modulus_mm / zone.modulus_mm;
+    assert.ok(ratio >= RISER_MODULUS_FACTOR);
+    assert.ok(twice.why.includes(`${String(Math.round(ratio * 100) / 100).replace('.', ',')} × module de la zone.`), twice.why);
+    assert.deepEqual(hotSpotsWithoutRiser(zones.zones, [twice]), []);
+    // D 10: its modulus under 1.2 × the zone's, no longer said "≥ 1,2 ×"; the zone without a riser.
+    const small = resizeRiser(twice, { diameter: 10, height: 15 });
+    assert.ok(small.riser_modulus_mm < RISER_MODULUS_FACTOR * zone.modulus_mm);
+    assert.doesNotMatch(small.why, /≥/);
+    assert.match(small.why, /\(moins de 1,2 : zone comptée sans masselotte\)\.$/);
+    assert.deepEqual(hotSpotsWithoutRiser(zones.zones, [small]), [zone.id]);
+    // One placed by hand and sized: the same, its own why.
+    const byHand = riserFromPoint([52, 32, 35], { triangle: triangleAt([52, 32, 35]), zones, normal: [0, 0, 1], diameter: 10, height: 15 });
+    assert.equal(byHand.reason, 'manual_sized');
+    assert.match(byHand.why, /^Placée et dimensionnée à la main ; module de la masselotte .* \(moins de 1,2 : zone comptée sans masselotte\)\.$/);
+    assert.deepEqual(hotSpotsWithoutRiser(zones.zones, [byHand]), [zone.id]);
+  });
+
   test('the ingate placed by hand: brought onto the parting line, inwards', () => {
     const gate = gateFromPoint([30, 2, 3], ctx, { triangle: triangleAt([30, 0, 3]) });
     assert.equal(gate.on_parting_line, true);

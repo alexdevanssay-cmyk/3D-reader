@@ -10,7 +10,7 @@ import {
   applyOverrides, canonicalAxis, faceRegions, lineMesh, lineSummary, partingLine,
 } from "./engine/parting.js";
 import {
-  FEEDING_VERSION, METHOD as FEEDING_METHOD, feedingContext, feedingYield, gateFromPoint, hotSpotsWithoutRiser,
+  FEEDING_VERSION, METHOD as FEEDING_METHOD, feedingContext, feedingYield, feeds, gateFromPoint, hotSpotsWithoutRiser,
   placeFeeding, resizeRiser, riserFromPoint,
 } from "./engine/feeding.js";
 
@@ -2772,13 +2772,15 @@ function feedingWhy(x) {
   const away = x.near_undercut == null ? "none" : !x.near_undercut && !x.near_riser ? "both" : !x.near_undercut ? "undercut" : !x.near_riser ? "riser" : "none";
   const params = {
     sphere: fmtNum(x.zone_sphere_mm, 1), modulus: fmtNum(x.modulus_mm, 2), riser: fmtNum(x.riser_modulus_mm, 2),
+    // A riser's modulus over its zone's; under 1.2 (made smaller by hand), the zone is counted without a riser.
+    ratio: x.modulus_mm > 0 ? fmtNum(x.riser_modulus_mm / x.modulus_mm, 2) : "—",
+    short: x.riser_modulus_mm != null && !feeds(x) ? t("feeding.why.short") : "",
     wall: fmtNum(x.wall_sphere_mm, 1), thickness: fmtNum(x.thickness_mm, 1), width: fmtNum(x.width_mm, 1),
     away: t(`feeding.why.away.${away}`),
   };
   const key = `feeding.why.${x.reason}`;
   const text = t(key, params);
-  if (text === key) return x.why ?? "";
-  return x.sized_by_hand && x.source === "proposed" ? `${text} ${t("feeding.why.resized")}` : text;
+  return text === key ? x.why ?? "" : text;
 }
 
 function renderFeeding() {

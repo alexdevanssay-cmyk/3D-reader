@@ -1317,10 +1317,19 @@ export function placeFeeding(positions, indices, zones, { parting = null, densit
   };
 }
 
-/** The zones that need a riser and have none (deleted, or moved away by hand). */
+/** The zones that need a riser and have none that feeds them (deleted, moved away or made smaller by hand). */
 export function hotSpotsWithoutRiser(zones, risers) {
-  const fed = new Set(risers.map((r) => r.zone));
+  const fed = new Set(risers.filter(feeds).map((r) => r.zone));
   return zones.filter((z) => z.needs_riser && !fed.has(z.id)).map((z) => z.id);
+}
+
+/**
+ * Whether a riser feeds its zone: its modulus at least RISER_MODULUS_FACTOR ×
+ * the zone's (both rounded to the micrometre). Not one resized smaller by
+ * hand.
+ */
+export function feeds(riser) {
+  return !(riser.modulus_mm > 0) || riser.riser_modulus_mm >= RISER_MODULUS_FACTOR * riser.modulus_mm - 1e-3;
 }
 
 /**
@@ -1370,7 +1379,7 @@ export function riserFromPoint(point, { triangle = -1, zones, normal = null, dir
   // Beside the part, square to d, on the side the face looks to.
   const offset = top ? null : normalize(sub(n, d.map((x) => x * dot(n, d))));
   const byHand = diameter > 0 || height > 0;
-  return {
+  const riser = {
     id,
     zone: zoneId,
     zone_sphere_mm: sphere != null ? round(sphere, 2) : null,
@@ -1385,16 +1394,34 @@ export function riserFromPoint(point, { triangle = -1, zones, normal = null, dir
     source: 'manual',
     sized_by_hand: byHand,
     reason: byHand ? 'manual_sized' : 'manual',
-    why: byHand
-      ? 'Placée et dimensionnée à la main.'
-      : `Placée à la main ; dimensionnée sur le module de la zone touchée (${fr(modulus, 2)} mm × 1,2).`,
   };
+  riser.why = byHand ? sizedByHandWhy(riser) : `Placée à la main ; dimensionnée sur le module de la zone touchée (${fr(modulus, 2)} mm × 1,2).`;
+  return riser;
 }
 
-/** A riser with another D and H (typed by hand): its volume, modulus and mass again. */
+/**
+ * Why of a riser whose D and H were typed in, from its numbers: its modulus
+ * over the zone's, and whether that is under RISER_MODULUS_FACTOR (the zone
+ * then counted without a riser).
+ */
+function sizedByHandWhy(riser) {
+  const ratio = riser.modulus_mm > 0 ? riser.riser_modulus_mm / riser.modulus_mm : null;
+  const sized = ratio == null
+    ? `module de la masselotte ${fr(riser.riser_modulus_mm, 2)} mm`
+    : `module de la masselotte ${fr(riser.riser_modulus_mm, 2)} mm, ${fr(ratio, 2)} × module de la zone${feeds(riser) ? '' : ' (moins de 1,2 : zone comptée sans masselotte)'}`;
+  return riser.source === 'manual'
+    ? `Placée et dimensionnée à la main ; ${sized}.`
+    : `Point chaud Ø ${fr(riser.zone_sphere_mm)} mm (module ${fr(riser.modulus_mm, 2)} mm) ; dimensions modifiées à la main : ${sized}.`;
+}
+
+/**
+ * A riser with another D and H (typed by hand): its volume, modulus and mass
+ * again, and its why from them (a proposed one: reason "resized").
+ */
 export function resizeRiser(riser, { diameter = null, height = null, density = null } = {}) {
   const size = sizeRiser(riser.modulus_mm ?? 0, { diameter: diameter ?? riser.diameter_mm, height: height ?? riser.height_mm, type: riser.type });
-  return { ...riser, ...size, mass_g: massOf(size.volume_mm3, density), sized_by_hand: true, reason: riser.source === 'manual' ? 'manual_sized' : riser.reason, why: riser.source === 'manual' ? 'Placée et dimensionnée à la main.' : `${riser.why} Dimensions modifiées à la main.` };
+  const resized = { ...riser, ...size, mass_g: massOf(size.volume_mm3, density), sized_by_hand: true, reason: riser.source === 'manual' ? 'manual_sized' : 'resized' };
+  return { ...resized, why: sizedByHandWhy(resized) };
 }
 
 /**
