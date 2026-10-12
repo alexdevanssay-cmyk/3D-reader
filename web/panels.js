@@ -245,14 +245,17 @@ function resetWidth() {
 const currentWidth = () => Math.round(panel.getBoundingClientRect().width);
 
 // Dragged: the panel's edge follows the pointer, once per frame (the 3D view is
-// drawn again at its new size, app.js).
+// drawn again at its new size, app.js). A click that does not move it changes
+// nothing: the width chosen stays the one kept, also while the window is too
+// narrow for it (the panel then shown narrower, wider again with the window).
+const DRAG_START = 2; // px the pointer moves before the edge follows it
 let drag = null;
 splitter.addEventListener("pointerdown", (e) => {
   if (e.button !== 0 || STACKED.matches) return;
   // (No preventDefault: the click focuses the splitter for the arrow keys, without its focus ring.)
   splitter.setPointerCapture(e.pointerId);
   const right = layout.getBoundingClientRect().right;
-  drag = { id: e.pointerId, x: e.clientX, grab: right - e.clientX - currentWidth(), frame: 0 };
+  drag = { id: e.pointerId, x0: e.clientX, x: e.clientX, grab: right - e.clientX - currentWidth(), frame: 0, moved: false };
   document.documentElement.classList.add("panel-resizing");
 });
 
@@ -261,6 +264,8 @@ const dragTo = (x) => setWidth(layout.getBoundingClientRect().right - x - drag.g
 splitter.addEventListener("pointermove", (e) => {
   if (!drag || e.pointerId !== drag.id) return;
   drag.x = e.clientX;
+  drag.moved ||= Math.abs(drag.x - drag.x0) >= DRAG_START;
+  if (!drag.moved) return;
   drag.frame ||= requestAnimationFrame(() => {
     if (!drag) return;
     drag.frame = 0;
@@ -271,11 +276,12 @@ splitter.addEventListener("pointermove", (e) => {
 function endDrag(e) {
   if (!drag || e.pointerId !== drag.id) return;
   cancelAnimationFrame(drag.frame);
-  if (e.type === "pointerup") dragTo(e.clientX);
+  const { moved } = drag;
+  if (moved && e.type === "pointerup") dragTo(e.clientX);
   drag = null;
   document.documentElement.classList.remove("panel-resizing");
   if (splitter.hasPointerCapture(e.pointerId)) splitter.releasePointerCapture(e.pointerId);
-  if (preferred != null) save(WIDTH_KEY, String(preferred));
+  if (moved && preferred != null) save(WIDTH_KEY, String(preferred));
 }
 for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) splitter.addEventListener(type, endDrag);
 

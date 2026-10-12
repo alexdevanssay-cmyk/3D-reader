@@ -8,8 +8,9 @@
 // panel's width set by dragging the splitter, the 3D view following as it goes
 // (never a blank frame), within limits, the thickness scale drawn again without
 // computing the thicknesses again; back to the default width on a double-click;
-// from the keyboard; kept after a reload and fitted to a smaller window; no
-// splitter on a narrow window (the panel under the view).
+// from the keyboard; kept after a reload and fitted to a smaller window, a click
+// without a drag changing nothing; no splitter on a narrow window (the panel
+// under the view).
 //
 //   npm run build && node --test tests/e2e/layout.test.mjs
 
@@ -376,6 +377,13 @@ describe('3D analysis panel: folded cards, width (dist/)', { skip: !existsSync(j
     // A smaller window: within the new limits (60 % of 1000 px); the width chosen again when it grows back.
     await page.setViewportSize({ width: 1000, height: 800 });
     await page.waitForFunction(() => Math.round(document.querySelector('#page-viewer > .panel').getBoundingClientRect().width) === 600);
+    assert.deepEqual(await value(), [260, 600, 600]);
+    // A click on the splitter (to focus it for the arrow keys) does not drag it: the width chosen is kept.
+    {
+      const { x, y } = await center();
+      await page.mouse.click(x, y);
+    }
+    assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.panel.width')), '700');
     assert.deepEqual(await value(), [260, 600, 600]);
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.waitForFunction(() => Math.round(document.querySelector('#page-viewer > .panel').getBoundingClientRect().width) === 700);
