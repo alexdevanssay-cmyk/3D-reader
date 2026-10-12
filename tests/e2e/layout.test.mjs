@@ -5,10 +5,11 @@
 // analysis; "Collapse all" / "Expand all"; English and French. Folding a card
 // stops a mode of the 3D view started from it; the folded thickness shows the
 // thinnest wall the quote uses; the warning of an open body stays in sight. The
-// panel's width set by dragging the splitter, the 3D view following as it goes,
-// within limits; back to the default width on a double-click; from the
-// keyboard; kept after a reload and fitted to a smaller window; no splitter on a
-// narrow window (the panel under the view).
+// panel's width set by dragging the splitter, the 3D view following as it goes
+// (never a blank frame), within limits, the thickness scale drawn again without
+// computing the thicknesses again; back to the default width on a double-click;
+// from the keyboard; kept after a reload and fitted to a smaller window; no
+// splitter on a narrow window (the panel under the view).
 //
 //   npm run build && node --test tests/e2e/layout.test.mjs
 
@@ -257,6 +258,29 @@ describe('3D analysis panel: folded cards, width (dist/)', { skip: !existsSync(j
     const { page, errors } = await newPage();
     await page.goto(base);
     await analyse(page);
+    await page.click('#thick-compute');
+    await page.waitForSelector('#thick-body:not([hidden])', { timeout: TIMEOUT });
+    // Watched while the splitter is dragged: the thicknesses computed again (the share of the band written again),
+    // the 3D view blank in the frame where it changed size (its centre, on the part, cleared).
+    await page.evaluate(() => {
+      window.watched = { shares: 0, frames: 0, blank: 0 };
+      new MutationObserver((records) => (window.watched.shares += records.length)).observe(document.getElementById('thick-share'), { childList: true, characterData: true, subtree: true });
+      const canvas = document.querySelector('#viewport canvas');
+      const probe = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+      // Called after those of app.js (observers are called in the order they were made).
+      new ResizeObserver(() => {
+        probe.clearRect(0, 0, 1, 1);
+        probe.drawImage(canvas, Math.floor(canvas.width / 2), Math.floor(canvas.height / 2), 1, 1, 0, 0, 1, 1);
+        window.watched.frames += 1;
+        if (probe.getImageData(0, 0, 1, 1).data[3] === 0) window.watched.blank += 1;
+      }).observe(document.getElementById('viewport'));
+    });
+    const watched = () => page.evaluate(() => window.watched);
+    // The thickness scale drawn at the width it is shown.
+    const scaleFits = () => page.waitForFunction(() => {
+      const canvas = document.getElementById('thick-scale');
+      return canvas.clientWidth > 0 && canvas.width === Math.round(canvas.clientWidth * devicePixelRatio);
+    });
     const width = () => page.evaluate(() => Math.round(document.querySelector('#page-viewer > .panel').getBoundingClientRect().width));
     // The canvas drawn at the size it is shown: never stretched.
     const view = () => page.evaluate(() => {
@@ -303,6 +327,18 @@ describe('3D analysis panel: folded cards, width (dist/)', { skip: !existsSync(j
     // Focused by the mouse (the arrow keys then move it), without the focus ring of the keyboard.
     assert.equal(await splitter.evaluate((el) => document.activeElement === el && !el.matches(':focus-visible')), true);
     assert.equal(await page.evaluate(() => getSelection().toString()), '', 'no text selected by the drag');
+    // The 3D view drawn in every frame it changed size; the thickness scale drawn again, the thicknesses not
+    // computed again; nor when their card is folded and unfolded.
+    await scaleFits();
+    {
+      const { shares, frames, blank } = await watched();
+      assert.ok(frames >= 3, `${frames} frames`);
+      assert.deepEqual({ shares, blank }, { shares: 0, blank: 0 });
+    }
+    await page.click('#thickness-card .card-toggle');
+    await page.click('#thickness-card .card-toggle');
+    await scaleFits();
+    assert.equal((await watched()).shares, 0);
 
     // Within its limits: at most 60 % of the page (the 3D view keeps 320 px at least), at least 260 px.
     await drag(-1000);

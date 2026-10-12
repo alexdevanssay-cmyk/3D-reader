@@ -1213,6 +1213,7 @@ const thick = {
   tol: null, // mm
   max: null, // mm, top of the colour scale
   userMax: false, // the scale was set by hand
+  scale: null, // {area, total}: the histogram drawn over the scale, drawn again alone when the card changes width
 };
 const HIGHLIGHT = new THREE.Color(0xff00ff);
 const NO_VALUE = new THREE.Color(0x9aa0aa);
@@ -1316,6 +1317,7 @@ function thickQuantiles(fractions) {
 /** A new model is shown: forget the previous thicknesses, recompute if in use. */
 function thicknessNewModel(kept = null) {
   thick.results = null;
+  thick.scale = null;
   thick.markCache = new Map();
   thick.minOverride = null;
   thick.pending = null;
@@ -1528,6 +1530,7 @@ function renderThickness() {
     const banded = Float32Array.from(values, (v) => (v >= lo && v <= hi ? 1 : 2));
     band += thicknessHistogram(geom.attributes.position.array, geom.index.array, banded, 1, 3).area[1];
   });
+  thick.scale = { area, total };
   drawScale(area, total);
 
   const stats = thickStats();
@@ -1740,7 +1743,8 @@ $("thick-max").addEventListener("change", (e) => {
     if (canvas.hasPointerCapture(e.pointerId)) pick(e);
   });
 }
-new ResizeObserver(() => thick.results && renderThickness()).observe($("thick-scale"));
+// The card wider or narrower (the panel's splitter dragged, the card folded): the scale only, its histogram kept.
+new ResizeObserver(() => thick.results && thick.scale && drawScale(thick.scale.area, thick.scale.total)).observe($("thick-scale"));
 
 // ---------------------------------------------------------------- parting line
 
