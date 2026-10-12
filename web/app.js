@@ -2408,15 +2408,17 @@ const feedClient = () => (feedClient.module ??= import("./engine/feedclient.js")
 // Per result: {results (per body {zones, body, zone, sphere, …} or null),
 // pending, percent, error, manual (body -> {risers: [...] or null (the
 // proposal's), gate: {...} or null (the proposal's)}), placed (body -> the
-// placement for a parting: {key, ctx, placement}), show, mode ("add" |
-// "move" | "gate" | null), selected (a riser id), message, restored}.
+// placement for a parting: {key, ctx, placement}), outward (body -> 1, or -1
+// when its triangles turn inwards), show, mode ("add" | "move" | "gate" |
+// null), selected (a riser id), body (the card's, for the selection),
+// message, restored}.
 const feedings = new WeakMap();
 
 function feedingOf(r = state.result) {
   if (!r) return null;
   let f = feedings.get(r);
   if (!f) {
-    f = { results: null, pending: null, percent: null, error: null, manual: new Map(), placed: new Map(), show: false, mode: null, selected: null, message: null, restored: false };
+    f = { results: null, pending: null, percent: null, error: null, manual: new Map(), placed: new Map(), outward: new Map(), show: false, mode: null, selected: null, body: -1, message: null, restored: false };
     feedings.set(r, f);
   }
   return f;
@@ -2641,11 +2643,38 @@ function resetFeeding(i) {
   refreshFeeding();
 }
 
-/** The point clicked in the frame of the mesh, its triangle and its outward normal there. */
-function feedingHit(hit) {
+/**
+ * 1, or -1 when the triangles of body i turn inwards (a mirrored CAD
+ * instance, an inside-out mesh: shown as they are, only the sign of their
+ * volume corrected): by the sign of its enclosed volume, once.
+ */
+function feedingOutward(i) {
+  const f = feedingOf();
+  let sign = f.outward.get(i);
+  if (sign == null) {
+    const { positions: P, indices: I } = bodyArrays(i);
+    let volume = 0;
+    for (let t = 0; t < I.length / 3; t++) {
+      const a = 3 * I[3 * t], b = 3 * I[3 * t + 1], c = 3 * I[3 * t + 2];
+      const u = [P[b] - P[a], P[b + 1] - P[a + 1], P[b + 2] - P[a + 2]];
+      const v = [P[c] - P[a], P[c + 1] - P[a + 1], P[c + 2] - P[a + 2]];
+      volume += P[a] * (u[1] * v[2] - u[2] * v[1]) + P[a + 1] * (u[2] * v[0] - u[0] * v[2]) + P[a + 2] * (u[0] * v[1] - u[1] * v[0]);
+    }
+    sign = volume < 0 ? -1 : 1;
+    f.outward.set(i, sign);
+  }
+  return sign;
+}
+
+/**
+ * The point clicked in the frame of the mesh, its triangle and its outward
+ * normal there (the normal of three.js follows the winding of the triangle:
+ * turned outwards by the sign of the body).
+ */
+function feedingHit(hit, sign = 1) {
   const point = hit.object.worldToLocal(hit.point.clone());
   const n = hit.face?.normal;
-  return { point: [point.x, point.y, point.z], triangle: hit.faceIndex ?? -1, normal: n ? [n.x, n.y, n.z] : null };
+  return { point: [point.x, point.y, point.z], triangle: hit.faceIndex ?? -1, normal: n ? [sign * n.x + 0, sign * n.y + 0, sign * n.z + 0] : null };
 }
 
 /** A click on the 3D view while placing a riser or the ingate: handled here (true), the selection unchanged. */
@@ -2660,12 +2689,33 @@ function feedingClick(hits) {
     renderFeeding();
     return true;
   }
-  const { point, triangle, normal } = feedingHit(hit);
+  const { point, triangle, normal } = feedingHit(hit, feedingOutward(i));
   const mode = f.mode;
+  const field = feedingField(i);
+  if (!field) return true;
+  let riser = null;
+  if (mode === "add" || mode === "move") {
+    const moved = mode === "move" ? field.risers.find((x) => x.id === f.selected) : null;
+    if (mode === "move" && !moved) {
+      // The riser to move is no longer shown (another parting line, another body): nothing changed.
+      f.mode = null;
+      f.message = null;
+      renderFeeding();
+      return true;
+    }
+    // Moved: sized again from the zone it now touches, unless its D and H were typed in.
+    const sized = moved?.sized_by_hand ? { diameter: moved.diameter_mm, height: moved.height_mm } : {};
+    riser = riserFromPoint(point, { triangle, normal, zones: field.res, direction: field.placement.direction, id: moved?.id ?? nextRiserId(field.risers), ...sized });
+    if (!riser) {
+      // A face turned down: no riser under the part; another face to click.
+      f.message = t("feeding.faceDown");
+      renderFeeding();
+      return true;
+    }
+  }
   f.mode = null;
   f.message = null;
   editFeeding(i, (next, field) => {
-    const direction = field.placement.direction;
     if (mode === "gate") {
       const { positions, indices } = bodyArrays(i);
       const ctx = feedingContext(positions, indices, field.res, { parting: feedingParting(i).parting });
@@ -2674,17 +2724,9 @@ function feedingClick(hits) {
     }
     const risers = manualRisers(field);
     if (mode === "add") {
-      const riser = riserFromPoint(point, { triangle, normal, zones: field.res, direction, id: nextRiserId(risers) });
       next.risers = [...risers, riser];
       f.selected = riser.id;
-    } else if (mode === "move") {
-      next.risers = risers.map((x) => {
-        if (x.id !== f.selected) return x;
-        // Moved: sized again from the zone it now touches, unless its D and H were typed in.
-        const sized = x.sized_by_hand ? { diameter: x.diameter_mm, height: x.height_mm } : {};
-        return riserFromPoint(point, { triangle, normal, zones: field.res, direction, id: x.id, ...sized });
-      });
-    }
+    } else next.risers = risers.map((x) => (x.id === riser.id ? riser : x));
   });
   return true;
 }
@@ -2833,7 +2875,16 @@ function renderFeeding() {
   origin.textContent = t(field.manual ? "parting.manual" : "parting.proposed");
   origin.classList.toggle("manual", field.manual);
   $("feeding-count").textContent = String(field.risers.length);
-  if (f.selected && !field.risers.some((x) => x.id === f.selected)) f.selected = null;
+  // The riser selected gone (another parting line, deleted) or another body: no selection, nothing to move.
+  if (f.body !== i || (f.selected && !field.risers.some((x) => x.id === f.selected))) {
+    f.body = i;
+    f.selected = null;
+    if (f.mode === "move") {
+      f.mode = null;
+      f.message = null;
+      renderer.domElement.style.cursor = p?.mode ? "crosshair" : "";
+    }
+  }
 
   // The risers: a click selects one (to move, resize or delete it).
   const zones = field.res.zones;

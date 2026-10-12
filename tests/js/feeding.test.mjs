@@ -325,6 +325,9 @@ describe('risers and ingate by hand', () => {
     assert.match(top.why, /^Placée à la main/);
     const side = riserFromPoint([0, 30, 5], { triangle: triangleAt([0, 30, 5]), zones, positions: mesh.positions, indices: mesh.indices, direction: parting.direction });
     assert.deepEqual([side.type, side.open, side.offset], ['side', false, [-1, 0, 0]]);
+    // A face turned down (the underside of the plate): no riser under the part, none beside it inside the part.
+    assert.equal(riserFromPoint([30, 30, 0], { triangle: triangleAt([30, 30, 0]), zones, normal: [0, 0, -1], direction: parting.direction }), null);
+    assert.equal(riserFromPoint([30, 30, 0], { triangle: triangleAt([30, 30, 0]), zones, positions: mesh.positions, indices: mesh.indices, direction: parting.direction }), null);
     // Beside the part: sized with both its ends cooling, larger than on top; and so when resized.
     assert.deepEqual({ ...side, ...sizeRiser(zones.zones[0].modulus_mm, { type: 'side' }) }, side);
     assert.ok(side.diameter_mm > top.diameter_mm);

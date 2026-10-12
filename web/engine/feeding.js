@@ -1361,7 +1361,8 @@ export function feedingYield(partVolume, risers, gate) {
  * triangle -- the triangle touched (its zone, its normal), or -1
  * zones    -- feedingZones of the body
  * normal   -- outward normal there (else the triangle's)
- * Returns a riser, like those of placeFeeding (source "manual").
+ * Returns a riser, like those of placeFeeding (source "manual"), or null on a
+ * face turned down (within 60° of -d): a riser does not stand under the part.
  */
 export function riserFromPoint(point, { triangle = -1, zones, normal = null, direction = [0, 0, 1], density = null, diameter = null, height = null, id = 'M1', positions = null, indices = null } = {}) {
   const d = normalize(direction) ?? [0, 0, 1];
@@ -1374,6 +1375,7 @@ export function riserFromPoint(point, { triangle = -1, zones, normal = null, dir
   }
   const sphere = z?.sphere_mm ?? (triangle >= 0 ? zones?.sphere?.[triangle] ?? null : null);
   const modulus = z?.modulus_mm ?? (sphere != null ? HOT_SPOT_MODULUS * sphere : 0);
+  if (n && dot(n, d) <= -0.5) return null;
   const top = !n || dot(n, d) >= 0.5;
   const size = sizeRiser(modulus, { diameter, height, type: top ? 'top' : 'side' });
   // Beside the part, square to d, on the side the face looks to.
