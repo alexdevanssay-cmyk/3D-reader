@@ -416,6 +416,9 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     await page.waitForFunction(() => /1 retour d'expérience de ce poste à écrire dans le dossier réseau partagé dès que son accès est autorisé/.test(document.getElementById('cnetwork')?.textContent));
     await page.click('#cnetwork [data-action="network-grant"]');
     await page.waitForFunction(() => /— accessible/.test(document.querySelector('#cnetwork .crow')?.textContent) && /1 retour de ce poste écrit/.test(document.getElementById('cnetwork').textContent));
+    // Still said once the folder is read again (the grant reads it twice: the second one has nothing to write).
+    await page.waitForTimeout(1000);
+    assert.match(await page.textContent('#cnetwork'), /lu à .*1 retour de ce poste écrit/);
     const files = Object.keys(await folderFiles(page, 'retours-experience'));
     assert.equal(files.length, 1);
     assert.match(files[0], /^REF-ATTENTE__CG3__/);

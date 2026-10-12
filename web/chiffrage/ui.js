@@ -2658,7 +2658,7 @@ function historyFileRow() {
 // The shared folder of the company network (network-folder.js) as last checked, what the readings of its
 // retours d'expérience brought during this visit (feedback.js), and where the last real time saved went.
 let netFolder = null; // {state, name, error} (checkSharedFolder); null: being checked
-let netSync = null; // the last reading (syncFeedback), with the records it brought since the page was opened: {..., total: {added, replaced}}
+let netSync = null; // the last reading (syncFeedback), with the records it brought since the page was opened: {..., total: {added, replaced, written}}
 let netFeedback = null; // {ref, state: "writing" | "written" | "pending", name, error}
 let netChecking = null;
 let netAgain = false; // asked again while checking (a button of the row, the folder changed): once more after it
@@ -2672,14 +2672,15 @@ function refreshNetwork() {
   netChecking = (async () => {
     netFolder = await network.checkSharedFolder().catch((err) => ({ state: "unreadable", name: null, error: err?.message || String(err) }));
     // Its access to grant: the real times of this PC waiting for it said; no folder: no reading to say.
-    if (["prompt", "denied"].includes(netFolder.state)) netSync = { state: "prompt", total: netSync?.total ?? { added: 0, replaced: 0 } };
+    if (["prompt", "denied"].includes(netFolder.state)) netSync = { state: "prompt", total: netSync?.total ?? { added: 0, replaced: 0, written: 0 } };
     else if (netFolder.state === "none") netSync = null;
     drawNetwork();
     if (netFolder.state !== "accessible") return;
     // A network that stops answering midway: said, read again at the next showing of the page.
     const report = await network.withTimeout(syncFeedback({ load: store.loadHistorique, save: store.saveHistorique }), 120_000, "le dossier réseau ne répond plus")
       .catch((err) => ({ state: "error", error: err?.message || String(err) }));
-    const total = { added: (netSync?.total.added ?? 0) + (report.added ?? 0), replaced: (netSync?.total.replaced ?? 0) + (report.replaced ?? 0) };
+    // Since the page was opened: a reading right after another one (a button clicked during it) does not hide what the first one did.
+    const total = { added: (netSync?.total.added ?? 0) + (report.added ?? 0), replaced: (netSync?.total.replaced ?? 0) + (report.replaced ?? 0), written: (netSync?.total.written ?? 0) + (report.written ?? 0) };
     netSync = { ...report, total };
     // A real time that was waiting for the folder: written with the others.
     if (netFeedback?.state === "pending" && report.state === "done" && !report.waiting) netFeedback = { ...netFeedback, state: "written", name: null };
@@ -2759,10 +2760,10 @@ function netSyncHtml() {
   if (s.state === "prompt") return waiting ? `<p class="small cnetwork-sync">${plural(waiting, "retour")} d'expérience de ce poste à écrire dans le dossier réseau partagé dès que son accès est autorisé.</p>` : "";
   if (s.state === "error") return `<p class="small cnetwork-sync">Dossier réseau partagé non lu : ${esc(s.error)}.</p>`;
   const time = new Date(s.at).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
-  const { added, replaced } = s.total;
+  const { added, replaced, written = 0 } = s.total;
   const brought = added || replaced ? `${plural(added, "temps mesuré")} ajouté${added > 1 ? "s" : ""} à l'historique, ${replaced} mis à jour depuis l'ouverture de la page` : "aucun temps mesuré nouveau depuis l'ouverture de la page";
   const more = [
-    s.written ? `${plural(s.written, "retour")} de ce poste écrit${s.written > 1 ? "s" : ""}` : "",
+    written ? `${plural(written, "retour")} de ce poste écrit${written > 1 ? "s" : ""}` : "",
     s.waiting ? `${s.waiting} encore à écrire` : "",
     s.unreadable?.length ? `fichier${s.unreadable.length > 1 ? "s" : ""} illisible${s.unreadable.length > 1 ? "s" : ""} : ${esc(list(s.unreadable, (x) => x))}` : "",
   ].filter(Boolean);
