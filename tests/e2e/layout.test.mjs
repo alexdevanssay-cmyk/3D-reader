@@ -1,0 +1,256 @@
+// End-to-end test of the side panel of the "3D analysis" page of the built site
+// (dist/): each card folds to its title (the chevron, a click on the title, the
+// keyboard), the controls of its head still at hand and never folding it, its
+// key value beside the title; kept after a reload, shown folded after the next
+// analysis; "Collapse all" / "Expand all"; English and French. The panel's
+// width set by dragging the splitter, the 3D view following as it goes, within
+// limits; back to the default width on a double-click; from the keyboard; kept
+// after a reload and fitted to a smaller window; no splitter on a narrow window
+// (the panel under the view).
+//
+//   npm run build && node --test tests/e2e/layout.test.mjs
+
+import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { after, before, describe, test } from 'node:test';
+
+import { chromium } from 'playwright';
+
+import { createStaticServer } from '../../scripts/serve.mjs';
+import { ROOT, fixturePath } from '../js/helpers.mjs';
+
+const DIST = join(ROOT, 'dist');
+const TIMEOUT = 120_000;
+const CARDS = ['summary-card', 'mass-card', 'thickness-card', 'bodies-card', 'parting-card', 'feeding-card', 'memory-card'];
+
+describe('3D analysis panel: folded cards, width (dist/)', { skip: !existsSync(join(DIST, 'index.html')) && 'run `npm run build` first' }, () => {
+  let server;
+  let base;
+  let browser;
+
+  before(async () => {
+    server = createStaticServer(DIST);
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    base = `http://127.0.0.1:${server.address().port}/`;
+    browser = await chromium.launch({ args: ['--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
+  });
+
+  after(async () => {
+    await browser?.close();
+    await new Promise((resolve) => server?.close(resolve));
+  });
+
+  async function newPage() {
+    const context = await browser.newContext({ locale: 'en-US', viewport: { width: 1280, height: 800 }, acceptDownloads: true });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    return { page, errors };
+  }
+
+  async function analyse(page) {
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
+  }
+
+  const folded = (page, id) => page.evaluate((card) => document.getElementById(card).classList.contains('is-collapsed'), id);
+  const toggleOf = (page, id) => page.evaluate((card) => {
+    const button = document.querySelector(`#${card} > .card-head > .card-toggle`);
+    return button && { expanded: button.getAttribute('aria-expanded'), controls: button.getAttribute('aria-controls'), title: button.title, name: document.getElementById(button.getAttribute('aria-labelledby'))?.textContent };
+  }, id);
+
+  test('cards fold to their title: chevron, title, keyboard; head controls kept; remembered', { timeout: 3 * TIMEOUT }, async () => {
+    const { page, errors } = await newPage();
+    await page.goto(base);
+
+    // Every card of the panel: a chevron at the start of its head, named by the title, unfolded.
+    for (const id of CARDS) assert.deepEqual(await toggleOf(page, id), { expanded: 'true', controls: id, title: 'Collapse', name: (await page.textContent(`#${id} h3`)) }, id);
+    // No card shown yet: no "Collapse all".
+    assert.equal(await page.isVisible('.panel-fold-all'), false);
+
+    await analyse(page);
+    assert.equal(await page.textContent('.panel-fold-all'), 'Collapse all');
+
+    // The chevron folds the summary: its head only, the unit list still there and usable.
+    await page.click('#summary-card .card-toggle');
+    assert.equal(await folded(page, 'summary-card'), true);
+    assert.deepEqual(await toggleOf(page, 'summary-card'), { expanded: 'false', controls: 'summary-card', title: 'Expand', name: 'Real volume' });
+    assert.equal(await page.isVisible('#total-volume'), false);
+    assert.equal(await page.isVisible('#bbox-size'), false);
+    assert.equal(await page.isVisible('#vol-unit'), true);
+    // The volume beside the title, following the unit chosen in the head.
+    assert.equal(await page.textContent('#summary-card .card-peek'), await page.textContent('#total-volume'));
+    assert.equal(await page.isVisible('#summary-card .card-peek'), true);
+    await page.selectOption('#vol-unit', 'mm3');
+    assert.equal(await folded(page, 'summary-card'), true, 'a control of the head does not unfold the card');
+    await page.waitForFunction(() => document.querySelector('#summary-card .card-peek').textContent === document.getElementById('total-volume').textContent);
+    assert.match(await page.textContent('#summary-card .card-peek'), /mm³$/);
+    // Compact: the head only.
+    const height = await page.evaluate(() => document.getElementById('summary-card').getBoundingClientRect().height);
+    assert.ok(height < 60, `folded card ${height} px high`);
+
+    // A click on the title folds the bodies; their export buttons stay and do not unfold them.
+    await page.click('#bodies-card h3');
+    assert.equal(await folded(page, 'bodies-card'), true);
+    assert.equal(await page.isVisible('table.bodies'), false);
+    const [download] = await Promise.all([page.waitForEvent('download'), page.click('#export-json')]);
+    assert.match(download.suggestedFilename(), /\.json$/);
+    assert.equal(await folded(page, 'bodies-card'), true);
+    await page.click('#bodies-card h3');
+    assert.equal(await folded(page, 'bodies-card'), false);
+    assert.equal(await page.isVisible('table.bodies'), true);
+
+    // The keyboard: Enter and Space on the chevron.
+    await page.focus('#mass-card .card-toggle');
+    await page.keyboard.press('Enter');
+    assert.equal(await folded(page, 'mass-card'), true);
+    assert.equal(await page.isVisible('#material'), false);
+    assert.equal(await page.textContent('#mass-card .card-peek'), await page.textContent('#mass'));
+    await page.keyboard.press('Space');
+    assert.equal(await folded(page, 'mass-card'), false);
+    assert.equal(await page.isVisible('#material'), true);
+    await page.click('#mass-card h3');
+    assert.equal(await folded(page, 'mass-card'), true);
+    assert.deepEqual(JSON.parse(await page.evaluate(() => localStorage.getItem('reader3d.panel.collapsed'))).sort(), ['mass-card', 'summary-card']);
+
+    // Kept after a reload: folded before the analysis, and when the cards are shown by it.
+    await page.reload();
+    assert.equal(await folded(page, 'summary-card'), true);
+    assert.equal(await folded(page, 'mass-card'), true);
+    assert.equal(await folded(page, 'bodies-card'), false);
+    await analyse(page);
+    assert.equal(await page.isVisible('#summary-card'), true);
+    assert.equal(await folded(page, 'summary-card'), true);
+    assert.equal(await page.isVisible('#total-volume'), false);
+    assert.equal(await page.isVisible('#vol-unit'), true);
+    assert.equal(await page.isVisible('table.bodies'), true);
+
+    // Collapse all, expand all (the cards shown).
+    const shown = () => page.evaluate(() => [...document.querySelectorAll('#page-viewer .panel > section.card')].filter((c) => !c.hidden).map((c) => [c.id, c.classList.contains('is-collapsed')]));
+    await page.click('.panel-fold-all');
+    assert.ok((await shown()).every(([, f]) => f), JSON.stringify(await shown()));
+    assert.equal(await page.textContent('.panel-fold-all'), 'Expand all');
+    // In French.
+    await page.selectOption('#language', 'fr');
+    assert.equal(await page.textContent('.panel-fold-all'), 'Tout déplier');
+    assert.equal(await page.getAttribute('#summary-card .card-toggle', 'title'), 'Déplier');
+    assert.equal(await page.getAttribute('.panel-splitter', 'aria-label'), 'Largeur du panneau');
+    assert.match(await page.getAttribute('.panel-splitter', 'title'), /^Largeur du panneau : glissez pour ajuster, double-clic pour revenir à la largeur par défaut/);
+    await page.click('.panel-fold-all');
+    assert.ok((await shown()).every(([, f]) => !f), JSON.stringify(await shown()));
+    assert.equal(await page.textContent('.panel-fold-all'), 'Tout replier');
+    assert.equal(await page.getAttribute('#summary-card .card-toggle', 'title'), 'Replier');
+    assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.panel.collapsed')), null);
+
+    // Only on the 3D analysis page.
+    await page.click('[data-page="parametres"]');
+    assert.equal(await page.isVisible('.panel-splitter'), false);
+    assert.equal(await page.locator('#page-parametres .card-toggle').count(), 0);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
+  test('panel width: dragged within limits, the 3D view following; double-click, keyboard, reload, window resized, narrow window', { timeout: 2 * TIMEOUT }, async () => {
+    const { page, errors } = await newPage();
+    await page.goto(base);
+    await analyse(page);
+    const width = () => page.evaluate(() => Math.round(document.querySelector('#page-viewer > .panel').getBoundingClientRect().width));
+    // The canvas drawn at the size it is shown: never stretched.
+    const view = () => page.evaluate(() => {
+      const canvas = document.querySelector('#viewport canvas');
+      return { shown: canvas.clientWidth, drawn: canvas.width / devicePixelRatio, viewport: document.getElementById('viewport').clientWidth };
+    });
+    const splitter = page.locator('.panel-splitter');
+    const value = () => splitter.evaluate((el) => ['aria-valuemin', 'aria-valuenow', 'aria-valuemax'].map((a) => Number(el.getAttribute(a))));
+    const center = async () => {
+      const box = await splitter.boundingBox();
+      return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    };
+    const drag = async (dx) => {
+      const { x, y } = await center();
+      await page.mouse.move(x, y);
+      await page.mouse.down();
+      await page.mouse.move(x + dx, y, { steps: 6 });
+      await page.mouse.up();
+    };
+
+    assert.equal(await width(), 380);
+    assert.equal(await splitter.getAttribute('role'), 'separator');
+    assert.equal(await splitter.getAttribute('aria-label'), 'Panel width');
+    assert.deepEqual(await value(), [260, 380, 768]);
+    assert.deepEqual(await view(), { shown: 900, drawn: 900, viewport: 900 });
+
+    // Dragged to the left: the panel widens as the pointer goes, the 3D view narrows with it.
+    {
+      const { x, y } = await center();
+      await page.mouse.move(x, y);
+      await page.mouse.down();
+      await page.mouse.move(x - 100, y, { steps: 4 });
+      await page.waitForFunction(() => Math.round(document.querySelector('#page-viewer > .panel').getBoundingClientRect().width) === 480);
+      await page.waitForFunction(() => document.querySelector('#viewport canvas').width === 800);
+      assert.equal(await page.evaluate(() => document.documentElement.classList.contains('panel-resizing')), true);
+      await page.mouse.move(x - 200, y, { steps: 4 });
+      await page.mouse.up();
+    }
+    assert.equal(await width(), 580);
+    await page.waitForFunction(() => document.querySelector('#viewport canvas').width === 700);
+    assert.deepEqual(await view(), { shown: 700, drawn: 700, viewport: 700 });
+    assert.equal(await page.evaluate(() => document.documentElement.classList.contains('panel-resizing')), false);
+    assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.panel.width')), '580');
+    // Focused by the mouse (the arrow keys then move it), without the focus ring of the keyboard.
+    assert.equal(await splitter.evaluate((el) => document.activeElement === el && !el.matches(':focus-visible')), true);
+    assert.equal(await page.evaluate(() => getSelection().toString()), '', 'no text selected by the drag');
+
+    // Within its limits: at most 60 % of the page (the 3D view keeps 320 px at least), at least 260 px.
+    await drag(-1000);
+    assert.equal(await width(), 768);
+    assert.deepEqual(await value(), [260, 768, 768]);
+    await drag(2000);
+    assert.equal(await width(), 260);
+    await page.waitForFunction(() => document.querySelector('#viewport canvas').width === 1020);
+    // Narrow, nothing sticks out of the panel.
+    assert.equal(await page.evaluate(() => { const p = document.querySelector('#page-viewer > .panel'); return p.scrollWidth <= p.clientWidth; }), true);
+
+    // A double-click: back to the default width, forgotten.
+    const { x, y } = await center();
+    await page.mouse.dblclick(x, y);
+    assert.equal(await width(), 380);
+    assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.panel.width')), null);
+
+    // The keyboard on the splitter: ← widens, → narrows (Shift: by more), Home / End, Enter: the default.
+    await splitter.focus();
+    const keys = [['ArrowLeft', 400], ['Shift+ArrowLeft', 480], ['ArrowRight', 460], ['Home', 260], ['End', 768], ['Enter', 380], ['ArrowRight', 360]];
+    for (const [key, expected] of keys) {
+      await page.keyboard.press(key);
+      assert.equal(await width(), expected, key);
+      assert.equal((await value())[1], expected, key);
+    }
+
+    // Kept after a reload.
+    await drag(-340);
+    assert.equal(await width(), 700);
+    await page.reload();
+    assert.equal(await width(), 700);
+    await analyse(page);
+    await page.waitForFunction(() => document.querySelector('#viewport canvas').width === 580);
+
+    // A smaller window: within the new limits (60 % of 1000 px); the width chosen again when it grows back.
+    await page.setViewportSize({ width: 1000, height: 800 });
+    await page.waitForFunction(() => Math.round(document.querySelector('#page-viewer > .panel').getBoundingClientRect().width) === 600);
+    assert.deepEqual(await value(), [260, 600, 600]);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.waitForFunction(() => Math.round(document.querySelector('#page-viewer > .panel').getBoundingClientRect().width) === 700);
+
+    // A narrow window: the panel under the 3D view, the whole width, no splitter.
+    await page.setViewportSize({ width: 800, height: 800 });
+    assert.equal(await splitter.isVisible(), false);
+    await page.waitForFunction(() => document.querySelector('#page-viewer > .panel').getBoundingClientRect().width === 800);
+    await page.waitForFunction(() => document.querySelector('#viewport canvas').width === 800);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    assert.equal(await splitter.isVisible(), true);
+    await page.waitForFunction(() => Math.round(document.querySelector('#page-viewer > .panel').getBoundingClientRect().width) === 700);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+});

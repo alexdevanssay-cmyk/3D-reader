@@ -111,6 +111,10 @@ renderer.setAnimationLoop(() => {
   controls.update();
   renderer.render(scene, camera);
 });
+// Drawn again as soon as the view changes size (the panel's splitter dragged,
+// panels.js): the canvas resized after the frame was drawn would stay blank, or
+// stretched, until the next one.
+new ResizeObserver(() => renderer.render(scene, camera)).observe(viewport);
 
 // ---------------------------------------------------------------- loading
 

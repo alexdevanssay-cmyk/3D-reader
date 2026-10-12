@@ -50,6 +50,11 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
 - Assemblies: one row per part with names and colours from the STEP file, per-part
   volume and share, show/hide, and click a part in 3D to select it.
 - Viewer: orbit, pan, zoom, standard views, wireframe, envelope display, section plane.
+- Side panel of the 3D view, condensed at will: each card folds to its title (its chevron,
+  a click on the title, or « Tout replier / Tout déplier »), its head's controls still at
+  hand and its key value (volume, mass, thinnest wall) beside the title; the panel's width
+  set by dragging the edge between the view and it (from 260 px to 60 % of the window;
+  arrow keys too, a double-click for the default width). Both are kept in the browser.
 - **Costing of cast parts** (tabs *Chiffrage* and *Paramètres*, in French): import the
   SAB costing workbook (.xlsm) and the metal prices file (sheet « Suivi indice »); the
   page recomputes the hourly costs of the profit centres and the cost price (PRI) and

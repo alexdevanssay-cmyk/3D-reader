@@ -93,8 +93,10 @@ button.toggle.active { background: var(--accent); border-color: var(--accent); c
 button.small { font-size: 12px; padding: 3px 8px; }
 
 .layout {
+  position: relative;
   display: grid;
-  grid-template-columns: 1fr 380px;
+  /* --panel-width: set by dragging the splitter (panels.js) */
+  grid-template-columns: minmax(0, 1fr) var(--panel-width, 380px);
   height: calc(100% - var(--topbar-h, 53px));
 }
 
@@ -478,3 +480,57 @@ table.feeding-risers tr.selected td { background: color-mix(in srgb, var(--selec
   .ai-chat { flex: none; max-height: 65vh; }
   .ai-hist-list { flex: none; max-height: 50vh; }
 }
+
+/* "Analyse 3D" panel (panels.js): each card folds to its title, the panel's width is set by dragging
+   the splitter between the 3D view and it. */
+#page-viewer > .panel { container: viewer-panel / inline-size; }
+.card-head.card-head-toggle { justify-content: flex-start; flex-wrap: wrap; gap: 4px 6px; }
+/* The title takes the free space and wraps word by word before the controls of the head (checkboxes, buttons,
+   lists) go to a line of their own, on the right. */
+.card-head-toggle > h3 { flex: 1 1 0; cursor: pointer; user-select: none; }
+.card-head-toggle > :not(.card-toggle, h3, .card-peek) { margin-left: auto; }
+.card-toggle {
+  flex: none; display: inline-grid; place-items: center; width: 22px; height: 22px; margin: -3px 0 -3px -6px; padding: 0;
+  border: none; border-radius: 5px; background: transparent; color: var(--muted);
+}
+.card-toggle:hover { color: var(--text); background: var(--bg); }
+.card-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.card-toggle svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; transition: transform .15s; }
+.card.is-collapsed .card-toggle svg { transform: rotate(-90deg); }
+/* Folded: the head only (its title, its controls), compact; the key value beside the title. */
+.card.is-collapsed { padding-top: 8px; padding-bottom: 8px; }
+.card.is-collapsed > .card-head { margin-bottom: 0; }
+.card.is-collapsed > .card-head select { padding: 2px 6px; font-size: 13px; }
+.card.is-collapsed > :not(.card-head) { display: none !important; }
+/* With its value beside it, the title keeps to one line; the value, never cut, on the right (on the next line in a
+   narrow panel). */
+.card-head-toggle.has-peek > h3 { flex: 0 1 auto; }
+.card-head-toggle.has-peek > .card-peek { flex: 1 0 auto; text-align: right; }
+.card-peek { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; cursor: pointer; white-space: nowrap; }
+.panel-tools { display: flex; justify-content: flex-end; margin: -4px 2px -6px; }
+.panel-fold-all { color: var(--muted); }
+.panel-fold-all:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+/* The splitter: on the panel's edge, a thin grip in the middle; the edge lit while it is hovered or dragged. */
+.panel-splitter { position: absolute; top: 0; bottom: 0; right: var(--panel-width, 380px); width: 12px; margin-right: -6px; z-index: 5; cursor: col-resize; touch-action: none; }
+.panel-splitter:focus { outline: none; }
+.panel-splitter::before { content: ""; position: absolute; top: 0; bottom: 0; left: 5px; width: 2px; background: transparent; transition: background .15s; }
+.panel-splitter::after { content: ""; position: absolute; top: 50%; left: 4px; width: 4px; height: 36px; margin-top: -18px; border-radius: 2px; background: color-mix(in srgb, var(--muted) 45%, transparent); transition: background .15s; }
+.panel-splitter:hover::before, .panel-splitter:focus-visible::before, .panel-resizing .panel-splitter::before { background: var(--accent); }
+.panel-splitter:hover::after, .panel-splitter:focus-visible::after, .panel-resizing .panel-splitter::after { background: var(--accent); }
+.panel-splitter:focus-visible::after { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
+.panel-resizing, .panel-resizing * { cursor: col-resize !important; user-select: none !important; }
+@media (max-width: 900px) { .panel-splitter { display: none; } }
+/* The bodies' names as wide as the panel lets them be. */
+#page-viewer table.bodies .name { max-width: clamp(48px, calc(100cqw - 200px), 100cqw); }
+/* A narrow panel: the lists go to a line of their own, the values wrap, a table too wide for it scrolls. */
+@container viewer-panel (max-width: 320px) {
+  #page-viewer .card .row { flex-wrap: wrap; }
+  #page-viewer .card .row > select { flex: 1 1 140px; }
+  #page-viewer .card .field { min-width: 0; flex-wrap: wrap; }
+  #page-viewer .card .field select { min-width: 0; max-width: 100%; }
+  #page-viewer .card .stats { grid-template-columns: minmax(min-content, 1fr) minmax(0, 1fr); }
+  #page-viewer .card .stats dd { white-space: normal; overflow-wrap: break-word; }
+  #page-viewer .card table.bodies, #page-viewer .card table.parting-candidates { display: block; overflow-x: auto; }
+  #page-viewer .card table.parting-candidates td { overflow-wrap: normal; }
+}
+@media (prefers-reduced-motion: reduce) { .card-toggle svg, .panel-splitter::before, .panel-splitter::after { transition: none; } }
