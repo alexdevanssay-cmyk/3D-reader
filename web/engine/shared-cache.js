@@ -353,7 +353,7 @@ let writing = Promise.resolve();
  * Write the results of the key `key` in the shared folder, in the background:
  *   data      -- the analysis (as cache.js keeps it), or null
  *   thickness -- its wall thickness, or null; with `bodies` (of its analysis) when `data` is not given
- *   replace   -- false: a file already there is left as it is (written by another PC, or before)
+ *   replace   -- false: a file already there is left as it is (written by another PC, or before), unless empty
  * Resolves to {state: "written" (files: the names written) | "none" | "prompt" | "error", error}.
  */
 export function writeShared(key, { data = null, thickness = null, bodies = null, replace = true } = {}) {
@@ -364,7 +364,9 @@ export function writeShared(key, { data = null, thickness = null, bodies = null,
     if (!where.dir) return where;
     const files = [];
     const put = async (name, part, value) => {
-      if (!replace && (await withTimeout(fileIn(where.dir, name), STEP_LIMIT, 'le dossier réseau ne répond pas'))) return;
+      // A file there is left, unless it is empty: one whose write failed or was cut (the browser creates it before writing it).
+      const there = !replace && (await withTimeout(fileIn(where.dir, name), STEP_LIMIT, 'le dossier réseau ne répond pas'));
+      if (there && (await withTimeout(there.getFile(), STEP_LIMIT, 'le dossier réseau ne répond pas')).size > 0) return;
       const parts = containerParts(value, { key: parseKey(key), part, date: new Date().toISOString() });
       await writeFile(where.dir, name, () => gzip(streamOf(parts)));
       files.push(name);

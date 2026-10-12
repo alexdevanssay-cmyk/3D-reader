@@ -1,6 +1,7 @@
 // Results of the 3D analyses shared on the network (web/engine/shared-cache.js):
 // their container (typed arrays out of the JSON, then their bytes), its gzip,
-// the names of their files, the checks of what is read.
+// the names of their files, the checks of what is read; their files written
+// and read in a folder in memory (fake-folder.mjs).
 //
 //   node --test tests/js/shared-cache.test.mjs
 import assert from 'node:assert/strict';
@@ -8,8 +9,9 @@ import { test } from 'node:test';
 
 import { cacheKey } from '../../web/engine/cache.js';
 import {
-  CONTAINER_VERSION, containerParts, gunzip, gzip, meshHash, packValue, parseKey, readContainer, sharedNames, streamOf, unpackValue, validData, validThickness,
+  CONTAINER_VERSION, containerParts, gunzip, gzip, meshHash, packValue, parseKey, readContainer, readShared, sharedNames, streamOf, unpackValue, validData, validThickness, writeShared,
 } from '../../web/engine/shared-cache.js';
+import { chooseFakeFolder, fakeFolder } from './fake-folder.mjs';
 
 /** A container written then read back, through gzip when `zip`. */
 async function roundTrip(value, meta = {}, { zip = true } = {}) {
@@ -145,4 +147,24 @@ test('what is read is checked: an analysis has bodies with their meshes; a thick
   assert.equal(validThickness([values(2)], data), false, 'a body missing');
   assert.equal(validThickness([values(1), null], data), false, 'of other meshes');
   assert.equal(validThickness([{ ...values(2), wall: new Float64Array(2) }, null], data), false);
+});
+
+test('a file of the folder left empty (a write that failed, or cut when the browser was closed) written again, even where a file there is kept', async () => {
+  const key = await cacheKey(new TextEncoder().encode('solid piece'), { ext: '.stl', unit: 'mm' });
+  const names = await sharedNames(key);
+  const analyses = fakeFolder({ [names.data]: new Uint8Array(0) }, { name: 'analyses-3d' });
+  chooseFakeFolder(fakeFolder({ 'analyses-3d': analyses }, { name: 'reseau' }));
+  const data = { summary: { volume: 1 }, bodies: [{ mesh: { positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), indices: new Uint32Array([0, 1, 2]) } }] };
+  assert.equal((await readShared(key)).state, 'missing', 'empty: being written, not read');
+  // Opened again from this browser's own results: written there (replace: false), the other PCs read it.
+  const written = await writeShared(key, { data, replace: false });
+  assert.deepEqual([written.state, written.files], ['written', [names.data]]);
+  const read = await readShared(key);
+  assert.equal(read.state, 'read');
+  assert.deepEqual([read.data.summary, read.data.bodies[0].mesh.indices], [data.summary, data.bodies[0].mesh.indices]);
+  // A file with its data: left as it is.
+  const bytes = analyses.files.get(names.data).bytes;
+  const again = await writeShared(key, { data: { ...data, summary: { volume: 2 } }, replace: false });
+  assert.deepEqual([again.state, again.files], ['written', []]);
+  assert.equal(analyses.files.get(names.data).bytes, bytes);
 });
