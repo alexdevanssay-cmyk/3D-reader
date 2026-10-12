@@ -566,6 +566,34 @@ describe('built site in Chromium', () => {
     }
   });
 
+  test('the model turns freely: over the top of the view, not stopped at the pole', { timeout: MESH_TIMEOUT }, async () => {
+    const { page, problems } = await openPage();
+    try {
+      await analyzeInPage(page, 'box.stl', MESH_TIMEOUT - 15_000);
+      await page.click('[data-view="front"]');
+      await page.waitForTimeout(300);
+      const box = await page.locator('#viewport canvas').boundingBox();
+      const x = box.x + box.width / 2;
+      // Dragged up by most of the view's height: past the top, the part upside down (an orbit stops at the pole, Z still up).
+      await page.mouse.move(x, box.y + box.height * 0.9);
+      await page.mouse.down();
+      await page.mouse.move(x, box.y + box.height * 0.1, { steps: 30 });
+      await page.waitForTimeout(300); // held still: no momentum left
+      await page.mouse.up();
+      await page.waitForTimeout(500);
+      const view = await page.evaluate(() => window.reader3d.view);
+      const up = view.up;
+      assert.ok(up[2] / Math.hypot(...up) < -0.2, `the view went over the top: up ${up.map((v) => v.toFixed(2))}`);
+      // A named view stands upright again.
+      await page.click('[data-view="iso"]');
+      await page.waitForTimeout(300);
+      assert.deepEqual((await page.evaluate(() => window.reader3d.view)).up.map((v) => Math.round(v * 1000) / 1000), [0, 0, 1]);
+      assert.deepEqual(problems, []);
+    } finally {
+      await page.close();
+    }
+  });
+
   for (const { name, cad } of FIXTURES) {
     const timeout = cad ? CAD_TIMEOUT : MESH_TIMEOUT;
     test(`${name}: total volume matches the Python engine`, { timeout }, async (t) => {

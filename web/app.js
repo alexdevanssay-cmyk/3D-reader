@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { TrackballControls } from "three/addons/controls/TrackballControls.js";
 import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.js";
 import { engravingMask, thicknessHistogram, thicknessStats } from "./engine/thickness.js";
 import { summarize } from "./engine/summary.js";
@@ -61,9 +61,16 @@ const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 1e7);
 camera.up.set(0, 0, 1); // CAD convention: Z is up
 camera.position.set(1, -1, 1);
 
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.screenSpacePanning = true;
+// Trackball: the model turns freely in every direction (an orbit stops at the poles,
+// half a turn over the top); the camera's up turns with it.
+const controls = new TrackballControls(camera, renderer.domElement);
+controls.rotateSpeed = 3;
+controls.zoomSpeed = 1.2;
+controls.panSpeed = 0.8;
+controls.staticMoving = true; // no drift after the mouse is released: a view stays where it is put
+controls.keys = []; // no A/S/D keys held for rotate/zoom/pan: they are typed in the fields of the page
+// Where the view is on the page, read again at each drag: the bar above it may have wrapped since.
+renderer.domElement.addEventListener("pointerdown", () => controls.handleResize(), true);
 
 scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.6));
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.8);
@@ -95,6 +102,7 @@ function resize() {
   renderer.setSize(w, h, false);
   camera.aspect = w / Math.max(h, 1);
   camera.updateProjectionMatrix();
+  controls.handleResize();
 }
 new ResizeObserver(resize).observe(viewport);
 resize();
@@ -973,9 +981,11 @@ function setView(name) {
   const radius = state.bounds.getSize(new THREE.Vector3()).length() / 2 || 1;
   const dist = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.05;
   const dir = (VIEWS[name] || camera.position.clone().sub(controls.target)).clone().normalize();
-  // A camera looking straight down Z needs a different up vector.
-  camera.up.set(0, 0, 1);
-  if (Math.abs(dir.z) > 0.999) camera.up.set(0, 1, 0);
+  // A named view stands upright (Z up; looking straight down Z, Y up); "Recadrer" keeps the turn of the view.
+  if (VIEWS[name]) {
+    camera.up.set(0, 0, 1);
+    if (Math.abs(dir.z) > 0.999) camera.up.set(0, 1, 0);
+  } else if (Math.abs(camera.up.clone().normalize().dot(dir)) > 0.999) camera.up.set(0, 0, 1);
   camera.position.copy(center).addScaledVector(dir, dist);
   camera.near = dist / 1000;
   camera.far = dist * 100;
@@ -3674,6 +3684,10 @@ window.reader3d = {
   },
   get status() {
     return document.body.dataset.status ?? "idle";
+  },
+  /** Where the 3D view looks from: the camera's position and up, and the point it turns about (mm). */
+  get view() {
+    return { position: camera.position.toArray(), up: camera.up.toArray(), target: controls.target.toArray() };
   },
   async analyze(input, { name } = {}) {
     state.noPrompt = true; // no memory confirmation dialog for scripts
