@@ -53,6 +53,26 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     rmSync(dir, { recursive: true, force: true });
   });
 
+  test('a file picked while the page is drawn again (a 3D result arriving): imported all the same', { timeout: 60_000 }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage .ccard');
+    // The input of the workbook, as the file picker holds it; the page drawn again meanwhile.
+    const input = await page.$('#page-chiffrage input[data-file="workbook"]');
+    await page.evaluate(() => document.dispatchEvent(new CustomEvent('reader3d-part')));
+    assert.ok(await input.evaluate((node) => node.isConnected), 'the input of the file picker still in the page');
+    await input.setInputFiles(join(dir, 'chiffrage.xlsm'));
+    await page.waitForSelector('#page-chiffrage .cmsg.ok');
+    assert.match(await page.textContent('#page-chiffrage .cmsg.ok'), /18 centres de profit/);
+    assert.equal(await page.$$eval('#page-chiffrage input[data-file="workbook"]', (inputs) => inputs.length), 1);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
   test('import, best routes, choice of an island, settings kept, export', { timeout: 120_000 }, async () => {
     const context = await browser.newContext({ locale: 'fr-FR', acceptDownloads: true });
     const page = await context.newPage();

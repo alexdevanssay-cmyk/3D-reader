@@ -1287,7 +1287,15 @@ function render() {
   pending = false;
   const container = page === "parametres" ? el.parametres : el.chiffrage;
   const focused = container.contains(document.activeElement) ? document.activeElement.dataset?.bind : null;
+  // The file inputs kept: one may be open in the file picker while the page is
+  // drawn again (a 3D result, the shared folder read), and a file picked in an
+  // input no longer in the page would be lost.
+  const files = new Map([...container.querySelectorAll("input[type=file][data-file]")].map((input) => [input.dataset.file, input]));
   container.innerHTML = page === "parametres" ? renderSettings() : renderQuote();
+  for (const input of container.querySelectorAll("input[type=file][data-file]")) {
+    const kept = files.get(input.dataset.file);
+    if (kept) input.replaceWith(kept);
+  }
   if (focused) container.querySelector(`[data-bind="${CSS.escape(focused)}"]`)?.focus();
 }
 
