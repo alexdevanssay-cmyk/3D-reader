@@ -2394,7 +2394,9 @@ $("parting-reset").addEventListener("click", () => {
 // hand), and placed again when it changes. They can be placed by hand: a
 // riser added, moved, resized or deleted, the ingate placed (brought onto the
 // parting line). That definition is kept per part (the SHA-256 of its file)
-// in this browser; the risers placed by hand stay when the parting changes.
+// in this browser, for the body as it was read (its triangles, its size: not
+// put back in another unit nor at another quality); the risers placed by hand
+// stay when the parting changes.
 const FEEDING_KEY = "reader3d.feeding.v1";
 const FEEDING_PARTS = 200; // parts whose definition by hand is kept, the latest
 const RISER_COLOR = 0xf08a24;
@@ -2497,11 +2499,22 @@ function feedingSaved() {
   }
 }
 
+/**
+ * What a definition by hand of body i of the model shown is of: its
+ * triangles and the size of its box. The same file read in another unit, or
+ * tessellated at another quality, has the same part id: its risers (in mm,
+ * on zones of these triangles) are not put back on it.
+ */
+function feedingMeshTag(i) {
+  const size = state.result.bodies[i].bbox?.size ?? [];
+  return `${bodyArrays(i).indices.length / 3}|${size.map((x) => Number(x).toFixed(3)).join(",")}`;
+}
+
 function saveFeedingDef(partId, body, def) {
   if (!partId) return;
   const all = feedingSaved();
   const entry = all[partId] ?? { bodies: {} };
-  if (def?.risers || def?.gate) entry.bodies[body] = { risers: def.risers ?? null, gate: def.gate ?? null };
+  if (def?.risers || def?.gate) entry.bodies[body] = { risers: def.risers ?? null, gate: def.gate ?? null, mesh: def.mesh ?? null };
   else delete entry.bodies[body];
   if (Object.keys(entry.bodies).length) all[partId] = { ...entry, savedAt: Date.now() };
   else delete all[partId];
@@ -2575,7 +2588,9 @@ function restoreFeeding() {
   const defs = feedingSaved()[partIdOf(r)]?.bodies ?? {};
   for (const [key, def] of Object.entries(defs)) {
     const i = Number(key);
-    if (!f.results[i]) continue;
+    if (!f.results[i] || !state.meshes[i]) continue;
+    // Of this body as read now (not in another unit, nor at another quality).
+    if (def?.mesh !== feedingMeshTag(i)) continue;
     const risers = Array.isArray(def?.risers) ? def.risers.filter(validRiser) : null;
     const gate = validGate(def?.gate) ? def.gate : null;
     if (risers || gate) f.manual.set(i, { risers, gate });
@@ -2601,7 +2616,7 @@ function editFeeding(i, edit) {
   edit(next, field);
   if (next.risers || next.gate) f.manual.set(i, next);
   else f.manual.delete(i);
-  saveFeedingDef(partIdOf(state.result), i, next);
+  saveFeedingDef(partIdOf(state.result), i, { ...next, mesh: feedingMeshTag(i) });
   refreshFeeding();
 }
 
