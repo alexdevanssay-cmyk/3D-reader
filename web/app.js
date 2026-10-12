@@ -476,6 +476,7 @@ async function openFile(file, { refresh = false, handle = null, close = false, t
     // Only now does the tab show this file (a failed file leaves the previous one).
     tab.handle = handle ?? (file === tab.file ? tab.handle : null);
     tab.file = file;
+    if (tab.result !== data) partingAbandon(tab.result);
     tab.result = data;
     tab.part = { id: partId, file: file.name };
     if (!shown()) {
@@ -1861,6 +1862,7 @@ function computePartings(r) {
   p.percent = 0;
   p.pending = partClient()
     .then((client) => client.computeParting(bodies, {
+      owner: r,
       onProgress: ({ percent }) => {
         p.percent = percent;
         if (r === state.result) renderParting();
@@ -1909,7 +1911,7 @@ async function partingDirection(i, d) {
   renderParting();
   try {
     const client = await partClient();
-    const ev = await client.evaluateDirection(bodyArrays(i), d);
+    const ev = await client.evaluateDirection(bodyArrays(i), d, { owner: r });
     const base = { direction: ev.summary.direction, summary: ev.summary, side: ev.side, flags: ev.flags, plane: ev.plane, segments: ev.segments };
     p.evaluated.set(key, base);
     return base;
@@ -1917,6 +1919,11 @@ async function partingDirection(i, d) {
     p.busy--;
     if (r === state.result) renderParting();
   }
+}
+
+/** A result no longer in any tab (closed, another file opened in it): its parting jobs dropped, they would hold up the other tabs'. */
+function partingAbandon(r) {
+  if (r) partClient.module?.then((client) => client.cancelParting(r));
 }
 
 /**
@@ -1993,7 +2000,7 @@ async function restoreParting() {
       if (Object.keys(overrides).length && def.faces !== partingGeometry(i).count) overrides = {};
       setPartingDefinition(i, { base, source: def.source ?? "vector", overrides, candidate: def.candidate ?? null });
     } catch (err) {
-      console.warn("Parting line kept not restored", err);
+      if (!err.cancelled) console.warn("Parting line kept not restored", err);
     }
   }
 }
@@ -2170,7 +2177,7 @@ async function pickPartingFace(i, f) {
     const base = await partingDirection(i, d);
     if (r === state.result && seq === p.seq) setPartingDefinition(i, { base, source: "face" });
   } catch (err) {
-    showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
+    if (!err.cancelled) showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
   }
 }
 
@@ -2322,8 +2329,7 @@ $("parting-candidates").addEventListener("click", async (e) => {
       return;
     }
   } catch (err) {
-    showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
-    renderParting();
+    if (!err.cancelled) showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
   }
   // Not applied (failed, or another choice made meanwhile): the radio of the direction in use checked again.
   if (r !== state.result) return;
@@ -2366,7 +2372,7 @@ async function applyTypedDirection() {
     const base = await partingDirection(i, d);
     if (r === state.result && seq === p.seq) setPartingDefinition(i, { base, source: "vector" });
   } catch (err) {
-    showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
+    if (!err.cancelled) showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
   }
 }
 $("parting-apply").addEventListener("click", applyTypedDirection);
@@ -2535,6 +2541,7 @@ function closeTab(tab) {
   cancelTab(tab);
   if (tab === activeTab) clearModel();
   else if (tab.view) disposeObjects(tab.view.meshes);
+  partingAbandon(tab.result);
   tab.view = tab.result = tab.file = tab.part = null;
   tabs.splice(i, 1);
   forgetQuote(tab.id);
