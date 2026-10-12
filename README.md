@@ -57,6 +57,16 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   casting yield. Shown on the 3D view; risers added, moved, resized or deleted and the
   ingate placed by a click (kept per part in the browser). See
   [Risers and gating](#risers-and-gating-method-and-limits).
+- **Through and blind holes** of CAD solids, measured on the geometry: each hole (a
+  cylinder with the material around it, with its counterbore, countersink or drill point)
+  is probed by lines cast along its axis on the closed mesh: open at both ends, a through
+  hole; closed by a bottom at one, a blind hole, with its depth (from the furthest point
+  of its opening) and bottom (flat, drill point). A rounded edge into a cavity still
+  opens; a hole cut in two by a cross bore is one hole; the outside of a boss or a tube
+  round a hole is none. The semantic contract and the AI context give them as measured
+  (`through_hole`, `blind_hole`, operations `drilling` / `drilling_blind`); a hole the
+  lines cannot decide stays provisional, with the reason. Mesh files (STL...) have no
+  hole candidates.
 - Assemblies: one row per part with names and colours from the STEP file, per-part
   volume and share, show/hide, and click a part in 3D to select it.
 - Viewer: orbit, pan, zoom, standard views, wireframe, envelope display, section plane.

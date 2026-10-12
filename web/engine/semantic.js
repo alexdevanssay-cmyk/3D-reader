@@ -9,11 +9,14 @@ import { buildManufacturingPlan, operationDependencyGraph, precedence } from "./
 import { buildFoundryAnalysis, FOUNDRY_SCHEMA_VERSION, FOUNDRY_KNOWLEDGE_VERSION } from "./foundry-knowledge.js";
 import { meshTopology } from "./meshanalysis.js";
 import { ANALYSIS_HINTS } from "./analysis-hints.js";
+import { HOLES_METHOD, currentHoles } from "./holes.js";
 
 export const SEMANTIC_VERSION = "1.0";
 
 const EPS = 1e-9;
-const FEATURE_SCHEMA_VERSION = "10.0";
+// 11.0: holes measured on the mesh (holes.js): subtypes through_hole and
+// blind_hole, with their depth and axis, no longer provisional.
+const FEATURE_SCHEMA_VERSION = "11.0";
 const MANUFACTURING_PLANNING_SCHEMA_VERSION = "1.0";
 const MANUFACTURING_SCHEMA_VERSION = "1.0";
 const FOUNDRY_PROFILE = "unspecified";
@@ -378,6 +381,91 @@ function cylindricalBlend(cylinder, graph) {
   return new Set(keys).size===keys.length;
 }
 
+/**
+ * The holes of a body measured on its mesh (holes.js, given with the Reader
+ * body): face index -> its hole. Empty without measurements, or of another
+ * version (a result kept before them: its holes stay provisional).
+ */
+function measuredHoles(body) {
+  const byFace=new Map();
+  if (!currentHoles(body.holes)) return byFace;
+  for (const hole of body.holes.holes) for (const i of hole.surfaces ?? []) byFace.set(i, hole);
+  return byFace;
+}
+
+/** Whether a hole was found through or blind (not undetermined). */
+const isMeasured = (hole) => typeof hole?.through === "boolean";
+const MEASURED_HOLE_CONFIDENCE = 0.95;
+
+/**
+ * The fields a feature of a hole gets from its measurement: through or blind,
+ * its open ends, length and, blind, its depth and bottom; the faces of the
+ * hole (a counterbore, a drill point...). Undetermined: why.
+ */
+function holeFields(hole) {
+  if (!isMeasured(hole)) return {measured:false, through:null, uncertain_reason:hole.reason ?? null};
+  return {
+    measured:true,
+    through:hole.through,
+    open_ends:hole.open_ends,
+    length_mm:hole.length_mm,
+    ...(hole.through ? {} : {
+      depth_mm:hole.depth_mm,
+      bottom:hole.bottom ?? null,
+      ...(finite(hole.tip_depth_mm) ? {tip_depth_mm:hole.tip_depth_mm} : {}),
+      ...(finite(hole.drill_point_angle_deg) ? {drill_point_angle_deg:hole.drill_point_angle_deg} : {}),
+    }),
+    hole_surfaces:hole.surfaces,
+    ...(Array.isArray(hole.diameters_mm) ? {hole_diameters_mm:hole.diameters_mm} : {}),
+  };
+}
+
+/** The hole all these faces belong to, when they belong to one. */
+function holeOf(surfaces, holes) {
+  const hole=holes.get(surfaces[0]);
+  return hole && surfaces.every(i=>holes.get(i)===hole) ? hole : null;
+}
+
+/**
+ * The holes of a body in short, for the AI: how many were measured through or
+ * blind, how many stay undetermined and why, how many faces given as holes are
+ * none (their axis in the material, a wall that does not go all round, or
+ * material between the axis and the wall: a face groove, a tube); or why none
+ * was measured. Status "measured" when every hole was, "partly_measured" when
+ * some were, "undetermined" when none was. Null for a body without cylinders.
+ */
+function holeSummary(body) {
+  const surfaces=body.geometric_surfaces ?? [];
+  if (!surfaces.some(x=>x.type==="cylinder")) return null;
+  if (!currentHoles(body.holes) || body.holes.reason) {
+    return {
+      method:HOLES_METHOD,
+      status:"not_measured",
+      // open_mesh: lines would leave the mesh through its gaps.
+      reason:!body.closed ? "open_body" : !body.holes ? "not_measured_for_this_result" : body.holes.reason ?? "measured_by_another_version",
+      note:"hole candidates are provisional: their through or blind status is not known",
+    };
+  }
+  const holes=body.holes.holes;
+  const notHoles=new Set(["start_point_in_material","not_a_full_revolution","material_inside"]);
+  const undetermined=holes.filter(h=>!isMeasured(h) && !notHoles.has(h.reason));
+  const reasons={};
+  for (const h of undetermined) reasons[h.reason ?? "unknown"]=(reasons[h.reason ?? "unknown"] ?? 0)+1;
+  const notHoleCount=holes.filter(h=>!isMeasured(h) && notHoles.has(h.reason)).length;
+  const through=holes.filter(h=>h.through===true).length;
+  const blind=holes.filter(h=>h.through===false).length;
+  return {
+    method:HOLES_METHOD,
+    status:!undetermined.length ? "measured" : through+blind ? "partly_measured" : "undetermined",
+    through,
+    blind,
+    undetermined:undetermined.length,
+    ...(undetermined.length ? {undetermined_reasons:reasons} : {}),
+    ...(notHoleCount ? {cylinders_not_holes:notHoleCount} : {}),
+    note:"through or blind measured on the closed mesh by lines along each hole axis (measured: true); undetermined holes keep a provisional subtype with uncertain_reason",
+  };
+}
+
 /** Whether a plane bounds the body's box, the whole body on one side of it: an outer face. False without a normal. */
 function envelopePlane(plane, bbox) {
   const n=normalizeAxis(plane.normal);
@@ -421,9 +509,42 @@ function featureCandidates(body, topo, relations, graph) {
   // Rounded edges are reported as fillets below, never as holes, bores or bosses.
   const blends=new Set(cylinders.filter(c=>cylindricalBlend(c,graph)).map(c=>c.index));
   const boundaryRelations=relations.filter(r=>r.type==="cylindrical_boundary_planes");
+  const boundaryRelationBySurface=new Map(boundaryRelations.map(r=>[r.surface,r]));
+  // Through or blind, measured on the mesh: what the signals below can only guess.
+  const holes=measuredHoles(body);
+  // One feature per hole measured, not per face: on its first face of its
+  // narrowest diameter. Its other faces (a counterbore, the other half of a
+  // cylinder given as two faces) are in its hole_surfaces.
+  const holeFace=new Map();
+  for (const hole of new Set(holes.values())) {
+    if (!isMeasured(hole)) continue;
+    const faces=(hole.surfaces ?? []).filter(i=>byIndex.get(i)?.type==="cylinder" && finite(byIndex.get(i).radius_mm) && !blends.has(i));
+    const main=faces.find(i=>Math.abs(2*byIndex.get(i).radius_mm-hole.diameter_mm)<=1e-9*Math.max(1,hole.diameter_mm)) ?? faces[0];
+    if (main!=null) holeFace.set(hole, main);
+  }
 
   for (const c of cylinders) {
     if (blends.has(c.index)) continue;
+    const hole=holes.get(c.index);
+    if (isMeasured(hole)) {
+      if (holeFace.get(hole)!==c.index) continue;
+      out.push({
+        type:"cylindrical_feature_candidate",
+        subtype:hole.through ? "through_hole" : "blind_hole",
+        confidence:MEASURED_HOLE_CONFIDENCE,
+        method:HOLES_METHOD,
+        surface_index:c.index,
+        radius_mm:c.radius_mm,
+        diameter_mm:2*c.radius_mm,
+        // Blind: from the opening into the material.
+        axis:hole.axis ?? c.axis ?? null,
+        center_mm:c.center_mm ?? null,
+        boundary_evidence:{wire_count:c.wire_count ?? null,edge_count:c.edge_count ?? null},
+        ...holeFields(hole),
+        needs_topology_confirmation:false
+      });
+      continue;
+    }
     const axial = Math.max(...s);
     const likelyThrough = c.radius_mm > 0 && axial > 0 && axial / (2*c.radius_mm) > 1.5;
     // Two boundary circles close a pin or a boss as well as a hole: only a face
@@ -442,16 +563,39 @@ function featureCandidates(body, topo, relations, graph) {
       axis:c.axis ?? null,
       center_mm:c.center_mm ?? null,
       boundary_evidence:{wire_count:c.wire_count ?? null,edge_count:c.edge_count ?? null},
+      ...(hole ? holeFields(hole) : {}),
       needs_topology_confirmation:true
     });
   }
 
-  // A cylindrical face bounded by two planar faces is a strong geometric
-  // signature of a cylindrical passage, but it is still not enough to prove
-  // design intent: an external boss can have the same topology.
-  for (const r of boundaryRelations) {
-    const cylinder = byIndex.get(r.surface);
-    if (!cylinder || blends.has(cylinder.index)) continue;
+  // A hole measured on the mesh is one, through or blind, whatever its
+  // neighbours. Otherwise a cylindrical face bounded by two planar faces is a
+  // strong geometric signature of a cylindrical passage, but it is still not
+  // enough to prove design intent: an external boss can have the same topology.
+  for (const c of cylinders) {
+    if (blends.has(c.index)) continue;
+    const r = boundaryRelationBySurface.get(c.index);
+    const hole = holes.get(c.index);
+    if (isMeasured(hole)) {
+      if (holeFace.get(hole)!==c.index) continue;
+      out.push({
+        type:"hole_feature_candidate",
+        subtype:hole.through ? "through_hole" : "blind_hole",
+        surface_index:c.index,
+        diameter_mm:2*c.radius_mm,
+        axis:hole.axis ?? c.axis ?? null,
+        center_mm:c.center_mm ?? null,
+        boundary_planes:r?.planes ?? [],
+        confidence:MEASURED_HOLE_CONFIDENCE,
+        method:HOLES_METHOD,
+        evidence:[...(r ? [{source:"relation", relation_id:r.relation_id}] : []), {source:"mesh_measurement", method:HOLES_METHOD, surfaces:hole.surfaces}],
+        ...holeFields(hole),
+        needs_topology_confirmation:false
+      });
+      continue;
+    }
+    if (!r) continue;
+    const cylinder = c;
     const planeCount = r.planes.length;
     const subtype = planeCount >= 2 ? "possible_through_hole_or_bore" :
       planeCount === 1 ? "possible_blind_hole_or_bore" : "cylindrical_cut_candidate";
@@ -467,9 +611,18 @@ function featureCandidates(body, topo, relations, graph) {
       confidence,
       method:"cylindrical_face_plus_shared_brep_planar_boundaries",
       evidence:[{source:"relation", relation_id:r.relation_id}],
+      ...(hole ? holeFields(hole) : {}),
       needs_topology_confirmation:true
     });
   }
+
+  // The faces of one hole measured through or blind (a counterbore and its
+  // bore, a countersink or a drill point and the hole): the status of the hole.
+  // What they are (a counterbore, a step) stays an interpretation.
+  const ofHole=(surfaces)=>{
+    const hole=holeOf(surfaces, holes);
+    return isMeasured(hole) ? {measured:true, through:hole.through, hole_surfaces:hole.surfaces} : {};
+  };
 
   // Promote analytic cone/cylinder junctions only when their boundary evidence
   // supports a machining-like transition. Keep the result explicitly provisional.
@@ -491,6 +644,7 @@ function featureCandidates(body, topo, relations, graph) {
         confidence: coneAngle > 0 && coneAngle < Math.PI / 4 ? 0.82 : 0.68,
         method: "coaxial_cylinder_cone_analytic_surfaces",
         evidence: [{source:"relation", relation_id:r.relation_id}],
+        ...ofHole(r.surfaces),
         needs_topology_confirmation: true
       });
     }
@@ -506,6 +660,9 @@ function featureCandidates(body, topo, relations, graph) {
       : circularCenters(members)
         ? "possible_circular_cylindrical_pattern"
         : "possible_repeated_cylindrical_pattern";
+    // Holes all measured through, or all blind: so is the pattern.
+    const statuses=new Set(members.map(c=>isMeasured(holes.get(c.index)) ? holes.get(c.index).through : null));
+    const through=statuses.size===1 ? [...statuses][0] : null;
     out.push({
       type:"pattern_feature_candidate",
       subtype,
@@ -515,6 +672,7 @@ function featureCandidates(body, topo, relations, graph) {
       centers_mm:members.map(x=>x.center_mm ?? null),
       confidence:subtype==="possible_repeated_cylindrical_pattern" ? 0.78 : 0.84,
       method:"parallel_equal_radius_cylindrical_surface_repetition",
+      ...(through!==null ? {measured:true, through} : {}),
       needs_topology_confirmation:true
     });
   }
@@ -617,10 +775,10 @@ function featureCandidates(body, topo, relations, graph) {
 
   // A cylindrical face attached to planar faces may represent an external boss
   // or an internal bore. Without a reliable inside/outside test, keep both
-  // interpretations explicit rather than misclassifying the feature.
-  const boundaryRelationBySurface=new Map(boundaryRelations.map(r=>[r.surface,r]));
+  // interpretations explicit rather than misclassifying the feature. A hole
+  // measured on the mesh has its axis in the air: no boss.
   for (const c of cylinders) {
-    if (blends.has(c.index)) continue;
+    if (blends.has(c.index) || isMeasured(holes.get(c.index))) continue;
     const neighbors=adjacencyByFace.get(c.index) ?? [];
     const planes=neighbors
       .map(x=>byIndex.get(x.face))
@@ -661,6 +819,7 @@ function featureCandidates(body, topo, relations, graph) {
       confidence: r.type === "coaxial_cylinders" ? 0.88 : 0.9,
       method: "coaxial_analytic_surface_relation",
       evidence: [{source:"relation", relation_id:r.relation_id}],
+      ...ofHole(r.surfaces),
       needs_topology_confirmation: true
     });
   }
@@ -688,6 +847,7 @@ function featureCandidates(body, topo, relations, graph) {
         confidence:0.78,
         method:"coaxial_analytic_surfaces",
         evidence:[{source:"relation", relation_id:r.relation_id}],
+        ...ofHole(r.surfaces),
         needs_topology_confirmation:true
       });
     } else if (r.type==="coaxial_cylinder_step") {
@@ -699,6 +859,7 @@ function featureCandidates(body, topo, relations, graph) {
         confidence:0.79,
         method:"coaxial_analytic_surfaces_with_different_radii",
         evidence:[{source:"relation", relation_id:r.relation_id}],
+        ...ofHole(r.surfaces),
         needs_topology_confirmation:true
       });
     } else if (r.type==="coaxial_cylinders") {
@@ -710,6 +871,7 @@ function featureCandidates(body, topo, relations, graph) {
         confidence:0.94,
         method:"coaxial_analytic_surfaces",
         evidence:[{source:"relation", relation_id:r.relation_id}],
+        ...ofHole(r.surfaces),
         needs_topology_confirmation:true
       });
     }
@@ -948,6 +1110,7 @@ function semanticBody(body, index) {
   const graph=faceGraph(body.geometric_surfaces ?? []);
   const relations=surfaceRelations(body.geometric_surfaces ?? [], graph, id);
   const features=normalizeFeatureEvidence(featureCandidates(body,topo,relations,graph), id);
+  const holes=holeSummary(body);
   const semantic = {
     id,
     source_index:sourceIndex,
@@ -973,6 +1136,8 @@ function semanticBody(body, index) {
     // Risers and ingate (feeding.js), proposed from the hot spots or placed by hand, when computed.
     ...(body.feeding ? {feeding:body.feeding} : {}),
     features,
+    // Through and blind holes measured on the mesh (holes.js), in short; the features carry each one.
+    ...(holes ? {holes} : {}),
     relations,
     quality:{
       closed:!!body.closed,

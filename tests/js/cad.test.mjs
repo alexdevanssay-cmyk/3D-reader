@@ -12,6 +12,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { analyzeCad, CAD_EXTENSIONS, QUALITY } from '../../web/engine/cad.js';
+import { HOLES_VERSION, holesOfInstance, measureHoles } from '../../web/engine/holes.js';
 import { loadOcctNode } from '../../web/engine/occt.js';
 import { ROOT, approx, approxVec, fixtureBytes, loadExpected } from './helpers.mjs';
 
@@ -218,6 +219,58 @@ function placement([r1, r2, r3], [tx, ty, tz]) {
   return new oc.TopLoc_Location_2(trsf);
 }
 
+// Parts with holes: solids along axes, booleans, rounded edges, turns.
+const axes = (x, y, z, dx, dy, dz) => new oc.gp_Ax2_3(new oc.gp_Pnt_3(x, y, z), new oc.gp_Dir_4(dx, dy, dz));
+const cylinderAt = (a, r, h) => new oc.BRepPrimAPI_MakeCylinder_3(a, r, h).Shape();
+const coneAt = (a, r1, r2, h) => new oc.BRepPrimAPI_MakeCone_3(a, r1, r2, h).Shape();
+const fuse = (a, b) => new oc.BRepAlgoAPI_Fuse_3(a, b, new oc.Message_ProgressRange_1()).Shape();
+const cut = (a, b) => new oc.BRepAlgoAPI_Cut_3(a, b, new oc.Message_ProgressRange_1()).Shape();
+
+/** The edges of a shape that are circles of radius r centred at c. */
+function circleEdges(shape, c, r) {
+  return edges(shape).filter((e) => {
+    const curve = new oc.BRepAdaptor_Curve_2(e);
+    if (curve.GetType() !== oc.GeomAbs_CurveType.GeomAbs_Circle) return false;
+    const circle = curve.Circle();
+    const at = circle.Location();
+    return Math.abs(circle.Radius() - r) < 1e-6 && Math.hypot(at.X() - c[0], at.Y() - c[1], at.Z() - c[2]) < 1e-6;
+  });
+}
+
+/** The straight edges of a shape from a to b (either way). */
+function lineEdges(shape, a, b) {
+  return edges(shape).filter((e) => {
+    const curve = new oc.BRepAdaptor_Curve_2(e);
+    if (curve.GetType() !== oc.GeomAbs_CurveType.GeomAbs_Line) return false;
+    const [p, q] = [curve.FirstParameter(), curve.LastParameter()].map((t) => curve.Value(t));
+    const d = (u, v) => Math.hypot(u.X() - v[0], u.Y() - v[1], u.Z() - v[2]);
+    return (d(p, a) < 1e-6 && d(q, b) < 1e-6) || (d(p, b) < 1e-6 && d(q, a) < 1e-6);
+  });
+}
+
+/** The shape with these edges rounded to radius r. */
+function filleted(shape, list, r) {
+  assert.ok(list.length, 'edges to round');
+  const fillet = new oc.BRepFilletAPI_MakeFillet(shape, oc.ChFi3d_FilletShape.ChFi3d_Rational);
+  for (const e of list) fillet.Add_2(r, e);
+  return fillet.Shape();
+}
+
+/** The shape turned by deg degrees about the line through p along d. */
+function turned(shape, p, d, deg) {
+  const trsf = new oc.gp_Trsf_1();
+  trsf.SetRotation_1(new oc.gp_Ax1_2(new oc.gp_Pnt_3(...p), new oc.gp_Dir_4(...d)), (deg * Math.PI) / 180);
+  return new oc.BRepBuilderAPI_Transform_2(shape, trsf, true).Shape();
+}
+
+/** The holes of the one solid of a shape, and its analytic surfaces. */
+function holesOf(name, shape) {
+  const [body, ...others] = analyzeCad(oc, brepBytes(`${name}.brep`, shape), `${name}.brep`).bodies;
+  assert.equal(others.length, 0, name);
+  assert.equal(body.holes.version, HOLES_VERSION, name);
+  return { holes: body.holes.holes, surfaces: body.geometric_surfaces, body };
+}
+
 function faces(shape) {
   const out = [];
   const exp = new oc.TopExp_Explorer_2(shape, oc.TopAbs_ShapeEnum.TopAbs_FACE, oc.TopAbs_ShapeEnum.TopAbs_SHAPE);
@@ -354,6 +407,210 @@ describe('CAD specifics', () => {
     assert.equal(hole.edge_count, 2);
     approxVec(hole.axis.map(Math.abs), [0, 0, 1], 0, 1e-12, 'hole axis');
     approxVec(hole.center_mm, [50, 30, 10], 0, 1e-9, 'hole centre');
+  });
+
+  test('holes measured on the mesh: through, blind with a drill point or a flat bottom, counterbored; a boss is none', (t) => {
+    // The fixture: its hole of radius 10 goes through the 20 mm of the block.
+    const [block] = structuredClone(timedAnalyze(t, 'holed_block.step', undefined, undefined, 'holed_block.step (holes)')).bodies;
+    assert.equal(block.holes.version, HOLES_VERSION);
+    assert.equal(block.holes.method, 'axis_rays_on_mesh');
+    const cylinder = block.geometric_surfaces.find((s) => s.type === 'cylinder');
+    assert.equal(block.holes.holes.length, 1);
+    const [through] = block.holes.holes;
+    assert.deepEqual(through.surfaces, [cylinder.index]);
+    assert.equal(through.through, true);
+    assert.equal(through.open_ends, 2);
+    approx(through.diameter_mm, 20, 1e-12, 0, 'diameter');
+    approx(through.length_mm, 20, 1e-9, 0, 'length');
+
+    // A block 120 x 40 x 20 with, along z: a through hole of 10 at x = 20, a
+    // hole of 8 drilled 12 deep with a 118° point at x = 50, a hole of 6
+    // counterbored 12 on 6 mm at x = 80; along x: a hole of 6 with a flat
+    // bottom 15 deep from the end face; on top: a boss of 8, 5 high.
+    const point = 4 / Math.tan((59 * Math.PI) / 180);
+    let shape = box(0, 0, 0, 120, 40, 20);
+    shape = cut(shape, cylinderAt(axes(20, 20, -1, 0, 0, 1), 5, 22));
+    shape = cut(shape, fuse(cylinderAt(axes(50, 20, 8, 0, 0, 1), 4, 13), coneAt(axes(50, 20, 8, 0, 0, -1), 4, 0, point)));
+    shape = cut(shape, fuse(cylinderAt(axes(80, 20, -1, 0, 0, 1), 3, 22), cylinderAt(axes(80, 20, 14, 0, 0, 1), 6, 7)));
+    shape = cut(shape, cylinderAt(axes(121, 30, 10, -1, 0, 0), 3, 16));
+    shape = fuse(shape, cylinderAt(axes(105, 10, 20, 0, 0, 1), 4, 5));
+    const [part] = analyzeCad(oc, brepBytes('holes.brep', shape), 'holes.brep').bodies;
+    const holes = part.holes.holes;
+    const at = (x, y, z) => holes.find((h) => h.surfaces.some((i) => {
+      const s = part.geometric_surfaces[i];
+      const c = s.center_mm;
+      return s.type === 'cylinder' && [x, y, z].every((v, k) => v === null || Math.abs(c[k] - v) < 1e-6);
+    }));
+    assert.equal(holes.length, 4, JSON.stringify(holes));
+    const plain = at(20, 20, null);
+    assert.equal(plain.through, true);
+    approx(plain.length_mm, 20, 1e-9, 0, 'through hole length');
+    const drilled = at(50, 20, null);
+    assert.equal(drilled.through, false);
+    assert.equal(drilled.bottom, 'drill_point');
+    assert.deepEqual(drilled.surfaces.map((i) => part.geometric_surfaces[i].type).sort(), ['cone', 'cylinder']);
+    approx(drilled.depth_mm, 12, 1e-9, 0, 'drilled depth');
+    approx(drilled.tip_depth_mm, 12 + point, 1e-4, 0, 'depth to the tip');
+    approx(drilled.drill_point_angle_deg, 118, 1e-9, 0, 'point angle');
+    approxVec(drilled.axis, [0, 0, -1], 0, 1e-12, 'drilled from the top');
+    const counterbored = at(80, 20, null);
+    assert.equal(counterbored.through, true);
+    assert.deepEqual(counterbored.diameters_mm, [6, 12]);
+    assert.equal(counterbored.surfaces.length, 2);
+    const side = at(null, 30, 10);
+    assert.equal(side.through, false);
+    assert.equal(side.bottom, 'flat');
+    approx(side.depth_mm, 15, 1e-9, 0, 'side hole depth');
+    approxVec(side.axis, [-1, 0, 0], 0, 1e-12, 'drilled from the end face');
+    // The boss (material inside its cylinder) is no hole.
+    assert.equal(at(105, 10, null), undefined);
+  });
+
+  test('a hole with a rounded edge where it opens into a gap or a cavity is through; a ball end stays blind', () => {
+    // The rounded edge (a torus) is no face of the hole: its walls stop where
+    // it starts, and the lines along the axis meet material further on.
+    const through = (name, shape, diameter) => {
+      const { holes } = holesOf(name, shape);
+      assert.equal(holes.length, 1, `${name}: ${JSON.stringify(holes)}`);
+      assert.deepEqual([holes[0].through, holes[0].open_ends, holes[0].diameter_mm], [true, 2, diameter], name);
+    };
+    // A U bracket: a hole of 10 through one flange, rounded 1.5 on the inner
+    // side; the other flange 50 mm further along its axis.
+    let bracket = fuse(fuse(box(0, 0, 0, 60, 40, 5), box(0, 0, 0, 5, 40, 40)), box(55, 0, 0, 5, 40, 40));
+    bracket = cut(bracket, cylinderAt(axes(-1, 20, 25, 1, 0, 0), 5, 7));
+    through('bracket', filleted(bracket, circleEdges(bracket, [5, 20, 25], 5), 1.5), 10);
+    // A hole of 8 from the top into a closed inner cavity (a core), rounded 2 on the cavity side.
+    let cored = cut(box(0, 0, 0, 60, 60, 40), box(10, 10, 10, 40, 40, 15));
+    cored = cut(cored, cylinderAt(axes(30, 30, 24, 0, 0, 1), 4, 17));
+    through('cored', filleted(cored, circleEdges(cored, [30, 30, 25], 4), 2), 8);
+    // A closed housing: a bore of 12 through its inner wall (x 38..46), rounded 2 on both sides.
+    let housing = cut(cut(box(0, 0, 0, 80, 40, 40), box(5, 5, 5, 33, 30, 30)), box(46, 5, 5, 29, 30, 30));
+    housing = cut(housing, cylinderAt(axes(37, 20, 20, 1, 0, 0), 6, 10));
+    through('housing', filleted(housing, [...circleEdges(housing, [38, 20, 20], 6), ...circleEdges(housing, [46, 20, 20], 6)], 2), 12);
+
+    // Closed beyond its walls all the same: a ball end, a bottom with a rounded corner.
+    const blind = (name, shape) => {
+      const { holes } = holesOf(name, shape);
+      assert.equal(holes.length, 1, `${name}: ${JSON.stringify(holes)}`);
+      assert.deepEqual([holes[0].through, holes[0].bottom], [false, 'other'], name);
+      approxVec(holes[0].axis, [0, 0, -1], 0, 1e-12, `${name}: drilled from the top`);
+      return holes[0];
+    };
+    const ball = blind('ball', cut(box(-20, -20, 0, 40, 40, 30), fuse(cylinderAt(axes(0, 0, 14, 0, 0, 1), 4, 17), new oc.BRepPrimAPI_MakeSphere_5(new oc.gp_Pnt_3(0, 0, 14), 4).Shape())));
+    approx(ball.depth_mm, 16, 1e-6, 0, 'ball end: the depth of its cylinder');
+    approx(ball.tip_depth_mm, 20, 1e-3, 0, 'ball end: to its tip');
+    const pocket = cut(box(-20, -20, 0, 40, 40, 30), cylinderAt(axes(0, 0, 14, 0, 0, 1), 6, 17));
+    blind('corner', filleted(pocket, circleEdges(pocket, [0, 0, 14], 6), 2));
+  });
+
+  test('the outside of a boss or a tube round a hole is no hole', () => {
+    // A plate with a boss of 20 round a hole of 15: only the hole.
+    const boss = cut(fuse(box(-30, -30, 0, 60, 60, 10), cylinderAt(axes(0, 0, 10, 0, 0, 1), 10, 8)), cylinderAt(axes(0, 0, -1, 0, 0, 1), 7.5, 20));
+    // Tubes of 40, bored 30, and bored 38 (a wall thinner than the gap between the radii seen from the axis).
+    const tube = (bore) => cut(cylinderAt(axes(0, 0, 0, 0, 0, 1), 20, 50), cylinderAt(axes(0, 0, -1, 0, 0, 1), bore, 52));
+    for (const [name, shape, diameter] of [['boss', boss, 15], ['tube', tube(15), 30], ['thin_tube', tube(19), 38]]) {
+      const { holes } = holesOf(name, shape);
+      assert.equal(holes.length, 1, `${name}: ${JSON.stringify(holes)}`);
+      assert.deepEqual([holes[0].diameter_mm, holes[0].through], [diameter, true], name);
+    }
+  });
+
+  test('a hole crossed by a wider bore is one hole: blind with its whole depth, or through with its whole length', () => {
+    // A block 60 x 40 x 40: a hole of 6 from the top, 30 deep (or through),
+    // crossed by a bore of 10 along x at z = 25.
+    for (const [name, from, length] of [['cross_blind', 10, 30], ['cross_through', -1, 42]]) {
+      const shape = cut(cut(box(0, 0, 0, 60, 40, 40), cylinderAt(axes(30, 20, from, 0, 0, 1), 3, length + 1)), cylinderAt(axes(-1, 20, 25, 1, 0, 0), 5, 62));
+      const { holes, surfaces } = holesOf(name, shape);
+      const small = holes.filter((h) => h.diameter_mm === 6);
+      assert.equal(small.length, 1, `${name}: ${JSON.stringify(holes)}`);
+      const [hole] = small;
+      // Its cylinder cut in two by the bore: both faces.
+      assert.deepEqual(hole.surfaces.map((i) => surfaces[i].type), ['cylinder', 'cylinder'], name);
+      if (from > 0) {
+        assert.deepEqual([hole.through, hole.bottom], [false, 'flat'], name);
+        approx(hole.depth_mm, 30, 1e-9, 0, `${name} depth`);
+      } else {
+        assert.equal(hole.through, true, name);
+        approx(hole.length_mm, 40, 1e-9, 0, `${name} length`);
+      }
+      assert.equal(holes.find((h) => h.diameter_mm === 10).through, true, `${name}: the bore`);
+    }
+  });
+
+  test('a slot rounded at one corner, an oblique hole, a nozzle, a face groove', () => {
+    // A slot 6 wide and 10 deep, one bottom corner rounded 4 (its axis 2 mm
+    // from the other side): no hole at all, not an undetermined one.
+    const slot = cut(box(0, 0, 0, 50, 30, 20), box(20, -1, 10, 6, 32, 11));
+    const { holes: corner } = holesOf('slot', filleted(slot, lineEdges(slot, [20, 0, 10], [20, 30, 10]), 4));
+    assert.deepEqual(corner.map((h) => [h.through, h.reason]), [[null, 'not_a_full_revolution']]);
+    // A hole of 10 through a plate of 4, at 45° and 30° from its normal: at
+    // any one place along its axis its wall is on one side only.
+    for (const deg of [45, 30]) {
+      const { holes } = holesOf(`oblique${deg}`, cut(box(-30, -30, 0, 60, 60, 4), turned(cylinderAt(axes(0, 0, -20, 0, 0, 1), 5, 44), [0, 0, 2], [0, 1, 0], deg)));
+      assert.deepEqual(holes.map((h) => [h.through, h.diameter_mm]), [[true, 10]], `oblique ${deg}°`);
+    }
+    // A hole of 10, then a cone down to 1.2 that opens at the bottom face: an orifice, through.
+    const nozzle = cut(cut(box(-20, -20, 0, 40, 40, 20), cylinderAt(axes(0, 0, 8, 0, 0, 1), 5, 13)), coneAt(axes(0, 0, 8, 0, 0, -1), 5, 0.6 - 0.55 * 0.5, 8.5));
+    const { holes: orifice, surfaces } = holesOf('nozzle', nozzle);
+    assert.equal(orifice.length, 1, JSON.stringify(orifice));
+    assert.deepEqual(orifice[0].surfaces.map((i) => surfaces[i].type).sort(), ['cone', 'cylinder']);
+    assert.deepEqual([orifice[0].through, 'bottom' in orifice[0]], [true, false]);
+    // A hole of 6 through, with a face groove of 14..20, 2 deep, round it: the
+    // groove is no step of the hole; its outer wall (material between its axis
+    // and it) is no hole either.
+    const groove = cut(cut(box(-20, -20, 0, 40, 40, 20), cylinderAt(axes(0, 0, -1, 0, 0, 1), 3, 22)), cut(cylinderAt(axes(0, 0, 18, 0, 0, 1), 10, 3), cylinderAt(axes(0, 0, 17, 0, 0, 1), 7, 5)));
+    const { holes: grooved } = holesOf('groove', groove);
+    const hole = grooved.find((h) => h.through);
+    assert.deepEqual([hole.diameter_mm, 'diameters_mm' in hole, hole.surfaces.length], [6, false, 1]);
+    approx(hole.length_mm, 20, 1e-9, 0, 'grooved hole length');
+    assert.deepEqual(grooved.filter((h) => h !== hole).map((h) => [h.diameter_mm, h.through, h.reason]), [[20, null, 'material_inside']]);
+  });
+
+  test('a blind hole opening on an inclined face: the same depth wherever the seam of its cylinder', () => {
+    // A block whose top is inclined 30° about y; a hole of 8, 20 deep on its axis, its cylinder turned about its axis.
+    const depths = [0, 90, 180, 270].map((deg) => {
+      const block = cut(box(-30, -30, 0, 60, 60, 60), turned(box(-100, -100, 30, 200, 200, 100), [0, 0, 30], [0, 1, 0], 30));
+      const { holes } = holesOf(`inclined${deg}`, cut(block, turned(cylinderAt(axes(0, 0, 10, 0, 0, 1), 4, 40), [0, 0, 0], [0, 0, 1], deg)));
+      assert.deepEqual(holes.map((h) => [h.through, h.bottom]), [[false, 'flat']], `seam at ${deg}°`);
+      return holes[0].depth_mm;
+    });
+    // From the bottom to the highest point of the opening: 20 + 4 tan 30°.
+    for (const depth of depths) approx(depth, 20 + 4 * Math.tan(Math.PI / 6), 0, 1e-2, 'depth');
+  });
+
+  test('the instances of a part, turned or mirrored: the same holes along their own axes', () => {
+    // A block with a hole of 6 through and one of 8 drilled 12 deep with a
+    // point, placed as is, half a turn about x, and mirrored.
+    const point = 4 / Math.tan((59 * Math.PI) / 180);
+    let part = cut(box(0, 0, 0, 40, 20, 20), cylinderAt(axes(10, 10, -1, 0, 0, 1), 3, 22));
+    part = cut(part, fuse(cylinderAt(axes(30, 10, 8, 0, 0, 1), 4, 13), coneAt(axes(30, 10, 8, 0, 0, -1), 4, 0, point)));
+    const flip = [[1, 0, 0], [0, -1, 0], [0, 0, -1]];
+    const written = xcafStep('holed_instances.step', ({ shapeTool: st, named }) => {
+      const top = named(st.NewShape(), 'Assembly');
+      const block = named(st.AddShape(part, false, true), 'Block');
+      named(st.AddComponent_1(top, block, new oc.TopLoc_Location_1()), 'AsIs');
+      named(st.AddComponent_1(top, block, placement(flip, [0, 50, 0])), 'Turned');
+      named(st.AddComponent_1(top, block, placement(flip, [100, 0, 0])), 'Mirrored');
+    });
+    const bytes = new TextEncoder().encode(mirrorStepInstance(new TextDecoder().decode(written), [100, 0, 0], 'Mirrored'));
+    const { bodies } = analyzeCad(oc, bytes, 'holed_instances.step');
+    assert.equal(bodies.length, 3);
+    // Drilled from the top as is, from below once turned; the turned one mirrored through the origin: from the top.
+    const instances = ['as is', 'turned', 'mirrored'];
+    bodies.forEach((body, i) => {
+      const holes = body.holes.holes;
+      assert.deepEqual(holes.map((h) => [h.diameter_mm, h.through]).sort(), [[6, true], [8, false]], instances[i]);
+      const drilled = holes.find((h) => !h.through);
+      assert.equal(drilled.bottom, 'drill_point', instances[i]);
+      approx(drilled.depth_mm, 12, 1e-9, 0, `${instances[i]}: depth`);
+      approxVec(drilled.axis, [0, 0, i === 1 ? 1 : -1], 0, 1e-9, `${instances[i]}: from its opening into the material`);
+      // As measured on its own mesh.
+      const own = measureHoles(body.mesh.positions64 ?? body.mesh.positions, body.mesh.indices, body.geometric_surfaces).holes;
+      const brief = (list) => list.map((h) => [h.surfaces, h.through, h.axis.map((x) => Math.round(x * 1e9) / 1e9 || 0)]);
+      assert.deepEqual(brief(own), brief(holes), instances[i]);
+    });
+    // Given from the first instance, not measured again.
+    bodies.slice(1).forEach((other, i) => assert.ok(holesOfInstance(bodies[0].holes, bodies[0].geometric_surfaces, other.geometric_surfaces), instances[i + 1]));
   });
 
   test('a cone gives the point of its reference radius: it can be rebuilt from its centre', () => {

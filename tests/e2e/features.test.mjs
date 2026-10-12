@@ -190,6 +190,10 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     };
     await open();
     assert.doesNotMatch(await page.textContent('#method'), /mémorisés/);
+    // The hole of the block, measured on its mesh by the engine: through.
+    const holeOf = () => page.evaluate(() => window.reader3d.semantic.bodies[0].features.find((f) => f.type === 'hole_feature_candidate'));
+    const hole = await holeOf();
+    assert.deepEqual([hole.subtype, hole.through, hole.measured, hole.status], ['through_hole', true, true, 'evidenced']);
     const volume = await page.textContent('#total-volume');
     await page.evaluate(() => window.reader3d.computeThickness());
     const min = await page.textContent('#thick-min');
@@ -233,6 +237,45 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.match(await page.textContent('#method'), /Résultats mémorisés/);
     assert.equal(await page.textContent('#total-volume'), volume);
     assert.equal(await page.textContent('#thick-min'), min);
+    assert.equal((await holeOf()).subtype, 'through_hole');
+
+    // Kept before the holes were measured (bodies without them): measured when
+    // opened again, and kept in a record of their own.
+    const dataRecord = (edit) => page.evaluate(async (edit) => {
+      const db = await new Promise((resolve, reject) => {
+        const req = indexedDB.open('reader3d-cache');
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      const store = db.transaction('data', 'readonly').objectStore('data');
+      const keys = await new Promise((resolve) => (store.getAllKeys().onsuccess = (e) => resolve(e.target.result)));
+      const key = keys.find((k) => !String(k).includes('#'));
+      const record = await new Promise((resolve) => (store.get(key).onsuccess = (e) => resolve(e.target.result)));
+      const kept = keys.includes(`${key}#holes`);
+      const bodies = ('data' in record ? record.data : record).bodies;
+      const measured = bodies.some((b) => b.holes);
+      if (edit) {
+        for (const b of bodies) delete b.holes;
+        await new Promise((resolve) => {
+          const tx = db.transaction('data', 'readwrite');
+          tx.objectStore('data').put(record, key);
+          tx.objectStore('data').delete(`${key}#holes`);
+          tx.oncomplete = resolve;
+        });
+      }
+      db.close();
+      return { kept, measured };
+    }, edit);
+    assert.deepEqual(await dataRecord(true), { kept: false, measured: true });
+    await page.reload();
+    await open();
+    assert.match(await page.textContent('#method'), /Résultats mémorisés/);
+    assert.equal((await holeOf()).subtype, 'through_hole');
+    await page.waitForTimeout(500);
+    assert.deepEqual(await dataRecord(false), { kept: true, measured: false });
+    await page.reload();
+    await open();
+    assert.equal((await holeOf()).subtype, 'through_hole');
 
     // A thickness kept by an older computation (without THICKNESS_VERSION): not shown, computed again.
     await page.evaluate(async () => {

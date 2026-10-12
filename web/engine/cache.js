@@ -72,24 +72,26 @@ function sizeOf(value, seen = new Set()) {
 // without reading and writing again the (large) analysis. A part added since
 // (the feeding zones) is missing from the results kept before: computed then,
 // the analysis itself unchanged (no new VERSION). Each part carries its own
-// version (PARTING_VERSION, FEEDING_VERSION) for its contents.
-const PARTS = ['data', 'thickness', 'parting', 'feeding'];
+// version (PARTING_VERSION, FEEDING_VERSION) for its contents. The holes are
+// measured with the analysis (body.holes); those of an analysis kept before
+// that, measured when it is opened again, are a part of their own.
+const PARTS = ['data', 'thickness', 'parting', 'feeding', 'holes'];
 const partKey = (key, part) => (part === 'data' ? key : `${key}#${part}`);
 
-/** The results kept for this key ({data, thickness, parting, feeding}), or null. Never throws. */
+/** The results kept for this key ({data, thickness, parting, feeding, holes}), or null. Never throws. */
 export async function loadResult(key) {
   if (!key) return null;
   try {
     const d = await db();
     const tx = d.transaction(['meta', 'data'], 'readwrite');
-    const [data, thickness, parting, feeding] = await Promise.all(PARTS.map((part) => request(tx.objectStore('data').get(partKey(key, part)))));
+    const [data, thickness, parting, feeding, holes] = await Promise.all(PARTS.map((part) => request(tx.objectStore('data').get(partKey(key, part)))));
     const meta = await request(tx.objectStore('meta').get(key));
     if (meta) tx.objectStore('meta').put({ ...meta, usedAt: Date.now() });
     await done(tx);
     // Kept by an earlier version: one record {data, thickness}; a thickness
     // computed since then is a record of its own.
-    if (data && 'data' in data) return { data: data.data, thickness: thickness ?? data.thickness ?? null, parting: parting ?? null, feeding: feeding ?? null };
-    return data ? { data, thickness: thickness ?? null, parting: parting ?? null, feeding: feeding ?? null } : null;
+    if (data && 'data' in data) return { data: data.data, thickness: thickness ?? data.thickness ?? null, parting: parting ?? null, feeding: feeding ?? null, holes: holes ?? null };
+    return data ? { data, thickness: thickness ?? null, parting: parting ?? null, feeding: feeding ?? null, holes: holes ?? null } : null;
   } catch {
     return null;
   }
@@ -97,7 +99,7 @@ export async function loadResult(key) {
 
 /**
  * Keep a part of the results: record {data} (the analysis, first),
- * {thickness}, {parting} or {feeding} (added to the analysis already kept). Never throws:
+ * {thickness}, {parting}, {feeding} or {holes} (added to the analysis already kept). Never throws:
  * the cache is an extra, a full disk or a private window just leave it out.
  * Resolves to whether it was kept (then it may go to the shared network
  * folder, client.js).

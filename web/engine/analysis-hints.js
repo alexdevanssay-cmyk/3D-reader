@@ -3,6 +3,7 @@
 // is compacted, the instructions of the model saying the same.
 export const ANALYSIS_HINTS = [
   "features are geometric candidates, not guaranteed design intent",
+  "hole features with measured=true have their through or blind status, depth and axis measured on the closed mesh by lines along the hole axis; other hole candidates remain provisional (uncertain_reason says why)",
   "manufacturing operations, setups, dependencies and DFM notes are candidates, not executable toolpaths",
   "V6 planning groups candidate operations by compatible tool axis and exposes unresolved access constraints",
   "functional thickness is reported only when an existing Reader metric is available",
