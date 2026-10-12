@@ -920,10 +920,37 @@ function placeRiser(ctx, z, patch, tops, n) {
 // ------------------------------------------------------------------ parting line
 
 /**
+ * The triangles next to point `at` of the parting line, within r: the
+ * nearest one, the thickest wall of those touching the point (the nearest
+ * within 1e-4 of the diagonal: the faces on either side of the line, not a
+ * thicker section further on, a large triangle of a CAD face reaching far)
+ * and their outward normals within r/2 (area-weighted, for the outward
+ * sense). {nearest (-1: none), sphere, normal}.
+ */
+function wallAt(ctx, at, r) {
+  const { g, grid } = ctx;
+  let nearest = -1, nd = Infinity, sphere = 0;
+  const normal = [0, 0, 0];
+  const hits = [];
+  grid.near(at, r, (f, d2) => {
+    if (d2 < nd || (d2 === nd && f < nearest)) {
+      nd = d2;
+      nearest = f;
+    }
+    hits.push(f, d2);
+    if (d2 <= (r / 2) ** 2) for (let k = 0; k < 3; k++) normal[k] += g.areas[f] * g.normals[3 * f + k];
+  });
+  const touch = (Math.sqrt(nd) + 1e-4 * (g.diag || 1)) ** 2;
+  for (let h = 0; h < hits.length; h += 2) if (hits[h + 1] <= touch && ctx.sphere[hits[h]] > sphere) sphere = ctx.sphere[hits[h]];
+  if (!(sphere > 0) && nearest >= 0) sphere = ctx.sphere[nearest];
+  return { nearest, sphere, normal };
+}
+
+/**
  * Points of the parting line (the middles of its segments, PARTING_POINTS at
  * most, spread along it), each with the triangles next to it: {at, tangent,
- * zone, sphere (the thickest wall there), normal (their outward normals,
- * area-weighted), height (along d), segment}.
+ * zone, sphere (the thickest wall touching it), normal (their outward
+ * normals, area-weighted), height (along d), segment}.
  */
 function partingPoints(ctx, segments) {
   const { g, grid, d } = ctx;
@@ -935,21 +962,8 @@ function partingPoints(ctx, segments) {
     const a = [segments[6 * s], segments[6 * s + 1], segments[6 * s + 2]];
     const b = [segments[6 * s + 3], segments[6 * s + 4], segments[6 * s + 5]];
     const at = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
-    const r = Math.max(reach, length(sub(b, a)));
-    let nearest = -1, nd = Infinity, sphere = 0;
-    const normal = [0, 0, 0];
-    grid.near(at, r, (f, d2) => {
-      if (d2 < nd || (d2 === nd && f < nearest)) {
-        nd = d2;
-        nearest = f;
-      }
-      if (d2 <= (r / 2) ** 2) {
-        if (ctx.sphere[f] > sphere) sphere = ctx.sphere[f];
-        for (let k = 0; k < 3; k++) normal[k] += g.areas[f] * g.normals[3 * f + k];
-      }
-    });
+    const { nearest, sphere, normal } = wallAt(ctx, at, Math.max(reach, length(sub(b, a))));
     if (nearest < 0) continue;
-    if (!(sphere > 0)) sphere = ctx.sphere[nearest];
     out.push({ at, tangent: sub(b, a), zone: ctx.zone[nearest], sphere, normal, triangle: nearest, height: dot(at, d), segment: s });
   }
   return out;
@@ -1401,20 +1415,8 @@ export function gateFromPoint(point, ctx, { triangle = -1, normal = null } = {})
     const s = snap.segment;
     const raw = ctx.segments;
     const a = [raw[6 * s], raw[6 * s + 1], raw[6 * s + 2]], b = [raw[6 * s + 3], raw[6 * s + 4], raw[6 * s + 5]];
-    let nearest = -1, nd = Infinity, wall = 0;
-    const nrm = [0, 0, 0];
     const r = Math.max(2 * ctx.grid.cell, length(sub(b, a)), 1e-4 * (ctx.g.diag || 1));
-    ctx.grid.near(snap.point, r, (f, d2) => {
-      if (d2 < nd || (d2 === nd && f < nearest)) {
-        nd = d2;
-        nearest = f;
-      }
-      if (d2 <= (r / 2) ** 2) {
-        if (ctx.sphere[f] > wall) wall = ctx.sphere[f];
-        for (let k = 0; k < 3; k++) nrm[k] += ctx.g.areas[f] * ctx.g.normals[3 * f + k];
-      }
-    });
-    if (!(wall > 0) && nearest >= 0) wall = ctx.sphere[nearest];
+    const { nearest, sphere: wall, normal: nrm } = wallAt(ctx, snap.point, r);
     const p = { at: snap.point, tangent: sub(b, a), normal: nrm, segment: s, zone: nearest >= 0 ? ctx.zone[nearest] : -1, sphere: wall };
     let out = outward(ctx, p);
     const outer = !!out;

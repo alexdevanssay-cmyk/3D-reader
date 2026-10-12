@@ -60,6 +60,50 @@ function voxels(filled, [nx, ny, nz], { size = 1, subdivide = 1 } = {}) {
   return { positions: Float32Array.from(positions), indices: Uint32Array.from(indices) };
 }
 
+/**
+ * Closed mesh of a union of the boxes of a rectilinear grid (cell i, j, k from
+ * xs[i], ys[j], zs[k] to the next), one quad (two triangles) per face of a
+ * cell: long triangles, as a CAD body tessellated coarsely.
+ */
+function rectilinear(filled, xs, ys, zs) {
+  const n = [xs.length - 1, ys.length - 1, zs.length - 1];
+  const at = (q) => q.every((v, k) => v >= 0 && v < n[k]) && filled(...q);
+  const positions = [];
+  const indices = [];
+  const ids = new Map();
+  const vertex = (q) => {
+    const key = q.join(',');
+    let id = ids.get(key);
+    if (id === undefined) {
+      id = positions.length / 3;
+      positions.push(xs[q[0]], ys[q[1]], zs[q[2]]);
+      ids.set(key, id);
+    }
+    return id;
+  };
+  for (let x = 0; x < n[0]; x++) for (let y = 0; y < n[1]; y++) for (let z = 0; z < n[2]; z++) {
+    if (!at([x, y, z])) continue;
+    for (let k = 0; k < 3; k++) for (const s of [-1, 1]) {
+      const q = [x, y, z];
+      q[k] += s;
+      if (at(q)) continue;
+      const a = (k + 1) % 3, b = (k + 2) % 3;
+      const base = [x, y, z];
+      if (s > 0) base[k] += 1;
+      const corner = (da, db) => {
+        const p = [...base];
+        p[a] += da;
+        p[b] += db;
+        return vertex(p);
+      };
+      const p00 = corner(0, 0), p10 = corner(1, 0), p11 = corner(1, 1), p01 = corner(0, 1);
+      if (s > 0) indices.push(p00, p10, p11, p00, p11, p01);
+      else indices.push(p00, p11, p10, p00, p01, p11);
+    }
+  }
+  return { positions: Float32Array.from(positions), indices: Uint32Array.from(indices) };
+}
+
 // 5 mm cells. A plate 100 × 60 × 10 with a boss 15 × 15 × 25 in its middle (x 45..60, y 25..40, z 10..35).
 const plateWithBoss = () => voxels((x, y, z) => z < 2 || (x >= 9 && x < 12 && y >= 5 && y < 8 && z < 7), [20, 12, 7], { size: 5, subdivide: 2 });
 // A plate 100 × 60 × 5 with a boss 15 × 15 × 15 at each end (x 0..15 and 85..100, y 20..35).
@@ -207,6 +251,24 @@ describe('gating', () => {
     assert.ok([x, y].some((c) => Math.abs(c) < 1e-6 || Math.abs(c - 120) < 1e-6), `on the outer outline: ${gate.position_mm}`);
     const inside = gate.position_mm.map((c, k) => c + 5 * gate.direction[k]);
     assert.ok(inBox(inside, [0, 0, 0], [120, 120, 0]), `inwards: ${inside}`);
+  });
+
+  test('a coarse mesh: the ingate sized from the wall it touches, not from a boss next to it', () => {
+    // A plate 160 × 80 × 5 with a boss 20 × 20 × 25 whose side is 15 mm from the edge y = 0, in triangles
+    // of 15 to 40 mm (a CAD body): the boss within half a triangle of the outline.
+    const xs = [0, 20, 40, 60, 70, 90, 100, 120, 140, 160];
+    const mesh = rectilinear((i, j, k) => k === 0 || (xs[i] === 70 && j === 1), xs, [0, 15, 35, 60, 80], [0, 5, 30]);
+    const parting = partingOf(mesh);
+    assert.deepEqual(parting.direction, [0, 0, 1]);
+    const f = proposeFeeding(mesh.positions, mesh.indices, { parting });
+    approx(f.zones[0].sphere_mm, 20, 0.05, 0, 'the boss');
+    approx(f.gate.wall_sphere_mm, 5, 0.05, 0, 'the plate at the ingate');
+    assert.deepEqual([f.gate.thickness_mm, f.gate.width_mm], [3.5, 10.5]);
+    // By hand next to the boss: the same.
+    const ctx = feedingContext(mesh.positions, mesh.indices, feedingZones(mesh.positions, mesh.indices), { parting });
+    const gate = gateFromPoint([80, 0, 2], ctx);
+    approx(gate.wall_sphere_mm, 5, 0.05, 0, 'the plate at the ingate placed by hand');
+    assert.match(gate.why, /paroi Ø inscrit 5 mm/);
   });
 
   test('without a parting line: risers along +Z, no ingate', () => {
