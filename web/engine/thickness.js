@@ -16,6 +16,17 @@
 // Both use a bounding volume hierarchy of the triangles (N log N in all).
 // Plain JavaScript without imports: it runs in the engine worker.
 
+// Version of the values, kept with them (in this browser and on the network
+// folder): a thickness of another version, or of none, is computed again.
+// 2: the separation angle of the shrinking ball at its new centre (version 1
+// read the end faces of a plate with a boss or a rib as long as the part).
+export const THICKNESS_VERSION = 2;
+
+/** Whether kept thickness results (per body {ray, sphere, wall, version} or null) are of this version. */
+export function currentThickness(results) {
+  return Array.isArray(results) && results.every((t) => t === null || t?.version === THICKNESS_VERSION);
+}
+
 const LEAF_SIZE = 8;
 const EDGE_MARGIN = 1e-7;
 const MAX_ITERATIONS = 40;

@@ -234,6 +234,32 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     assert.equal(await page.textContent('#total-volume'), volume);
     assert.equal(await page.textContent('#thick-min'), min);
 
+    // A thickness kept by an older computation (without THICKNESS_VERSION): not shown, computed again.
+    await page.evaluate(async () => {
+      const db = await new Promise((resolve, reject) => {
+        const req = indexedDB.open('reader3d-cache');
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      const store = db.transaction('data', 'readwrite').objectStore('data');
+      const keys = await new Promise((resolve) => (store.getAllKeys().onsuccess = (e) => resolve(e.target.result)));
+      const key = keys.find((k) => String(k).endsWith('#thickness'));
+      const record = await new Promise((resolve) => (store.get(key).onsuccess = (e) => resolve(e.target.result)));
+      if (!record.every((t) => t === null || t.version >= 2)) throw new Error('thickness kept without its version');
+      await new Promise((resolve) => {
+        const tx = db.transaction('data', 'readwrite');
+        tx.objectStore('data').put(record.map((t) => t && { ray: t.ray, sphere: t.sphere, wall: t.wall }), key);
+        tx.oncomplete = resolve;
+      });
+      db.close();
+    });
+    await page.reload();
+    await open();
+    assert.match(await page.textContent('#method'), /Résultats mémorisés/);
+    assert.equal(await page.isVisible('#thick-body'), false);
+    await page.evaluate(() => window.reader3d.computeThickness());
+    assert.equal(await page.textContent('#thick-min'), min);
+
     // "Refresh": analysed again, without the kept results.
     await page.evaluate(() => (document.body.dataset.status = ''));
     await page.click('#refresh');

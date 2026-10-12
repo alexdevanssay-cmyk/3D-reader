@@ -23,6 +23,7 @@
 // waits on the network without a time limit, nor holds the page.
 
 import { SUBFOLDERS, fileIn, sharedDir, sharedFolder, withTimeout, writeFile } from '../network-folder.js';
+import { THICKNESS_VERSION } from './thickness.js';
 
 export const CONTAINER_VERSION = 1;
 const FORMAT = 'reader3d-resultats';
@@ -228,10 +229,15 @@ export function validData(data) {
     && data.bodies.every((b) => b && isArray(b.mesh?.positions, Float32Array, 3) && isArray(b.mesh?.indices, Uint32Array, 3));
 }
 
-/** Whether `thickness` is the wall thickness of the bodies of `data`: per body null, or {ray, sphere, wall} with a value per triangle. */
+/**
+ * Whether `thickness` is the wall thickness of the bodies of `data`, by this
+ * version of its computation: per body null, or {ray, sphere, wall} with a
+ * value per triangle and version THICKNESS_VERSION (another one, or none:
+ * computed again, and written again).
+ */
 export function validThickness(thickness, data) {
   return Array.isArray(thickness) && thickness.length === data.bodies.length
-    && thickness.every((t, i) => t === null || ['ray', 'sphere', 'wall'].every((k) => t?.[k] instanceof Float32Array && t[k].length === data.bodies[i].mesh.indices.length / 3));
+    && thickness.every((t, i) => t === null || (t?.version === THICKNESS_VERSION && ['ray', 'sphere', 'wall'].every((k) => t[k] instanceof Float32Array && t[k].length === data.bodies[i].mesh.indices.length / 3)));
 }
 
 // --------------------------------------------------------------------------- the network

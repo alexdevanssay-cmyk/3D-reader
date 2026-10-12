@@ -11,6 +11,7 @@ import { MESH_EXTENSIONS, needsMainThread } from './meshload.js';
 import { cacheKey, loadResult, saveResult } from './cache.js';
 import { readShared, sharedState, writeShared } from './shared-cache.js';
 import { cancelThickness, thicknessOnAllCores, warmThicknessPool } from './thickpool.js';
+import { THICKNESS_VERSION, currentThickness } from './thickness.js';
 
 export { warmThicknessPool };
 
@@ -156,11 +157,13 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
   if (cache && key && !close) {
     const kept = await loadResult(key);
     if (kept?.data) {
+      // A thickness kept by another version of its computation (or of none): computed again.
+      const thickness = currentThickness(kept.thickness) ? kept.thickness : null;
       // Kept before the shared folder was chosen, or when it could not be reached: written there now.
       const state = await sharedState().catch(() => 'none');
-      if (state === 'granted') share(key, { data: kept.data, thickness: kept.thickness, replace: false });
+      if (state === 'granted') share(key, { data: kept.data, thickness, replace: false });
       return {
-        ...kept.data, file: file.name, cacheKey: key, cached: true, cachedThickness: kept.thickness ?? null, cachedParting: kept.parting ?? null, cachedFeeding: kept.feeding ?? null, elapsed_s: Math.round(performance.now() - start) / 1000,
+        ...kept.data, file: file.name, cacheKey: key, cached: true, cachedThickness: thickness, cachedParting: kept.parting ?? null, cachedFeeding: kept.feeding ?? null, elapsed_s: Math.round(performance.now() - start) / 1000,
         networkNote: noteOf({ state }),
       };
     }
@@ -221,12 +224,13 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
 /**
  * Keep the wall thickness of a model with its results (see analyzeInBrowser),
  * and on the shared network folder with them (`bodies`: those of the model,
- * whose meshes the thickness is of).
+ * whose meshes the thickness is of); each body with THICKNESS_VERSION.
  */
 export async function saveThickness(key, results, bodies = null) {
   await saving.get(key);
-  const kept = await saveResult(key, { thickness: results });
-  if (kept && bodies) share(key, { thickness: results, bodies });
+  const versioned = results.map((t) => (t ? { ...t, version: THICKNESS_VERSION } : null));
+  const kept = await saveResult(key, { thickness: versioned });
+  if (kept && bodies) share(key, { thickness: versioned, bodies });
   return kept;
 }
 

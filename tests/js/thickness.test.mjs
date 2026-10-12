@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { before, describe, test } from 'node:test';
 
-import { ballPass, coverPass, engravingMask, mergeMax, prepareMesh, thicknessHistogram, thicknessStats, valueRange, wallOf, wallThickness } from '../../web/engine/thickness.js';
+import { THICKNESS_VERSION, ballPass, coverPass, currentThickness, engravingMask, mergeMax, prepareMesh, thicknessHistogram, thicknessStats, valueRange, wallOf, wallThickness } from '../../web/engine/thickness.js';
 import { approx } from './helpers.mjs';
 
 /** Closed mesh of an extruded polygon (counter-clockwise, star-shaped from `kernel`), z from 0 to h. */
@@ -172,6 +172,17 @@ describe('wall thickness', () => {
       // At most the plate (a ball tangent off the middle of the end face is smaller).
       if (xs.every((x) => x === 0)) assert.ok(sphere[f] > 5 && sphere[f] <= 10.2, `end face of the plate: ${sphere[f]}`);
     }
+  });
+
+  test('kept thickness of another version of the computation (or of none) is not served: computed again', () => {
+    // Version 1 read the end faces of the plate above as long as the plate (100 mm).
+    assert.ok(THICKNESS_VERSION >= 2);
+    const body = { ray: new Float32Array(2), sphere: new Float32Array(2), wall: new Float32Array(2) };
+    assert.equal(currentThickness([{ ...body, version: THICKNESS_VERSION }, null]), true);
+    assert.equal(currentThickness([null]), true, 'open bodies only: nothing computed');
+    assert.equal(currentThickness([body, null]), false, 'kept before the version');
+    assert.equal(currentThickness([{ ...body, version: 1 }]), false, 'by version 1');
+    assert.equal(currentThickness(null), false);
   });
 
   test('thinnest wall: the ends of a bar do not count as thin walls', () => {

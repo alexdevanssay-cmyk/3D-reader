@@ -10,6 +10,7 @@ import { cacheKey } from '../../web/engine/cache.js';
 import {
   CONTAINER_VERSION, containerParts, gunzip, gzip, meshHash, packValue, parseKey, readContainer, sharedNames, streamOf, unpackValue, validData, validThickness,
 } from '../../web/engine/shared-cache.js';
+import { THICKNESS_VERSION } from '../../web/engine/thickness.js';
 
 /** A container written then read back, through gzip when `zip`. */
 async function roundTrip(value, meta = {}, { zip = true } = {}) {
@@ -140,9 +141,13 @@ test('what is read is checked: an analysis has bodies with their meshes; a thick
   assert.equal(validData({ bodies: data.bodies }), false);
   assert.equal(validData({ summary: {}, bodies: [{ mesh: { positions: [0, 0, 0], indices: new Uint32Array(3) } }] }), false);
   assert.equal(validData({ summary: {}, bodies: [{ mesh: { positions: new Float32Array(8), indices: new Uint32Array(3) } }] }), false);
-  const values = (n) => ({ ray: new Float32Array(n), sphere: new Float32Array(n), wall: new Float32Array(n) });
+  const values = (n) => ({ ray: new Float32Array(n), sphere: new Float32Array(n), wall: new Float32Array(n), version: THICKNESS_VERSION });
   assert.equal(validThickness([values(2), null], data), true);
   assert.equal(validThickness([values(2)], data), false, 'a body missing');
   assert.equal(validThickness([values(1), null], data), false, 'of other meshes');
   assert.equal(validThickness([{ ...values(2), wall: new Float64Array(2) }, null], data), false);
+  // Computed by another version of the thickness (or before it had one): computed again.
+  const { version, ...unversioned } = values(2);
+  assert.equal(validThickness([unversioned, null], data), false, 'without a version');
+  assert.equal(validThickness([{ ...values(2), version: version - 1 }, null], data), false, 'of an older version');
 });
