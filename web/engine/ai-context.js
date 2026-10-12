@@ -379,13 +379,15 @@ function shortFoundry(foundry) {
 export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6 } = {}) {
   const size = (o) => JSON.stringify(o).length;
   let common = {};
-  let holesNote = null;
+  // The note on the holes, given once when every body has the same: a body
+  // measured and one not (an open mesh) each keep theirs.
+  const holesNotes = new Set(context.bodies.map((body) => body.holes?.note).filter(Boolean));
+  const holesNote = holesNotes.size === 1 ? [...holesNotes][0] : null;
   const bodies1 = context.bodies.map((body) => {
     const { analytic_surfaces, ...geometry } = body.geometry ?? {};
     let holes = body.holes ?? null;
-    if (holes?.note) {
+    if (holes?.note && holesNote) {
       const { note, ...own } = holes;
-      holesNote ??= note;
       holes = own;
     }
     let foundry = body.foundry ?? null;

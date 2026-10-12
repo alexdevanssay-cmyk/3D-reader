@@ -431,7 +431,8 @@ function holeOf(surfaces, holes) {
  * blind, how many stay undetermined and why, how many faces given as holes are
  * none (their axis in the material, a wall that does not go all round, or
  * material between the axis and the wall: a face groove, a tube); or why none
- * was measured. Null for a body without cylinders.
+ * was measured. Status "measured" when every hole was, "partly_measured" when
+ * some were, "undetermined" when none was. Null for a body without cylinders.
  */
 function holeSummary(body) {
   const surfaces=body.geometric_surfaces ?? [];
@@ -451,11 +452,13 @@ function holeSummary(body) {
   const reasons={};
   for (const h of undetermined) reasons[h.reason ?? "unknown"]=(reasons[h.reason ?? "unknown"] ?? 0)+1;
   const notHoleCount=holes.filter(h=>!isMeasured(h) && notHoles.has(h.reason)).length;
+  const through=holes.filter(h=>h.through===true).length;
+  const blind=holes.filter(h=>h.through===false).length;
   return {
     method:HOLES_METHOD,
-    status:undetermined.length ? "partly_measured" : "measured",
-    through:holes.filter(h=>h.through===true).length,
-    blind:holes.filter(h=>h.through===false).length,
+    status:!undetermined.length ? "measured" : through+blind ? "partly_measured" : "undetermined",
+    through,
+    blind,
     undetermined:undetermined.length,
     ...(undetermined.length ? {undetermined_reasons:reasons} : {}),
     ...(notHoleCount ? {cylinders_not_holes:notHoleCount} : {}),
@@ -509,11 +512,22 @@ function featureCandidates(body, topo, relations, graph) {
   const boundaryRelationBySurface=new Map(boundaryRelations.map(r=>[r.surface,r]));
   // Through or blind, measured on the mesh: what the signals below can only guess.
   const holes=measuredHoles(body);
+  // One feature per hole measured, not per face: on its first face of its
+  // narrowest diameter. Its other faces (a counterbore, the other half of a
+  // cylinder given as two faces) are in its hole_surfaces.
+  const holeFace=new Map();
+  for (const hole of new Set(holes.values())) {
+    if (!isMeasured(hole)) continue;
+    const faces=(hole.surfaces ?? []).filter(i=>byIndex.get(i)?.type==="cylinder" && finite(byIndex.get(i).radius_mm) && !blends.has(i));
+    const main=faces.find(i=>Math.abs(2*byIndex.get(i).radius_mm-hole.diameter_mm)<=1e-9*Math.max(1,hole.diameter_mm)) ?? faces[0];
+    if (main!=null) holeFace.set(hole, main);
+  }
 
   for (const c of cylinders) {
     if (blends.has(c.index)) continue;
     const hole=holes.get(c.index);
     if (isMeasured(hole)) {
+      if (holeFace.get(hole)!==c.index) continue;
       out.push({
         type:"cylindrical_feature_candidate",
         subtype:hole.through ? "through_hole" : "blind_hole",
@@ -563,6 +577,7 @@ function featureCandidates(body, topo, relations, graph) {
     const r = boundaryRelationBySurface.get(c.index);
     const hole = holes.get(c.index);
     if (isMeasured(hole)) {
+      if (holeFace.get(hole)!==c.index) continue;
       out.push({
         type:"hole_feature_candidate",
         subtype:hole.through ? "through_hole" : "blind_hole",
