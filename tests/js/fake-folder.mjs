@@ -80,3 +80,38 @@ export function fakeFolder(content = {}, { name = 'dossier', hooks = {} } = {}) 
     },
   };
 }
+
+// The settings of network-folder.js (an IndexedDB of the browser), in memory: key -> value.
+const settings = new Map();
+const later = (req, result) => setTimeout(() => {
+  req.result = result;
+  req.onsuccess?.();
+});
+
+/**
+ * `folder` (a fakeFolder) the shared folder chosen in this process, its
+ * access `permission`: kept as the page keeps it (an IndexedDB, only read
+ * here), in a browser that can open a folder.
+ */
+export function chooseFakeFolder(folder, { permission = 'granted' } = {}) {
+  folder.queryPermission = async () => permission;
+  settings.set('dossier', folder);
+  globalThis.showDirectoryPicker ??= async () => folder;
+  globalThis.indexedDB ??= {
+    open() {
+      const req = {};
+      later(req, {
+        transaction: () => ({
+          objectStore: () => ({
+            get(key) {
+              const get = {};
+              later(get, settings.get(key) ?? null);
+              return get;
+            },
+          }),
+        }),
+      });
+      return req;
+    },
+  };
+}
