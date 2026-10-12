@@ -3,7 +3,9 @@
 // beside the parting line, a riser added by a click on the part, resized, the
 // ingate placed by a click (brought onto the parting line), all kept after a
 // reload, a riser deleted, back to the proposal; the semantic contract, the
-// foundry screen and the AI context follow; a phone's width.
+// foundry screen and the AI context follow; a phone's width. On an inside-out
+// mesh, the risers placed by hand on the faces clicked, not put back once the
+// file is read in another unit; "Move" stopped when another body is shown.
 //
 //   npm run build && node --test tests/e2e/feeding.test.mjs
 
@@ -131,13 +133,13 @@ describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html
 
     // Another parting line (the candidate X): the ingate proposed again on it, the risers placed by hand kept.
     await page.click('#parting-candidates tr[data-candidate] >> text=X');
-    await page.waitForFunction(() => window.reader3d.semantic.bodies[0].feeding.draw_direction[0] === 1, null, { timeout: 30_000 });
+    await page.waitForFunction(() => window.reader3d.semantic.bodies[0].feeding?.draw_direction[0] === 1, null, { timeout: 30_000 });
     s = await semantic();
     assert.deepEqual(s.feeding.risers.map((r) => r.id), ['R1', 'M1']);
     assert.equal(s.feeding.gate.source, 'proposed');
     approx(s.feeding.gate.direction[0], 0, 0, 1e-6, 'ingate in the plane of the new parting line');
     await page.click('#parting-reset');
-    await page.waitForFunction(() => window.reader3d.semantic.bodies[0].feeding.draw_direction[2] === 1, null, { timeout: 30_000 });
+    await page.waitForFunction(() => window.reader3d.semantic.bodies[0].feeding?.draw_direction[2] === 1, null, { timeout: 30_000 });
     assert.deepEqual((await semantic()).feeding.gate.position_mm, gate.position_mm);
 
     // M1 selected (a riser added is), R1 selected by a click in the list, then M1 again: its D and H typed in.
@@ -152,7 +154,7 @@ describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html
     await page.press('#feeding-d', 'Enter');
     await page.fill('#feeding-h', '40');
     await page.press('#feeding-h', 'Enter');
-    await page.waitForFunction(() => window.reader3d.semantic.bodies[0].feeding.risers[1].height_mm === 40, null, { timeout: 10_000 });
+    await page.waitForFunction(() => window.reader3d.semantic.bodies[0].feeding?.risers[1]?.height_mm === 40, null, { timeout: 10_000 });
     s = await semantic();
     assert.deepEqual([s.feeding.risers[1].diameter_mm, s.feeding.risers[1].height_mm, s.feeding.risers[1].sized_by_hand], [30, 40, true]);
     approx(s.feeding.risers[1].volume_mm3, Math.PI * 225 * 40, 1e-6, 0.1, 'volume');
@@ -161,7 +163,7 @@ describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html
     // The ingate placed by a click on the front face: brought onto the parting line under it.
     await page.click('#feeding-gate');
     await clickFrontFace();
-    await page.waitForFunction(() => window.reader3d.semantic.bodies[0].feeding.gate?.source === 'manual', null, { timeout: 10_000 });
+    await page.waitForFunction(() => window.reader3d.semantic.bodies[0].feeding?.gate?.source === 'manual', null, { timeout: 10_000 });
     s = await semantic();
     assert.equal(s.feeding.gate.on_parting_line, true);
     approx(s.feeding.gate.position_mm[0], 50, 0, 2, 'ingate under the click');
@@ -213,6 +215,98 @@ describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html
       wide: [...document.querySelectorAll('#feeding-card *')].filter((x) => x.offsetParent && x.getBoundingClientRect().right > 375).map((x) => x.id || x.className || x.tagName),
     }));
     assert.deepEqual(overflow, { page: 375, wide: [] });
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('an inside-out mesh: risers placed by hand on the face clicked, outwards; not put back in another unit', { timeout: CAD_TIMEOUT }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 } });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+
+    // A box 10 × 20 × 30 mm round the origin whose triangles all turn inwards (shown as they are).
+    const open = async () => {
+      await page.evaluate(() => (document.body.dataset.status = ''));
+      await page.setInputFiles('#file-input', fixturePath('inverted.obj'));
+      await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    };
+    const feeding = () => page.evaluate(() => window.reader3d.semantic.bodies[0].feeding ?? null);
+    const waitStatus = (status, count) => page.waitForFunction(([s, n]) => document.getElementById('feeding-card').dataset.status === s && document.getElementById('feeding-count').textContent === n, [status, count], { timeout: 60_000 });
+    const clickView = async (view) => {
+      await page.click(`[data-view="${view}"]`);
+      const box = await page.locator('#viewport canvas').boundingBox();
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    };
+    await open();
+    // Drawn along Z: its top face z = 15 turned up, its front face y = -10 on the side.
+    await page.waitForSelector('#parting-candidates tr[data-candidate]', { timeout: 60_000 });
+    await page.click('#parting-candidates tr[data-candidate] >> text=Z');
+    await page.waitForFunction(() => Math.abs(window.reader3d.semantic.bodies[0].feeding?.draw_direction[2] ?? 0) === 1, null, { timeout: 60_000 });
+    const up = (await feeding()).draw_direction[2];
+    await waitStatus('proposed', '1');
+
+    // On the face turned up: an open riser standing on it (not a side one without an offset).
+    await page.click('#feeding-add');
+    await clickView('top');
+    if (up > 0) {
+      await waitStatus('manual', '2');
+      const riser = (await feeding()).risers.find((r) => r.id === 'M1');
+      assert.deepEqual([riser.type, riser.open, riser.offset], ['top', true, null]);
+      approx(riser.position_mm[2], 15, 0, 1e-3, 'on the top face');
+    } else {
+      // Drawn the other way: that face is turned down, refused; another face asked for.
+      assert.match(await page.textContent('#feeding-hint'), /tournée vers le bas/);
+      assert.equal((await feeding()).risers.length, 1);
+      await page.keyboard.press('Escape');
+    }
+    // On the front face: a blind riser beside it, outwards (not inside the part).
+    await page.click('#feeding-add');
+    await clickView('front');
+    const count = up > 0 ? '3' : '2';
+    await waitStatus('manual', count);
+    const side = (await feeding()).risers.at(-1);
+    assert.deepEqual([side.type, side.open, side.offset], ['side', false, [0, -1, 0]]);
+    approx(side.position_mm[1], -10, 0, 1e-3, 'on the front face');
+
+    // The same file read in inches: 25.4 × larger, the risers placed in mm not put back on it.
+    await page.selectOption('#unit', 'in');
+    await page.waitForFunction(() => document.body.dataset.status === 'done' && window.reader3d.semantic.bodies[0].metrics?.bbox_mm?.size?.[2] > 700, null, { timeout: CAD_TIMEOUT });
+    await waitStatus('proposed', '1');
+    assert.ok((await feeding()).risers.every((r) => r.source === 'proposed'));
+    // Back in mm: put back.
+    await page.selectOption('#unit', 'mm');
+    await page.waitForFunction(() => document.body.dataset.status === 'done' && window.reader3d.semantic.bodies[0].metrics?.bbox_mm?.size?.[2] < 31, null, { timeout: CAD_TIMEOUT });
+    await waitStatus('manual', count);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('two bodies: "Move" stops when the card shows another body', { timeout: CAD_TIMEOUT }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 } });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    // A cube and a cylinder, two bodies (glTF, read in mm).
+    await page.selectOption('#unit', 'mm');
+    await page.setInputFiles('#file-input', fixturePath('two_objects.glb'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    const waitProposed = () => page.waitForFunction(() => document.getElementById('feeding-card').dataset.status === 'proposed', null, { timeout: 60_000 });
+    await page.click('#bodies tr[data-index="0"] td.name');
+    await waitProposed();
+    await page.click('#feeding-risers tr[data-riser="R1"]');
+    await page.click('#feeding-move');
+    assert.ok(await page.$eval('#feeding-move', (b) => b.classList.contains('active')));
+    assert.ok(await page.isVisible('#feeding-hint'));
+    // The other body: its R1 is not the one selected; nothing to move, no selection.
+    await page.click('#bodies tr[data-index="1"] td.name');
+    await waitProposed();
+    assert.equal(await page.$eval('#feeding-move', (b) => b.classList.contains('active')), false);
+    assert.equal(await page.isVisible('#feeding-hint'), false);
+    assert.equal(await page.$$eval('#feeding-risers tr.selected', (trs) => trs.length), 0);
+    assert.equal(await page.isVisible('#feeding-editor'), false);
     assert.deepEqual(errors, []);
     await context.close();
   });
