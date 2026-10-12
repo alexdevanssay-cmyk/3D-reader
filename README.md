@@ -45,11 +45,11 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   the line (a height field of at most 48 × 48 cells, inverse distance weighting), so the
   interface follows the line near it and goes from one level to the other between its
   runs. While the parting line or the risers of a body are shown, the other bodies of the
-  model are faded, and a click picks the card's body even through another one in front of
-  it (two versions of a part). Another candidate, the normal of a face, a typed
-  direction, or faces moved by a click to the upper or lower half define it by hand (kept
-  per part in the browser). The semantic contract, the foundry screen and the AI context
-  carry it, marked proposed or manual.
+  model are faded and a click goes through them: it reaches the card's body behind another
+  one (two versions of a part), never through a body drawn opaque. Another candidate, the
+  normal of a face, a typed direction, or faces moved by a click to the upper or lower half
+  define it by hand (kept per part in the browser). The semantic contract, the foundry
+  screen and the AI context carry it, marked proposed or manual.
 - **Risers and gating** ("masselottes et attaque de coulée"), card *Masselottes et attaque
   de coulée*: the hot spots and the feeding zones read from the inscribed spheres, a riser
   proposed on each zone no other one can feed (where, open on top or blind on the side,

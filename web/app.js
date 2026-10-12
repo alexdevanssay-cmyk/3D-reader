@@ -150,6 +150,9 @@ function clearModel() {
   state.meshes = [];
   state.edges = [];
   state.selected = -1;
+  // The hooks of the view for scripts and tests: nothing faded, no parting shown.
+  noteFaded();
+  $("parting-card").dataset.overlay = $("parting-card").dataset.undercuts = "";
 }
 
 /**
@@ -1123,7 +1126,9 @@ renderer.domElement.addEventListener("pointerup", (e) => {
     .intersectObjects(state.meshes.filter((m) => m.visible), false)
     .filter((h) => !sectionOn || sectionPlane.distanceToPoint(h.point) >= 0);
   if (feedingClick(hits) || partingClick(hits)) return;
-  select(hits.length ? hits[0].object.userData.index : -1);
+  // Through the bodies faded: the first body seen there (a faded one where nothing else is behind it).
+  const hit = hits.find((h) => !h.object.userData.faded) ?? hits[0];
+  select(hit ? hit.object.userData.index : -1);
 });
 
 // Drag and drop anywhere on the page.
@@ -1432,10 +1437,14 @@ function fadeBody(mesh) {
   setSeeThrough(mesh, "faded");
 }
 
-/** The body whose overlays are shown (its parting line, or its risers and ingate), the others faded; -1: none. */
+/**
+ * The body whose overlays are shown (its parting line, or its risers and
+ * ingate), the others faded; -1: none (or that body unchecked in the list:
+ * hidden with its overlays, the others keep their own look).
+ */
 function overlayBody() {
   const i = partingBody();
-  if (i < 0 || !state.meshes[i]) return -1;
+  if (i < 0 || !state.meshes[i]?.visible) return -1;
   if (partingShown()) return i;
   const f = feedingOf();
   return f?.show && feedingField(i) ? i : -1;
@@ -2174,9 +2183,11 @@ function applyParting() {
   }
   const color = new THREE.Color();
   let undercuts = 0;
+  // The card's body unchecked in the list (hidden, with its overlays): the others in their own look, not faded.
+  const fade = state.meshes[i].visible;
   state.meshes.forEach((mesh, j) => {
     mesh.userData.parting = j === i;
-    if (j !== i) return fadeBody(mesh);
+    if (j !== i) return fade ? fadeBody(mesh) : (setSeeThrough(mesh, false), plainColors(mesh));
     setSeeThrough(mesh, false);
     const geom = flatGeometry(mesh);
     const colors = geom.attributes.color.array;
@@ -2236,15 +2247,24 @@ function partingOff() {
     removePartingOverlay(mesh);
     mesh.userData.parting = false; // coloured by the thickness next
   });
+  const card = $("parting-card");
+  card.dataset.overlay = card.dataset.undercuts = "";
   renderParting();
 }
 
 /**
- * The point clicked on body i: the first of the ray on it, whatever bodies
- * the ray met before (another in front of it, two versions of a part one
- * over the other); null when the ray does not meet it.
+ * The point clicked on body i: the first of the ray on it, through the
+ * bodies faded in front of it (another body, two versions of a part one over
+ * the other); null when the ray does not meet it, or meets first a body that
+ * is not faded (opaque: the face clicked is that body's).
  */
-const cardHit = (hits, i) => hits.find((h) => h.object.userData.index === i) ?? null;
+function cardHit(hits, i) {
+  for (const h of hits) {
+    if (h.object.userData.index === i) return h;
+    if (!h.object.userData.faded) return null;
+  }
+  return null;
+}
 
 /** A click on the 3D view while picking a face or reassigning faces: handled here (true), the selection unchanged. */
 function partingClick(hits) {

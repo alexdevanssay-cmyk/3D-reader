@@ -413,7 +413,7 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     await context.close();
   });
 
-  test('two bodies, one in front of the other: a click on the front one acts on the body of the card behind it', { timeout: CAD_TIMEOUT }, async () => {
+  test('two bodies, one in front of the other: a click through the faded front one acts on the body of the card behind it, never through an opaque one', { timeout: CAD_TIMEOUT }, async () => {
     const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 } });
     const page = await context.newPage();
     const errors = [];
@@ -429,14 +429,31 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     const A = bodies.findIndex((y) => y < 0), B = bodies.findIndex((y) => y > 0);
     assert.deepEqual([A, B].sort(), [0, 1]);
     const parting = (i) => page.evaluate((k) => window.reader3d.semantic.bodies.find((b) => b.source_index === k).parting, i);
+    const faded = () => page.evaluate(() => document.getElementById('viewport').dataset.faded ?? '0');
+    const overlay = () => page.evaluate(() => document.getElementById('parting-card').dataset.overlay ?? '');
+    const selected = () => page.$$eval('#bodies tr.selected', (trs) => trs.map((tr) => Number(tr.dataset.index)));
+    // A click in the middle of the 3D view, seen from the front: on A, B behind it.
+    const clickMiddle = async () => {
+      const view = await page.locator('#viewport canvas').boundingBox();
+      await page.mouse.click(view.x + view.width / 2, view.y + view.height / 2);
+    };
 
-    // The card on B, behind A: its faces reassigned by clicks; A drawn faded.
+    // The card on B, nothing shown: A opaque in front of it. A face picked
+    // there is A's: B's direction unchanged, the hint says so.
     await page.click(`#bodies tr[data-index="${B}"] td.name`);
-    await page.click('#parting-assign');
-    assert.equal(await page.evaluate(() => document.getElementById('viewport').dataset.faded), '1');
     await page.click('[data-view="front"]');
-    const view = await page.locator('#viewport canvas').boundingBox();
-    await page.mouse.click(view.x + view.width / 2, view.y + view.height / 2);
+    assert.equal(await faded(), '0');
+    const proposed = (await parting(B)).direction;
+    await page.click('#parting-pick');
+    await clickMiddle();
+    assert.match(await page.textContent('#parting-hint'), /autre corps/);
+    assert.deepEqual([(await parting(B)).status, (await parting(B)).direction], ['proposed', proposed]);
+    await page.click('#parting-pick');
+
+    // Its faces reassigned by clicks: A drawn faded, the click goes through it.
+    await page.click('#parting-assign');
+    assert.equal(await faded(), '1');
+    await clickMiddle();
     // The front face of B (y = 20), not of A, moved to the lower half.
     await page.waitForFunction(() => document.getElementById('parting-origin').textContent === 'manuel', null, { timeout: 30_000 });
     assert.doesNotMatch(await page.textContent('#parting-hint'), /autre corps/);
@@ -444,12 +461,33 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     assert.deepEqual([b.status, b.reassigned_faces], ['manual', 1]);
     assert.equal((await parting(A)).status, 'proposed');
     // B still selected.
-    assert.deepEqual(await page.$$eval('#bodies tr.selected', (trs) => trs.map((tr) => Number(tr.dataset.index))), [B]);
+    assert.deepEqual(await selected(), [B]);
 
-    // Both displays off: nothing faded.
+    // No mode, the parting still shown: a click through the faded A selects B, seen behind it.
     await page.click('#parting-assign');
-    await page.uncheck('#parting-show');
-    assert.equal(await page.evaluate(() => document.getElementById('viewport').dataset.faded), '0');
+    assert.equal(await overlay(), 'lower upper line');
+    await clickMiddle();
+    assert.deepEqual(await selected(), [B]);
+    assert.equal(await faded(), '1');
+
+    // B unchecked in the list: hidden with its overlays, A in its own look again; checked again, A faded.
+    await page.uncheck(`#bodies tr[data-index="${B}"] input`);
+    assert.equal(await faded(), '0');
+    await page.check(`#bodies tr[data-index="${B}"] input`);
+    assert.equal(await faded(), '1');
+
+    // The thickness colours instead: the parting no longer shown, nor said to be.
+    await page.click('#toggle-thickness');
+    assert.equal(await page.isChecked('#parting-show'), false);
+    assert.equal(await overlay(), '');
+    await page.waitForFunction(() => document.getElementById('toggle-thickness').classList.contains('active') && document.getElementById('viewport').dataset.faded === '0', null, { timeout: 60_000 });
+
+    // Shown again, then another file of one body opened in this tab: nothing faded, nothing shown.
+    await page.check('#parting-show');
+    assert.deepEqual([await overlay(), await faded()], ['lower upper line', '1']);
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done' && window.reader3d.tab.file === 'box.stl', null, { timeout: CAD_TIMEOUT });
+    assert.deepEqual([await overlay(), await faded()], ['', '0']);
     assert.deepEqual(errors, []);
     await context.close();
   });
