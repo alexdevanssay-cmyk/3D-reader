@@ -429,8 +429,9 @@ function holeOf(surfaces, holes) {
 /**
  * The holes of a body in short, for the AI: how many were measured through or
  * blind, how many stay undetermined and why, how many faces given as holes are
- * none (their axis in the material, or a wall that does not go all round);
- * or why none was measured. Null for a body without cylinders.
+ * none (their axis in the material, a wall that does not go all round, or
+ * material between the axis and the wall: a face groove, a tube); or why none
+ * was measured. Null for a body without cylinders.
  */
 function holeSummary(body) {
   const surfaces=body.geometric_surfaces ?? [];
@@ -445,7 +446,7 @@ function holeSummary(body) {
     };
   }
   const holes=body.holes.holes;
-  const notHoles=new Set(["start_point_in_material","not_a_full_revolution"]);
+  const notHoles=new Set(["start_point_in_material","not_a_full_revolution","material_inside"]);
   const undetermined=holes.filter(h=>!isMeasured(h) && !notHoles.has(h.reason));
   const reasons={};
   for (const h of undetermined) reasons[h.reason ?? "unknown"]=(reasons[h.reason ?? "unknown"] ?? 0)+1;

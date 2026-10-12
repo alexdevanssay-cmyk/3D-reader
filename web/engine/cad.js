@@ -27,7 +27,7 @@
 // every analysed model stayed in memory.
 
 import { meshTopology } from './meshanalysis.js';
-import { measureHoles } from './holes.js';
+import { holesOfInstance, measureHoles } from './holes.js';
 
 export const CAD_EXTENSIONS = {
   '.step': 'step',
@@ -750,11 +750,13 @@ function solidBody(ctx, name, solid, color, notes) {
   let surfaceArea = 0;
   const surfaceTypes = { plane: 0, cylinder: 0, cone: 0, sphere: 0, torus: 0, bspline: 0, bezier: 0, other: 0 };
   const geometricSurfaces = [];
+  const faceOf = []; // per analytic surface, the rank of its face (the order of triangulate())
   try {
     const faces = Math.max(1, countChildren(ctx, solid, TopAbs_FACE));
     let done = 0;
     forEachChild(ctx, solid, TopAbs_FACE, TopAbs_SHAPE, (shape) => {
       const face = oc.TopoDS.Face_1(shape);
+      const rank = done;
       try {
         const orientation = face.Orientation_1();
         if (orientation === TopAbs_FORWARD || orientation === TopAbs_REVERSED) {
@@ -779,6 +781,7 @@ function solidBody(ctx, name, solid, color, notes) {
         surfaceArea += area(ctx, face);
         countSurfaceType(oc, face, surfaceTypes);
         describeGeometricSurface(oc, face, geometricSurfaces, geometricSurfaces.length);
+        while (faceOf.length < geometricSurfaces.length) faceOf.push(rank);
       } finally {
         release(oc, face);
       }
@@ -798,6 +801,20 @@ function solidBody(ctx, name, solid, color, notes) {
   }
 
   const tri = triangulate(ctx, solid);
+  axialExtents(geometricSurfaces, faceOf, tri);
+  // Through and blind holes, measured along the axes of its cylinders on its
+  // mesh (holes.js): once per shape, its other instances (an assembly part
+  // placed again, mirrored or not) given the same holes along their own axes.
+  const shapeKey = tshapeAddress(solid);
+  const holes = (closed) => {
+    const key = `${shapeKey}:${closed}`;
+    const kept = ctx.holes.get(key);
+    const copy = kept ? holesOfInstance(kept.record, kept.surfaces, geometricSurfaces) : null;
+    if (copy) return copy;
+    const record = measureHoles(tri.verts, tri.indices, geometricSurfaces, { closed });
+    if (record) ctx.holes.set(key, { record, surfaces: geometricSurfaces });
+    return record;
+  };
   return makeBody({
     name,
     volume,
@@ -810,9 +827,17 @@ function solidBody(ctx, name, solid, color, notes) {
     notes,
     surface_types: surfaceTypes,
     geometric_surfaces: geometricSurfaces,
-    solid: true,
+    holes,
     tri,
   });
+}
+
+/** Address of the shared geometry (TShape) of a shape: the same for its instances. */
+function tshapeAddress(shape) {
+  const tshape = shape.TShape_1();
+  const key = tshape.get().$$.ptr;
+  tshape.delete();
+  return key;
 }
 
 /** Compact analytic descriptors used by the semantic layer. */
@@ -999,12 +1024,12 @@ function openBody(ctx, name, shape, color) {
  * plus surface_types, geometric_surfaces, topology and the holes of a solid
  * for semantic.js, which the Python engine does not give.
  */
-function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], centroid, closed, color, notes, tri, surface_types, geometric_surfaces, solid = false }) {
+function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], centroid, closed, color, notes, tri, surface_types, geometric_surfaces, holes: holesOf = null }) {
   const mesh = { positions: new Float32Array(tri.verts), indices: tri.indices };
   // In the engine worker, not on the page: about 1.5 s for 2 million triangles.
   const topology = meshTopology(tri.verts, tri.indices);
-  // Through and blind holes of a solid, measured along the axes of its cylinders on its mesh (holes.js).
-  const holes = solid ? measureHoles(tri.verts, tri.indices, geometric_surfaces, { closed: topology.watertight }) : null;
+  // The through and blind holes of a solid (solidBody), on a watertight mesh only.
+  const holes = holesOf ? holesOf(topology.watertight) : null;
   // The display copy is float32. When that rounded the vertices, the double-precision
   // ones are kept for the oriented envelope (summary.js), which the Python engine
   // measures on its double-precision vertices (float32 made a thin plate's envelope
@@ -1338,6 +1363,7 @@ class Context {
     this.objects = [];
     this.matrices = new Map(); // TopLoc_Location hash -> [{loc, matrix}]
     this.meshed = new Set(); // TShape addresses of the shapes already tessellated
+    this.holes = new Map(); // TShape address of a solid -> its holes measured, for its other instances (solidBody)
     this.identity = null;
     this.untriangulatedFaces = 0;
   }
@@ -1543,12 +1569,7 @@ function heapExhausted(oc) {
 function meshEach(ctx, shapes, deflection, ang, report = true) {
   const { oc } = ctx;
   const { TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE, TopAbs_SHAPE } = oc.TopAbs_ShapeEnum;
-  const tshapeKey = (shape) => {
-    const tshape = shape.TShape_1();
-    const key = tshape.get().$$.ptr;
-    tshape.delete();
-    return key;
-  };
+  const tshapeKey = tshapeAddress;
   const mesh = (shape) => {
     const key = tshapeKey(shape);
     if (ctx.meshed.has(key)) return;
@@ -1684,6 +1705,8 @@ function triangulate(ctx, shape) {
   const { TopAbs_FACE, TopAbs_SHAPE } = oc.TopAbs_ShapeEnum;
   const reversed = oc.TopAbs_Orientation.TopAbs_REVERSED;
   const pieces = [];
+  // The vertices of each face, in the order of the faces (null: not triangulated).
+  const faceNodes = [];
   let nodeCount = 0;
   let triCount = 0;
   forEachChild(ctx, shape, TopAbs_FACE, TopAbs_SHAPE, (current) => {
@@ -1693,9 +1716,11 @@ function triangulate(ctx, shape) {
     try {
       if (handle.IsNull()) {
         ctx.untriangulatedFaces++;
+        faceNodes.push(null);
         return;
       }
       const { nodes, triangles } = readTriangulation(oc, handle.get());
+      faceNodes.push([nodeCount, nodeCount + nodes.length / 3]);
       pieces.push({
         nodes,
         triangles,
@@ -1743,7 +1768,33 @@ function triangulate(ctx, shape) {
     indices: faces,
     triangles: triCount,
     signedVolume: triCount ? meshSignedVolume(verts, faces) : 0,
+    faceNodes,
   };
+}
+
+/**
+ * The extent of each cylinder and cone along its axis, from the vertices of
+ * its own triangles (`faceOf`: per surface, the rank of its face in the
+ * solid; `tri`: the triangulation of the solid): axial_extent_mm, the
+ * distances from center_mm along axis to its two ends. The vertices of the
+ * B-Rep edges give only part of it (the seam vertex of an opening on an
+ * inclined face, anywhere on it). Holes are measured along it (holes.js).
+ */
+function axialExtents(surfaces, faceOf, tri) {
+  surfaces.forEach((s, i) => {
+    if ((s.type !== 'cylinder' && s.type !== 'cone') || !s.axis || !s.center_mm) return;
+    const range = tri.faceNodes[faceOf[i]];
+    if (!range) return;
+    const [ax, ay, az] = s.axis;
+    const [cx, cy, cz] = s.center_mm;
+    let lo = Infinity, hi = -Infinity;
+    for (let v = range[0]; v < range[1]; v++) {
+      const t = (tri.verts[3 * v] - cx) * ax + (tri.verts[3 * v + 1] - cy) * ay + (tri.verts[3 * v + 2] - cz) * az;
+      if (t < lo) lo = t;
+      if (t > hi) hi = t;
+    }
+    if (hi >= lo) s.axial_extent_mm = [lo, hi];
+  });
 }
 
 /** 3x4 row-major matrix of a location (rotation and scale included, then translation). */

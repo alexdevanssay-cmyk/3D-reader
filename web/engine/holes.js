@@ -10,16 +10,21 @@
 // section, on the axis and around it, lines are cast along the axis in both
 // senses on the closed triangle mesh of the body:
 // - an end is open when the lines get past the end of the walls of the chain
-//   without meeting material (the air around the part, or a cavity of it),
+//   without meeting material (the air around the part, or a cavity of it,
+//   past a rounded edge that flares the end of the walls),
 // - closed when they meet a bottom (flat, a drill point...) within the walls,
 //   or beyond them while still enclosed (a ball end, an inclined bottom: the
 //   lines square to the axis there meet material all around),
 // each end by a majority of the lines. Both ends open: a through hole; one: a
 // blind hole, with its depth. Undetermined (null) when the vote is split, the
 // point on the axis is in the material, or the walls do not go all round.
+// A hole crossed by a wider one (a cross drilling) is cut in two faces of one
+// radius on one axis line, the crossing hole between them: one hole.
 //
-// The extent of each face along its axis comes from the vertices of its B-Rep
-// edges (edge_signatures), exact on the circles that end a hole.
+// The extent of each face along its axis comes from its own triangles
+// (axial_extent_mm, cad.js), with the vertices of its B-Rep edges
+// (edge_signatures, exact on the circles that end a hole; the only source for
+// results kept without the triangles' extent).
 //
 // Plain JavaScript without bare imports: it runs in the engine worker, after
 // the triangulation of each solid (cad.js), and for the results kept by an
@@ -35,10 +40,18 @@ export const HOLES_METHOD = 'axis_rays_on_mesh';
 // Lines square to the axis from the start point: the wall all round at about
 // the radius (the display mesh is inscribed in the cylinder: within cos of half
 // its angular step, 0.97 at the coarsest preset). A cross hole may take two.
+// Closer than WALL_NEAR, it is other material (the bore of a boss or a tube,
+// seen from the axis of its outside).
 const RING = 12;
 const RING_MIN = 10;
-const WALL_NEAR = 0.7;
+const WALL_NEAR = 0.9;
 const WALL_FAR = 1.05;
+// A line that leaves the material again within this share of the radius met a
+// shell inside the face (the bore of a thin tube, from the axis of its outside): no wall.
+const WALL_THIN = 1.01;
+// A wall that does not go all round at one place (an oblique hole through a
+// thin wall): the lines tried at so many places at most along the face.
+const SPREAD = 24;
 // Past the end of the walls: open when a line square to the axis goes further than this (radii of that end).
 const OPEN_FAR = 1.2;
 // Lines along the axis: on it and at this share of the radius around it, a majority of 5.
@@ -76,11 +89,11 @@ function basis(a) {
 
 /**
  * The faces that can bound a hole: cylinders and cones, each with its axis
- * (canonical), a point of it and its extent along it (from the vertices of its
- * B-Rep edges), moved by -origin. Either orientation: the material is outside
- * a "reversed" face of a right-handed surface, but a mirrored placement or a
- * solid turned inside out reverses that; the lines tell (the axis of a boss
- * is in the material).
+ * (canonical), a point of it and its extent along it (from its triangles and
+ * the vertices of its B-Rep edges), moved by -origin. Either orientation: the
+ * material is outside a "reversed" face of a right-handed surface, but a
+ * mirrored placement or a solid turned inside out reverses that; the lines
+ * tell (the axis of a boss is in the material).
  */
 function holeFaces(surfaces, origin) {
   const faces = [];
@@ -91,13 +104,22 @@ function holeFaces(surfaces, origin) {
     if (s.type === 'cylinder' && !(s.radius_mm > 0)) continue;
     if (s.type === 'cone' && !(finite(s.semi_angle_rad) && finite(s.ref_radius_mm) && Array.isArray(s.axis_origin_mm) && s.axis_origin_mm.every(finite))) continue;
     let lo = Infinity, hi = -Infinity;
+    const extend = (t) => {
+      if (t < lo) lo = t;
+      if (t > hi) hi = t;
+    };
     for (const e of s.edge_signatures ?? []) {
       if (!Array.isArray(e) || e.length !== 6 || !e.every(finite)) continue;
-      for (const k of [0, 3]) {
-        const t = (e[k] - origin[0]) * axis[0] + (e[k + 1] - origin[1]) * axis[1] + (e[k + 2] - origin[2]) * axis[2];
-        if (t < lo) lo = t;
-        if (t > hi) hi = t;
-      }
+      for (const k of [0, 3]) extend((e[k] - origin[0]) * axis[0] + (e[k + 1] - origin[1]) * axis[1] + (e[k + 2] - origin[2]) * axis[2]);
+    }
+    // The extent of its triangles, along its own axis from its centre: the
+    // whole face, where an edge only gives its vertices (the seam vertex of an
+    // opening on an inclined face, anywhere on it).
+    const extent = s.axial_extent_mm;
+    if (Array.isArray(extent) && extent.length === 2 && extent.every(finite)) {
+      const tc = dot(s.center_mm.map((x, k) => x - origin[k]), axis);
+      const sense = dot(axis, s.axis) < 0 ? -1 : 1;
+      for (const x of extent) extend(tc + sense * x);
     }
     if (!(hi > lo)) continue;
     const point = s.center_mm.map((x, k) => x - origin[k]);
@@ -124,18 +146,18 @@ function lineDistance(a, b) {
   return Math.hypot(d[0] - t * a.axis[0], d[1] - t * a.axis[1], d[2] - t * a.axis[2]);
 }
 
+/** Largest radius of a face. */
+const maxRadius = (f) => f.radius ?? Math.max(f.radiusAt(f.lo), f.radiusAt(f.hi));
+
+/** Whether two faces are cylinders of one radius (the pieces of one cylinder). */
+const sameCylinder = (f, g) => f.type === 'cylinder' && g.type === 'cylinder' && Math.abs(f.radius - g.radius) <= Math.max(1e-6, 1e-5 * Math.max(f.radius, g.radius));
+
 /**
- * The chains of faces: coaxial faces of the same orientation whose extents
- * along the axis touch, joined (union-find over a hash of the axis lines:
- * direction, foot of the perpendicular from the origin in cells of `cell` mm).
- * The outside of a boss is not part of the hole through it.
+ * Calls fn(i, j) for each pair of faces i < j of the same orientation on one
+ * axis line (a hash of the lines: direction, foot of the perpendicular from
+ * the origin in cells of `cell` mm).
  */
-function chainsOf(faces, tolT, cell) {
-  const parent = faces.map((_, i) => i);
-  const find = (i) => {
-    while (parent[i] !== i) i = parent[i] = parent[parent[i]];
-    return i;
-  };
+function coaxialPairs(faces, cell, fn) {
   const dirKey = (f) => f.flag + ':' + f.axis.map((x) => Math.round(x * 1e4)).join(',');
   const grid = new Map();
   const cellOf = (f) => f.foot.map((x) => Math.floor(x / cell));
@@ -148,26 +170,56 @@ function chainsOf(faces, tolT, cell) {
   faces.forEach((f, i) => {
     const c = cellOf(f);
     const dk = dirKey(f);
-    const r = f.radius ?? Math.max(f.radiusAt(f.lo), f.radiusAt(f.hi));
+    const r = maxRadius(f);
     for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
       for (const j of grid.get(dk + '|' + [c[0] + dx, c[1] + dy, c[2] + dz].join(',')) ?? []) {
         if (j <= i) continue;
         const g = faces[j];
-        const rg = g.radius ?? Math.max(g.radiusAt(g.lo), g.radiusAt(g.hi));
-        const tol = Math.min(cell, Math.max(1e-4, 1e-3 * Math.min(r, rg)));
-        if (lineDistance(f, g) > tol || f.lo > g.hi + tolT || g.lo > f.hi + tolT) continue;
-        parent[find(j)] = find(i);
+        const tol = Math.min(cell, Math.max(1e-4, 1e-3 * Math.min(r, maxRadius(g))));
+        if (lineDistance(f, g) <= tol) fn(i, j);
       }
     }
   });
-  const groups = new Map();
-  faces.forEach((f, i) => {
-    const root = find(i);
-    const list = groups.get(root);
-    if (list) list.push(f);
-    else groups.set(root, [f]);
+}
+
+/** Union-find over n items: join(i, j), and the groups of items. */
+function unionFind(n) {
+  const parent = Array.from({ length: n }, (_, i) => i);
+  const find = (i) => {
+    while (parent[i] !== i) i = parent[i] = parent[parent[i]];
+    return i;
+  };
+  return {
+    join: (i, j) => {
+      parent[find(j)] = find(i);
+    },
+    groups: (items) => {
+      const groups = new Map();
+      items.forEach((item, i) => {
+        const root = find(i);
+        const list = groups.get(root);
+        if (list) list.push(item);
+        else groups.set(root, [item]);
+      });
+      return [...groups.values()];
+    },
+  };
+}
+
+/**
+ * The chains of faces: coaxial faces of the same orientation that continue
+ * each other, end to end along the axis (a counterbore and its bore, a drill
+ * point), or the pieces of one cylinder (equal radii) whose extents overlap
+ * (a cylinder given as two half faces). A face groove round a hole overlaps
+ * it without meeting it end to end: not part of it; nor is the outside of a
+ * boss (the other orientation).
+ */
+function chainFaces(faces, tolT, cell, join) {
+  coaxialPairs(faces, cell, (i, j) => {
+    const f = faces[i], g = faces[j];
+    const meet = Math.abs(f.hi - g.lo) <= tolT || Math.abs(g.hi - f.lo) <= tolT;
+    if (meet || (sameCylinder(f, g) && f.lo <= g.hi + tolT && g.lo <= f.hi + tolT)) join(i, j);
   });
-  return [...groups.values()].filter((list) => list.some((f) => f.type === 'cylinder'));
 }
 
 /**
@@ -227,14 +279,18 @@ export function measureHoles(positions, indices, surfaces, { closed = true } = {
 
   const diag = Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2]);
   const tolT = Math.max(1e-3, 1e-6 * diag);
-  const chains = chainsOf(faces, tolT, Math.max(0.05, 1e-5 * diag));
+  const cell = Math.max(0.05, 1e-5 * diag);
+  const { join, groups } = unionFind(faces.length);
+  chainFaces(faces, tolT, cell, join);
   const { ray } = rayCaster(P, indices);
   const hit = [-1];
   const tMin = 1e-9 * Math.max(1, diag);
+  // Past a hit, to the next one (the triangles that share its edge or vertex too).
+  const skip = Math.max(tMin, 1e-7 * diag);
 
-  /** First triangle along (p, d): {t, entering} (entering: from the air into the material), or null. */
-  const cast = (p, d) => {
-    const t = ray(p, d, tMin, hit);
+  /** First triangle along (p, d) beyond `from`: {t, entering} (entering: from the air into the material), or null. */
+  const cast = (p, d, from = tMin) => {
+    const t = ray(p, d, from, hit);
     if (t === Infinity) return null;
     const f = hit[0];
     const a = 3 * indices[3 * f], b = 3 * indices[3 * f + 1], c = 3 * indices[3 * f + 2];
@@ -246,22 +302,61 @@ export function measureHoles(positions, indices, surfaces, { closed = true } = {
 
   /**
    * The lines square to the axis from p ({u, v} its basis): how many meet the
-   * material between near and far, closer, further or nowhere; or inside when
-   * one leaves the material (p is in it).
+   * material between near and far (the wall), closer, further or nowhere, and
+   * each line's kind; or inside when one leaves the material (p is in it).
+   * With `thin`: a line into material that it leaves again within `thin`
+   * meets material inside the face, not its wall (the island inside a face
+   * groove, the bore of a tube from the axis of its outside): "island".
    */
-  const ring = (p, [u, v], near, far) => {
-    let wall = 0, beyond = 0, closer = 0;
+  const ring = (p, [u, v], near, far, thin = 0) => {
+    const count = { wall: 0, beyond: 0, closer: 0, island: 0 };
+    const kinds = [];
     for (let k = 0; k < RING; k++) {
       const angle = (2 * Math.PI * k) / RING;
       const c = Math.cos(angle), s = Math.sin(angle);
-      const h = cast(p, [c * u[0] + s * v[0], c * u[1] + s * v[1], c * u[2] + s * v[2]]);
+      const d = [c * u[0] + s * v[0], c * u[1] + s * v[1], c * u[2] + s * v[2]];
+      const h = cast(p, d);
       if (h && !h.entering) return { inside: true };
-      if (!h || h.t > far) beyond++;
-      else if (h.t < near) closer++;
-      else wall++;
+      let kind = !h || h.t > far ? 'beyond' : h.t < near ? 'closer' : 'wall';
+      if (kind !== 'beyond' && thin > 0) {
+        const out = cast(p, d, h.t + skip);
+        if (out && !out.entering && out.t <= thin) kind = 'island';
+      }
+      kinds.push(kind);
+      count[kind]++;
     }
-    return { wall, beyond, closer, inside: false };
+    return { ...count, kinds, inside: false };
   };
+
+  // A hole crossed by a wider one (a cross drilling): its cylinder cut in two
+  // faces of one radius on one axis line, apart, the crossing hole between
+  // them (both ends of the gap inside it) and the air along the axis from one
+  // to the other: one hole. Not two bores of one line across a cavity.
+  const crossing = faces.filter((f) => f.type === 'cylinder');
+  coaxialPairs(faces, cell, (i, j) => {
+    if (!sameCylinder(faces[i], faces[j])) return;
+    const [f, g] = faces[i].hi < faces[j].lo ? [faces[i], faces[j]] : [faces[j], faces[i]];
+    if (!(g.lo - f.hi > tolT)) return;
+    const a = f.axis;
+    const at = (t) => [0, 1, 2].map((k) => f.foot[k] + t * a[k]);
+    const ends = [at(f.hi), at(g.lo)];
+    const middle = at((f.hi + g.lo) / 2);
+    const crossed = crossing.some((c) => {
+      if (c === f || c === g || Math.abs(dot(c.axis, a)) > 0.999) return false;
+      const t = dot(middle, c.axis);
+      if (t < c.lo - tolT || t > c.hi + tolT) return false;
+      return ends.every((p) => {
+        const d = [0, 1, 2].map((k) => p[k] - c.point[k]);
+        const along = dot(d, c.axis);
+        return Math.hypot(d[0] - along * c.axis[0], d[1] - along * c.axis[1], d[2] - along * c.axis[2]) <= c.radius * (1 + 1e-3) + tolT;
+      });
+    });
+    if (!crossed) return;
+    const from = (f.lo + f.hi) / 2;
+    const h = cast(at(from), a);
+    if (!h || (h.entering && from + h.t >= g.lo - tolT)) join(i, j);
+  });
+  const chains = groups(faces).filter((list) => list.some((f) => f.type === 'cylinder'));
 
   for (const chain of chains) {
     chain.sort((x, y) => x.index - y.index);
@@ -291,22 +386,44 @@ export function measureHoles(positions, indices, surfaces, { closed = true } = {
     // A start point on the axis, inside the narrowest section, with its wall all round.
     const base = narrow.point.map((x, k) => x - dot(narrow.point, a) * a[k]); // the axis point at t = 0
     const at = (t) => [base[0] + t * a[0], base[1] + t * a[1], base[2] + t * a[2]];
+    const near = WALL_NEAR * r, far = WALL_FAR * r + tolEnd, thin = WALL_THIN * r;
     let start = null;
     let why = null;
+    let partial = null; // a start point in the air, its wall not all round there
     for (const share of STARTS) {
       const ts = narrow.lo + share * (narrow.hi - narrow.lo);
-      const probe = ring(at(ts), frame, WALL_NEAR * r, WALL_FAR * r + tolEnd);
+      const probe = ring(at(ts), frame, near, far, thin);
       if (probe.inside) {
         // The outside of a boss or a shaft (or a rounded edge): not a hole.
         why = 'start_point_in_material';
         break;
       }
-      if (probe.closer) why ??= 'obstructed';
-      else if (probe.wall < RING_MIN) why ??= 'not_a_full_revolution';
+      // Lines into the open first: a rounded inside corner with the opposite wall near its axis is no hole either.
+      if (probe.beyond > RING - RING_MIN) {
+        why ??= 'not_a_full_revolution';
+        if (!probe.closer && !probe.island) partial ??= ts;
+      } else if (probe.closer) why ??= 'obstructed';
+      // Material between the axis and the wall, all round: the outer wall of
+      // a face groove round a hole, the outside of a tube or a boss.
+      else if (probe.island) why ??= 'material_inside';
       else {
         start = ts;
         break;
       }
+    }
+    // An oblique hole through a wall thinner than its diameter: at any one
+    // place along the axis its wall is on one side only, but each line square
+    // to the axis meets it at some place. Tried along the face and a radius
+    // beyond its ends (its extent from the edges alone may be short).
+    if (start == null && why === 'not_a_full_revolution' && partial != null) {
+      const from = narrow.lo - r, to = narrow.hi + r;
+      const n = Math.min(SPREAD, Math.max(3, Math.ceil((to - from) / (0.25 * r)) + 1));
+      const covered = new Set();
+      for (let i = 0; i < n && covered.size < RING; i++) {
+        const probe = ring(at(from + ((to - from) * i) / (n - 1)), frame, near, far, thin);
+        if (!probe.inside) probe.kinds.forEach((kind, k) => kind === 'wall' && covered.add(k));
+      }
+      if (covered.size >= RING_MIN) start = partial;
     }
     if (start == null) {
       out.reason = why;
@@ -317,9 +434,13 @@ export function measureHoles(positions, indices, surfaces, { closed = true } = {
 
     // The radius of the chain at one of its ends (its widest face there: a counterbore, the top of a countersink).
     const endRadius = (t) => Math.max(r, ...chain.filter((f) => Math.abs((t === hi ? f.hi : f.lo) - t) <= tolT).map((f) => f.radius ?? f.radiusAt(t)));
+    // The lines along the axis pass through its narrowest opening: a cone that
+    // narrows below the narrowest cylinder and opens (a nozzle, an orifice).
+    // A cone down to a point is closed there anyway (a drill point).
+    const throat = Math.min(r, ...chain.filter((f) => f.type === 'cone').flatMap((f) => [f.radiusAt(f.lo), f.radiusAt(f.hi)]).filter((x) => x > tolEnd));
     const points = [[0, 0], [OFF_AXIS, 0], [-OFF_AXIS, 0], [0, OFF_AXIS], [0, -OFF_AXIS]].map(([x, y]) => {
       const p = at(start);
-      return [0, 1, 2].map((k) => p[k] + r * (x * frame[0][k] + y * frame[1][k]));
+      return [0, 1, 2].map((k) => p[k] + throat * (x * frame[0][k] + y * frame[1][k]));
     });
     const ends = [1, -1].map((s) => {
       const d = a.map((x) => s * x);
@@ -334,7 +455,11 @@ export function measureHoles(positions, indices, surfaces, { closed = true } = {
         if (onAxis && (!onAxis.entering || gap <= tolEnd)) return (past = null);
         const step = Math.min(Math.max(tolEnd, 0.1 * r), gap / 2);
         const R = endRadius(s > 0 ? hi : lo);
-        const probe = ring(at(start + s * (reach + step)), frame, 0, OPEN_FAR * R + tolEnd);
+        const probeAt = (t) => ring(at(start + s * (reach + t)), frame, 0, OPEN_FAR * R + tolEnd);
+        let probe = probeAt(step);
+        // A rounded edge at the end of the walls (not of the chain) flares
+        // within OPEN_FAR there: tried again half way to what the axis meets.
+        if (!probe.inside && !probe.beyond && Number.isFinite(gap) && gap > 2 * step) probe = probeAt(gap / 2);
         return (past = probe.inside ? null : probe.beyond ? 'open' : 'closed');
       };
       const votes = hits.map((h) => {
@@ -391,6 +516,43 @@ export function measureHoles(positions, indices, surfaces, { closed = true } = {
 /** Whether a body's hole measurements (body.holes) are of this version. */
 export function currentHoles(record) {
   return record?.version === HOLES_VERSION && Array.isArray(record.holes);
+}
+
+/**
+ * The holes of another instance of a shape (an assembly part placed again,
+ * mirrored or not), from those measured on one (`record`): the same holes,
+ * each axis carried by the axis of its first face (`from`: the analytic
+ * surfaces of the measured instance, `to`: those of this one, face by face).
+ * Null when the faces of a hole differ (another shape, or scaled).
+ */
+export function holesOfInstance(record, from, to) {
+  if (!currentHoles(record) || !Array.isArray(from) || !Array.isArray(to) || from.length !== to.length) return null;
+  // Equal but for the rounding of a placement.
+  const equal = (p, q) => (p ?? null) === (q ?? null) || (finite(p) && finite(q) && Math.abs(p - q) <= 1e-9 * Math.max(1, Math.abs(p)));
+  const same = (i) => {
+    const x = from[i], y = to[i];
+    return x?.type === y?.type && equal(x.radius_mm, y.radius_mm) && equal(x.semi_angle_rad, y.semi_angle_rad) && canonical(y.axis) != null;
+  };
+  const holes = [];
+  for (const hole of record.holes) {
+    if (!Array.isArray(hole.surfaces) || !hole.surfaces.length || !hole.surfaces.every(same)) return null;
+    // The axes of the face as given (not canonical: a placement turns them as it turns the hole).
+    const unit = (v) => {
+      const n = Math.hypot(v[0], v[1], v[2]);
+      return v.map((x) => x / n);
+    };
+    const a = unit(from[hole.surfaces[0]].axis), b = unit(to[hole.surfaces[0]].axis);
+    // A blind hole's axis from its opening into the material: the same sense along its face's axis.
+    const sense = dot(hole.axis, a) < 0 ? -1 : 1;
+    const { surfaces, diameters_mm, ...rest } = hole;
+    holes.push({
+      ...rest,
+      surfaces: [...surfaces],
+      axis: hole.through === false ? b.map((x) => (x ? sense * x : 0)) : canonical(b),
+      ...(diameters_mm ? { diameters_mm: [...diameters_mm] } : {}),
+    });
+  }
+  return { ...record, holes };
 }
 
 /**

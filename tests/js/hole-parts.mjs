@@ -9,10 +9,12 @@
 //   'flat'     on a flat bottom
 //   'drill'    on a drill point (cone of `pointDeg`, 118° by default)
 // or a boss: a cylinder of radius `boss.r` standing `boss.h` on the top face.
+// `split`: each cylinder of the hole given as two half faces (as some STEP
+// and IGES exports do).
 
 const N = 32; // segments round a circle (a multiple of 8: the corners of the square are among them)
 
-export function plate({ S = 20, H = 10, sections = [], end = 'through', pointDeg = 118, cavity = null, boss = null, inverted = false } = {}) {
+export function plate({ S = 20, H = 10, sections = [], end = 'through', pointDeg = 118, cavity = null, boss = null, inverted = false, split = false } = {}) {
   const positions = [];
   const indices = [];
   const vertex = (p) => positions.push(...p) / 3 - 1;
@@ -49,11 +51,17 @@ export function plate({ S = 20, H = 10, sections = [], end = 'through', pointDeg
   const surfaces = [];
   const seam = (r, z0, z1) => [r, 0, z0, r, 0, z1];
   const circleEdge = (r, z) => [r, 0, z, r, 0, z];
-  const cylinder = (r, bottom, top, orientation = 'reversed') => surfaces.push({
-    index: surfaces.length, type: 'cylinder', radius_mm: r, axis: [0, 0, 1], center_mm: [0, 0, (bottom + top) / 2],
-    orientation, wire_count: 1, edge_count: 2,
-    edge_signatures: [circleEdge(r, top), seam(r, bottom, top), circleEdge(r, bottom), seam(r, bottom, top)],
-  });
+  const cylinder = (r, bottom, top, orientation = 'reversed') => {
+    const face = (edge_signatures) => surfaces.push({
+      index: surfaces.length, type: 'cylinder', radius_mm: r, axis: [0, 0, 1], center_mm: [0, 0, (bottom + top) / 2],
+      orientation, wire_count: 1, edge_count: split ? 4 : 2, edge_signatures,
+    });
+    if (!split) return face([circleEdge(r, top), seam(r, bottom, top), circleEdge(r, bottom), seam(r, bottom, top)]);
+    // Two halves (y >= 0, y <= 0), each bounded by two half circles and the lines at x = r and x = -r.
+    const arc = (z) => [-r, 0, z, r, 0, z];
+    const line = (x) => [x, 0, bottom, x, 0, top];
+    for (let k = 0; k < 2; k++) face([arc(top), line(r), arc(bottom), line(-r)]);
+  };
   const plane = (normal, z, edges) => surfaces.push({
     index: surfaces.length, type: 'plane', normal, center_mm: [0, 0, z], orientation: normal[2] > 0 ? 'forward' : 'reversed', wire_count: 2, edge_count: edges.length, edge_signatures: edges,
   });

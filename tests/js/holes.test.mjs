@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { HOLES_VERSION, currentHoles, holesToMeasure, measureHoles, restoreHoles } from '../../web/engine/holes.js';
+import { HOLES_VERSION, currentHoles, holesOfInstance, holesToMeasure, measureHoles, restoreHoles } from '../../web/engine/holes.js';
 import { approx, approxVec } from './helpers.mjs';
 import { partBody, plate } from './hole-parts.mjs';
 
@@ -71,6 +71,14 @@ test('a counterbored blind hole: blind, its depth from the top of the counterbor
   assert.equal(hole.bottom, 'flat');
   approx(hole.depth_mm, 14, 1e-9, 0, 'depth');
   approxVec(hole.axis, [0, 0, -1], 0, 1e-12, 'axis');
+});
+
+test('a hole whose cylinder is given as two half faces: one hole of both', () => {
+  const { holes } = measure(plate({ H: 10, sections: [{ r: 5, top: 10, bottom: 0 }], split: true }));
+  assert.deepEqual(holes.map((h) => [h.surfaces, h.through, h.diameter_mm, 'diameters_mm' in h]), [[[1, 2], true, 10, false]]);
+  const [blind] = measure(plate({ H: 20, sections: [{ r: 8, top: 20, bottom: 14 }, { r: 3, top: 14, bottom: 6 }], end: 'flat', split: true })).holes;
+  assert.deepEqual([blind.surfaces, blind.through, blind.bottom, blind.diameters_mm], [[1, 2, 4, 5], false, 'flat', [6, 16]]);
+  approx(blind.depth_mm, 14, 1e-9, 0, 'depth');
 });
 
 test('a hole opening into an inner cavity: through (into the air of the part)', () => {
@@ -178,4 +186,21 @@ test('results kept before the holes were measured: measured once, then given fro
   // Measured with the analysis (current): nothing to do.
   assert.equal(await restoreHoles(bodies, null, measure), null);
   assert.deepEqual(calls, [2]);
+});
+
+test('the holes of another instance of a part: the same, along its own axes; none for another part', () => {
+  const part = plate({ H: 20, sections: [{ r: 4, top: 20, bottom: 8 }], end: 'drill' });
+  const record = measure(part);
+  // Turned half a turn about x (z -> -z): the axes of its faces too.
+  const turned = part.surfaces.map((s) => (s.axis ? { ...s, axis: [s.axis[0], -s.axis[1], -s.axis[2]] } : s));
+  const copy = holesOfInstance(record, part.surfaces, turned);
+  assert.equal(copy.version, HOLES_VERSION);
+  const [hole] = copy.holes;
+  assert.deepEqual([hole.surfaces, hole.through, hole.depth_mm, hole.bottom], [[1, 2], false, 12, 'drill_point']);
+  // Drilled from the top of the part as is (-z): from below once turned.
+  approxVec(record.holes[0].axis, [0, 0, -1], 0, 1e-12, 'as is');
+  approxVec(hole.axis, [0, 0, 1], 0, 1e-12, 'turned');
+  // Another radius, or other faces: measured on its own.
+  assert.equal(holesOfInstance(record, part.surfaces, part.surfaces.map((s) => (s.type === 'cylinder' ? { ...s, radius_mm: 5 } : s))), null);
+  assert.equal(holesOfInstance(record, part.surfaces, part.surfaces.slice(1)), null);
 });
