@@ -121,6 +121,39 @@ async function viewColours(page) {
   }, png.toString('base64'));
 }
 
+// ---- drawing by hand: points aimed on the part through reader3d.screenOf
+
+/** The view turned by the right arrow until the face of normal `n` at `p` faces the camera (outward normal · towards the camera > 0.2). */
+async function faceToward(page, p, n) {
+  for (let k = 0; k < 8; k++) {
+    const seen = await page.evaluate(([q, normal]) => {
+      const eye = window.reader3d.view.position;
+      const d = [eye[0] - q[0], eye[1] - q[1], eye[2] - q[2]];
+      return normal[0] * d[0] + normal[1] * d[1] + normal[2] * d[2] > 0.2 * Math.hypot(...d);
+    }, [p, n]);
+    if (seen) return;
+    await page.click('#turn-right');
+    await page.waitForFunction(() => !document.getElementById('viewport').dataset.turning);
+  }
+  throw new Error(`face ${n} at ${p} never towards the camera`);
+}
+
+/** A click on the 3D view where a point of the model is ([dx, dy] pixels off). */
+async function clickModel(page, p, [dx, dy] = [0, 0]) {
+  const at = await page.evaluate((q) => window.reader3d.screenOf(q), p);
+  assert.ok(at, `${p} in front of the camera`);
+  await page.mouse.click(at.x + dx, at.y + dy);
+}
+
+/** The segments of the table: their names, and the text of their length. */
+const segmentRows = (page) => page.$$eval('#parting-draw-segments tbody tr[data-seg]:not(.seg-arc-edit):not(.parting-seg-error)', (rows) => rows.map((tr) => ({ name: tr.cells[0].textContent, length: tr.cells[2].textContent, type: tr.querySelector('select').value })));
+
+/** The parting card's figures, by their label. */
+const partingStats = (page) => page.evaluate(() => Object.fromEntries([...document.querySelectorAll('#parting-stats dt')].map((dt) => [dt.textContent, dt.nextElementSibling.textContent])));
+
+/** Two boxes (DOMRects) overlapping. */
+const overlap = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+
 describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) && 'run `npm run build` first' }, () => {
   let server;
   let base;
@@ -488,6 +521,365 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
     await page.waitForFunction(() => document.body.dataset.status === 'done' && window.reader3d.tab.file === 'box.stl', null, { timeout: CAD_TIMEOUT });
     assert.deepEqual([await overlay(), await faded()], ['', '0']);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('dessin manuel : plan, flèches, points autour de la pièce, boucle fermée, une courbe, chapes par partie, gardé après rechargement', { timeout: 2 * CAD_TIMEOUT }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    // A block 60 × 40 × 20 mm, drawn along Z.
+    const box = voxelsObj([['a', () => true]], [12, 8, 4], 5);
+    const open = async () => {
+      await page.setInputFiles('#file-input', { name: 'box.obj', mimeType: 'text/plain', buffer: box });
+      await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+      await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
+    };
+    const hint = () => page.textContent('#parting-hint');
+    const card = () => page.evaluate(() => {
+      const el = document.getElementById('parting-card');
+      return { origin: document.getElementById('parting-origin').textContent, stage: el.dataset.draw ?? '', overlay: el.dataset.overlay ?? '' };
+    });
+    const semantic = () => page.evaluate(() => {
+      const body = window.reader3d.semantic.bodies[0];
+      return { parting: body.parting, foundry: body.foundry, ai: window.reader3d.aiContext().bodies[0].parting };
+    });
+    await open();
+    assert.equal(await page.isHidden('#draw-overlay'), true);
+
+    // 1. Dessin manuel: the plane of the direction shown (Z), the side view (Z upright), the arrows and the step on the view.
+    await page.click('#parting-draw');
+    assert.equal(await page.evaluate(() => document.getElementById('parting-draw').classList.contains('active')), true);
+    assert.equal(await page.inputValue('#parting-draw-plane'), 'Z');
+    for (const id of ['#turn-left', '#turn-right', '#turn-step', '#draw-actions']) assert.equal(await page.isVisible(id), true, id);
+    assert.equal(await page.getAttribute('#turn-step [data-step="4"]', 'aria-checked'), 'true');
+    const up = (await page.evaluate(() => window.reader3d.view)).up;
+    assert.ok(Math.abs(up[0]) < 1e-9 && Math.abs(up[1]) < 1e-9 && Math.abs(up[2] - 1) < 1e-9, `up ${up}`);
+    const layout = await page.evaluate(() => {
+      const r = (id) => document.getElementById(id).getBoundingClientRect().toJSON();
+      return { view: r('viewport'), left: r('turn-left'), right: r('turn-right'), step: r('turn-step') };
+    });
+    const middle = layout.view.top + layout.view.height / 2;
+    for (const arrow of [layout.left, layout.right]) assert.ok(Math.abs(arrow.top + arrow.height / 2 - middle) <= 5, JSON.stringify(layout));
+    assert.ok(layout.left.left - layout.view.left < layout.view.width / 4 && layout.right.right - layout.view.left > (3 * layout.view.width) / 4);
+    assert.ok(layout.step.right <= layout.view.right - 10 && layout.step.bottom <= layout.view.bottom && layout.step.left > layout.view.left + layout.view.width / 2);
+    assert.match(await hint(), /point 1\b/);
+    assert.match(await page.textContent('#draw-hint'), /point 1\b/);
+    assert.match(await page.getAttribute('#turn-left', 'aria-label'), /vers la gauche de 1\/4 de tour autour de l'axe Z/);
+
+    // 2. Two points on the front face (placed by hand: not quite level), then a quarter turn: still drawing.
+    const front = [0, -1, 0];
+    await faceToward(page, [20, 0, 10], front);
+    await clickModel(page, [20, 0, 10.2]);
+    await clickModel(page, [40, 0, 9.9]);
+    assert.deepEqual((await segmentRows(page)).map((r) => r.name), ['1-2']);
+    const turned = await page.evaluate(() => document.getElementById('viewport').dataset.turn);
+    await page.click('#turn-right');
+    assert.equal(await page.evaluate(() => document.getElementById('viewport').dataset.turn), String((Number(turned) + 90) % 360));
+    assert.equal(await page.evaluate(() => document.getElementById('parting-draw').classList.contains('active')), true);
+    assert.match(await hint(), /^Point 3 : cliquez sur la pièce/);
+
+    // 3. Round the part, the arrows turning it to each face; undone, redone.
+    for (const [p, n] of [[[60, 20, 10.1], [1, 0, 0]], [[40, 40, 9.8], [0, 1, 0]], [[20, 40, 10.2], [0, 1, 0]], [[0, 20, 10], [-1, 0, 0]]]) {
+      await faceToward(page, p, n);
+      await clickModel(page, p);
+    }
+    assert.equal((await segmentRows(page)).length, 5);
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.press('Control+z');
+    assert.equal((await segmentRows(page)).length, 4);
+    await page.keyboard.press('Control+y');
+    assert.equal((await segmentRows(page)).length, 5);
+
+    // 4. A click 5 px from point 1: the loop closed, the halves proposed and applied.
+    await faceToward(page, [20, 0, 10.2], front);
+    await clickModel(page, [20, 0, 10.2], [5, 0]);
+    await page.waitForFunction(() => document.getElementById('parting-origin').textContent === 'dessin manuel', null, { timeout: 30_000 });
+    assert.deepEqual((await segmentRows(page)).map((r) => r.name), ['1-2', '2-3', '3-4', '4-5', '5-6', '6-1']);
+    let shown = await card();
+    assert.equal(shown.stage, 'halves');
+    assert.ok(shown.overlay.split(' ').includes('drawing'), shown.overlay);
+    let stats = await partingStats(page);
+    assert.equal(stats['Contre-dépouilles (noyaux, tiroirs)'], '0 % (0 cm²)');
+    assert.match(stats['Dessin manuel'], /^6 points, 6 segments \(0 courbes\), 1 boucle\(s\), 2 parties$/);
+    assert.match(await page.textContent('#parting-draw-parts'), /^2 parties : 1 en chape supérieure, 1 en chape inférieure$/);
+    // The points not quite level: aligned at Z = 10, the line planar there, 200 mm round the block.
+    assert.equal(await page.isVisible('#parting-draw-align'), true);
+    assert.match(await page.textContent('#parting-draw-align-label'), /^Aligner les points de la boucle 1 à Z =$/);
+    await page.fill('#parting-draw-level', '10');
+    await page.click('#parting-draw-align-apply');
+    await page.waitForFunction(() => [...document.querySelectorAll('#parting-stats dt')].some((dt) => dt.textContent === 'Ligne de joint' && dt.nextElementSibling.textContent === 'plane, à Z = 10 mm'), null, { timeout: 30_000 });
+    stats = await partingStats(page);
+    assert.equal(stats['Longueur de la ligne'], '200 mm, 1 boucle(s)');
+    assert.equal(await page.isHidden('#parting-draw-align'), true);
+    let s = await semantic();
+    assert.deepEqual([s.parting.status, s.parting.source, s.parting.undercut_basis, s.parting.drawn.segments.length], ['manual', 'drawn', 'drawn_halves', 6]);
+    assert.ok(s.parting.drawn.segments.every((seg) => seg.on_parting_line && seg.type === 'straight'));
+    assert.equal(s.foundry.rules.parting_line, 'manual');
+    assert.ok(s.foundry.evidence.confirmed.includes('parting_line_drawn_by_hand'));
+    assert.deepEqual([s.ai.source, s.ai.drawn_loops, s.ai.curved_segments, s.ai.planar], ['drawn', 1, 0, true]);
+
+    // 5. The top part given to the lower chape: undercuts (the top cannot leave downwards); swapped: none.
+    await page.click('#parting-draw-lower');
+    assert.equal(await page.evaluate(() => document.getElementById('parting-draw-lower').classList.contains('active')), true);
+    await page.click('[data-view="top"]');
+    await clickModel(page, [30, 20, 20]);
+    await page.waitForFunction(() => !/^0 %/.test([...document.querySelectorAll('#parting-stats dt')].find((dt) => dt.textContent.startsWith('Contre-dépouilles')).nextElementSibling.textContent), null, { timeout: 30_000 });
+    await page.click('#parting-draw-swap');
+    await page.waitForFunction(() => [...document.querySelectorAll('#parting-stats dt')].find((dt) => dt.textContent.startsWith('Contre-dépouilles')).nextElementSibling.textContent === '0 % (0 cm²)', null, { timeout: 30_000 });
+
+    // 6. The step 1/8: the right arrow key turns by 45°, the drawing goes on.
+    await page.click('#turn-step [data-step="8"]');
+    assert.equal(await page.getAttribute('#turn-step [data-step="8"]', 'aria-checked'), 'true');
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.press('ArrowRight');
+    const before = Number(await page.evaluate(() => document.getElementById('viewport').dataset.turn));
+    await page.keyboard.press('ArrowRight');
+    // (Seen from the top, the axis towards the viewer: the right arrow turns the part clockwise on the screen, -45° about +Z.)
+    const after = Number(await page.evaluate(() => document.getElementById('viewport').dataset.turn));
+    assert.equal(after, (before + 315) % 360);
+    assert.equal(await page.textContent('#turn-angle'), `Rotation : ${String(after).replace('.', ',')}°`);
+    assert.equal((await card()).stage, 'halves');
+
+    // 7. Segment 1-2 curved: radius 20 by default; 9 refused (under half the chord); 15: an arc 21,9 mm, the line no longer planar.
+    const row = '#parting-draw-segments tr[data-seg="0:0"]';
+    const edit = '#parting-draw-segments tr.seg-arc-edit[data-seg="0:0"]';
+    await page.selectOption(`${row} select`, 'arc');
+    await page.waitForSelector(edit);
+    assert.ok(Math.abs(Number(await page.inputValue(`${edit} input[data-field="radius"]`)) - 20) < 0.1);
+    const lengthBefore = (await segmentRows(page))[0].length;
+    await page.fill(`${edit} input[data-field="radius"]`, '9');
+    await page.dispatchEvent(`${edit} input[data-field="radius"]`, 'change');
+    assert.match(await page.textContent('#parting-draw-segments tr.parting-seg-error[data-seg="0:0"]'), /^Rayon trop petit : au moins 10(,\d+)? mm/);
+    assert.equal(await page.getAttribute(`${edit} input[data-field="radius"]`, 'aria-invalid'), 'true');
+    assert.equal((await segmentRows(page))[0].length, lengthBefore);
+    await page.fill(`${edit} input[data-field="radius"]`, '15');
+    await page.dispatchEvent(`${edit} input[data-field="radius"]`, 'change');
+    await page.waitForFunction(() => /^non plane/.test([...document.querySelectorAll('#parting-stats dt')].find((dt) => dt.textContent === 'Ligne de joint').nextElementSibling.textContent), null, { timeout: 30_000 });
+    assert.deepEqual((await segmentRows(page))[0], { name: '1-2', length: '21,9 mm', type: 'arc' });
+    assert.equal(await page.isHidden('#parting-draw-segments tr.parting-seg-error[data-seg="0:0"]'), true);
+    const centreZ = async () => Number((await page.inputValue(`${edit} input[data-field="centre"]`)).split(' ; ')[2].replace(',', '.'));
+    assert.ok((await centreZ()) < 10, 'the centre under the line: the arc rises');
+    s = await semantic();
+    assert.deepEqual([s.parting.drawn.segments[0].type, s.parting.drawn.segments[0].radius_mm, s.ai.curved_segments, s.ai.planar], ['curved', 15, 1, false]);
+    // '⇅': the centre above the line, the arc dips.
+    await page.click(`${edit} button[data-action="centreFlip"]`);
+    await page.waitForFunction(() => {
+      const input = document.querySelector('#parting-draw-segments tr.seg-arc-edit[data-seg="0:0"] input[data-field="centre"]');
+      return input && Number(input.value.split(' ; ')[2].replace(',', '.')) > 10;
+    });
+    assert.ok((await centreZ()) > 10);
+
+    // 8. Terminer: the drawn line shown as any definition (blocks, line), the controls of the view gone.
+    await page.click('#parting-draw-done');
+    assert.equal(await page.isHidden('#draw-overlay'), true);
+    shown = await card();
+    assert.deepEqual([shown.overlay, shown.origin, shown.stage], ['lower upper line', 'dessin manuel', '']);
+    const kept = Object.values(JSON.parse(await page.evaluate(() => localStorage.getItem('reader3d.parting.v1'))))[0];
+    assert.equal(kept.bodies[0].source, 'drawn');
+    assert.equal(kept.bodies[0].drawing.loops[0].pts.length, 6);
+    assert.equal(kept.drafts, undefined);
+    stats = await partingStats(page);
+
+    // 9. Kept in this browser: after a reload, the same line, the same drawing to go on with.
+    await page.reload();
+    await open();
+    await page.waitForFunction(() => document.getElementById('parting-origin').textContent === 'dessin manuel', null, { timeout: 30_000 });
+    assert.deepEqual(await partingStats(page), stats);
+    await page.click('#parting-draw');
+    const rows = await segmentRows(page);
+    assert.deepEqual(rows.map((r) => r.name), ['1-2', '2-3', '3-4', '4-5', '5-6', '6-1']);
+    assert.deepEqual([rows[0].type, rows[0].length], ['arc', '21,9 mm']);
+    assert.equal((await card()).origin, 'dessin manuel');
+
+    // 10. Cleared (confirmed): the proposal back. Two points, then Esc: kept as a draft, after a reload too.
+    page.once('dialog', (dialog) => dialog.accept());
+    await page.click('#parting-draw-clear');
+    await page.waitForFunction(() => document.getElementById('parting-origin').textContent === 'proposé');
+    assert.equal((await segmentRows(page)).length, 0);
+    assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.parting.v1')), '{}');
+    await page.click('#parting-draw-side'); // from the top view: the side view, the axis upright
+    assert.ok(Math.abs((await page.evaluate(() => window.reader3d.view)).up[2] - 1) < 1e-9);
+    await faceToward(page, [20, 0, 10], front);
+    await clickModel(page, [20, 0, 10]);
+    await clickModel(page, [40, 0, 10]);
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.press('Escape');
+    assert.equal(await page.isHidden('#parting-draw-panel'), true);
+    assert.equal(await page.textContent('#parting-draw-kept'), 'Tracé en cours gardé : 2 points');
+    await page.waitForFunction(() => Object.values(JSON.parse(localStorage.getItem('reader3d.parting.v1') ?? '{}'))[0]?.drafts?.[0]);
+    await page.reload();
+    await open();
+    await page.waitForSelector('#parting-draw-kept:not([hidden])');
+    assert.equal(await page.textContent('#parting-draw-kept'), 'Tracé en cours gardé : 2 points');
+
+    // 11. A phone: the arrows, the step and the actions within the view, none over another; no horizontal scroll.
+    await page.setViewportSize({ width: 375, height: 800 });
+    await page.click('#parting-draw');
+    assert.deepEqual((await segmentRows(page)).map((r) => r.name), ['1-2']);
+    const phone = await page.evaluate(() => {
+      const r = (id) => document.getElementById(id).getBoundingClientRect().toJSON();
+      return {
+        page: document.documentElement.scrollWidth,
+        view: r('viewport'),
+        boxes: ['turn-left', 'turn-right', 'turn-step', 'draw-actions'].map(r),
+        table: r('parting-draw-segments'),
+        wide: [...document.querySelectorAll('#parting-card *')].filter((x) => x.offsetParent && x.getBoundingClientRect().right > 375).map((x) => x.id || x.className || x.tagName),
+      };
+    });
+    assert.equal(phone.page, 375);
+    assert.deepEqual(phone.wide, []);
+    assert.ok(phone.table.right <= 375);
+    for (const b of phone.boxes) assert.ok(b.left >= phone.view.left && b.right <= phone.view.right && b.top >= phone.view.top && b.bottom <= phone.view.bottom, JSON.stringify(phone));
+    for (let a = 0; a < phone.boxes.length; a++) for (let b = a + 1; b < phone.boxes.length; b++) assert.ok(!overlap(phone.boxes[a], phone.boxes[b]), `${a} over ${b}: ${JSON.stringify(phone.boxes)}`);
+
+    // 12. In English.
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.selectOption('#language', 'en');
+    assert.equal(await page.textContent('#parting-draw'), 'Draw by hand');
+    assert.equal(await page.textContent('.turn-step-label'), 'Step');
+    assert.match(await page.textContent('#parting-hint'), /^Point 3: click the part/);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('dessin manuel, bloc percé : la boucle extérieure seule ne sépare pas la pièce ; une boucle dans le trou en plus, deux parties', { timeout: 2 * CAD_TIMEOUT }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    // The block 100 × 60 × 20 mm with a hole Ø 20 through it along Z, round (50, 30).
+    await page.setInputFiles('#file-input', fixturePath('holed_block.step'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
+    await page.click('#parting-draw');
+    assert.equal(await page.inputValue('#parting-draw-plane'), 'Z');
+
+    // Round the outside at mid-height, closed by Enter: a hole goes through the loop, nothing applied.
+    for (const [p, n] of [[[30, 0, 10], [0, -1, 0]], [[100, 30, 10], [1, 0, 0]], [[70, 60, 10], [0, 1, 0]], [[0, 30, 10], [-1, 0, 0]]]) {
+      await faceToward(page, p, n);
+      await clickModel(page, p);
+    }
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => /ne sépare pas la pièce/.test(document.getElementById('parting-hint').textContent), null, { timeout: 30_000 });
+    assert.equal(await page.textContent('#parting-origin'), 'proposé');
+    assert.equal(await page.isEnabled('#parting-draw-new'), true);
+    assert.equal(await page.isHidden('#parting-draw-parts'), true);
+
+    // A new loop on the wall of the hole at mid-height, seen from above into it (Iso), turned a quarter at a time.
+    await page.click('#parting-draw-new');
+    assert.equal(await page.evaluate(() => document.getElementById('parting-card').dataset.draw), 'points');
+    await page.click('[data-view="iso"]');
+    for (let k = 0; k < 4; k++) {
+      // The far side of the hole: its wall faces the camera.
+      const p = await page.evaluate(() => {
+        const eye = window.reader3d.view.position;
+        const az = Math.atan2(eye[1] - 30, eye[0] - 50) + Math.PI;
+        return [50 + 10 * Math.cos(az), 30 + 10 * Math.sin(az), 10];
+      });
+      await clickModel(page, p);
+      assert.equal(await page.$$eval('#draw-labels span', (s) => s.length), 5 + k, `point ${5 + k} placed in the hole`);
+      await page.click('#turn-right');
+    }
+    await page.click('#parting-draw-close');
+    await page.waitForFunction(() => document.getElementById('parting-origin').textContent === 'dessin manuel', null, { timeout: 30_000 });
+    assert.equal(await page.textContent('#parting-draw-parts'), '2 parties : 1 en chape supérieure, 1 en chape inférieure');
+    const rows = await segmentRows(page);
+    assert.deepEqual(rows.map((r) => r.name), ['1-2', '2-3', '3-4', '4-1', '5-6', '6-7', '7-8', '8-5']);
+    assert.ok(await page.isVisible('#parting-draw-segments tr.loop-head'));
+    const stats = await partingStats(page);
+    assert.equal(stats['Contre-dépouilles (noyaux, tiroirs)'], '0 % (0 cm²)');
+    assert.match(stats['Longueur de la ligne'], /, 2 boucle\(s\)$/);
+    assert.match(stats['Ligne de joint'], /^plane, à Z = 10 mm$/);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('dessin manuel, deux corps : un clic sur l\'autre corps, un tour puis un point glissé, une masselotte quitte le dessin, la coupe', { timeout: 2 * CAD_TIMEOUT }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    await page.setInputFiles('#file-input', { name: 'blocks.obj', mimeType: 'text/plain', buffer: blocksObj() });
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
+    const bodies = await page.evaluate(() => window.reader3d.result.bodies.map((b) => ({ closed: b.closed, x: b.bbox.min[0] })));
+    const A = bodies.findIndex((b) => b.closed && b.x < 0);
+    await page.click(`#bodies tr[data-index="${A}"] td.name`);
+    await page.click('#parting-draw');
+    await page.selectOption('#parting-draw-plane', 'Z');
+    await page.click('#parting-draw-side');
+    const points = () => page.$$eval('#draw-labels span', (s) => s.length);
+    const front = [0, -1, 0];
+
+    // B (faded) clicked: no point, the hint says so.
+    await faceToward(page, [50, -10, 0], front);
+    await clickModel(page, [50, -10, 0]);
+    assert.match(await page.textContent('#parting-hint'), /autre corps/);
+    assert.equal(await points(), 0);
+    // Two points on A's front face.
+    await faceToward(page, [-50, -10, 0], front);
+    await clickModel(page, [-80, -10, 0]);
+    await clickModel(page, [-30, -10, 0]);
+    assert.equal(await points(), 2);
+    const length = async () => (await segmentRows(page))[0].length;
+    const first = await length();
+    assert.equal(first, '50 mm');
+
+    // A turn there and back, the view dragged by hand: the drawing goes on, nothing lost.
+    await page.click('#turn-right');
+    await page.click('#turn-left');
+    const view = await page.locator('#viewport canvas').boundingBox();
+    const eye = (await page.evaluate(() => window.reader3d.view)).position;
+    await page.mouse.move(view.x + 0.5 * view.width, view.y + 0.85 * view.height);
+    await page.mouse.down();
+    await page.mouse.move(view.x + 0.53 * view.width, view.y + 0.85 * view.height, { steps: 5 });
+    await page.mouse.up();
+    assert.notDeepEqual((await page.evaluate(() => window.reader3d.view)).position, eye);
+    assert.equal(await points(), 2);
+    assert.equal(await page.evaluate(() => document.getElementById('parting-draw').classList.contains('active')), true);
+    // Point 2 dragged along the face: its segment laid again, the view not turned; undone.
+    await faceToward(page, [-30, -10, 0], front);
+    const eye2 = (await page.evaluate(() => window.reader3d.view)).position;
+    const from = await page.evaluate(() => window.reader3d.screenOf([-30, -10, 0]));
+    const to = await page.evaluate(() => window.reader3d.screenOf([-55, -10, 0]));
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(to.x, to.y, { steps: 8 });
+    await page.mouse.up();
+    await page.waitForFunction((l) => document.querySelector('#parting-draw-segments tr[data-seg="0:0"] td:nth-child(3)').textContent !== l, first);
+    const moved = Number((await length()).replace(' mm', '').replace(',', '.'));
+    assert.ok(Math.abs(moved - 25) < 2, `point 2 dragged: ${moved}`);
+    assert.deepEqual((await page.evaluate(() => window.reader3d.view)).position, eye2);
+    assert.equal(await points(), 2);
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.press('Control+z');
+    assert.equal(await length(), first);
+
+    // A riser to place: the drawing left (kept), the view's controls gone.
+    await page.waitForSelector('#feeding-main:not([hidden])', { timeout: 60_000 });
+    await page.click('#feeding-add');
+    assert.equal(await page.evaluate(() => document.getElementById('parting-draw').classList.contains('active')), false);
+    assert.equal(await page.isHidden('#draw-overlay'), true);
+    assert.equal(await page.textContent('#parting-draw-kept'), 'Tracé en cours gardé : 2 points');
+    await page.click('#feeding-add');
+
+    // Back to the drawing, the section on (Z at mid-height: z ≤ 10 kept): a point on the kept side placed, one on the side cut away not.
+    await page.click('#parting-draw');
+    assert.equal(await points(), 2);
+    await page.click('#toggle-section');
+    await page.click('#parting-draw-side');
+    await faceToward(page, [-50, -10, 0], front);
+    await clickModel(page, [-50, -10, 0]);
+    assert.equal(await points(), 3);
+    await clickModel(page, [-50, -10, 30]);
+    assert.equal(await points(), 3);
     assert.deepEqual(errors, []);
     await context.close();
   });
