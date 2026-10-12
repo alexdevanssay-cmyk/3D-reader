@@ -109,7 +109,8 @@ closed mesh, in a worker after the analysis (`feedworker.js`), kept with the res
 - **Risers**: a cylinder H = 1.5 D whose modulus, its contact face excluded (M = 3D/14), is
   at least 1.2 × the zone's (Wlodawer); open on top over the hot spot (on a face of it
   turned up, its footprint held by the part, along the draw direction, +Z without a parting
-  line), or blind on the side at the parting line when the hot spot is closer to the joint.
+  line), or blind on the side at the parting line when the hot spot is closer to the joint
+  (beside the part, both its ends cool: M = 3D/16).
   Zones under 1 % of the volume get none (a local cooling or a chill); 8 risers at most,
   the largest moduli first, the zones left listed as hot spots without a riser.
 - **Ingate**: on the outer outline of the parting line, not next to an undercut, the lowest

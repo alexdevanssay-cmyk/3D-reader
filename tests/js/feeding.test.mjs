@@ -325,6 +325,10 @@ describe('risers and ingate by hand', () => {
     assert.match(top.why, /^Placée à la main/);
     const side = riserFromPoint([0, 30, 5], { triangle: triangleAt([0, 30, 5]), zones, positions: mesh.positions, indices: mesh.indices, direction: parting.direction });
     assert.deepEqual([side.type, side.open, side.offset], ['side', false, [-1, 0, 0]]);
+    // Beside the part: sized with both its ends cooling, larger than on top; and so when resized.
+    assert.deepEqual({ ...side, ...sizeRiser(zones.zones[0].modulus_mm, { type: 'side' }) }, side);
+    assert.ok(side.diameter_mm > top.diameter_mm);
+    approx(resizeRiser(side, { diameter: 32, height: 48 }).riser_modulus_mm, 6, 1e-9, 0, 'M = 3D/16 beside');
     // D and H typed in: the volume, the modulus and the mass follow.
     const resized = resizeRiser(top, { diameter: 40, height: 50, density: 2.7 });
     assert.deepEqual([resized.diameter_mm, resized.height_mm, resized.sized_by_hand], [40, 50, true]);
@@ -373,6 +377,21 @@ describe('sizes', () => {
       assert.ok((3 * (r.diameter_mm - 1)) / 14 < 1.2 * m);
     }
     approx(sizeRiser(0, { diameter: 14, height: 21 }).riser_modulus_mm, 3, 1e-9, 0, 'M = 3D/14');
+  });
+
+  test('a blind riser beside the part: both its ends cool, M = 3D/16 at least 1.2 × the zone', () => {
+    // V / (side + both ends) of a cylinder D × H.
+    const cooled = (r) => (Math.PI * r.diameter_mm ** 2 * r.height_mm / 4) / (Math.PI * r.diameter_mm * r.height_mm + Math.PI * r.diameter_mm ** 2 / 2);
+    for (const m of [1, 2.5, 5, 10]) {
+      const r = sizeRiser(m, { type: 'side' });
+      assert.equal(r.height_mm, Math.ceil(1.5 * r.diameter_mm));
+      approx(r.riser_modulus_mm, cooled(r), 0, 1e-3, `${m}: the modulus with both ends`);
+      assert.ok(r.riser_modulus_mm >= 1.2 * m - 1e-9, `${m}: ${r.riser_modulus_mm}`);
+      assert.ok((3 * (r.diameter_mm - 1)) / 16 < 1.2 * m);
+    }
+    // A zone of modulus 5: D 32 × H 48 (28 × 42 on top), modulus 6.
+    assert.deepEqual([sizeRiser(5, { type: 'side' }).diameter_mm, sizeRiser(5, { type: 'side' }).height_mm, sizeRiser(5).diameter_mm], [32, 48, 28]);
+    approx(sizeRiser(0, { diameter: 16, height: 24, type: 'side' }).riser_modulus_mm, 3, 1e-9, 0, 'M = 3D/16');
   });
 
   test('an ingate: 0.7 × the wall thick, 3 × as wide, to the half millimetre', () => {

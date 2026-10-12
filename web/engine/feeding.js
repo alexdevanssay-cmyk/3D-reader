@@ -729,21 +729,27 @@ function closestOnTriangle(P, I, f, p, out) {
 
 /**
  * A riser of modulus at least RISER_MODULUS_FACTOR × `modulus` (mm): a
- * cylinder H = RISER_ASPECT × D whose contact face with the casting does not
- * cool. With H = 1.5 D:
+ * cylinder H = RISER_ASPECT × D. On top of the casting (type "top"), its
+ * contact face with it does not cool. With H = 1.5 D:
  *   V = πD²H/4 = 3πD³/8, A = πDH + πD²/4 = 7πD²/4 (the side and the top),
  *   M = V/A = 3D/14, so D = 14 M / 3.
+ * Beside it (type "side", blind, standing on the parting plane), it touches
+ * the casting along a strip of its side and both its ends cool (the strip
+ * counted as cooling: on the safe side):
+ *   A = πDH + πD²/2 = 2πD², M = 3D/16, so D = 16 M / 3.
  * D rounded up to the millimetre, H too; or the D and H given (by hand).
  * Returns {diameter_mm, height_mm, volume_mm3, riser_modulus_mm}.
  */
-export function sizeRiser(modulus, { diameter = null, height = null } = {}) {
+export function sizeRiser(modulus, { diameter = null, height = null, type = 'top' } = {}) {
   const aspect = RISER_ASPECT;
-  // M of a cylinder D across, aspect × D high, without its contact face: D·aspect / (4·aspect + 1).
-  const perD = aspect / (4 * aspect + 1);
+  // The ends that cool: the top only (on the casting), or both (beside it).
+  const ends = type === 'side' ? 2 : 1;
+  // M of a cylinder D across, aspect × D high: D·aspect / (4·aspect + ends).
+  const perD = aspect / (4 * aspect + ends);
   const D = diameter > 0 ? diameter : Math.max(1, Math.ceil((RISER_MODULUS_FACTOR * Math.max(0, modulus)) / perD - 1e-9));
   const H = height > 0 ? height : Math.ceil(aspect * D - 1e-9);
   const volume = (Math.PI * D * D * H) / 4;
-  const cooling = Math.PI * D * H + (Math.PI * D * D) / 4;
+  const cooling = Math.PI * D * H + (ends * Math.PI * D * D) / 4;
   return { diameter_mm: round(D, 2), height_mm: round(H, 2), volume_mm3: round(volume, 1), riser_modulus_mm: round(volume / cooling, 3) };
 }
 
@@ -882,20 +888,22 @@ function placeRiser(ctx, z, patch, tops, n) {
       if (out) side = { point: best.p, out };
     }
   }
-  const base = {
+  const base = (sized) => ({
     id: `R${n}`,
     zone: z.id,
     zone_sphere_mm: z.sphere_mm,
     modulus_mm: z.modulus_mm,
-    ...size,
-    mass_g: massOf(size.volume_mm3, ctx.density),
+    ...sized,
+    mass_g: massOf(sized.volume_mm3, ctx.density),
     axis: roundVec(ctx.d, 6),
     source: 'proposed',
-  };
+  });
   if (side) {
-    const params = { sphere: fr(z.sphere_mm), modulus: fr(z.modulus_mm, 2), riser: fr(size.riser_modulus_mm, 2) };
+    // Beside the part: both its ends cool, larger than on top.
+    const beside = sizeRiser(z.modulus_mm, { type: 'side' });
+    const params = { sphere: fr(z.sphere_mm), modulus: fr(z.modulus_mm, 2), riser: fr(beside.riser_modulus_mm, 2) };
     return {
-      ...base,
+      ...base(beside),
       type: 'side',
       open: false,
       position_mm: roundVec(side.point.at),
@@ -908,7 +916,7 @@ function placeRiser(ctx, z, patch, tops, n) {
   const params = { sphere: fr(z.sphere_mm), modulus: fr(z.modulus_mm, 2), riser: fr(size.riser_modulus_mm, 2) };
   const reason = top.highest ? 'highest_face_of_zone' : 'isolated_hot_spot_top';
   return {
-    ...base,
+    ...base(size),
     type: 'top',
     open: true,
     position_mm: roundVec(top.contact),
@@ -1357,8 +1365,8 @@ export function riserFromPoint(point, { triangle = -1, zones, normal = null, dir
   }
   const sphere = z?.sphere_mm ?? (triangle >= 0 ? zones?.sphere?.[triangle] ?? null : null);
   const modulus = z?.modulus_mm ?? (sphere != null ? HOT_SPOT_MODULUS * sphere : 0);
-  const size = sizeRiser(modulus, { diameter, height });
   const top = !n || dot(n, d) >= 0.5;
+  const size = sizeRiser(modulus, { diameter, height, type: top ? 'top' : 'side' });
   // Beside the part, square to d, on the side the face looks to.
   const offset = top ? null : normalize(sub(n, d.map((x) => x * dot(n, d))));
   const byHand = diameter > 0 || height > 0;
@@ -1385,7 +1393,7 @@ export function riserFromPoint(point, { triangle = -1, zones, normal = null, dir
 
 /** A riser with another D and H (typed by hand): its volume, modulus and mass again. */
 export function resizeRiser(riser, { diameter = null, height = null, density = null } = {}) {
-  const size = sizeRiser(riser.modulus_mm ?? 0, { diameter: diameter ?? riser.diameter_mm, height: height ?? riser.height_mm });
+  const size = sizeRiser(riser.modulus_mm ?? 0, { diameter: diameter ?? riser.diameter_mm, height: height ?? riser.height_mm, type: riser.type });
   return { ...riser, ...size, mass_g: massOf(size.volume_mm3, density), sized_by_hand: true, reason: riser.source === 'manual' ? 'manual_sized' : riser.reason, why: riser.source === 'manual' ? 'Placée et dimensionnée à la main.' : `${riser.why} Dimensions modifiées à la main.` };
 }
 
