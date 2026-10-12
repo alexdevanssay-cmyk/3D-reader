@@ -16,6 +16,7 @@ import {
   FEEDING_VERSION, METHOD as FEEDING_METHOD, feedingContext, feedingYield, feeds, gateFromPoint, hotSpotsWithoutRiser,
   resizeRiser, riserFromPoint,
 } from "./engine/feeding.js";
+import { capOrders, capQuad, planeCutsBox } from "./section.js";
 
 // ---------------------------------------------------------------- units
 
@@ -54,7 +55,8 @@ function fmtMass(mm3, density) {
 // ---------------------------------------------------------------- scene
 
 const viewport = $("viewport");
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+// A stencil buffer: the section closes the solids it cuts (syncCaps; three.js 0.180 has none by default).
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, stencil: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.localClippingEnabled = true;
 viewport.appendChild(renderer.domElement);
@@ -129,6 +131,7 @@ resize();
 
 renderer.setAnimationLoop(() => {
   controls.update();
+  syncCaps();
   renderer.render(scene, camera);
 });
 
@@ -1029,6 +1032,153 @@ function updateSection() {
   // Keeps points where n·p + c >= 0
   sectionPlane.normal.copy(n);
   sectionPlane.constant = sectionFlip ? -pos : pos;
+}
+
+// The section closes the solids it cuts: each closed body shown (not an open
+// one, nor one faded), each riser and the ingate gets a cap lying in the
+// section plane, drawn where the plane is inside it. The stencil buffer
+// counts per pixel the back faces of the solid clipped by the plane up and
+// its front faces down, along the whole ray (no depth test): what is left is
+// non-zero where the ray meets the plane inside the solid (three.js
+// webgl_clipping_stencil). One solid after the other (increasing render
+// orders), each cap resetting the count wherever it is drawn: solids of
+// different colours do not mix. A cap is the solid's colour, darker (the
+// neutral grey of the parting display, the grey of no value under the
+// thickness colours); opaque, drawn after the opaque bodies and before the
+// translucent overlays; translucent for a body seen through (a thickness
+// highlight). The halves of the mould are a display round the part, not
+// material: cut, not capped. The caps are not in state.meshes: clicks go
+// through them, as before. Followed at each frame (syncCaps): the plane
+// moved or flipped, another model or tab, the risers or the ingate changed,
+// a body shown or hidden; nothing drawn without the section.
+const capGroup = new THREE.Group();
+scene.add(capGroup);
+let caps = []; // {target, kind ("body" | "riser" | "gate"), geometry, translucent, group, stencil, cap, last}
+const CAP_SHADE = 0.75; // a body's cut darker than its faces: material, not a face
+const CAP_GLOW = 0.4;
+const CAP_SEE_THROUGH = 0.45;
+const capColor = new THREE.Color();
+const capBox = new THREE.Box3();
+
+/** The materials counting a solid's faces: its back faces up, its front faces down; [opaque pass, translucent pass]. */
+const capCounters = [false, true].map((transparent) => [
+  [THREE.BackSide, THREE.IncrementWrapStencilOp],
+  [THREE.FrontSide, THREE.DecrementWrapStencilOp],
+].map(([side, op]) => new THREE.MeshBasicMaterial({
+  side, transparent, colorWrite: false, depthWrite: false, depthTest: false, clippingPlanes: [sectionPlane],
+  stencilWrite: true, stencilFunc: THREE.AlwaysStencilFunc, stencilFail: op, stencilZFail: op, stencilZPass: op,
+})));
+
+/** Whether an object is drawn: it and its parents visible, in the scene. */
+function shownInScene(o) {
+  for (; o; o = o.parent) {
+    if (!o.visible) return false;
+    if (o === scene) return true;
+  }
+  return false;
+}
+
+/** The solids the section closes, in drawing order: the bodies, then the risers and the ingate (over them where they meet). */
+function capTargets() {
+  if (!sectionOn || state.bounds.isEmpty()) return [];
+  const bodies = [], markers = [];
+  for (const mesh of state.meshes) {
+    if (!shownInScene(mesh)) continue;
+    if (state.result?.bodies[mesh.userData.index]?.closed && !mesh.userData.faded) {
+      bodies.push({ target: mesh, kind: "body", geometry: mesh.userData.indexed ?? mesh.geometry, translucent: mesh.material.transparent });
+    }
+    mesh.userData.feedingOverlay?.traverse((o) => {
+      if (o.userData.cap && o.visible) markers.push({ target: o, kind: o.userData.cap, geometry: o.geometry, translucent: false });
+    });
+  }
+  return [...bodies, ...markers];
+}
+
+/** The caps of these solids, those before freed. */
+function buildCaps(want) {
+  for (const { cap } of caps) {
+    cap.geometry.dispose();
+    cap.material.dispose();
+  }
+  capGroup.clear();
+  const orders = capOrders(want.length);
+  caps = want.map((w, k) => {
+    const [countOrder, capOrder] = orders[k];
+    const stencil = capCounters[w.translucent ? 1 : 0].map((material) => {
+      const m = new THREE.Mesh(w.geometry, material);
+      m.matrixAutoUpdate = false; // the solid's place, copied at each frame
+      m.renderOrder = countOrder;
+      return m;
+    });
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(12), 3));
+    geometry.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(12), 3));
+    geometry.setIndex([0, 1, 2, 0, 2, 3]);
+    // Drawn where the count is not 0, which it sets back to 0 wherever it is drawn (seen from either side).
+    const cap = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
+      metalness: 0.15, roughness: 0.55, side: THREE.DoubleSide, // lit as the bodies are
+      transparent: w.translucent, opacity: w.translucent ? CAP_SEE_THROUGH : 1, depthWrite: !w.translucent,
+      stencilWrite: true, stencilRef: 0, stencilFunc: THREE.NotEqualStencilFunc,
+      stencilFail: THREE.ReplaceStencilOp, stencilZFail: THREE.ReplaceStencilOp, stencilZPass: THREE.ReplaceStencilOp,
+    }));
+    cap.renderOrder = capOrder;
+    cap.frustumCulled = false;
+    const group = new THREE.Group();
+    group.add(...stencil, cap);
+    capGroup.add(group);
+    return { ...w, group, stencil, cap, last: null };
+  });
+}
+
+/**
+ * The colour of a solid's cap: a riser's or the ingate's own (opaque, where
+ * their faces are translucent); a body's own, darker (the neutral grey of the
+ * parting display, the grey of no value under the thickness colours).
+ */
+function capColorOf({ target, kind }) {
+  if (kind !== "body") return capColor.copy(target.material.color);
+  if (target.userData.parting) capColor.copy(PARTING_FACE);
+  else if (target.material.vertexColors) capColor.copy(NO_VALUE);
+  else capColor.copy(target.userData.color);
+  return capColor.multiplyScalar(CAP_SHADE);
+}
+
+/** The caps as the view now is (before each frame): built again when the solids changed, else put on the plane where it cuts them. */
+function syncCaps() {
+  const want = capTargets();
+  if (want.length !== caps.length || want.some((w, k) => w.target !== caps[k].target || w.geometry !== caps[k].geometry || w.translucent !== caps[k].translucent)) buildCaps(want);
+  const { normal, constant } = sectionPlane;
+  for (const entry of caps) {
+    const { target, geometry, group, stencil, cap } = entry;
+    target.updateWorldMatrix(true, false);
+    if (!geometry.boundingBox) geometry.computeBoundingBox();
+    capBox.copy(geometry.boundingBox).applyMatrix4(target.matrixWorld);
+    const box = { min: capBox.min.toArray(), max: capBox.max.toArray() };
+    group.visible = planeCutsBox(normal.toArray(), constant, box);
+    if (!group.visible) continue;
+    for (const m of stencil) {
+      m.matrix.copy(target.matrixWorld);
+      m.matrixWorldNeedsUpdate = true;
+    }
+    cap.material.color.copy(capColorOf(entry));
+    // A body's glow when selected; a riser or the ingate lit from within a little: its own colour at any angle, where a lit face would turn brown.
+    if (entry.kind === "body") cap.material.emissive.copy(target.material.emissive);
+    else cap.material.emissive.copy(capColor).multiplyScalar(CAP_GLOW);
+    // On the plane, over the solid's box: set again when either moved.
+    const now = [normal.x, normal.y, normal.z, constant, ...box.min, ...box.max];
+    if (entry.last && now.every((x, k) => x === entry.last[k])) continue;
+    entry.last = now;
+    const quad = capQuad(now.slice(0, 3), constant, box);
+    if (!quad) continue;
+    const position = cap.geometry.attributes.position;
+    const normals = cap.geometry.attributes.normal;
+    position.array.set(quad);
+    for (let k = 0; k < 4; k++) normals.setXYZ(k, normal.x, normal.y, normal.z);
+    position.needsUpdate = normals.needsUpdate = true;
+  }
+  // What the section closes, for scripts and tests: "body riser gate"…
+  const shown = caps.filter((c) => c.group.visible).map((c) => c.kind).join(" ");
+  if (viewport.dataset.caps !== shown) viewport.dataset.caps = shown;
 }
 
 // ---------------------------------------------------------------- events
@@ -2999,6 +3149,7 @@ function applyFeeding() {
   const i = feedingBody();
   const field = f?.show && i >= 0 && state.meshes[i] ? feedingField(i) : null;
   $("feeding-card").dataset.markers = field ? String(field.risers.length + (field.gate ? 1 : 0)) : "0";
+  $("feeding-card").dataset.gateTip = "";
   // The other bodies faded, or given back (the colours of the view again).
   if (fadeStale()) applyThickness();
   if (!field) return;
@@ -3022,6 +3173,7 @@ function applyFeeding() {
     cylinder.renderOrder = ORDER_MARKERS;
     cylinder.userData.own = true;
     cylinder.userData.riser = riser.id;
+    cylinder.userData.cap = "riser"; // a solid: closed by the section (syncCaps)
     group.add(cylinder);
   }
   if (field.gate) {
@@ -3043,11 +3195,19 @@ function applyFeeding() {
       part.position.copy(tip).addScaledVector(dir, -along);
       part.renderOrder = ORDER_MARKERS;
       part.userData.own = true;
+      part.userData.cap = "gate";
       group.add(part);
     }
   }
   mesh.add(group);
   mesh.userData.feedingOverlay = group;
+  // Where the tip of the arrow is drawn (mm), for scripts and tests: the cone's apex, on the ingate's point.
+  const cone = group.children.find((o) => o.userData.cap === "gate");
+  if (cone) {
+    cone.updateWorldMatrix(true, false);
+    const apex = cone.localToWorld(new THREE.Vector3(0, cone.geometry.parameters.height / 2, 0));
+    $("feeding-card").dataset.gateTip = JSON.stringify(apex.toArray().map((x) => Math.round(x * 1e4) / 1e4));
+  }
 }
 
 // ---- card

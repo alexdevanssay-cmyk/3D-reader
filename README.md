@@ -59,7 +59,9 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   [Risers and gating](#risers-and-gating-method-and-limits).
 - Assemblies: one row per part with names and colours from the STEP file, per-part
   volume and share, show/hide, and click a part in 3D to select it.
-- Viewer: orbit, pan, zoom, standard views, wireframe, envelope display, section plane.
+- Viewer: orbit, pan, zoom, standard views, wireframe, envelope display, section plane
+  (the solids it cuts, bodies, risers and ingate, are closed: the cut shows as a solid
+  face, a body's darker than its own colour; open bodies and the mould halves stay open).
 - **Costing of cast parts** (tabs *Chiffrage* and *Paramètres*, in French): import the
   SAB costing workbook (.xlsm) and the metal prices file (sheet « Suivi indice »); the
   page recomputes the hourly costs of the profit centres and the cost price (PRI) and
