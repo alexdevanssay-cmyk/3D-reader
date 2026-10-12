@@ -159,6 +159,16 @@ export function parseDirection(text) {
     v["xyz".indexOf(axis[2].toLowerCase())] = axis[1] === "-" ? -1 : 1;
     return v;
   }
+  const v = parseTriple(s);
+  return v ? snapDirection(v) : null;
+}
+
+/**
+ * Three numbers typed in: "40 ; 10 ; 15,9", "40, 10, 15.9", "(40, 10, 15.9)",
+ * "0,6 0 0,8"… as [x, y, z] (not normalised), or null.
+ */
+export function parseTriple(text) {
+  const s = String(text ?? "").replace(/[()]/g, "").trim();
   // With a decimal point, commas are separators too; else spaces or semicolons
   // between the components (then a comma is a decimal comma, a comma at the
   // end of a component a separator), else commas.
@@ -168,7 +178,7 @@ export function parseDirection(text) {
       ? s.split(/[\s;]+/).map((x) => x.replace(/,$/, "").replace(",", "."))
       : s.split(",");
   if (parts.length !== 3 || parts.some((x) => !/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(x))) return null;
-  return snapDirection(parts.map(Number));
+  return parts.map(Number);
 }
 
 // ------------------------------------------------------------------ candidates
@@ -722,19 +732,14 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
   }
 
   const m = pieces.length;
-  const segments = new Float32Array(6 * m);
-  if (!m) return { segments, length_mm: 0, loops: 0, planar: null, kind: null, height_range_mm: null, heights_mm: null, level: null, levels: [] };
-  const hOf = (p) => p[0] * d[0] + p[1] * d[1] + p[2] * d[2];
-  let length = 0, lo = Infinity, hi = -Infinity;
-  const lengths = new Float64Array(m);
+  // The ends measured in double precision, written to float32 for the display.
+  const ends = new Float64Array(6 * m);
   pieces.forEach(([a, b], k) => {
-    segments.set(a, 6 * k);
-    segments.set(b, 6 * k + 3);
-    lengths[k] = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
-    length += lengths[k];
-    lo = Math.min(lo, hOf(a), hOf(b));
-    hi = Math.max(hi, hOf(a), hOf(b));
+    ends.set(a, 6 * k);
+    ends.set(b, 6 * k + 3);
   });
+  const segments = Float32Array.from(ends);
+  if (!m) return { segments, length_mm: 0, loops: 0, planar: null, kind: null, height_range_mm: null, heights_mm: null, level: null, levels: [] };
 
   // Loops: the pieces chained by their ends.
   const byEnd = new Map();
@@ -764,12 +769,46 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
       }
     }
   }
+  const shape = lineShape(ends, d, { height, loops });
+  return { segments, length_mm: shape.length_mm, loops, planar: shape.planar, kind: shape.kind, height_range_mm: shape.height_range_mm, heights_mm: shape.heights_mm, level: shape.level, levels: shape.levels };
+}
+
+/**
+ * Shape of a parting line from its pieces (Float64Array, xyz of both ends of
+ * each, in double precision): its length, its heights along d, planar (95 %
+ * of its length within the planarity tolerance of one height), stepped (most
+ * of it in level runs at two heights or more) or warped. Shared by the line
+ * of a split into halves (partingLine) and the line drawn by hand.
+ *
+ * height -- of the part along d, for the planarity tolerance (else the span of the line)
+ * loops -- the number of loops of the line, counted by the caller
+ * Returns {length_mm, planar, kind ("planar", "stepped", "warped", or null
+ * without a line), height_range_mm, heights_mm [lowest, highest] along d,
+ * level (the median height by length), levels (heights of its level runs),
+ * loops}.
+ */
+export function lineShape(pieces, d, { height = null, loops = 0 } = {}) {
+  const m = Math.floor(pieces.length / 6);
+  if (!m) return { length_mm: 0, planar: null, kind: null, height_range_mm: null, heights_mm: null, level: null, levels: [], loops };
+  const hOf = (k) => pieces[k] * d[0] + pieces[k + 1] * d[1] + pieces[k + 2] * d[2];
+  let length = 0, lo = Infinity, hi = -Infinity;
+  const lengths = new Float64Array(m);
+  const ha = new Float64Array(m), hb = new Float64Array(m);
+  for (let k = 0; k < m; k++) {
+    const s = 6 * k;
+    lengths[k] = Math.hypot(pieces[s + 3] - pieces[s], pieces[s + 4] - pieces[s + 1], pieces[s + 5] - pieces[s + 2]);
+    length += lengths[k];
+    ha[k] = hOf(s);
+    hb[k] = hOf(s + 3);
+    lo = Math.min(lo, ha[k], hb[k]);
+    hi = Math.max(hi, ha[k], hb[k]);
+  }
 
   const span = hi - lo;
   const tol = Math.max(PLANAR_TOL_MM, PLANAR_TOL_SHARE * (height ?? span));
   // Planar: 95 % of its length within ±tol of one height (the median). A line
   // along the edges of a curved silhouette zigzags by a facet: still planar.
-  const byHeight = pieces.map(([a, b], k) => [(hOf(a) + hOf(b)) / 2, lengths[k], Math.abs(hOf(b) - hOf(a)) / 2]).sort((x, y) => x[0] - y[0]);
+  const byHeight = Array.from({ length: m }, (_, k) => [(ha[k] + hb[k]) / 2, lengths[k], Math.abs(hb[k] - ha[k]) / 2]).sort((x, y) => x[0] - y[0]);
   let median = byHeight[0][0];
   for (let k = 0, acc = 0; k < m; k++) {
     if ((acc += byHeight[k][1]) >= length / 2) {
@@ -783,11 +822,11 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
   // Stepped: most of its length in level runs, at two heights or more; else warped.
   const runs = [];
   let levelLength = 0;
-  pieces.forEach(([a, b], k) => {
-    if (Math.abs(hOf(b) - hOf(a)) > tol) return;
+  for (let k = 0; k < m; k++) {
+    if (Math.abs(hb[k] - ha[k]) > tol) continue;
     levelLength += lengths[k];
-    runs.push([(hOf(a) + hOf(b)) / 2, lengths[k]]);
-  });
+    runs.push([(ha[k] + hb[k]) / 2, lengths[k]]);
+  }
   runs.sort((x, y) => x[0] - y[0]);
   const levels = [];
   for (const [h, len] of runs) {
@@ -801,7 +840,7 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
   // Levels of at least 5 % of the line (a few level pieces of a warped line are not steps).
   const kept = levels.filter((l) => l.length >= 0.05 * length).map((l) => l.sum / l.length);
   const kind = planar ? "planar" : levelLength >= 0.6 * length && kept.length >= 2 ? "stepped" : "warped";
-  return { segments, length_mm: length, loops, planar, kind, height_range_mm: span, heights_mm: [lo, hi], level: median, levels: kept };
+  return { length_mm: length, planar, kind, height_range_mm: span, heights_mm: [lo, hi], level: median, levels: kept, loops };
 }
 
 // ------------------------------------------------------------------ faces
