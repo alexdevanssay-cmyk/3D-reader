@@ -12,6 +12,7 @@ import { cacheKey, loadResult, saveResult } from './cache.js';
 import { readShared, sharedState, writeShared } from './shared-cache.js';
 import { cancelThickness, thicknessOnAllCores, warmThicknessPool } from './thickpool.js';
 import { THICKNESS_VERSION, currentThickness } from './thickness.js';
+import { restoreHoles } from './holes.js';
 
 export { warmThicknessPool };
 
@@ -159,6 +160,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
     if (kept?.data) {
       // A thickness kept by another version of its computation (or of none): computed again.
       const thickness = currentThickness(kept.thickness) ? kept.thickness : null;
+      await withHoles(key, kept.data, kept.holes, onProgress);
       // Kept before the shared folder was chosen, or when it could not be reached: written there now.
       const state = await sharedState().catch(() => 'none');
       if (state === 'granted') share(key, { data: kept.data, thickness, replace: false });
@@ -171,6 +173,7 @@ export async function analyzeInBrowser(file, { unit = 'auto', quality = 'normal'
     const shared = await readFromNetwork(key, onProgress);
     if (shared.state === 'read') {
       keep(key, shared, file.name);
+      await withHoles(key, shared.data, null, onProgress);
       return { ...shared.data, file: file.name, cacheKey: key, cached: true, cachedFrom: 'network', cachedThickness: shared.thickness, elapsed_s: Math.round(performance.now() - start) / 1000 };
     }
     networkNote = noteOf(shared);
@@ -232,6 +235,28 @@ export async function saveThickness(key, results, bodies = null) {
   const kept = await saveResult(key, { thickness: versioned });
   if (kept && bodies) share(key, { thickness: versioned, bodies });
   return kept;
+}
+
+/**
+ * The holes of results kept by a version that did not measure them (see
+ * holes.js restoreHoles): those measured since, else measured now in the
+ * engine worker (a mesh ray cast, no OpenCascade) and kept with the results.
+ * Not measured (left provisional) when the worker fails; stopped by cancelAll.
+ */
+async function withHoles(key, data, kept, onProgress) {
+  let records;
+  try {
+    records = await restoreHoles(data.bodies, kept, (bodies) => {
+      onProgress?.({ stage: 'analyze', percent: 97, step: 'holes' });
+      return call({ type: 'holes', bodies });
+    });
+  } catch (err) {
+    if (err.cancelled) throw err;
+    console.warn('Holes not measured', err);
+    return;
+  }
+  // Added to the results kept, once they are (read from the shared folder: being written).
+  if (records) (saving.get(key) ?? Promise.resolve()).catch(() => {}).then(() => saveResult(key, { holes: records }));
 }
 
 // ------------------------------------------------------------------ the shared network folder

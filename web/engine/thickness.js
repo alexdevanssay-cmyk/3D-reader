@@ -95,6 +95,16 @@ export function withQueries({ query, ...data }) {
 }
 
 /**
+ * Lines cast on a triangle mesh (holes.js): ray(p, d, tMin, hit) is the
+ * distance along the ray (p, unit d) to the first triangle beyond tMin
+ * (Infinity when none), the index of that triangle in hit[0]. Only the
+ * hierarchy the rays need (no planes for the closest-point searches).
+ */
+export function rayCaster(positions, indices) {
+  return { ray: makeQueries(buildBvh(positions, indices, undefined, { planes: false })).ray };
+}
+
+/**
  * The triangle on the other side of each edge (3 per triangle, edge e from
  * vertex e to vertex e + 1): -1 on a free edge, -2 on an edge shared by more
  * than two triangles. Found with an open-addressing hash of the edges.
@@ -410,7 +420,7 @@ function triangleNormals(pos, idx, alloc = (Type, n) => new Type(n)) {
  * each); node i has bounds box[6i..6i+5] and either two children (left = i+1,
  * right = right[i]) or a leaf range [start[i], start[i] + count[i]).
  */
-function buildBvh(pos, idx, alloc = (Type, n) => new Type(n)) {
+function buildBvh(pos, idx, alloc = (Type, n) => new Type(n), { planes: withPlanes = true } = {}) {
   const nt = idx.length / 3;
   const order = alloc(Uint32Array, nt);
   const centre = new Float64Array(3 * nt);
@@ -470,10 +480,11 @@ function buildBvh(pos, idx, alloc = (Type, n) => new Type(n)) {
   const tris = alloc(pos instanceof Float32Array ? Float32Array : Float64Array, 9 * nt);
   // Plane of each triangle (unit normal, offset): the distance to the plane is
   // a cheap lower bound of the distance to the triangle.
-  const planes = alloc(Float64Array, 4 * nt);
+  const planes = withPlanes ? alloc(Float64Array, 4 * nt) : null;
   for (let i = 0; i < nt; i++) {
     const t = order[i];
     for (let k = 0; k < 3; k++) for (let axis = 0; axis < 3; axis++) tris[9 * i + 3 * k + axis] = tri(t, k, axis);
+    if (!planes) continue;
     const o = 9 * i;
     const ux = tris[o + 3] - tris[o], uy = tris[o + 4] - tris[o + 1], uz = tris[o + 5] - tris[o + 2];
     const vx = tris[o + 6] - tris[o], vy = tris[o + 7] - tris[o + 1], vz = tris[o + 8] - tris[o + 2];
@@ -569,8 +580,8 @@ function makeQueries({ box, right, start, count, tris, planes, order }) {
     return best;
   }
 
-  /** Distance along the ray (p, unit d) to the first triangle beyond tMin. */
-  function ray(p, d, tMin) {
+  /** Distance along the ray (p, unit d) to the first triangle beyond tMin (its index in hit[0], when given). */
+  function ray(p, d, tMin, hit = null) {
     const [ox, oy, oz] = p;
     const ix = 1 / d[0], iy = 1 / d[1], iz = 1 / d[2];
     let best = Infinity;
@@ -594,12 +605,19 @@ function makeQueries({ box, right, start, count, tris, planes, order }) {
       if (count[node]) {
         for (let i = start[node], end = i + count[node]; i < end; i++) {
           const t = rayTriangle(tris, 9 * i, ox, oy, oz, d[0], d[1], d[2]);
-          if (t > tMin && t < best) best = t;
+          if (t > tMin && t < best) {
+            best = t;
+            if (hit) hit[0] = order[i];
+          }
         }
         continue;
       }
-      stack[sp++] = right[node];
-      stack[sp++] = node + 1;
+      // The nearer child along the ray (its box centre) on top of the stack:
+      // a near hit prunes the far boxes (the same distance in any order).
+      const l = 6 * (node + 1), r = 6 * right[node];
+      const near = (box[l] + box[l + 3] - box[r] - box[r + 3]) * d[0] + (box[l + 1] + box[l + 4] - box[r + 1] - box[r + 4]) * d[1] + (box[l + 2] + box[l + 5] - box[r + 2] - box[r + 5]) * d[2] <= 0;
+      stack[sp++] = near ? right[node] : node + 1;
+      stack[sp++] = near ? node + 1 : right[node];
     }
     return best;
   }

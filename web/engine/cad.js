@@ -27,6 +27,7 @@
 // every analysed model stayed in memory.
 
 import { meshTopology } from './meshanalysis.js';
+import { measureHoles } from './holes.js';
 
 export const CAD_EXTENSIONS = {
   '.step': 'step',
@@ -809,6 +810,7 @@ function solidBody(ctx, name, solid, color, notes) {
     notes,
     surface_types: surfaceTypes,
     geometric_surfaces: geometricSurfaces,
+    solid: true,
     tri,
   });
 }
@@ -994,11 +996,15 @@ function openBody(ctx, name, shape, color) {
 
 /**
  * Body object of the result contract (same fields as Body.to_dict in model.py),
- * plus surface_types, geometric_surfaces and topology for semantic.js, which the
- * Python engine does not give.
+ * plus surface_types, geometric_surfaces, topology and the holes of a solid
+ * for semantic.js, which the Python engine does not give.
  */
-function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], centroid, closed, color, notes, tri, surface_types, geometric_surfaces }) {
+function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], centroid, closed, color, notes, tri, surface_types, geometric_surfaces, solid = false }) {
   const mesh = { positions: new Float32Array(tri.verts), indices: tri.indices };
+  // In the engine worker, not on the page: about 1.5 s for 2 million triangles.
+  const topology = meshTopology(tri.verts, tri.indices);
+  // Through and blind holes of a solid, measured along the axes of its cylinders on its mesh (holes.js).
+  const holes = solid ? measureHoles(tri.verts, tri.indices, geometric_surfaces, { closed: topology.watertight }) : null;
   // The display copy is float32. When that rounded the vertices, the double-precision
   // ones are kept for the oriented envelope (summary.js), which the Python engine
   // measures on its double-precision vertices (float32 made a thin plate's envelope
@@ -1019,8 +1025,8 @@ function makeBody({ name, volume, mesh_volume, area: surface, bbox: [min, max], 
     notes,
     surface_types: surface_types ?? null,
     geometric_surfaces: geometric_surfaces ?? [],
-    // In the engine worker, not on the page: about 1.5 s for 2 million triangles.
-    topology: meshTopology(tri.verts, tri.indices),
+    topology,
+    ...(holes ? { holes } : {}),
     mesh,
   };
 }

@@ -12,6 +12,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { analyzeCad, CAD_EXTENSIONS, QUALITY } from '../../web/engine/cad.js';
+import { HOLES_VERSION } from '../../web/engine/holes.js';
 import { loadOcctNode } from '../../web/engine/occt.js';
 import { ROOT, approx, approxVec, fixtureBytes, loadExpected } from './helpers.mjs';
 
@@ -354,6 +355,67 @@ describe('CAD specifics', () => {
     assert.equal(hole.edge_count, 2);
     approxVec(hole.axis.map(Math.abs), [0, 0, 1], 0, 1e-12, 'hole axis');
     approxVec(hole.center_mm, [50, 30, 10], 0, 1e-9, 'hole centre');
+  });
+
+  test('holes measured on the mesh: through, blind with a drill point or a flat bottom, counterbored; a boss is none', (t) => {
+    // The fixture: its hole of radius 10 goes through the 20 mm of the block.
+    const [block] = structuredClone(timedAnalyze(t, 'holed_block.step', undefined, undefined, 'holed_block.step (holes)')).bodies;
+    assert.equal(block.holes.version, HOLES_VERSION);
+    assert.equal(block.holes.method, 'axis_rays_on_mesh');
+    const cylinder = block.geometric_surfaces.find((s) => s.type === 'cylinder');
+    assert.equal(block.holes.holes.length, 1);
+    const [through] = block.holes.holes;
+    assert.deepEqual(through.surfaces, [cylinder.index]);
+    assert.equal(through.through, true);
+    assert.equal(through.open_ends, 2);
+    approx(through.diameter_mm, 20, 1e-12, 0, 'diameter');
+    approx(through.length_mm, 20, 1e-9, 0, 'length');
+
+    // A block 120 x 40 x 20 with, along z: a through hole of 10 at x = 20, a
+    // hole of 8 drilled 12 deep with a 118° point at x = 50, a hole of 6
+    // counterbored 12 on 6 mm at x = 80; along x: a hole of 6 with a flat
+    // bottom 15 deep from the end face; on top: a boss of 8, 5 high.
+    const ax = (x, y, z, dx, dy, dz) => new oc.gp_Ax2_3(new oc.gp_Pnt_3(x, y, z), new oc.gp_Dir_4(dx, dy, dz));
+    const cylinder3 = (axes, r, h) => new oc.BRepPrimAPI_MakeCylinder_3(axes, r, h).Shape();
+    const fuse = (a, b) => new oc.BRepAlgoAPI_Fuse_3(a, b, new oc.Message_ProgressRange_1()).Shape();
+    const cut = (a, b) => new oc.BRepAlgoAPI_Cut_3(a, b, new oc.Message_ProgressRange_1()).Shape();
+    const point = 4 / Math.tan((59 * Math.PI) / 180);
+    let shape = box(0, 0, 0, 120, 40, 20);
+    shape = cut(shape, cylinder3(ax(20, 20, -1, 0, 0, 1), 5, 22));
+    shape = cut(shape, fuse(cylinder3(ax(50, 20, 8, 0, 0, 1), 4, 13), new oc.BRepPrimAPI_MakeCone_3(ax(50, 20, 8, 0, 0, -1), 4, 0, point).Shape()));
+    shape = cut(shape, fuse(cylinder3(ax(80, 20, -1, 0, 0, 1), 3, 22), cylinder3(ax(80, 20, 14, 0, 0, 1), 6, 7)));
+    shape = cut(shape, cylinder3(ax(121, 30, 10, -1, 0, 0), 3, 16));
+    shape = fuse(shape, cylinder3(ax(105, 10, 20, 0, 0, 1), 4, 5));
+    const [part] = analyzeCad(oc, brepBytes('holes.brep', shape), 'holes.brep').bodies;
+    const holes = part.holes.holes;
+    const at = (x, y, z) => holes.find((h) => h.surfaces.some((i) => {
+      const s = part.geometric_surfaces[i];
+      const c = s.center_mm;
+      return s.type === 'cylinder' && [x, y, z].every((v, k) => v === null || Math.abs(c[k] - v) < 1e-6);
+    }));
+    assert.equal(holes.length, 4, JSON.stringify(holes));
+    const plain = at(20, 20, null);
+    assert.equal(plain.through, true);
+    approx(plain.length_mm, 20, 1e-9, 0, 'through hole length');
+    const drilled = at(50, 20, null);
+    assert.equal(drilled.through, false);
+    assert.equal(drilled.bottom, 'drill_point');
+    assert.deepEqual(drilled.surfaces.map((i) => part.geometric_surfaces[i].type).sort(), ['cone', 'cylinder']);
+    approx(drilled.depth_mm, 12, 1e-9, 0, 'drilled depth');
+    approx(drilled.tip_depth_mm, 12 + point, 1e-4, 0, 'depth to the tip');
+    approx(drilled.drill_point_angle_deg, 118, 1e-9, 0, 'point angle');
+    approxVec(drilled.axis, [0, 0, -1], 0, 1e-12, 'drilled from the top');
+    const counterbored = at(80, 20, null);
+    assert.equal(counterbored.through, true);
+    assert.deepEqual(counterbored.diameters_mm, [6, 12]);
+    assert.equal(counterbored.surfaces.length, 2);
+    const side = at(null, 30, 10);
+    assert.equal(side.through, false);
+    assert.equal(side.bottom, 'flat');
+    approx(side.depth_mm, 15, 1e-9, 0, 'side hole depth');
+    approxVec(side.axis, [-1, 0, 0], 0, 1e-12, 'drilled from the end face');
+    // The boss (material inside its cylinder) is no hole.
+    assert.equal(at(105, 10, null), undefined);
   });
 
   test('a cone gives the point of its reference radius: it can be rebuilt from its centre', () => {
