@@ -766,7 +766,9 @@ function select(i) {
   });
   document.querySelectorAll("#bodies tr").forEach((tr) => tr.classList.toggle("selected", +tr.dataset.index === i));
   renderBodyDetail();
-  // The parting line card is the body selected's.
+  // The parting line card is the body selected's (a message about the body before it, gone).
+  const p = partingOf();
+  if (p) p.message = null;
   renderParting();
   applyParting();
   document.querySelector("#bodies tr.selected")?.scrollIntoView({ block: "nearest" });
@@ -1749,14 +1751,16 @@ const partClient = () => (partClient.module ??= import("./engine/partclient.js")
 // Per result: {results (per body {proposal, side, flags, plane, segments} or
 // null), pending, percent, error, current (body -> definition by hand), geom
 // (body -> its faces and edges), evaluated (directions classified), show,
-// mode ("pick" | "assign" | null), busy, message, restored}.
+// mode ("pick" | "assign" | null), busy (directions being classified), seq
+// (the choices made on the card: a direction classified after a later
+// choice is not applied), message, restored}.
 const partings = new WeakMap();
 
 function partingOf(r = state.result) {
   if (!r) return null;
   let p = partings.get(r);
   if (!p) {
-    p = { results: null, pending: null, percent: null, error: null, current: new Map(), geom: new Map(), evaluated: new Map(), show: false, mode: null, busy: false, message: null, restored: false };
+    p = { results: null, pending: null, percent: null, error: null, current: new Map(), geom: new Map(), evaluated: new Map(), show: false, mode: null, busy: 0, seq: 0, message: null, restored: false };
     partings.set(r, p);
   }
   return p;
@@ -1901,7 +1905,7 @@ async function partingDirection(i, d) {
   if (sameDirection(d, res.proposal.direction)) return proposalBase(res);
   const key = `${i}|${d.map((x) => x.toFixed(9)).join(",")}`;
   if (p.evaluated.has(key)) return p.evaluated.get(key);
-  p.busy = true;
+  p.busy++;
   renderParting();
   try {
     const client = await partClient();
@@ -1910,7 +1914,7 @@ async function partingDirection(i, d) {
     p.evaluated.set(key, base);
     return base;
   } finally {
-    p.busy = false;
+    p.busy--;
     if (r === state.result) renderParting();
   }
 }
@@ -1926,6 +1930,7 @@ function setPartingDefinition(i, { base, source, overrides = {}, candidate = nul
   const p = partingOf(r);
   const res = p.results[i];
   const moved = Object.keys(overrides).length;
+  p.message = null;
   if (!moved && sameDirection(base.direction, res.proposal.direction)) {
     p.current.delete(i);
     savePartingDef(partIdOf(r), i, null);
@@ -1954,8 +1959,10 @@ function setPartingDefinition(i, { base, source, overrides = {}, candidate = nul
 /** Back to the proposal for body i. */
 function resetParting(i) {
   const p = partingOf();
+  p.seq++; // a direction still being classified is not applied
   p.current.delete(i);
   p.mode = null;
+  p.message = null;
   savePartingDef(partIdOf(state.result), i, null);
   applyParting();
   renderParting();
@@ -1973,7 +1980,10 @@ async function restoreParting() {
     const i = Number(key);
     if (!p.results[i] || !Array.isArray(def?.direction) || def.direction.length !== 3) continue;
     try {
+      const seq = p.seq;
       const base = await partingDirection(i, def.direction);
+      // A choice made on the card meanwhile: it stands.
+      if (seq !== p.seq) return;
       if (r !== state.result) {
         p.restored = false; // finished when its tab is shown again
         return;
@@ -2099,6 +2109,14 @@ function partingClick(hits) {
   const p = partingOf();
   if (!p?.mode) return false;
   const i = partingBody();
+  // The card's body without a parting (open, none, being computed): its
+  // buttons hidden, the mode off; the click selects as usual.
+  if (i < 0 || !partingField(i)) {
+    p.mode = null;
+    p.message = null;
+    renderParting();
+    return false;
+  }
   const hit = hits[0];
   if (!hit) return true;
   if (hit.object.userData.index !== i) {
@@ -2146,9 +2164,11 @@ async function pickPartingFace(i, f) {
   const n = (planar ? sum : normal(f)).map((x) => x * g.outward);
   const d = snapDirection(n);
   if (!d) return;
+  const p = partingOf(r);
+  const seq = ++p.seq;
   try {
     const base = await partingDirection(i, d);
-    if (r === state.result) setPartingDefinition(i, { base, source: "face" });
+    if (r === state.result && seq === p.seq) setPartingDefinition(i, { base, source: "face" });
   } catch (err) {
     showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
   }
@@ -2160,6 +2180,7 @@ function assignPartingFace(i, f, target) {
   if (!field) return;
   const face = partingGeometry(i).region[f];
   const overrides = { ...field.overrides, [face]: target };
+  partingOf().seq++; // a direction still being classified is not applied
   const base = field.manual ? field.base : proposalBase(partingOf().results[i]);
   setPartingDefinition(i, { base, source: field.manual ? field.source : "proposal", overrides, candidate: field.candidate });
 }
@@ -2283,16 +2304,31 @@ $("parting-candidates").addEventListener("click", async (e) => {
   const row = e.target.closest("[data-candidate]");
   const i = partingBody();
   const p = partingOf();
-  if (!row || !p?.results?.[i] || p.busy) return;
+  // Not taken: the radio clicked is not checked (the browser checks it before this runs).
+  if (!row || !p?.results?.[i] || p.busy) {
+    e.preventDefault();
+    return;
+  }
   const k = Number(row.dataset.candidate);
+  const direction = p.results[i].proposal.candidates[k].direction;
+  // The direction in use: as it is, with its faces reassigned by hand.
+  if (sameDirection(direction, partingField(i).direction)) return;
   const r = state.result;
+  const seq = ++p.seq;
   try {
-    const base = await partingDirection(i, p.results[i].proposal.candidates[k].direction);
-    if (r === state.result) setPartingDefinition(i, { base, source: "candidate", candidate: k });
+    const base = await partingDirection(i, direction);
+    if (r === state.result && seq === p.seq) {
+      setPartingDefinition(i, { base, source: "candidate", candidate: k });
+      return;
+    }
   } catch (err) {
     showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
     renderParting();
   }
+  // Not applied (failed, or another choice made meanwhile): the radio of the direction in use checked again.
+  if (r !== state.result) return;
+  htmlShown.delete($("parting-candidates").tBodies[0]);
+  renderParting();
 });
 /** Turn a mode of the 3D view on or off; reassigning faces shows the halves. */
 function setPartingMode(mode) {
@@ -2325,9 +2361,10 @@ async function applyTypedDirection() {
   }
   p.message = null;
   const r = state.result;
+  const seq = ++p.seq;
   try {
     const base = await partingDirection(i, d);
-    if (r === state.result) setPartingDefinition(i, { base, source: "vector" });
+    if (r === state.result && seq === p.seq) setPartingDefinition(i, { base, source: "vector" });
   } catch (err) {
     showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
   }
@@ -2429,6 +2466,8 @@ function showTab(tab) {
     controls.update();
     Object.assign(thick, view.thick);
     thick.statsHtml = null;
+    // The thickness colours turned on in another tab (they are the page's): its parting no longer shown.
+    if (thick.colors || thick.highlight) partingOff();
     showWireframe($("toggle-wire").classList.contains("active"));
     $("drop-hint").hidden = true;
     $("refresh").disabled = false;
