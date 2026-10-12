@@ -1,0 +1,36 @@
+// Worker of the feeding zones (see feeding.js): the hot spots of each body of
+// a model and the zones they feed, for the risers and the ingate placed on the
+// page. Plain JavaScript, no bare imports. A worker of its own: the parting
+// line (its worker) and the wall thickness (pool) do not wait for it, nor a
+// direction chosen by hand for the parting line.
+
+import { FEEDING_VERSION, feedingZones } from './feeding.js';
+
+self.onmessage = ({ data: msg }) => {
+  try {
+    if (msg.type !== 'zones') return;
+    // Bodies: {positions, indices, sphere (inscribed diameters, or null)} or null (open bodies: no inside).
+    const total = Math.max(1, msg.bodies.reduce((n, b) => n + (b ? b.indices.length : 0), 0));
+    let done = 0;
+    let last = -1;
+    const bodies = msg.bodies.map((b) => {
+      if (!b || !b.indices.length) return null;
+      const size = b.indices.length;
+      const { zone, sphere, ...rest } = feedingZones(b.positions, b.indices, {
+        sphere: b.sphere ?? null,
+        onProgress: (f) => {
+          const percent = Math.floor(((done + f * size) / total) * 100);
+          if (percent === last) return;
+          last = percent;
+          postMessage({ type: 'progress', id: msg.id, percent });
+        },
+      });
+      done += size;
+      return { ...rest, zone, sphere };
+    });
+    const buffers = bodies.flatMap((r) => (r ? [r.zone.buffer, r.sphere.buffer] : []));
+    postMessage({ type: 'result', id: msg.id, result: { version: FEEDING_VERSION, bodies } }, buffers);
+  } catch (err) {
+    postMessage({ type: 'error', id: msg.id, message: err?.message || String(err) });
+  }
+};
