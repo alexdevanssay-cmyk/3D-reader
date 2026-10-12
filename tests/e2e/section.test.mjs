@@ -4,8 +4,11 @@
 // its ingate shown, cut through the riser and the part: the cut reads as
 // material (the riser's orange, opaque; the part's own colour, darker), the
 // ingate's arrow tip on the part; the caps follow the plane, go with the
-// section. A model of three bodies: an open one and a faded one not capped,
-// a hidden one neither.
+// section; a click on the cut places nothing on the faces it hides. A model
+// of three bodies: an open one and a faded one not capped, a hidden one
+// neither. Solids overlapping: one cap over both, never a mix; a body whose
+// triangles were turned round: not capped; a body seen through: its cap from
+// the side removed only.
 //
 //   npm run build && node --test tests/e2e/section.test.mjs
 
@@ -23,8 +26,8 @@ const DIST = join(ROOT, 'dist');
 const CAD_TIMEOUT = 180_000;
 const FOV = 40; // the camera of app.js
 
-/** The pixel of the 3D view (CSS px from its top left) where a point (mm) is seen, from reader3d.view. */
-async function project(page, p) {
+/** The pixels of the 3D view (CSS px from its top left) where points (mm) are seen, from reader3d.view. */
+async function projectAll(page, points) {
   const { view, width, height } = await page.evaluate(() => {
     const canvas = document.querySelector('#viewport canvas');
     return { view: window.reader3d.view, width: canvas.clientWidth, height: canvas.clientHeight };
@@ -36,12 +39,17 @@ async function project(page, p) {
   const f = unit(sub(view.target, view.position));
   const r = unit(cross(f, view.up));
   const u = cross(r, f);
-  const d = sub(p, view.position);
   const t = Math.tan((FOV * Math.PI) / 360);
-  const x = dot(d, r) / (dot(d, f) * t * (width / height));
-  const y = dot(d, u) / (dot(d, f) * t);
-  return [Math.round(((x + 1) / 2) * width), Math.round(((1 - y) / 2) * height)];
+  return points.map((p) => {
+    const d = sub(p, view.position);
+    const x = dot(d, r) / (dot(d, f) * t * (width / height));
+    const y = dot(d, u) / (dot(d, f) * t);
+    return [Math.round(((x + 1) / 2) * width), Math.round(((1 - y) / 2) * height)];
+  });
 }
+
+/** The pixel of the 3D view where a point (mm) is seen. */
+const project = async (page, p) => (await projectAll(page, [p]))[0];
 
 /** The colours [r, g, b] of the 3D view at these pixels, once drawn again. */
 async function pixels(page, points) {
@@ -69,6 +77,24 @@ const capsShown = (page) => page.evaluate(() => new Promise((resolve) => {
 const linear = (c) => c.map((v) => ((v / 255) <= 0.04045 ? v / 255 / 12.92 : ((v / 255 + 0.055) / 1.055) ** 2.4));
 const isOrange = ([r, g, b]) => r > 170 && b < 80 && r - g > 50 && g > 60;
 const isPurple = ([r, g, b]) => r > 120 && b > 120 && g < 90;
+const near = (a, b, tol) => a.every((v, k) => Math.abs(v - b[k]) <= tol);
+
+/**
+ * An OBJ file of boxes {material, min, max, flip}: a body per material (none: the body
+ * before), each face counter-clockwise seen from outside but the face `flip` (0..5: -X, +X,
+ * -Y, +Y, -Z, +Z) turned round.
+ */
+function objOf(boxes) {
+  const lines = [];
+  const faces = [];
+  for (const [n, { material, min, max, flip }] of boxes.entries()) {
+    for (let i = 0; i < 8; i++) lines.push(`v ${i & 1 ? max[0] : min[0]} ${i & 2 ? max[1] : min[1]} ${i & 4 ? max[2] : min[2]}`);
+    if (material) faces.push(`usemtl ${material}`);
+    const quads = [[0, 4, 6, 2], [1, 3, 7, 5], [0, 1, 5, 4], [2, 6, 7, 3], [0, 2, 3, 1], [4, 5, 7, 6]];
+    quads.forEach((q, k) => faces.push(`f ${(k === flip ? [...q].reverse() : q).map((j) => 8 * n + j + 1).join(' ')}`));
+  }
+  return Buffer.from([...lines, ...faces, ''].join('\n'));
+}
 
 describe('section view: closed cuts (dist/)', { skip: !existsSync(join(DIST, 'index.html')) && 'run `npm run build` first' }, () => {
   let server;
@@ -186,6 +212,35 @@ describe('section view: closed cuts (dist/)', { skip: !existsSync(join(DIST, 'in
     approx(placed.tip[1], 0, 0, 1e-3, 'on the front side');
     approx(placed.tip[2], 0, 0, 1e-3, 'on the bottom outline');
 
+    // A click on the cut places nothing on the face it hides. Cut along Z at mid height (the top
+    // half removed), seen from the top: the cut covers the bottom face, turned down. "Add a riser"
+    // clicked there: no riser, no "face turned down"; "Place the ingate": it does not move.
+    await setSection('Z', 10);
+    await page.click('[data-view="top"]');
+    assert.ok((await caps()).startsWith('body'));
+    const feedingNow = () => page.evaluate(() => window.reader3d.semantic.bodies[0].feeding);
+    const before = await feedingNow();
+    const [kx, ky] = await project(page, [20, 15, 10]);
+    const clickCut = async () => {
+      await page.mouse.click(view.x + kx, view.y + ky);
+      await page.waitForTimeout(300);
+    };
+    await page.click('#feeding-add');
+    const hint = await page.textContent('#feeding-hint');
+    await clickCut();
+    assert.equal((await feedingNow()).risers.length, before.risers.length);
+    assert.equal(await page.textContent('#feeding-hint'), hint);
+    await page.click('#feeding-gate');
+    await clickCut();
+    assert.deepEqual((await feedingNow()).gate.position_mm, before.gate.position_mm);
+    await page.keyboard.press('Escape');
+    // Without a placing mode, a click on the cut selects the body cut (nothing selected before: a click beside the part).
+    const [bx, by] = await project(page, [-5, 30, 10]);
+    await page.mouse.click(view.x + bx, view.y + by);
+    assert.equal(await page.locator('#bodies tr.selected').count(), 0);
+    await clickCut();
+    assert.equal(await page.getAttribute('#bodies tr.selected', 'data-index'), '0');
+
     // The section off: no cap left; on again: back.
     await page.click('#toggle-section');
     assert.equal(await caps(), '');
@@ -252,6 +307,81 @@ describe('section view: closed cuts (dist/)', { skip: !existsSync(join(DIST, 'in
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
     await page.waitForFunction(() => document.body.dataset.status === 'done' && window.reader3d.tab.file === 'box.stl', null, { timeout: CAD_TIMEOUT });
     assert.equal(await caps(), 'body');
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('solids overlapping, triangles turned round, a body seen through: what the caps show', { timeout: CAD_TIMEOUT }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 } });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    const caps = () => capsShown(page);
+    const open = async (name, boxes) => {
+      await page.setInputFiles('#file-input', { name, mimeType: 'text/plain', buffer: objOf(boxes) });
+      await page.waitForFunction((n) => document.body.dataset.status === 'done' && window.reader3d.tab.file === n, name, { timeout: CAD_TIMEOUT });
+    };
+    const at = async (points) => pixels(page, await projectAll(page, points));
+
+    // A cube a (0..20) and a body b inside it, cut along Z at mid height, seen at an angle: over b,
+    // one cap at every pixel, the one drawn later (a's when a is listed after b), never a mix of
+    // both (each cap a rectangle of its own in the plane, the depths fought over).
+    await open('overlap.obj', [{ material: 'a', min: [0, 0, 0], max: [20, 20, 20] }, { material: 'b', min: [5, 5, 3], max: [15, 15, 17] }]);
+    await page.click('[data-view="iso"]');
+    await page.click('#toggle-section');
+    assert.equal(await caps(), 'body body');
+    const grid = [];
+    for (let x = 5.5; x <= 14.5; x += 0.3) for (let y = 5.5; y <= 14.5; y += 0.3) grid.push([x, y, 10]);
+    const over = await at(grid);
+    const mixed = over.filter((c) => !near(c, over[0], 3));
+    assert.equal(mixed.length, 0, `${mixed.length} of ${over.length} pixels over b not ${over[0]}: ${mixed.slice(0, 5).join(' ')}`);
+    const [aCut] = await at([[2, 2, 10]]);
+    const order = await page.evaluate(() => window.reader3d.result.bodies.map((b) => b.bbox.min[0]));
+    if (order.indexOf(0) > order.indexOf(5)) assert.ok(near(over[0], aCut, 3), `over b ${over[0]}, a's cap ${aCut}`);
+
+    // One body of two cubes 20 mm apart, then the same with the +X face of the first turned round:
+    // closed, repaired by the analysis but not on the display, where the count of its faces would
+    // not be 0 in the gap between the cubes. Not capped (cut open, as before the caps): no cap in the gap.
+    const cubes = (flip) => [{ material: 'a', min: [0, 0, 0], max: [20, 20, 20], flip }, { min: [40, 0, 0], max: [60, 20, 20] }];
+    const gap = [[25, 10, 10], [30, 5, 10]];
+    await page.click('#toggle-section');
+    await open('two_cubes.obj', cubes());
+    await page.click('[data-view="iso"]');
+    await page.click('#toggle-section');
+    assert.equal(await caps(), 'body');
+    const [cut, ...face] = await at([[10, 10, 10], ...gap]);
+    for (const c of face) assert.ok(!near(c, cut, 6), `the gap ${c}, not the cut ${cut}`);
+    await page.click('#toggle-section');
+    await open('two_cubes_turned.obj', cubes(1));
+    assert.deepEqual(await page.evaluate(() => window.reader3d.result.bodies.map((b) => [b.closed, b.notes])), [[true, ['Inconsistent triangle orientation was repaired']]]);
+    await page.click('[data-view="iso"]');
+    await page.click('#toggle-section');
+    assert.equal(await caps(), '');
+    for (const c of await at(gap)) assert.ok(!near(c, cut, 6), `the gap ${c}, not the cut ${cut}`);
+
+    // A cube, every wall highlighted (20 ± 2 mm): seen through, its cap translucent. From the side
+    // removed, the cap; from the side kept (⇄), none: it would be drawn over the top face in front
+    // of the cut (seen through, the faces write no depth), which keeps its colour.
+    await page.click('#toggle-section');
+    await open('cube.obj', [{ min: [0, 0, 0], max: [20, 20, 20] }]);
+    await page.click('#toggle-thickness');
+    await page.waitForSelector('#thick-body:not([hidden])', { timeout: 60_000 });
+    await page.fill('#thick-tol', '2');
+    await page.dispatchEvent('#thick-tol', 'change');
+    await page.fill('#thick-value', '20');
+    await page.dispatchEvent('#thick-value', 'change');
+    assert.equal(await page.isChecked('#thick-highlight'), true);
+    await page.click('[data-view="top"]');
+    const [topFace] = await at([[6, 6, 20]]);
+    await page.click('#toggle-section');
+    assert.equal(await caps(), 'body');
+    const [seenThrough] = await at([[6, 6, 10]]);
+    assert.ok(!near(seenThrough, topFace, 6), `the cap over the walls seen through: ${seenThrough}`);
+    await page.click('#section-flip');
+    assert.equal(await caps(), '');
+    const [kept] = await at([[6, 6, 20]]);
+    assert.ok(near(kept, topFace, 2), `the top face ${kept}, as without the section ${topFace}`);
     assert.deepEqual(errors, []);
     await context.close();
   });
