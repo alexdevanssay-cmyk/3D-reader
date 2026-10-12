@@ -596,7 +596,8 @@ function renderPanel() {
   if (estimated) notes.push(t("method.estimated", { n: estimated }));
   if (s.open_bodies > 0) notes.push(t("method.open", { n: s.open_bodies }));
   if (r.cached) notes.push(t(r.cachedFrom === "network" ? "method.network" : "method.cached"));
-  // The shared network folder (engine/shared-cache.js): its access to grant, or a read or a write that failed, said discreetly.
+  // The shared network folder (engine/shared-cache.js): its access to grant, or a read or a write that failed, said discreetly
+  // (why it failed, said in French by the folder's modules, in the French note only: the English one leaves {message} out).
   const net = r.networkNote;
   if (net) notes.push(net.kind === "prompt" ? t("method.networkPrompt") : t(net.write ? "method.networkWrite" : "method.networkRead", { message: net.message }));
   method.textContent = s.volume == null ? t("method.none") : [how, ...notes].join(" ");

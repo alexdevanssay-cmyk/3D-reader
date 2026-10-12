@@ -123,8 +123,9 @@ const STRINGS = {
     "method.cached": "Results kept from an earlier opening of this file (\u201cRefresh\u201d computes them again).",
     "method.network": "Analysis read in the shared network folder (\u201cRefresh\u201d computes it again).",
     "method.networkPrompt": "Shared network folder: access to grant (Settings page), the analysis is not shared.",
-    "method.networkRead": "Shared network folder not read ({message}): analysed on this PC.",
-    "method.networkWrite": "Not written in the shared network folder ({message}): kept on this PC.",
+    // Without {message}: why it failed is said in French by network-folder.js and engine/shared-cache.js (as in the costing pages).
+    "method.networkRead": "Shared network folder not read: analysed on this PC.",
+    "method.networkWrite": "Not written in the shared network folder: kept on this PC.",
     "brand.title": "Start again: closes all the tabs (the settings, the costing workbook and the metal prices are kept)",
     "tabs.label": "Parts",
     "tabs.new": "New tab",

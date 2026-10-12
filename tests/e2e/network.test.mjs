@@ -192,6 +192,10 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
     assert.match(await page.textContent('#method'), /Dossier réseau partagé non lu \(.+\) : analyse faite sur ce poste/);
+    // In English: why (said in French only) left out of the note.
+    await page.selectOption('#language', 'en');
+    assert.match(await page.textContent('#method'), /Shared network folder not read: analysed on this PC\.$/);
+    await page.selectOption('#language', 'fr');
     assert.equal(await page.textContent('#total-volume'), volume);
     assert.ok((await page.evaluate(() => window.__posted)).includes('analyze'));
     await until(page, async (name) => {
