@@ -25,6 +25,7 @@
 // folder is forgotten.
 
 import { SUBFOLDERS, TRIES, chooseSharedFolder, fileNames, notFound, pause, readText, sharedDir, sharedFolder, writeFile } from "./network-folder.js";
+import { cleanFacts } from "./ai-facts.js";
 
 export { CHANGED as FOLDER_CHANGED, folderSupported } from "./network-folder.js";
 
@@ -83,6 +84,14 @@ function cleanMessage(m, id, date) {
   }
   const t = m.target;
   if (t && typeof t === "object" && Number.isInteger(t.tab)) out.target = { tab: t.tab, file: text(t.file) };
+  // An answer: the key facts of the data it was given (ai-facts.js); a question: what the AI was told had changed since.
+  const facts = cleanFacts(m.facts);
+  if (facts) out.facts = facts;
+  const u = m.update;
+  if (u && typeof u === "object" && Array.isArray(u.labels)) {
+    const strings = (list) => (Array.isArray(list) ? list.filter((x) => typeof x === "string") : []);
+    out.update = { labels: strings(u.labels), lines: strings(u.lines) };
+  }
   const a = m.application;
   if (a && typeof a === "object" && typeof a.message === "string") {
     out.application = {

@@ -584,9 +584,10 @@ table.feeding-risers tr.selected td { background: color-mix(in srgb, var(--selec
 .ai-check.ok { color: var(--ok); }
 .ai-check.bad { color: var(--warn); font-weight: 600; }
 /* The local model answering in place of the gateway; the numbers of an answer that come from none of
-   the data sent; the real names of the labels the gateway was sent. */
+   the data sent; the real names of the labels the gateway was sent; under a question, what the AI was
+   told had changed of the part since its last answer. */
 .ai-notice { margin-bottom: 6px; font-size: 12px; font-weight: 600; color: var(--warn); }
-.ai-numbers, .ai-names { margin-top: 6px; font-size: 12px; color: var(--muted); }
+.ai-numbers, .ai-names, .ai-update { margin-top: 6px; font-size: 12px; color: var(--muted); }
 /* The reasoning of the model while it is written: one line, its latest words; then folded. */
 .ai-thought { display: flex; justify-content: flex-end; overflow: hidden; white-space: nowrap; margin-top: 6px; font-size: 12px; font-style: italic; color: var(--muted); }
 .ai-thought-details { margin-top: 6px; font-size: 12px; color: var(--muted); }

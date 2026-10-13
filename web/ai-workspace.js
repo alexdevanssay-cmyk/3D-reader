@@ -38,10 +38,19 @@
 // the local model answers if it can (box "Repli automatique sur le modèle
 // local"). What the local model answered never goes online with the
 // conversation (onlineMessages): it was given the real names and amounts.
+//
+// The model is told what changed of the part since its last answer
+// (ai-facts.js): each answer is kept with the key facts of the data it was
+// given (wall thickness, parting, slides, feeding, holes, bodies sent, the
+// island and cycle of the costing...); a question asked with the
+// conversation starts, in what the model gets only, with what changed since,
+// and that the data sent replace what it wrote before. A small grey line
+// under the question tells the person.
 
 import { anonymizer, buildAIContext, checkContextNumbers, compactAIContext, partNames, summaryAIContext } from "./engine/ai-context.js";
 import { PROPOSAL_FIELDS, checkProposals, readProposals, valueLabel } from "./chiffrage/ai-apply.js";
 import * as archives from "./ai-history.js";
+import { factsOf, lastFacts, updateNote, withNote } from "./ai-facts.js";
 
 const PROVIDERS = [
   ["openai", "En ligne via la passerelle (Groq…)"], // value of earlier versions, kept in this browser's storage
@@ -615,6 +624,9 @@ N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux. Ne 
 Propositions : quand l'utilisateur demande de changer une saisie d'une pièce ou en donne la bonne valeur, ou quand costing_trace ou l'analyse de la pièce donnent une valeur plus juste d'une saisie, termine ta réponse par un seul bloc \`\`\`json {"propositions": [{"piece": "nom de la pièce dans costing_trace.pieces", "cle": "piece.poids", "valeur": 1.35, "unite": "kg", "source": "question", "justification": "une phrase"}]} \`\`\` ; cle : piece.poids, piece.toileMini, piece.epaisseurMax, piece.module, piece.dimMax, piece.ilot, piece.finition, piece.miseAuMille, piece.empreintes, piece.cycle, piece.mode, piece.tth, piece.tthMode, piece.noyaux, piece.tribo, piece.redressage, piece.outillage.tiroirs ou piece.outillage.complexite ; valeur dans l'unité de la saisie (kg, mm, s) ; source : question (le nombre que l'utilisateur a écrit), trace (la valeur de cette même clé pour cette pièce dans costing_trace) ou analyse_3d (la cote mesurée de la pièce : plus grande dimension, module, épaisseurs ; ou le nombre de tiroirs de l'analyse 3D, slides.count, par pièce : × empreintes pour le moule) ; un nombre absent de la source indiquée est refusé. Jamais un prix, un taux, une marge, un paramètre ni un nombre que tu calcules : seulement un nombre écrit par l'utilisateur, dans costing_trace ou dans l'analyse de la pièce. Une personne accepte chaque proposition avant qu'elle soit appliquée. Sans proposition, pas de bloc.
 Si costing_trace est null, aucun classeur de chiffrage n'est importé : dis-le et propose de l'importer dans la page Chiffrage.`;
 
+// As the gateway (api/ai.js RULES): the data of each question over the model's earlier answers (see ai-facts.js).
+const CURRENT_STATE = "À chaque question, les DONNÉES jointes décrivent l'état actuel de la pièce et du chiffrage. Elles priment sur tes réponses précédentes de la conversation : si une donnée que tu disais manquante y figure maintenant, utilise-la sans attendre qu'on te le redise.";
+
 // As the gateway's text tasks (api/ai.js TEXT_RULES): not in the task « Chiffrage », which proposes values in its own block.
 const PROPOSALS = "Paramètres de fonderie et de chiffrage (nombre de noyaux, de tiroirs, de chapes, îlot de coulée, coefficient de difficulté…) : quand on te les demande, propose-les en fondeur à partir des features et du criblage fonderie du contexte. Présente chaque valeur comme « Proposition IA — à valider », avec sa justification (identifiants des features) et ta confiance. N'invente jamais de prix, de taux horaires ni de mesures.";
 
@@ -629,6 +641,7 @@ Pour la fonderie, cite les identifiants de sources fournis et dis clairement qua
 Ce contexte est l'analyse de la pièce par 3D Reader (features détectées avec leurs identifiants, criblage fonderie, pistes de fabrication) : ne renvoie jamais vers un module ou un outil de 3D Reader que tu supposes. S'il manque du détail (champ "summary_only" ou "compaction"), dis-le et indique l'analyse à choisir dans la page IA : « Features », « Fabrication », « DFM » ou « Chiffrage ».
 Champ "selection" : seuls ces corps de la pièce sont envoyés ; réponds sur eux seulement.
 Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.
+${CURRENT_STATE}
 ${costing ? COSTING_RULES : PROPOSALS}`;
 }
 
@@ -1048,9 +1061,20 @@ export function mount({ page, reader }) {
     body.append(box);
   }
 
+  /** Under a question: what the AI was told had changed of the part since its last answer (`update`: {labels, lines}, ai-facts.js updateNote). */
+  function showUpdate(body, update) {
+    body.parentElement.querySelector(".ai-update")?.remove();
+    if (!update?.labels?.length) return;
+    line(body, "ai-update", `Mise à jour envoyée à l'IA : ${update.labels.join(", ")}`).title = (update.lines ?? []).join("\n");
+  }
+
   /** A message kept in a conversation, on screen. */
   function showMessage(m) {
-    if (m.role !== "assistant") return bubble("user", m.content);
+    if (m.role !== "assistant") {
+      const body = bubble("user", m.content);
+      showUpdate(body, m.update);
+      return body;
+    }
     const body = bubble("assistant", "", !!m.costing);
     setAnswer(body, formatAnswer(m.content));
     if (m.notice) line(body, "ai-notice", m.notice, true);
@@ -1468,11 +1492,23 @@ export function mount({ page, reader }) {
       let answer = null; // of the gateway
       let localModel = null; // of Ollama
       let output;
+      let facts = null; // the key facts of the context the model was given (ai-facts.js), kept with its answer
+      let update = null; // what it was told had changed since its last answer: {text (as sent), lines, labels}
+      // The note before the question (updateNote), for the model that answers: what changed since the facts
+      // of its last answer in the conversation it is sent (`messages`), when some of it is (`history`).
+      const noteFor = (messages, sentHistory) => {
+        update = updateNote(lastFacts(messages), facts, sentHistory.length > 0);
+        showUpdate(userBox, update);
+        return update;
+      };
       const askLocal = async (ollama) => {
-        sent = compacted(await contextOf(part, read, askedTask, true), askedTask, LOCAL_CONTEXT_CHARS, true);
+        const whole = await contextOf(part, read, askedTask, true);
+        facts = factsOf(whole); // before its compaction
+        sent = compacted(whole, askedTask, LOCAL_CONTEXT_CHARS, true);
         asked = questions(question, history);
         localModel = ollama.model;
-        return askOllama(question, sent, history, askedTask, ollama, signal, onText, showThought);
+        // The local model is given the whole conversation: the facts of its last answer, of either model.
+        return askOllama(withNote(noteFor(conversation.messages, history), question), sent, history, askedTask, ollama, signal, onText, showThought);
       };
       if (local) {
         const ollama = { base: ollamaBase($("ai-url").value.trim()), model: $("ai-model").value.trim() || OLLAMA_MODEL };
@@ -1491,11 +1527,15 @@ export function mount({ page, reader }) {
         const model = info && wanted && !models.includes(wanted) ? null : wanted;
         if (info && wanted && !model) notice = `Modèle « ${wanted} » non proposé par la passerelle (variable AI_MODELS dans Vercel) : réponse de son modèle par défaut`;
         let whole = await contextOf(part, read, askedTask, false, budget);
+        facts = factsOf(whole); // before its compaction and the anonymizer (its internal amounts masked as sent)
         // The names of the quote of the tab, whatever the task: a question may name the customer.
         const { costingNames } = await import("./chiffrage/ui.js");
         quoteNames = costingNames({ tab: tabId });
         // Not what was answered with the internal amounts of the costing, unless they may go now, to this gateway.
-        let online = { question, history: recent(onlineMessages(conversation.messages, { amounts: $("ai-amounts").checked, gateway: $("ai-url").value.trim() })) };
+        const messages = onlineMessages(conversation.messages, { amounts: $("ai-amounts").checked, gateway: $("ai-url").value.trim() });
+        let online = { question, history: recent(messages) };
+        // What changed since the gateway's last answer it is sent (the facts of an answer of the local model never go online).
+        noteFor(messages, online.history);
         if ($("ai-anon").checked) {
           // Before the compaction: the labels count in the budget. With the names this conversation
           // replaced before: one changed since in the quote may be in its history.
@@ -1503,11 +1543,12 @@ export function mount({ page, reader }) {
           names = anonymizer(whole, unionNames(quoteNames, conversation.names), ofPart);
           whole = names.context(whole);
           online = { question: names.text(online.question), history: online.history.map((m) => ({ ...m, content: names.text(m.content) })) };
+          if (update) update = { ...update, text: names.text(update.text) }; // as the question
         }
         sent = compacted(whole, askedTask, budget, false);
         asked = questions(online.question, online.history);
         try {
-          answer = await askGateway(online.question, sent, online.history, askedTask, model, signal, budget);
+          answer = await askGateway(withNote(update, online.question), sent, online.history, askedTask, model, signal, budget);
           output = answer.output;
         } catch (err) {
           // The free quota reached: the local model, when it answers (its own address and model).
@@ -1547,8 +1588,9 @@ export function mount({ page, reader }) {
           return piece ? { ...p, piece: piece.nom, cle_piece: piece.cle } : p;
         });
       }
-      // Every task with a part: the numbers that come from none of the data sent (informative).
-      const numbers = sent.no_model_loaded ? [] : checkContextNumbers(answerText(output), sent, asked).inconnus;
+      // Every task with a part: the numbers that come from none of the data sent (informative). Those of the
+      // note sent with the question come from the data (now and of the last answer): not counted.
+      const numbers = sent.no_model_loaded ? [] : checkContextNumbers(answerText(output), sent, update ? [...asked, update.text] : asked).inconnus;
       const legend = names ? names.legend(formatAnswer(output)) : [];
       // An answer of the local model is marked: it never goes online with the conversation (onlineMessages);
       // one of the gateway given the internal amounts of the costing too, with the gateway: not without the box ticked.
@@ -1559,6 +1601,8 @@ export function mount({ page, reader }) {
         ...(localModel ? { local: true } : {}), ...(amountsSent !== null && !localModel ? { amounts: true, gateway: amountsSent } : {}),
         ...(check ? { costing: check } : {}), ...(numbers.length ? { numbers } : {}), ...(notice ? { notice } : {}), ...(legend.length ? { names: legend } : {}),
         ...(proposals.length ? { proposals, target: { tab: tabId, file: tabFile } } : {}),
+        // What it was given, for the next question to tell it what changed since.
+        ...(facts ? { facts } : {}),
       };
       signal.throwIfAborted();
       decorate(answerBox, message);
@@ -1576,7 +1620,8 @@ export function mount({ page, reader }) {
         const record = archives.normalizeConversation({
           ...kept, id: kept.id ?? archives.newId(), part, file: kept.file ?? (here ? asking.file ?? here.file : null) ?? conv.file ?? part?.file ?? null,
           started: kept.started ?? askedAt, updated: new Date().toISOString(),
-          messages: [...kept.messages, { id: archives.newId(), role: "user", content: question, date: askedAt }, message], names: known,
+          // The question as the person wrote it; what the AI was told had changed beside it (its grey line).
+          messages: [...kept.messages, { id: archives.newId(), role: "user", content: question, date: askedAt, ...(update?.labels.length ? { update: { labels: update.labels, lines: update.lines } } : {}) }, message], names: known,
         });
         writeConversation(conv.key, record);
         archive(record);
