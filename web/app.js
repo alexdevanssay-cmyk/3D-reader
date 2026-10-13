@@ -6763,6 +6763,7 @@ function orientWrite(all) {
   // The latest parts only.
   const ids = Object.keys(parts).sort((a, b) => (parts[b].savedAt ?? 0) - (parts[a].savedAt ?? 0));
   for (const id of ids.slice(ORIENT_PARTS)) delete parts[id];
+  dieRead = null;
   try {
     localStorage.setItem(ORIENT_KEY, JSON.stringify(all));
     orientMemory = null;
@@ -6826,9 +6827,16 @@ function processOf(i, r = state.result) {
   return { ...DEFAULT_PROCESS, source: "default", island };
 }
 
+// The die options as last read (asked for at every rendering): read again once written, here or by another page.
+let dieRead = null;
+window.addEventListener("storage", (e) => {
+  if (e.key === ORIENT_KEY || e.key === null) dieRead = null;
+});
+
 /** The die options of the parting jobs: the margins and the steel density of the costing's dies (as it told them last; else its defaults), one cavity (the blank shown is one cavity's). */
 function dieOptions() {
-  return { ...normalizeDie(orientSaved().die ?? null), cavities: 1 };
+  dieRead ??= { ...normalizeDie(orientSaved().die ?? null), cavities: 1 };
+  return dieRead;
 }
 
 /** What the parting of body i is proposed and classified for: {process ({plan, alimentation}), die, key (orientationKey)}. */
