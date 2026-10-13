@@ -33,17 +33,30 @@
 //     bounds of a junction (heuristic);
 //   and the larger of the two.
 //
+// Up is the direction up when the metal is cast (« haut de coulée », g, from
+// the orientation of the parting for the process: orientation.js); without
+// one, the draw direction (+Z without a parting line).
+//
 // Risers: a cylinder, H = 1.5 D, of modulus at least 1.2 × the zone's
-// (Wlodawer, Chvorinov), on the part above the hot spot: on top (open, in
-// the upper half along the draw direction; +Z without a parting line), or on
-// the side at the parting line (blind) when the hot spot is closer to the
-// joint than to the top. Gating: an ingate on the parting line, where the
-// mould opens, on its outer outline (reached from outside the mould): not
-// next to an undercut (cores, slides), the lowest along the draw direction
-// (bottom filling), not under a riser, the thickest wall there, a zone
-// without a riser, then the shortest way into the part. Its section from the
-// wall it enters. The casting yield, part / (part + risers + ingate), for
-// information (the sprue and runners are not designed here).
+// (Wlodawer, Chvorinov), on the part above the hot spot: on top (open, on a
+// face turned up), or, on a horizontal parting plane, on the side at the
+// parting line (blind) when the hot spot is closer to the joint than to the
+// top. A vertical parting plane (up across the draw direction) cuts the part
+// from top to bottom, near every hot spot: its risers stand on top, along up.
+// Gating: an ingate on the parting line, where the mould opens, on its
+// outer outline (reached from outside the mould): not next to an undercut
+// (cores, slides), the lowest along up (bottom filling) and never at the top,
+// not under a riser, the thickest wall there, a zone without a riser, then
+// the shortest way into the part. Its section from the wall it enters.
+//
+// Fed from below (low pressure, « alimentation par le bas »): no riser; the
+// tube under the lower die feeds the casting while it solidifies from the
+// top towards it. One feed (an ingate through the lower die) per zone that
+// needs feeding, the main one first: at the lowest point of the part under
+// its hot spot, round, its modulus (D/4, a neck cooled on its side) at least
+// FEED_MODULUS_FACTOR × the zone's, like the neck of a riser. The casting
+// yield, part / (part + risers + ingates), for information (the sprue and
+// runners are not designed here).
 //
 // The sources named by the constants are in foundry-knowledge.js
 // (FOUNDRY_SOURCES); the others are marked heuristic.
@@ -55,11 +68,13 @@
 // (feedworker.js) and on the page (the risers and the ingate placed again
 // when the parting line changes, or by hand).
 
+import { normalizeProcess } from './orientation.js';
 import { SIDE_NONE, sampleByArea } from './parting.js';
 import { ballPass, coverPass, edgeNeighbours, prepareMesh, weld } from './thickness.js';
 
 // 2: every zone but the small ones needs a riser (MAX_RISERS caps the risers proposed, not the zones).
-export const FEEDING_VERSION = 2;
+// 3: up along the orientation of the process (not the draw direction), fed from below for low pressure.
+export const FEEDING_VERSION = 3;
 
 // Two zones are one when the section between them is at least this share of
 // the hot spot of the smaller one (heuristic: directional solidification,
@@ -86,6 +101,12 @@ export const MAX_RISERS = 8;
 export const GATE_THICKNESS_RATIO = 0.7;
 export const GATE_WIDTH_RATIO = 3;
 export const GATE_LENGTH_RATIO = 1.5;
+// A feed from below (low pressure): its modulus over the zone's, the neck of
+// a riser in Wlodawer's 1 : 1.1 : 1.2 ("wlodawer_1966"; for the ingate of a
+// low pressure die, heuristic); its length through the lower die over its
+// diameter (for the yield; heuristic).
+export const FEED_MODULUS_FACTOR = 1.1;
+export const FEED_LENGTH_RATIO = 1;
 // Every triangle has its own inscribed sphere up to this size; above, the
 // spheres of triangles drawn by area (fixed seed), spread to the others.
 export const FULL_LIMIT = 200_000;
@@ -773,16 +794,16 @@ function sampled(list) {
 }
 
 /**
- * Where a riser stands on the part, for one zone: on top, over the hot spot.
- * On a face of the hot spot turned up with nothing above it; else where the
- * line along d from the centre of one of its balls leaves the part, nothing
- * above; of these, the place whose footprint the part holds best (not over
- * a hole), the nearest to the middle of the hot spot first. Else on the
- * highest free face of the zone.
+ * Where a riser stands on the part, for one zone: on top, over the hot spot
+ * (along up). On a face of the hot spot turned up with nothing above it; else
+ * where the line up from the centre of one of its balls leaves the part,
+ * nothing above; of these, the place whose footprint the part holds best
+ * (not over a hole), the nearest to the middle of the hot spot first. Else
+ * on the highest free face of the zone.
  * patch, tops -- the triangles of its hot spot, of its faces turned up near it (indices)
  */
 function topPlace(ctx, zoneId, patch, tops, diameter) {
-  const { g, grid, d } = ctx;
+  const { g, upGrid: grid, up: d } = ctx;
   const R = diameter / 2;
   const tol = Math.max(1, 0.15 * diameter);
   const lift = Math.max(1e-3 * (g.diag || 1), 0.02 * diameter);
@@ -809,16 +830,16 @@ function topPlace(ctx, zoneId, patch, tops, diameter) {
   const held = (contact) => {
     let n = 0;
     for (const [x, y] of footprint) {
-      const q = addScaled(addScaled(addScaled(contact, ctx.u, x), ctx.v, y), d, lift);
+      const q = addScaled(addScaled(addScaled(contact, ctx.upU, x), ctx.upV, y), d, lift);
       const down = grid.crossings(q, -1);
       if (down.length && Math.abs(down[0].t - lift) <= tol && dot(normalAt(g, down[0].f), d) > 0.2 && !grid.crossings(q, 1).length) n++;
     }
     return n;
   };
-  // Tried in the order of their distance to the middle of the hot spot, across d, spread over it.
+  // Tried in the order of their distance to the middle of the hot spot, across up, spread over it.
   const across = (p) => {
     const w = sub(p, mean);
-    return Math.hypot(dot(w, ctx.u), dot(w, ctx.v));
+    return Math.hypot(dot(w, ctx.upU), dot(w, ctx.upV));
   };
   const spread = (list) => {
     list.sort((a, b) => a.r - b.r || a.f - b.f);
@@ -890,8 +911,10 @@ const normalAt = (g, f) => [g.normals[3 * f], g.normals[3 * f + 1], g.normals[3 
 const centreAt = (g, f) => [g.centres[3 * f], g.centres[3 * f + 1], g.centres[3 * f + 2]];
 
 /**
- * Riser of a zone (a summary of feedingZones): on top, or on the side at the
- * parting line when the hot spot is closer to it than to the top.
+ * Riser of a zone (a summary of feedingZones): on top, or, on a horizontal
+ * parting plane, on the side at the parting line when the hot spot is closer
+ * to it than to the top (a vertical plane runs through the part from top to
+ * bottom: the joint is near every hot spot, the risers stand on top).
  * patch -- the triangles of its hot spot; tops -- of its faces near the hot spot turned up (indices)
  */
 function placeRiser(ctx, z, patch, tops, n) {
@@ -900,7 +923,7 @@ function placeRiser(ctx, z, patch, tops, n) {
   const hot = top?.centre ?? z.hot_spot_mm;
   // The nearest point of the parting line on this zone, on its outer outline.
   let side = null;
-  if (ctx.points && hot) {
+  if (ctx.points && hot && ctx.horizontal) {
     let best = null;
     for (const p of ctx.points) {
       if (p.zone !== z.id) continue;
@@ -919,7 +942,7 @@ function placeRiser(ctx, z, patch, tops, n) {
     modulus_mm: z.modulus_mm,
     ...sized,
     mass_g: massOf(sized.volume_mm3, ctx.density),
-    axis: roundVec(ctx.d, 6),
+    axis: roundVec(ctx.up, 6),
     source: 'proposed',
   });
   if (side) {
@@ -985,10 +1008,10 @@ function wallAt(ctx, at, r) {
  * Points of the parting line (the middles of its segments, PARTING_POINTS at
  * most, spread along it), each with the triangles next to it: {at, tangent,
  * zone, sphere (the thickest wall touching it), normal (their outward
- * normals, area-weighted), height (along d), segment}.
+ * normals, area-weighted), height (along up), segment}.
  */
 function partingPoints(ctx, segments) {
-  const { g, grid, d } = ctx;
+  const { g, grid, up } = ctx;
   const m = segments.length / 6;
   const step = Math.max(1, Math.ceil(m / PARTING_POINTS));
   const out = [];
@@ -999,7 +1022,7 @@ function partingPoints(ctx, segments) {
     const at = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
     const { nearest, sphere, normal } = wallAt(ctx, at, Math.max(reach, length(sub(b, a))));
     if (nearest < 0) continue;
-    out.push({ at, tangent: sub(b, a), zone: ctx.zone[nearest], sphere, normal, triangle: nearest, height: dot(at, d), segment: s });
+    out.push({ at, tangent: sub(b, a), zone: ctx.zone[nearest], sphere, normal, triangle: nearest, height: dot(at, up), segment: s });
   }
   return out;
 }
@@ -1222,12 +1245,13 @@ function undercutIndex(g, side, radius) {
 /**
  * The ingate on the parting line: on its outer outline (a free way out in the
  * parting plane; the loops of the line with none, the holes, last), not next
- * to an undercut (a core or a slide there), the lowest along d (bottom
- * filling: a planar line is level), then away from the risers and their
- * zones, the thickest wall, the first along the line.
+ * to an undercut (a core or a slide there), the lowest along up (bottom
+ * filling: a planar line square to up is level), never at the top when the
+ * line spans heights, then away from the risers and their zones, the
+ * thickest wall, the first along the line.
  */
 function placeGate(ctx, risers) {
-  const { g, grid, d, points, side } = ctx;
+  const { g, up, points, side } = ctx;
   if (!points?.length) return null;
   // The points of the outer outline first: those of a hole have no way out (whatever their rank).
   const { outer, free } = outerLoops(ctx, points);
@@ -1238,9 +1262,12 @@ function placeGate(ctx, risers) {
     high = Math.max(high, p.height);
     if (onOuter(p)) lowOuter = Math.min(lowOuter, p.height);
   }
-  const band = Math.max(LOW_BAND_MM, LOW_BAND_SHARE * (dot(g.max, d.map(Math.abs)) - dot(g.min, d.map(Math.abs)) || high - low));
+  const band = Math.max(LOW_BAND_MM, LOW_BAND_SHARE * (dot(g.max, up.map(Math.abs)) - dot(g.min, up.map(Math.abs)) || high - low));
   // The lowest of the outer outline (of the whole line without one found).
   const bottom = Number.isFinite(lowOuter) ? lowOuter : low;
+  // The top of a line that spans heights (a vertical parting plane): never, unless nothing else is free.
+  const spans = high - low > 2 * band;
+  const atTop = (p) => spans && p.height >= high - band;
   const fedZones = new Set(risers.map((r) => r.zone));
   // An undercut within the reach of the ingate and its wall.
   const reach = (p) => Math.max(sizeGate(p.sphere).width_mm, 2 * p.sphere);
@@ -1248,17 +1275,17 @@ function placeGate(ctx, risers) {
   const scored = points.map((p, k) => {
     const gate = sizeGate(p.sphere);
     const undercut = !!undercuts?.within(p.at, reach(p));
-    // Under the footprint of a riser (across d, with the width of the ingate): the riser's own feeding.
-    const across = (w) => Math.hypot(dot(w, ctx.u), dot(w, ctx.v));
-    const nearRiser = risers.some((r) => across(sub(r.position_mm, p.at)) < r.diameter_mm / 2 + gate.width_mm / 2);
+    // Under the footprint of a riser (across up, with the width of the ingate): the riser's own feeding.
+    const under = (w) => Math.hypot(dot(w, ctx.upU), dot(w, ctx.upV));
+    const nearRiser = risers.some((r) => under(sub(r.position_mm, p.at)) < r.diameter_mm / 2 + gate.width_mm / 2);
     // The way into the part: from the point to the centroid, in the parting plane.
-    const way = across(sub(p.at, g.centroid));
-    return { p, k, gate, outer: onOuter(p), undercut, low: p.height <= bottom + band, nearRiser, fed: fedZones.has(p.zone), way };
+    const way = Math.hypot(dot(sub(p.at, g.centroid), ctx.u), dot(sub(p.at, g.centroid), ctx.v));
+    return { p, k, gate, outer: onOuter(p), top: atTop(p), undercut, low: p.height <= bottom + band, nearRiser, fed: fedZones.has(p.zone), way };
   });
   // The thickest walls (within THICK_SHARE of the thickest, where the ingate may go), a zone
   // without a riser, then the shortest way into the part (the middle of a long side rather than a corner).
   const thickest = Math.max(0, ...scored.filter((s) => (s.outer || !outer.size) && !s.undercut && s.low).map((s) => s.p.sphere));
-  const rank = (s) => [s.outer ? 0 : 1, s.undercut ? 1 : 0, s.low ? 0 : 1, s.nearRiser ? 1 : 0, s.p.sphere >= THICK_SHARE * thickest ? 0 : 1, s.fed ? 1 : 0, Math.round(s.way * 10), s.k];
+  const rank = (s) => [s.outer ? 0 : 1, s.top ? 1 : 0, s.undercut ? 1 : 0, s.low ? 0 : 1, s.nearRiser ? 1 : 0, s.p.sphere >= THICK_SHARE * thickest ? 0 : 1, s.fed ? 1 : 0, Math.round(s.way * 10), s.k];
   scored.sort((a, b) => {
     const x = rank(a), y = rank(b);
     for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] - y[i];
@@ -1291,7 +1318,7 @@ function placeGate(ctx, risers) {
   const params = { wall: fr(chosen.p.sphere), thickness: fr(chosen.gate.thickness_mm), width: fr(chosen.gate.width_mm) };
   const where = planar
     ? `Sur la ligne de joint (contour extérieur), dans la paroi la plus épaisse qu'elle longe (Ø inscrit ${params.wall} mm)`
-    : `Sur la ligne de joint (contour extérieur), au plus bas selon la direction de démoulage (remplissage par le bas), paroi Ø inscrit ${params.wall} mm`;
+    : `Sur la ligne de joint (contour extérieur), au plus bas selon ${ctx.upAlongD ? 'la direction de démoulage' : 'le haut de coulée'} (remplissage par le bas), paroi Ø inscrit ${params.wall} mm`;
   const away = [chosen.undercut ? null : 'des contre-dépouilles', chosen.nearRiser ? null : 'des masselottes'].filter(Boolean);
   return {
     position_mm: roundVec(chosen.p.at),
@@ -1314,15 +1341,33 @@ function placeGate(ctx, risers) {
 
 /**
  * What the placements need of a body with its zones (feedingZones) and its
- * parting ({direction, side (SIDE_* per triangle), segments}, or null: +Z,
- * no side riser, no ingate).
+ * parting ({direction, side (SIDE_* per triangle), segments, up, process},
+ * or null: +Z, no side riser, no ingate).
+ * up -- the direction up when the metal is cast (orientation.js), else
+ *       parting.up, else the draw direction
+ * process -- {plan, alimentation} (orientation.js; alimentation "bas": fed
+ *       from below), else parting.process, else fed from the top
  */
-export function feedingContext(positions, indices, zones, { parting = null, density = null } = {}) {
+export function feedingContext(positions, indices, zones, { parting = null, density = null, up = null, process = null } = {}) {
   const g = feedingMesh(positions, indices);
   const d = normalize(parting?.direction ?? [0, 0, 1]) ?? [0, 0, 1];
   const grid = columnGrid(g, d);
+  const upward = normalize(up ?? parting?.up ?? d) ?? d;
+  const along = dot(upward, d);
+  // Up along ±d: the lines of the parting's grid, either sense; else a grid of their own.
+  const upGrid = along > 1 - 1e-9 ? grid : along < -1 + 1e-9 ? { ...grid, d: upward, crossings: (o, sense) => grid.crossings(o, -sense) } : columnGrid(g, upward);
+  const given = process ?? parting?.process ?? null;
+  const profile = given ? normalizeProcess(given) : null;
   const segments = parting?.segments?.length ? parting.segments : null;
-  const ctx = { g, grid, d, u: grid.u, v: grid.v, zone: zones.zone, sphere: zones.sphere, zones: zones.zones, side: parting?.side ?? null, density, segments, points: null, flat: null, loops: null, parting: !!parting?.direction };
+  const ctx = {
+    g, grid, d, u: grid.u, v: grid.v, zone: zones.zone, sphere: zones.sphere, zones: zones.zones, side: parting?.side ?? null, density, segments, points: null, flat: null, loops: null, parting: !!parting?.direction,
+    up: upward, upGrid, upU: upGrid.u, upV: upGrid.v,
+    upAlongD: Math.abs(along) > 1 - 1e-9,
+    // A horizontal parting plane: up along the draw direction (either sense).
+    horizontal: Math.abs(along) >= 0.5,
+    process: profile,
+    bottom: profile?.alimentation === 'bas',
+  };
   if (segments) {
     ctx.flat = flatten(segments, grid.u, grid.v);
     ctx.loops = lineLoops(segments, g.diag);
@@ -1332,13 +1377,29 @@ export function feedingContext(positions, indices, zones, { parting = null, dens
 }
 
 /**
- * Risers and ingate of a body from its zones (feedingZones) for a parting
- * line ({direction, side, segments} or null). Returns {risers, gate,
- * yield, hot_spots_without_riser, direction, parting_known}.
+ * What a placement depends on beyond the mesh, its zones and its parting
+ * line: the process and the up direction ("vertical-haut|0,0,1"; none given:
+ * "top|" and the draw direction's). For the keys of the placements the page
+ * keeps (the zones, kept in the cache, do not depend on them).
  */
-export function placeFeeding(positions, indices, zones, { parting = null, density = null, ctx = null } = {}) {
-  ctx ??= feedingContext(positions, indices, zones, { parting, density });
-  const { g, d } = ctx;
+export function feedingOptionsKey({ parting = null, up = null, process = null } = {}) {
+  const given = process ?? parting?.process ?? null;
+  const p = given ? normalizeProcess(given) : null;
+  const w = normalize(up ?? parting?.up ?? parting?.direction ?? [0, 0, 1]) ?? [0, 0, 1];
+  return `${p ? `${p.plan}-${p.alimentation}` : 'top'}|${w.map((x) => round(x, 6)).join(',')}`;
+}
+
+/**
+ * Risers and ingate of a body from its zones (feedingZones) for a parting
+ * line ({direction, side, segments, up, process} or null) and a process (up,
+ * process: as feedingContext). Returns {risers, gate, feed_points, yield,
+ * hot_spots_without_riser, direction, up, process, mode ("top" | "bottom"),
+ * parting_known}. Fed from below: no riser, a feed point under each zone
+ * that needs feeding (feed_points, the main one first: the gate).
+ */
+export function placeFeeding(positions, indices, zones, { parting = null, density = null, ctx = null, up = null, process = null } = {}) {
+  ctx ??= feedingContext(positions, indices, zones, { parting, density, up, process });
+  const { g, up: d } = ctx;
   // The triangles of the hot spot of each zone (its balls), and of its faces near the hot spot
   // turned up: their indices, by zone (a list of numbers, not an object per triangle).
   const ids = zones.zones.length;
@@ -1372,8 +1433,33 @@ export function placeFeeding(positions, indices, zones, { parting = null, densit
   }
   const patchOf = (z) => (z >= 0 && z < ids ? patchList.subarray(patchStart[z], patchStart[z + 1]) : new Int32Array(0));
   const topsOf = (z) => (z >= 0 && z < ids ? topList.subarray(topStart[z], topStart[z + 1]) : new Int32Array(0));
-  const risers = [];
   const order = zones.zones.filter((z) => z.needs_riser).sort((a, b) => b.modulus_mm - a.modulus_mm || a.id - b.id);
+  const placed = {
+    direction: roundVec(ctx.d, 6),
+    up: roundVec(ctx.up, 6),
+    process: ctx.process,
+    parting_known: ctx.parting,
+  };
+  if (ctx.bottom) {
+    // Fed from below: a feed point per zone (MAX_RISERS at most), the main one (the largest modulus) first.
+    const points = [];
+    for (const z of order) {
+      if (points.length >= MAX_RISERS) break;
+      const p = placeFeedPoint(ctx, z, patchOf(z.id), points.length + 1);
+      if (p) points.push(p);
+    }
+    const gate = points[0] ?? null;
+    return {
+      ...placed,
+      mode: 'bottom',
+      risers: [],
+      gate,
+      feed_points: points,
+      yield: feedingYield(zones.body.volume_mm3, [], gate, points.slice(1)),
+      hot_spots_without_riser: hotSpotsWithoutRiser(zones.zones, [], points),
+    };
+  }
+  const risers = [];
   for (const z of order) {
     // MAX_RISERS at most: the zones left are listed without a riser.
     if (risers.length >= MAX_RISERS) break;
@@ -1382,18 +1468,114 @@ export function placeFeeding(positions, indices, zones, { parting = null, densit
   }
   const gate = placeGate(ctx, risers);
   return {
-    direction: roundVec(ctx.d, 6),
-    parting_known: ctx.parting,
+    ...placed,
+    mode: 'top',
     risers,
     gate,
+    feed_points: [],
     yield: feedingYield(zones.body.volume_mm3, risers, gate),
     hot_spots_without_riser: hotSpotsWithoutRiser(zones.zones, risers),
   };
 }
 
-/** The zones that need a riser and have none that feeds them (deleted, moved away or made smaller by hand). */
-export function hotSpotsWithoutRiser(zones, risers) {
-  const fed = new Set(risers.filter(feeds).map((r) => r.zone));
+// ------------------------------------------------------------------ fed from below
+
+/**
+ * A feed point (an ingate through the lower die, low pressure) for a zone
+ * of modulus `modulus` (mm): round, its modulus D/4 (a neck: its side cools,
+ * not its ends, joined to the casting and to the tube) at least
+ * FEED_MODULUS_FACTOR × the zone's, D rounded up to the millimetre (or D
+ * given); FEED_LENGTH_RATIO × D long (for the yield). Its thickness and
+ * width are its diameter (a round section, shown as an ingate's).
+ */
+export function sizeFeedPoint(modulus, { diameter = null } = {}) {
+  const D = diameter > 0 ? diameter : Math.max(1, Math.ceil(4 * FEED_MODULUS_FACTOR * Math.max(0, modulus) - 1e-9));
+  const L = Math.ceil(FEED_LENGTH_RATIO * D - 1e-9);
+  const section = (Math.PI * D * D) / 4;
+  return { diameter_mm: round(D, 2), thickness_mm: round(D, 2), width_mm: round(D, 2), length_mm: round(L, 2), section_mm2: round(section, 2), volume_mm3: round(section * L, 1), feed_modulus_mm: round(D / 4, 3) };
+}
+
+/** Whether a feed point feeds its zone: its modulus at least FEED_MODULUS_FACTOR × the zone's (both rounded to the micrometre). */
+export function feedPointFeeds(point) {
+  return !(point.modulus_mm > 0) || point.feed_modulus_mm >= FEED_MODULUS_FACTOR * point.modulus_mm - 1e-3;
+}
+
+/**
+ * The feed point of a zone, fed from below: at the lowest point of the part
+ * under its hot spot (the middle of its balls, area-weighted), where the line
+ * down from it leaves the part the last time, on a face turned down: the
+ * lower die reaches it from below. Without one (no part under it along up):
+ * the lowest face of the zone turned down with nothing under it.
+ * patch -- the triangles of its hot spot (indices)
+ */
+function placeFeedPoint(ctx, z, patch, n) {
+  const { g, upGrid: grid, up } = ctx;
+  let hot = null;
+  let wsum = 0;
+  const mean = [0, 0, 0];
+  for (const f of patch) {
+    const w = g.areas[f], D = ctx.sphere[f];
+    for (let k = 0; k < 3; k++) mean[k] += w * (g.centres[3 * f + k] - (g.normals[3 * f + k] * D) / 2);
+    wsum += w;
+  }
+  if (wsum > 0) hot = mean.map((x) => x / wsum);
+  hot ??= z.hot_spot_mm;
+  let at = null, triangle = -1, reason = 'bottom_feed_under_hot_spot';
+  if (hot) {
+    const down = grid.crossings(hot, -1);
+    for (let k = down.length - 1; k >= 0 && !at; k--) {
+      if (dot(normalAt(g, down[k].f), up) >= 0) continue;
+      at = addScaled(hot, up, -down[k].t);
+      triangle = down[k].f;
+    }
+  }
+  if (!at) {
+    let low = Infinity;
+    const lift = 1e-6 * (g.diag || 1);
+    for (let f = 0; f < g.nt; f++) {
+      if (ctx.zone[f] !== z.id || !(g.areas[f] > 0) || dot(normalAt(g, f), up) > -0.5) continue;
+      const h = dot(centreAt(g, f), up);
+      if (h >= low) continue;
+      if (grid.crossings(addScaled(centreAt(g, f), up, -lift), -1).length) continue;
+      low = h;
+      triangle = f;
+    }
+    if (triangle < 0) return null;
+    at = centreAt(g, triangle);
+    reason = 'bottom_feed_lowest_face';
+  }
+  const size = sizeFeedPoint(z.modulus_mm);
+  const params = { sphere: fr(z.sphere_mm), modulus: fr(z.modulus_mm, 2), d: fr(size.diameter_mm), feed: fr(size.feed_modulus_mm, 2) };
+  const where = reason === 'bottom_feed_under_hot_spot' ? 'au point le plus bas de la pièce sous lui' : 'sur la face la plus basse de la zone';
+  return {
+    id: `A${n}`,
+    type: 'bottom',
+    zone: z.id,
+    zone_sphere_mm: z.sphere_mm,
+    modulus_mm: z.modulus_mm,
+    position_mm: roundVec(at),
+    direction: roundVec(up, 6), // inwards: up into the part
+    on_parting_line: false,
+    outer_outline: null,
+    bottom_feed: true,
+    wall_sphere_mm: round(ctx.sphere[triangle] ?? z.sphere_mm, 2),
+    height_mm: round(dot(at, up), 2),
+    ...size,
+    near_undercut: null,
+    near_riser: null,
+    reason,
+    why: `Basse pression, alimentation par le bas : point chaud Ø ${params.sphere} mm (module ${params.modulus} mm), attaque ${where}, côté chape inférieure ; Ø ${params.d} mm, module D/4 = ${params.feed} mm ≥ 1,1 × module de la zone (col de masselotte, Wlodawer ; heuristique).`,
+    source: 'proposed',
+  };
+}
+
+/**
+ * The zones that need a riser and have none that feeds them (deleted, moved
+ * away or made smaller by hand), nor a feed point from below (`points`, low
+ * pressure) that feeds them.
+ */
+export function hotSpotsWithoutRiser(zones, risers, points = []) {
+  const fed = new Set([...risers.filter(feeds), ...(points ?? []).filter(feedPointFeeds)].map((r) => r.zone));
   return zones.filter((z) => z.needs_riser && !fed.has(z.id)).map((z) => z.id);
 }
 
@@ -1407,20 +1589,21 @@ export function feeds(riser) {
 }
 
 /**
- * Casting yield, for information: part / (part + risers + ingate). The
+ * Casting yield, for information: part / (part + risers + ingate, and the
+ * other ingates `others`: the feed points from below past the first). The
  * sprue, the runners and the pouring cup are not counted (not designed
  * here): an upper bound.
  */
-export function feedingYield(partVolume, risers, gate) {
+export function feedingYield(partVolume, risers, gate, others = []) {
   const risersVolume = risers.reduce((s, r) => s + (r.volume_mm3 || 0), 0);
-  const gating = gate?.volume_mm3 ?? 0;
+  const gating = (gate?.volume_mm3 ?? 0) + (others ?? []).reduce((s, x) => s + (x.volume_mm3 || 0), 0);
   const total = partVolume + risersVolume + gating;
   return {
     value: total > 0 ? round(partVolume / total, 4) : null,
     part_volume_mm3: round(partVolume, 1),
     risers_volume_mm3: round(risersVolume, 1),
     gating_volume_mm3: round(gating, 1),
-    counted: 'part_risers_ingate',
+    counted: others?.length ? 'part_risers_ingates' : 'part_risers_ingate',
   };
 }
 
@@ -1429,17 +1612,19 @@ export function feedingYield(partVolume, risers, gate) {
 /**
  * A riser placed by hand at a point of the part (a click on the 3D view):
  * sized from the zone of the triangle touched (or the D and H given), on top
- * when the face there is turned up along d (open), else on the side (blind).
+ * when the face there is turned up (open), else on the side (blind).
  *
  * point    -- on the surface (mm, the frame of the mesh)
  * triangle -- the triangle touched (its zone, its normal), or -1
  * zones    -- feedingZones of the body
  * normal   -- outward normal there (else the triangle's)
+ * up       -- the direction up when cast (orientation.js), else `direction`
+ *             (the draw direction; +Z)
  * Returns a riser, like those of placeFeeding (source "manual"), or null on a
- * face turned down (within 60° of -d): a riser does not stand under the part.
+ * face turned down (within 60° of -up): a riser does not stand under the part.
  */
-export function riserFromPoint(point, { triangle = -1, zones, normal = null, direction = [0, 0, 1], density = null, diameter = null, height = null, id = 'M1', positions = null, indices = null } = {}) {
-  const d = normalize(direction) ?? [0, 0, 1];
+export function riserFromPoint(point, { triangle = -1, zones, normal = null, direction = [0, 0, 1], up = null, density = null, diameter = null, height = null, id = 'M1', positions = null, indices = null } = {}) {
+  const d = normalize(up ?? direction) ?? [0, 0, 1];
   const zoneId = triangle >= 0 && zones?.zone ? zones.zone[triangle] : -1;
   const z = zones?.zones?.[zoneId] ?? null;
   let n = normal ? normalize(normal) : null;
@@ -1452,7 +1637,7 @@ export function riserFromPoint(point, { triangle = -1, zones, normal = null, dir
   if (n && dot(n, d) <= -0.5) return null;
   const top = !n || dot(n, d) >= 0.5;
   const size = sizeRiser(modulus, { diameter, height, type: top ? 'top' : 'side' });
-  // Beside the part, square to d, on the side the face looks to.
+  // Beside the part, square to up, on the side the face looks to.
   const offset = top ? null : normalize(sub(n, d.map((x) => x * dot(n, d))));
   const byHand = diameter > 0 || height > 0;
   const riser = {
@@ -1522,10 +1707,13 @@ export function snapToPartingLine(point, segments) {
 /**
  * The ingate placed by hand near `point`: brought to the nearest point of the
  * parting line when there is one (inward in the parting plane, sized from the
- * wall there), else where it was clicked (along -normal).
+ * wall there), else where it was clicked (along -normal). Fed from below
+ * (ctx.bottom, low pressure): a feed point where it was clicked, up into the
+ * part, sized from the zone touched (feedPointFromPoint).
  * ctx -- feedingContext of the body for its parting
  */
 export function gateFromPoint(point, ctx, { triangle = -1, normal = null } = {}) {
+  if (ctx.bottom) return feedPointFromPoint(point, ctx, { triangle });
   const snap = ctx.segments ? snapToPartingLine(point, ctx.segments) : null;
   if (snap) {
     const s = snap.segment;
@@ -1545,7 +1733,7 @@ export function gateFromPoint(point, ctx, { triangle = -1, normal = null } = {})
       outer_outline: outer,
       zone: p.zone,
       wall_sphere_mm: round(wall, 2),
-      height_mm: round(dot(snap.point, ctx.d), 2),
+      height_mm: round(dot(snap.point, ctx.up), 2),
       ...gate,
       near_undercut: null,
       near_riser: null,
@@ -1565,12 +1753,46 @@ export function gateFromPoint(point, ctx, { triangle = -1, normal = null } = {})
     outer_outline: null,
     zone: triangle >= 0 ? ctx.zone[triangle] : -1,
     wall_sphere_mm: round(wall, 2),
-    height_mm: round(dot(point, ctx.d), 2),
+    height_mm: round(dot(point, ctx.up), 2),
     ...gate,
     near_undercut: null,
     near_riser: null,
     reason: 'manual_without_parting_line',
     why: `Placée à la main (pas de ligne de joint connue) ; attaque ${fr(gate.thickness_mm)} × ${fr(gate.width_mm)} mm.`,
+    source: 'manual',
+  };
+}
+
+/**
+ * A feed point from below placed by hand at `point` (low pressure): up into
+ * the part, sized from the zone of the triangle touched (its modulus; else
+ * from the wall there, as a hot spot of that diameter).
+ * ctx -- feedingContext of the body
+ */
+export function feedPointFromPoint(point, ctx, { triangle = -1, id = 'A1' } = {}) {
+  const zoneId = triangle >= 0 ? ctx.zone[triangle] : -1;
+  const z = ctx.zones?.[zoneId] ?? null;
+  const wall = triangle >= 0 ? ctx.sphere[triangle] ?? 0 : 0;
+  const modulus = z?.modulus_mm ?? HOT_SPOT_MODULUS * wall;
+  const size = sizeFeedPoint(modulus);
+  return {
+    id,
+    type: 'bottom',
+    zone: zoneId,
+    zone_sphere_mm: z?.sphere_mm ?? null,
+    modulus_mm: round(modulus, 3),
+    position_mm: roundVec(point),
+    direction: roundVec(ctx.up, 6),
+    on_parting_line: false,
+    outer_outline: null,
+    bottom_feed: true,
+    wall_sphere_mm: round(wall, 2),
+    height_mm: round(dot(point, ctx.up), 2),
+    ...size,
+    near_undercut: null,
+    near_riser: null,
+    reason: 'manual_bottom_feed',
+    why: `Placée à la main (basse pression, alimentation par le bas) ; Ø ${fr(size.diameter_mm)} mm, module D/4 = ${fr(size.feed_modulus_mm, 2)} mm ≥ 1,1 × module de la zone touchée (${fr(modulus, 2)} mm).`,
     source: 'manual',
   };
 }
@@ -1582,15 +1804,16 @@ export function gateFromPoint(point, ctx, { triangle = -1, normal = null } = {})
  *
  * positions, indices -- its mesh (mm); not modified
  * sphere  -- inscribed diameter per triangle (thickness.js), computed when not given
- * parting -- {direction, side, segments} (parting.js), or null (+Z, no ingate)
+ * parting -- {direction, side, segments, up, process} (parting.js), or null (+Z, no ingate)
+ * up, process -- as feedingContext (the orientation of the parting)
  * density -- g/cm³, for the masses (else volumes only)
- * Returns {version, status, method, zones, risers, gate, yield,
- * hot_spots_without_riser, direction, parting_known, body, sphere_source,
- * sampled} and, per triangle, zone and sphere (typed arrays).
+ * Returns {version, status, method, zones, risers, gate, feed_points, yield,
+ * hot_spots_without_riser, direction, up, process, mode, parting_known, body,
+ * sphere_source, sampled} and, per triangle, zone and sphere (typed arrays).
  */
-export function proposeFeeding(positions, indices, { sphere = null, parting = null, density = null, fullLimit = FULL_LIMIT, samples = SAMPLES, seed = SEED, onProgress = null } = {}) {
+export function proposeFeeding(positions, indices, { sphere = null, parting = null, up = null, process = null, density = null, fullLimit = FULL_LIMIT, samples = SAMPLES, seed = SEED, onProgress = null } = {}) {
   const zones = feedingZones(positions, indices, { sphere, fullLimit, samples, seed, onProgress });
-  const placed = placeFeeding(positions, indices, zones, { parting, density });
+  const placed = placeFeeding(positions, indices, zones, { parting, up, process, density });
   return {
     version: FEEDING_VERSION,
     status: 'proposed',

@@ -1,14 +1,17 @@
 // Orientation of a part in its die by casting process (web/engine/orientation.js):
 // the minimum-area rectangle and the die block of a draw direction, the
-// direction up when cast; the draw directions ranked with them (parting.js).
-// Synthetic meshes.
+// direction up when cast; the draw directions ranked with them (parting.js);
+// the risers and the feed placed along up (feeding.js). Synthetic meshes.
 //
 //   node --test tests/js/orientation.test.mjs
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import { DEFAULT_TOOLING, dieSize } from '../../web/chiffrage/tooling.js';
-import { feedingZones } from '../../web/engine/feeding.js';
+import {
+  FEED_MODULUS_FACTOR, feedingContext, feedingOptionsKey, feedingZones, gateFromPoint, hotSpotsWithoutRiser, placeFeeding, proposeFeeding,
+  riserFromPoint, snapToPartingLine,
+} from '../../web/engine/feeding.js';
 import {
   DIE_DEFAULTS, blockFrame, convexHull, dieBlock, dieKey, minAreaRect, normalizeDie, normalizeProcess, orientationKey, orientationMesh,
   orientationOf, processForIsland,
@@ -378,5 +381,96 @@ describe('draw directions ranked by their die block and their feeding', () => {
     console.log(`orientation of a body of 2M triangles: ${ms(times)} ms of processor (${ms(walls)} ms); a frame ${frame.toFixed(0)} ms`);
     for (const t of times) assert.ok(t < 1500, `${t} ms`);
     assert.ok(frame < 1000, `frame ${frame} ms`);
+  });
+});
+
+describe('risers and feed along up', () => {
+  test('a vertical parting plane: the riser on the face turned up along g, the ingate at the bottom along g', () => {
+    const t = tPart();
+    const p = proposeParting(t.positions, t.indices);
+    const o = p.proposal.orientation;
+    assert.deepEqual([p.proposal.direction, o.up], [[1, 0, 0], [0, 0, -1]]);
+    const parting = { direction: p.proposal.direction, side: p.side, segments: p.segments, up: o.up, process: o.process };
+    const f = proposeFeeding(t.positions, t.indices, { parting });
+    assert.deepEqual([f.mode, f.up, f.direction], ['top', [0, 0, -1], [1, 0, 0]]);
+    assert.ok(f.risers.length >= 1);
+    for (const r of f.risers) {
+      // On top along g: under the base (z = 0), over its hot spot; standing along g.
+      assert.deepEqual([r.type, r.open, r.axis], ['top', true, [0, 0, -1]]);
+      approx(r.position_mm[2], 0, 0, 1e-6, 'on the face turned up along g');
+      assert.ok(r.position_mm[0] >= 0 && r.position_mm[0] <= 60, `riser at ${r.position_mm}`);
+    }
+    // The ingate on the parting line, at the bottom along g: the end of the wall (z = 110).
+    assert.ok(f.gate?.on_parting_line, 'an ingate on the line');
+    assert.ok(snapToPartingLine(f.gate.position_mm, parting.segments).distance < 1e-3);
+    approx(f.gate.position_mm[2], 110, 0, 1e-6, 'at the bottom along g');
+    approx(f.gate.height_mm, -110, 0, 1e-6, 'its height along g');
+    assert.match(f.gate.why, /au plus bas selon le haut de coulée/);
+    // Up along the draw direction (as before, no orientation given): the riser on top along +X instead.
+    const along = proposeFeeding(t.positions, t.indices, { parting: { direction: [1, 0, 0], side: p.side, segments: p.segments } });
+    assert.deepEqual(along.up, [1, 0, 0]);
+    assert.ok(along.risers.every((r) => r.axis.join() === '1,0,0'));
+    // By hand: on top along g on a face turned up along g, none under the part (the wall's end).
+    const zones = feedingZones(t.positions, t.indices);
+    assert.equal(riserFromPoint([30, 50, 0], { zones, normal: [0, 0, -1], up: o.up, direction: [1, 0, 0] }).type, 'top');
+    assert.equal(riserFromPoint([30, 50, 110], { zones, normal: [0, 0, 1], up: o.up, direction: [1, 0, 0] }), null);
+    assert.notEqual(feedingOptionsKey({ parting }), feedingOptionsKey({ parting: { direction: [1, 0, 0] } }));
+  });
+
+  test('fed from below (low pressure): no riser, a feed point under the massive zone, on the -g side', () => {
+    const t = tPart();
+    const p = proposeParting(t.positions, t.indices, { process: LOW_PRESSURE });
+    const o = p.proposal.orientation;
+    const parting = { direction: p.proposal.direction, side: p.side, segments: p.segments, up: o.up, process: o.process };
+    const f = proposeFeeding(t.positions, t.indices, { parting, density: 2.7 });
+    assert.deepEqual([f.mode, f.up, f.process, f.risers], ['bottom', [0, 0, 1], LOW_PRESSURE, []]);
+    assert.equal(f.feed_points.length, f.zones.filter((z) => z.needs_riser).length);
+    const [main] = f.feed_points;
+    assert.equal(f.gate, main);
+    // Under the hot spot of the base (x 30, the middle of its 60 mm), at the lowest point of the part: its underside.
+    assert.deepEqual([main.type, main.bottom_feed, main.on_parting_line, main.direction, main.source, main.reason], ['bottom', true, false, [0, 0, 1], 'proposed', 'bottom_feed_under_hot_spot']);
+    approx(main.position_mm[2], 0, 0, 1e-6, 'on the -g side');
+    approx(main.position_mm[0], 30, 0, 3, 'under the hot spot');
+    // Sized from the zone: its modulus D/4 at least 1.1 × the zone's.
+    const zone = f.zones[main.zone];
+    assert.ok(main.feed_modulus_mm >= FEED_MODULUS_FACTOR * zone.modulus_mm - 1e-9);
+    assert.equal(main.feed_modulus_mm, Math.round((main.diameter_mm / 4) * 1000) / 1000);
+    assert.ok(((main.diameter_mm - 1) / 4) < FEED_MODULUS_FACTOR * zone.modulus_mm, 'the smallest whole diameter');
+    assert.match(main.why, /^Basse pression, alimentation par le bas/);
+    assert.deepEqual(f.hot_spots_without_riser, []);
+    assert.equal(f.yield.gating_volume_mm3, f.feed_points.reduce((s, x) => s + x.volume_mm3, 0));
+    // Without the feed points: the zones listed unfed.
+    assert.deepEqual(hotSpotsWithoutRiser(f.zones, [], []), f.zones.filter((z) => z.needs_riser).map((z) => z.id));
+    // By hand: a feed point where it is clicked, up into the part, sized from the zone touched.
+    const zones = feedingZones(t.positions, t.indices);
+    const ctx = feedingContext(t.positions, t.indices, zones, { parting });
+    const tri = centres(t).findIndex((c) => c[2] < 1e-9);
+    const byHand = gateFromPoint([10, 20, 0], ctx, { triangle: tri });
+    assert.deepEqual([byHand.type, byHand.source, byHand.position_mm, byHand.direction, byHand.on_parting_line], ['bottom', 'manual', [10, 20, 0], [0, 0, 1], false]);
+  });
+
+  test('fed from below: one feed point per massive zone, the bosses turned to the bottom', () => {
+    // A plate 100 × 60 × 5 with a boss 15 × 15 × 15 at each end (on top along +Z): two zones apart.
+    const mesh = voxels((x, y, z) => z < 1 || ((x < 3 || x >= 17) && y >= 4 && y < 7 && z < 4), [20, 12, 4], { size: 5, subdivide: 2 });
+    const p = proposeParting(mesh.positions, mesh.indices, { process: LOW_PRESSURE });
+    const o = p.proposal.orientation;
+    // The bosses down, near the feed: drawn along -Z, up = -Z.
+    assert.deepEqual([p.proposal.direction, o.up], [[0, 0, -1], [0, 0, -1]]);
+    const parting = { direction: p.proposal.direction, side: p.side, segments: p.segments, up: o.up, process: o.process };
+    const zones = feedingZones(mesh.positions, mesh.indices);
+    const placed = placeFeeding(mesh.positions, mesh.indices, zones, { parting });
+    assert.equal(zones.zones.length, 2);
+    assert.equal(placed.risers.length, 0);
+    assert.equal(placed.feed_points.length, 2);
+    assert.deepEqual(placed.feed_points.map((x) => x.id), ['A1', 'A2']);
+    // Each under its boss, on its face turned down along g (z = 20), one per zone.
+    const xs = placed.feed_points.map((x) => x.position_mm[0]).sort((a, b) => a - b);
+    assert.ok(xs[0] <= 15 && xs[1] >= 85, `feed points at x = ${xs}`);
+    for (const x of placed.feed_points) approx(x.position_mm[2], 20, 0, 1e-6, 'on the -g side of its boss');
+    assert.notEqual(placed.feed_points[0].zone, placed.feed_points[1].zone);
+    assert.deepEqual(placed.hot_spots_without_riser, []);
+    assert.equal(placed.yield.counted, 'part_risers_ingates');
+    // The same placement twice.
+    assert.deepEqual(placeFeeding(mesh.positions, mesh.indices, zones, { parting }), placed);
   });
 });

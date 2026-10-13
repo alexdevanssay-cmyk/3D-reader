@@ -65,9 +65,14 @@ export function computeFeeding(bodies, { onProgress } = {}) {
  * Risers and ingate of bodies for their parting lines (feeding.js
  * placeFeeding), in one go.
  * bodies -- per body {positions, indices, zones ({zone, sphere, zones, body}
- *           of feedingZones), parting ({direction, side, segments} or null)}
- *           (copied, the caller keeps its arrays)
- * Resolves to their placements, in the same order.
+ *           of feedingZones), parting ({direction, side, segments} or null),
+ *           up (the direction up when cast: the orientation of the parting,
+ *           orientation.js; else the draw direction), process ({plan,
+ *           alimentation}: "bas", fed from below, low pressure)} (copied, the
+ *           caller keeps its arrays)
+ * Resolves to their placements, in the same order; each says the up and the
+ * process it was placed for (feedingOptionsKey: what a placement kept by the
+ * page is keyed by, beside its parting).
  */
 export function placeFeedings(bodies) {
   return call('place', { type: 'place', bodies });
