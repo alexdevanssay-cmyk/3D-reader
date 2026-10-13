@@ -156,7 +156,7 @@ function fromTrace(p, trace) {
   return values.find((v) => sameValue(v, p.valeur)) ?? null;
 }
 
-/** The measure of the analysis of the part sent that gives this input (its size, modulus, wall thicknesses), as sent. */
+/** The measure of the analysis of the part sent that gives this input (its size, modulus, wall thicknesses, slides), as sent. */
 function fromAnalysis(p, sent) {
   const bodies = Array.isArray(sent?.bodies) ? sent.bodies : [];
   const measures = bodies.flatMap((b) => {
@@ -168,8 +168,10 @@ function fromAnalysis(p, sent) {
       "piece.module": m.volume_mm3 > 0 && m.surface_area_mm2 > 0 ? [m.volume_mm3 / m.surface_area_mm2] : [],
       "piece.toileMini": [thickness.min_mm, b.manufacturing?.functional_thickness?.minimum_wall_thickness_mm],
       "piece.epaisseurMax": [thickness.max_mm],
+      // The slides of the 3D analysis, per part (× the cavities of the die: from the trace).
+      "piece.outillage.tiroirs": [b.slides?.count],
     }[p.cle] ?? [];
-  }).filter((v) => typeof v === "number" && v > 0);
+  }).filter((v) => typeof v === "number" && (v > 0 || (p.cle === "piece.outillage.tiroirs" && v === 0)));
   // The analysis sent rounds to the thousandth: within half a thousandth, or 0.1 %.
   return measures.find((v) => Math.abs(v - p.valeur) <= Math.max(5e-4, 1e-3 * v)) ?? null;
 }

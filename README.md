@@ -161,7 +161,11 @@ hand" of `web/app.js`:
   valeur » (then traced as « estimation IA validée »). « Banc d'essai IA » backtests that
   estimate on the history (each record left out of its own similar parts) against the
   formula: mean errors by island and source, paced for the free quota of the gateway,
-  resumable, exported as CSV.
+  resumable, exported as CSV. Under « Tiroirs du moule » of an in-house die, the slides
+  of the 3D analysis (per part × the cavities of the die) are proposed with « Utiliser N
+  tiroirs »: used only by that click (traced « analyse 3D validée »), a value typed is
+  never replaced, and a change of the parting line, of the slides or of the cavities
+  since is shown with the value kept.
 - **Shared network folder** (Chrome or Edge; chosen once per PC in *Paramètres*): a
   folder of the company network where every PC writes, and reads, the results of its 3D
   analyses (`analyses-3d`: a part analysed on one PC opens at once on another, wall

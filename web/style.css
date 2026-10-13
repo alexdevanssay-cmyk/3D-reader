@@ -466,6 +466,10 @@ table.feeding-risers tr.selected td { background: color-mix(in srgb, var(--selec
 .cf > input, .cf > select, .cf > output { font-size: 14px; color: var(--text); }
 .cf > output { padding: 5px 0; font-weight: 600; font-variant-numeric: tabular-nums; }
 .cf small { font-size: 11px; }
+/* Under « Tiroirs du moule »: the count of the 3D analysis and « Utiliser ». */
+.cslides { margin: 2px 0 10px; line-height: 1.7; }
+.cslides.cmsg { padding: 6px 10px; }
+.cslides button { margin-left: 4px; }
 .cf small .cauto { color: var(--text); font-size: 12px; font-weight: 600; }
 .crow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
 /* The shared network folder: a long folder name or error wraps within a phone's width. */
