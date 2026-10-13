@@ -250,10 +250,11 @@ function outlineFilter(xs, ys, ids, K) {
 /**
  * Convex hull of the points (xs[i], ys[i]) of `list` (all when null), Andrew's
  * monotone chain in double precision: their indices, counter-clockwise from
- * the lowest x (then y), without collinear points (within rounding). The points inside the
- * octagon of their extreme points along 8 directions are left out first
- * (Akl-Toussaint): only those near the outline are sorted; many of them,
- * their near duplicates dropped, then filtered again (DEDUPE_*, OUTLINE_FINE).
+ * the lowest x (then y; x within rounding of each other as equal), without
+ * collinear points (within rounding). The points inside the octagon of their
+ * extreme points along 8 directions are left out first (Akl-Toussaint): only
+ * those near the outline are sorted; many of them, their near duplicates
+ * dropped, then filtered again (DEDUPE_*, OUTLINE_FINE).
  */
 export function convexHull(xs, ys, list = null) {
   const n = list ? list.length : xs.length;
@@ -266,8 +267,27 @@ export function convexHull(xs, ys, list = null) {
   let { ids: keep, span } = outlineFilter(xs, ys, ids, 8);
   if (keep.length > DEDUPE_ABOVE && span > 0) keep = dedupe(xs, ys, keep, DEDUPE_SHARE * span);
   if (keep.length > DEDUPE_ABOVE) keep = outlineFilter(xs, ys, keep, OUTLINE_FINE).ids;
-  const sorted = Int32Array.from(keep).sort((i, j) => xs[i] - xs[j] || ys[i] - ys[j] || i - j);
-  const m = sorted.length;
+  const m = keep.length;
+  // Sorted on the grid of DEDUPE_SHARE of the extent (as dedupe), then as
+  // given: the points of a side along y whose x differ by rounding only (a
+  // part turned, far from the origin) in their order along y. By x alone, a
+  // point a hair to the left of that side's middle came before its lower
+  // end, and the chain dropped that corner as straight on (within `flat`).
+  const q = DEDUPE_SHARE * span;
+  let x0 = Infinity, y0 = Infinity;
+  for (let k = 0; k < m; k++) {
+    if (xs[keep[k]] < x0) x0 = xs[keep[k]];
+    if (ys[keep[k]] < y0) y0 = ys[keep[k]];
+  }
+  const gx = new Float64Array(m), gy = new Float64Array(m);
+  for (let k = 0; k < m; k++) {
+    gx[k] = q > 0 ? Math.round((xs[keep[k]] - x0) / q) : 0;
+    gy[k] = q > 0 ? Math.round((ys[keep[k]] - y0) / q) : 0;
+  }
+  const sorted = Int32Array.from(Int32Array.from({ length: m }, (_, k) => k).sort((a, b) => {
+    const i = keep[a], j = keep[b];
+    return gx[a] - gx[b] || gy[a] - gy[b] || xs[i] - xs[j] || ys[i] - ys[j] || i - j;
+  }), (k) => keep[k]);
   const hull = new Int32Array(2 * m + 1);
   let h = 0;
   // A turn within the rounding of the coordinates (1e-12 of the extent squared): straight on, the middle point dropped.

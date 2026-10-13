@@ -14,7 +14,7 @@ import {
 } from '../../web/engine/feeding.js';
 import {
   DIE_DEFAULTS, blockFrame, convexHull, dieBlock, dieKey, minAreaRect, normalizeDie, normalizeProcess, orientationKey, orientationMesh,
-  orientationOf, processForIsland,
+  orientationOf, planeBasis, processForIsland,
 } from '../../web/engine/orientation.js';
 import { SIDE_LOWER, SIDE_UPPER, evaluateParting, proposeParting } from '../../web/engine/parting.js';
 import { analyseSlides, effectiveSlides, prepareSlides, slidesSignature, undercutMask } from '../../web/engine/slides.js';
@@ -143,6 +143,56 @@ describe('minimum-area rectangle', () => {
     // The hull: counter-clockwise, without the points inside or along its sides.
     const xs = Float64Array.from([0, 2, 1, 2, 0, 1, 1]), ys = Float64Array.from([0, 0, 1, 2, 2, 0, 2]);
     assert.deepEqual([...convexHull(xs, ys)], [0, 1, 3, 4]);
+  });
+
+  test('a side along y whose x differ by rounding only: its corners kept, the block as by brute force', () => {
+    // The side x = -50 of a rectangle 100 × 60: its middle point a hair to the left of its ends. Sorted by x
+    // alone, that point came first and the chain dropped the corner (-50, -30) as straight on.
+    const e = 4e-14;
+    const xs = Float64Array.from([-50 - e, -50 + e, -50 + e, -50 + e, 50, 50]), ys = Float64Array.from([0, -30, -2, 30, -30, 30]);
+    assert.deepEqual([...convexHull(xs, ys)], [1, 4, 5, 3]);
+    const r = minAreaRect(xs, ys);
+    approx(r.area, 6000, 1e-12, 0, 'area');
+    // The T turned 30° about X and moved off the origin, in double precision: seen along its height, its block
+    // 100 × 60 (its base), not an impossible 113.02 × 30.65 from a hull without a corner, which was proposed.
+    const c = Math.cos(30 * deg), s = Math.sin(30 * deg);
+    const t = tPart();
+    const P = Float64Array.from(t.positions, (x, i) => {
+      const p = i - (i % 3), y = t.positions[p + 1], z = t.positions[p + 2];
+      return [x, c * y - s * z + 1000, s * y + c * z - 500][i % 3];
+    });
+    assert.deepEqual(orientationOf(P, t.indices, [0, -s, c]).raw_mm, [100, 60, 110]);
+    const { proposal } = proposeParting(P, t.indices);
+    assert.deepEqual([proposal.axis, proposal.orientation.raw_mm], ['X', [110, 100, 60]]);
+    // Fuzz: turned about X, Y or Z and moved far (double precision), along each of its turned axes: the
+    // rectangle of every edge of the hull, the least of every pair of vertices (brute force).
+    const next = random(17);
+    const turned = (k, a) => (v) => {
+      const [i, j] = [[1, 2], [2, 0], [0, 1]][k];
+      const w = [...v];
+      w[i] = Math.cos(a) * v[i] - Math.sin(a) * v[j];
+      w[j] = Math.sin(a) * v[i] + Math.cos(a) * v[j];
+      return w;
+    };
+    let wrong = 0;
+    for (let frame = 0; frame < 900; frame++) {
+      const turn = turned(frame % 3, Math.PI * next());
+      const off = [0, 1, 2].map(() => Math.round(4000 * next() - 2000));
+      const Q = new Float64Array(t.positions.length);
+      for (let i = 0; i < Q.length; i += 3) Q.set(turn([t.positions[i], t.positions[i + 1], t.positions[i + 2]]).map((x, k) => x + off[k]), i);
+      const om = orientationMesh(Q, t.indices);
+      // Its points once each (each face of the prism has its own vertices).
+      const corners = [...new Map(Array.from({ length: om.P.length / 3 }, (_, i) => [...om.P.subarray(3 * i, 3 * i + 3)]).map((p) => [p.join(), p])).values()];
+      for (const axis of [[1, 0, 0], [0, 1, 0], [0, 0, 1]]) {
+        const d = turn(axis);
+        const f = blockFrame(om, d);
+        const [e1, e2] = planeBasis(d);
+        const pts = corners.map((p) => [e1, e2].map((e) => p[0] * e[0] + p[1] * e[1] + p[2] * e[2]));
+        const least = bruteRect(pts);
+        if (Math.abs(f.a * f.b - least) > 1e-9 * least) wrong++;
+      }
+    }
+    assert.equal(wrong, 0, `${wrong} of 2700 blocks smaller than the part`);
   });
 });
 
