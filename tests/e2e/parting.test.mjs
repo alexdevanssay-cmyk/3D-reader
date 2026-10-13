@@ -977,11 +977,20 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     assert.match(await hint(), /^Point 8 : .* le point 5 \(/);
     assert.deepEqual((await segmentRows(page)).map((r) => r.name), ['1-2', '2-3', '3-4', '4-1', '5-6', '6-7']);
 
-    // 3. On another page, the drawing's keys do nothing: back on the 3D view, the same points, the same turn.
+    // 3. On another page, the drawing's keys do nothing, and no point of the model is on the page. Back on the 3D view
+    // (its tab clicked and the question asked at once, before the view's next frame): each point where it was, the
+    // same points, the same turn.
     const before = await view();
+    const at = (p) => page.evaluate((q) => window.reader3d.screenOf(q), p);
+    const seen = await at(second[3][0]);
+    assert.ok(seen);
     await page.click('.tabs .tab[data-page="chiffrage"]');
     for (const key of ['Backspace', 'Delete', 'ArrowRight']) await page.keyboard.press(key);
-    await page.click('.tabs .tab[data-page="viewer"]');
+    assert.equal(await at(second[3][0]), null);
+    assert.deepEqual(await page.evaluate((q) => {
+      document.querySelector('.tabs .tab[data-page="viewer"]').click();
+      return window.reader3d.screenOf(q);
+    }, second[3][0]), seen);
     assert.equal(await labels(), 7);
     assert.equal((await view()).turn, before.turn);
 
