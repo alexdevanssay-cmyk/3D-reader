@@ -156,6 +156,26 @@ function partingEvidence(body) {
 }
 
 /**
+ * The casting process of the body and its orientation in the die
+ * (orientation.js, given with its parting): the parting plane and the
+ * feeding of the island retained in the costing (or chosen for the part, or
+ * the default), up when cast, the die blank and its steel. Null without one.
+ */
+function orientationEvidence(body) {
+  const o = body?.parting?.orientation;
+  const p = body?.parting?.process;
+  if (!o || !p) return null;
+  return {
+    process: { plan: p.plan ?? null, alimentation: p.alimentation ?? null, source: p.source ?? null, island: p.island ?? null },
+    orientation: {
+      up: o.up ?? null, up_axis: o.up_axis ?? null, up_source: o.up_source ?? null, upper_half_down: o.upper_half_down === true,
+      block_axes: o.block_axes ?? null, raw_mm: o.raw_mm ?? null, die_block_mm: o.die_block_mm ?? null, steel_kg: o.steel_kg ?? null,
+      feeding_score: o.feeding_score ?? null, feeding_basis: o.feeding_basis ?? null,
+    },
+  };
+}
+
+/**
  * Risers and ingate of the body (feeding.js, given with the Reader body):
  * proposed from the inscribed spheres and the moduli (heuristics of the
  * modulus method, not a solidification simulation), or placed by hand.
@@ -184,7 +204,11 @@ function feedingEvidence(body) {
       position_mm: gate.position_mm ?? null,
       on_parting_line: gate.on_parting_line === true,
       section_mm2: gate.section_mm2 ?? null,
+      // Low pressure: the feed through the lower die, not at the parting line.
+      ...(gate.bottom_feed === true ? { bottom_feed: true } : {}),
     } : null,
+    // Fed from below (low pressure): no riser proposed, a feed point per zone.
+    ...(f.mode === "bottom" ? { mode: "bottom", feed_point_count: Array.isArray(f.feed_points) ? f.feed_points.length : 0 } : {}),
     yield: f.yield?.value ?? null,
     parting_known: f.parting_known ?? null,
     sampled: !!f.sampled,
@@ -247,6 +271,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
   const feedingKnown = feeding.status !== "not_evaluated";
   const slides = slidesEvidence(body);
   const slidesKnown = slides.status !== "not_evaluated";
+  const oriented = orientationEvidence(body);
   const undercut = partingKnown && parting.undercut_area_mm2 > 0;
   const zeroDraft = partingKnown && parting.zero_draft_area_mm2 > 0;
   const nonPlanar = partingKnown && parting.parting_line?.planar === false;
@@ -421,6 +446,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
   if (feedingKnown) {
     confirmedEvidence.push(feeding.risers_status === "manual" ? "risers_placed_manually" : "risers_proposed_from_geometry");
     if (feeding.gate?.on_parting_line) confirmedEvidence.push("gate_on_parting_line");
+    if (feeding.gate?.bottom_feed) confirmedEvidence.push("bottom_feed_through_lower_die");
     if (feeding.hot_spots_without_riser.length) {
       risks.push(issue(
         "hot_spot_without_riser",
@@ -431,7 +457,8 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
         { zones: feeding.hot_spots_without_riser },
       ));
     }
-    if (feeding.gate && !feeding.gate.on_parting_line) {
+    // A feed from below (low pressure) goes through the lower die, not at the parting line.
+    if (feeding.gate && !feeding.gate.on_parting_line && !feeding.gate.bottom_feed) {
       risks.push(issue(
         "gate_off_parting_line",
         "review",
@@ -463,7 +490,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
     hot_spots: feedingKnown ? "located_by_inscribed_sphere_feeding_zones" : thickness.status === "measured" ? "screened_by_thickness_distribution" : "not_available",
     directional_solidification: feedingKnown ? "screened_by_section_necks_not_simulated" : "not_simulated",
     risering: !feedingKnown ? "not_sized" : feeding.risers_status === "manual" ? "placed_manually" : "proposed_by_modulus_heuristic",
-    gating: !feedingKnown || !feeding.gate ? "not_sized" : feeding.gate.source === "manual" ? "placed_manually" : "proposed_on_parting_line",
+    gating: !feedingKnown || !feeding.gate ? "not_sized" : feeding.gate.source === "manual" ? "placed_manually" : feeding.gate.bottom_feed ? "proposed_bottom_feed" : "proposed_on_parting_line",
     filling: "not_simulated",
     porosity: "not_simulated",
     distortion: "not_simulated",
@@ -496,6 +523,8 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
       topology: body?.topology ?? null,
       thickness,
       parting,
+      // Beside the parting: the casting process and the orientation of the part in its die.
+      ...(oriented ?? {}),
       slides,
       feeding,
       principal_axes: principalAxes,

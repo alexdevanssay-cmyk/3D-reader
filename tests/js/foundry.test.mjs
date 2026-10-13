@@ -422,3 +422,70 @@ test("the wall thickness measured is kept at every level of the compaction, the 
   }), { task: "manufacturing_analysis" });
   assert.deepEqual(compactAIContext(none, { maxChars: 1 }).bodies[0].thickness, { status: "not_computed" });
 });
+
+/** The orientation of the part in its die for its process (web/engine/orientation.js, given with its parting by app.js). */
+function oriented(process, orientation = {}) {
+  return {
+    process,
+    orientation: {
+      process: { plan: process.plan, alimentation: process.alimentation },
+      up: [0, 0, 1], up_axis: "+Z", up_side: "+d", upper_half_down: false,
+      block_axes: { u: [1, 0, 0], v: [0, 1, 0], d: [0, 0, 1] }, raw_mm: [100, 80, 40], raw_centre_mm: [0, 0, 0],
+      die_block_mm: [220, 200, 140], die_volume_dm3: 6.16, steel_kg: 48, cavities: 1,
+      margins_mm: { longueur: 60, largeur: 60, hauteur: 50, entreEmpreintes: 40 }, density: 7.8,
+      feeding_score: -0.02, feeding_basis: "volume_centroid", choices: [], centroids_mm: { area: [0, 0, 0], feeding: [0, 0, -1] }, up_source: "feeding",
+      ...orientation,
+    },
+  };
+}
+
+test("low pressure: the process and the orientation in the die beside the parting; fed from below, not an ingate off the parting line", () => {
+  const LOW = { plan: "horizontal", alimentation: "bas", source: "costing", island: "BPR", famille: "Basse pression" };
+  const feed = { ...feeding().gate, id: "A1", type: "bottom", on_parting_line: false, outer_outline: null, bottom_feed: true, direction: [0, 0, 1], position_mm: [52.5, 32.5, -20], diameter_mm: 18, section_mm2: 254.5, reason: "bottom_feed_under_hot_spot" };
+  const semantic = buildSemantic3D({
+    file: "casting.step", kind: "cad", engine: "browser",
+    summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 },
+    bodies: [body({
+      parting: parting(oriented(LOW)),
+      feeding: feeding({ risers: [], gate: feed, feed_points: [feed, { ...feed, id: "A2", position_mm: [10, 30, -20] }], mode: "bottom", up: [0, 0, 1], process: { plan: "horizontal", alimentation: "bas" }, yield: { ...feeding().yield, counted: "part_risers_ingates" } }),
+    })],
+  });
+  const b = semantic.bodies[0];
+  const { rules, risks, evidence } = b.foundry;
+  // The foundry screen: the process and the orientation beside the parting; the feed through the lower die.
+  assert.deepEqual(evidence.process, { plan: "horizontal", alimentation: "bas", source: "costing", island: "BPR" });
+  assert.deepEqual([evidence.orientation.up_axis, evidence.orientation.die_block_mm, evidence.orientation.steel_kg, evidence.orientation.upper_half_down], ["+Z", [220, 200, 140], 48, false]);
+  assert.equal(evidence.parting.status, "proposed");
+  assert.equal(evidence.feeding.gate.bottom_feed, true);
+  assert.deepEqual([evidence.feeding.mode, evidence.feeding.feed_point_count], ["bottom", 2]);
+  assert.ok(!risks.some(r => r.code === "gate_off_parting_line"));
+  assert.equal(rules.gating, "proposed_bottom_feed");
+  assert.ok(evidence.confirmed.includes("bottom_feed_through_lower_die"));
+  // The AI context: beside the parting (its keys as before), the process and the orientation in short.
+  const context = buildAIContext(semantic, { task: "general" });
+  const ai = context.bodies[0];
+  assert.deepEqual(Object.keys(ai.parting).sort(), ["axis", "direction", "planar", "status", "undercut_share", "zero_draft_share"]);
+  assert.deepEqual(ai.process, { plan: "horizontal", alimentation: "bas", source: "costing", island: "BPR" });
+  assert.deepEqual(ai.orientation, { up: [0, 0, 1], up_axis: "+Z", up_source: "feeding", block_axes: { u: [1, 0, 0], v: [0, 1, 0], d: [0, 0, 1] }, raw_mm: [100, 80, 40], die_block_mm: [220, 200, 140], steel_kg: 48, feeding_score: -0.02, feeding_basis: "volume_centroid" });
+  assert.deepEqual([ai.feeding.mode, ai.feeding.feed_points, ai.feeding.gate.bottom_feed, ai.feeding.risers.length], ["bottom", 2, true, 0]);
+  // Compacted: the orientation in short (the process folded in), then left out at the last resort, said so.
+  const four = compactAIContext(context, { maxChars: 1 });
+  assert.equal(four.bodies[0].orientation, undefined);
+  assert.ok(four.compaction.omitted.includes("orientation in the die"));
+  const levels = Array.from({ length: 50 }, (_, k) => compactAIContext(context, { maxChars: 1000 + 250 * k }).bodies[0].orientation).filter(Boolean);
+  for (const o of levels) assert.equal(o.up_axis, "+Z");
+  assert.ok(levels.some((o) => o.process === "horizontal-bas" && o.island === "BPR" && !("block_axes" in o)), "in short");
+  assert.ok(levels.some((o) => "block_axes" in o), "whole while there is room");
+});
+
+test("the feeding of a horizontal plane putting the upper half underneath (a line drawn by hand, not turned over): said in the foundry screen and the AI context", () => {
+  const CHOSEN = { plan: "horizontal", alimentation: "haut", source: "part", island: "CG3", famille: "Coquille gravité (traditionnel)" };
+  const semantic = buildSemantic3D({
+    file: "casting.step", kind: "cad", engine: "browser",
+    summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 },
+    bodies: [body({ parting: parting({ status: "manual", source: "drawn", ...oriented(CHOSEN, { up: [0, 0, -1], up_axis: "-Z", up_side: "-d", upper_half_down: true, up_source: "manual" }) }) })],
+  });
+  assert.deepEqual([semantic.bodies[0].foundry.evidence.orientation.upper_half_down, semantic.bodies[0].foundry.evidence.orientation.up_source], [true, "manual"]);
+  const ai = buildAIContext(semantic, { task: "general" }).bodies[0];
+  assert.deepEqual([ai.orientation.upper_half_down, ai.orientation.up_axis, ai.process.source], [true, "-Z", "part"]);
+});
