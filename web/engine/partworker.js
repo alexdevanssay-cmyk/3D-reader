@@ -4,8 +4,9 @@
 // file (engine worker) and the wall thickness (pool) do not wait for it.
 //
 // Every job carries the casting process ({plan, alimentation}) and the die
-// options ({marges, densite, cavities}) of orientation.js: they rank the
-// directions and orient each one (its die block, up when cast).
+// options ({marges, densite, cavities}) of orientation.js: the die options
+// rank the directions (their die block), the process orients each one (up
+// when cast; it does not rank them).
 
 import { orientationKey, orientationOf } from './orientation.js';
 import { PARTING_VERSION, evaluateParting, proposeParting } from './parting.js';

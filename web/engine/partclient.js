@@ -10,8 +10,9 @@
 //
 // Each job carries the casting process ({plan, alimentation}) and the die
 // options ({marges, densite, cavities}; orientation.js): the proposals are
-// ranked with them, and kept with their key (orientationKey): proposals of
-// another process or other die options are not taken from the cache.
+// ranked with the die options and oriented for the process, and kept with
+// their key (orientationKey): proposals of another process or other die
+// options are not taken from the cache.
 
 import { saveResult } from './cache.js';
 import { orientationKey } from './orientation.js';

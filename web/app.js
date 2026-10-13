@@ -6718,11 +6718,13 @@ document.addEventListener("keydown", (e) => {
 // of the island in Paramètres), else the default (gravity die, vertical
 // plane); it can be chosen for the part on the parting card. The parting of
 // a body is proposed for its process and the margins of the dies of the
-// costing (the worker ranks the draw directions by their die block and their
-// feeding), again when they change. Shown on the card: the process, the
-// direction up when the metal is cast (« haut de coulée »: by the feeding
-// rule, again with the wall thickness once computed, or chosen by hand; on a
-// horizontal plane, another up turns the halves over), the die blank (« brut
+// costing (the worker ranks the draw directions by their die block, the same
+// whatever the process, and orients each one for the process: up when cast),
+// again when they change.
+// Shown on the card: the process, the direction up when the metal is cast
+// (« haut de coulée »: by the feeding rule, again with the wall thickness
+// once computed, or chosen by hand; on a horizontal plane, another up turns
+// the halves over), the die blank (« brut
 // de coquille »: the smallest block round the part along its draw direction
 // plus the margins, one cavity) and its steel; on the 3D view an arrow « haut »
 // and the blank as a wire box. The risers and the ingate are placed along that
@@ -6953,17 +6955,18 @@ function orientChanged(r) {
  * pieceKey "index:name" (ui.js piecesOf; null: every body of the part shown),
  * info {code (null: none retained), famille, orientation (the island's,
  * Paramètres), die ({marges, densite}: the costing's dies)}. Kept for the
- * part; its parting proposed again for that process (nothing when nothing
- * changed). For the model shown.
+ * part; its parting proposed again for that process. Nothing when nothing
+ * changed (the costing tells it at each drawing of its page): neither kept
+ * nor drawn again. For the model shown. Returns whether anything changed.
  */
 function setProcess(pieceKey, info) {
   const r = state.result;
-  if (!r) return;
+  if (!r) return false;
   let bodies = r.bodies.map((_, i) => i);
   if (pieceKey != null) {
     const m = /^(\d+):([\s\S]*)$/.exec(String(pieceKey));
     const i = m ? Number(m[1]) : -1;
-    if (!(i < r.bodies.length) || i < 0 || r.bodies[i].name !== m[2]) return;
+    if (!(i < r.bodies.length) || i < 0 || r.bodies[i].name !== m[2]) return false;
     bodies = [i];
   }
   let changed = false;
@@ -6985,6 +6988,7 @@ function setProcess(pieceKey, info) {
   }
   // Told from within the costing page's drawing: the parting proposed again after it.
   if (changed) setTimeout(() => orientChanged(r));
+  return changed;
 }
 
 // ---- the orientation shown
@@ -7999,9 +8003,10 @@ window.reader3d = {
    * body of the part shown): {code (null: none), famille, orientation
    * ({plan, alimentation} of Paramètres), die ({marges, densite} of its
    * dies)}. The parting of the body is proposed for that casting process.
+   * Returns whether anything changed (false: the same as told last).
    */
   setProcess(pieceKey, info) {
-    setProcess(pieceKey, info);
+    return setProcess(pieceKey, info);
   },
   /** Compute the wall thickness of the part shown (with progress), then return part(). */
   async computeThickness() {

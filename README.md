@@ -33,10 +33,10 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   shows the hot spots at wall junctions) and *ray* (distance to the opposite wall).
 - **Parting line** ("plan de joint") of cast parts, card *Plan de joint*: the draw direction
   proposed from the geometry (candidates: dominant face normals, the frame axes, the
-  principal axes; ranked by undercut area, then the steel of the die block, then the
-  massive sections on the feeding side of the casting process, then a planar line, then
-  the faces without draft), each face classified by lines of sight along the direction (upper half, lower
-  half, undercut for a core or slide), and the parting line, planar or stepped/warped with
+  principal axes; ranked by undercut area, then the steel of the die block, then a planar
+  line, then the faces without draft: the same whatever the casting process), each face
+  classified by lines of sight along the direction (upper half, lower half, undercut for
+  a core or slide), and the parting line, planar or stepped/warped with
   its height range. Shown on the 3D view: the parting line as a thick red line drawn over
   everything, the undercuts in yellow, the other faces in light grey (lighter without
   draft), and the two halves of the mould ("chapes") as translucent blocks round the part,
@@ -111,8 +111,10 @@ hand" of `web/app.js`:
   setting of *Paramètres*, « Plan de joint » and « Alimentation »), else a gravity die
   with a vertical plane (said « par défaut : aucun îlot retenu »), and can be chosen for
   the part (*Procédé pour cette pièce*, kept in the browser; « Revenir au procédé du
-  chiffrage »). The draw direction is proposed for it, and the card shows the direction up
-  when the metal is cast (*Haut de coulée*: the massive sections on the feeding side,
+  chiffrage »). The draw direction does not depend on it (the die and its undercuts depend
+  on the part and the draw direction, not on where the metal comes in): the process
+  decides which way is up. The card shows the direction up when the metal is cast
+  (*Haut de coulée*: the massive sections on the feeding side,
   again with the wall thickness once computed, or chosen by hand; on a horizontal plane,
   the other side turns the halves over) and the die blank (« brut de coquille »: the
   smallest block round the part along its draw direction plus the margins of the
@@ -264,11 +266,16 @@ below}:
   Σ area t³ in place of c_V. Ties: the shorter side upright, then + before −, then u
   before v.
 - **Ranking** of the draw directions: undercut area first, then the steel of the block
-  (within 5 %), then the feeding score (within 0.05), then as before. The proposals are
-  kept with the results of the file for their process and die options; a change of either
-  proposes the body again. A direction chosen by hand gets its orientation too; a line
-  drawn by hand is never turned over (its upper half at the bottom is said, « chape
-  supérieure en bas »).
+  (within 5 %), then as before (a planar line, the faces without draft, the projected area
+  for the height). Not the feeding score: the die and its undercuts depend on the part and
+  the draw direction, not on where the metal comes in, so the direction, its blank and its
+  undercuts are the same whatever the process, which only chooses *g* (and on a horizontal
+  plane the sense of *d*). The costing, which sizes the die of every in-house island from
+  that blank, thus cannot retain another island because of the orientation the retained
+  one causes. The proposals are kept with the results of the file for their process and
+  die options; a change of either proposes the body again. A direction chosen by hand
+  gets its orientation too; a line drawn by hand is never turned over (its upper half at
+  the bottom is said, « chape supérieure en bas »).
 - **Risers and feed** along *g* (feeding.js): risers on the faces turned up along *g*;
   the ingate low along *g*, never at the top; fed from below, a feed point per massive
   zone at the lowest point of the part under its hot spot, through the lower die.

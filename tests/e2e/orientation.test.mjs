@@ -23,6 +23,7 @@ import { chromium } from 'playwright';
 import { createStaticServer } from '../../scripts/serve.mjs';
 import { ROOT, approx, fixturePath } from '../js/helpers.mjs';
 import { costingWorkbook } from '../js/costing-fixture.mjs';
+import { prism } from '../js/meshes.mjs';
 
 const DIST = join(ROOT, 'dist');
 const CAD_TIMEOUT = 180_000;
@@ -44,6 +45,29 @@ async function zoomOut(page, steps = 2) {
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   for (let k = 0; k < steps; k++) await page.mouse.wheel(0, 250);
   await page.waitForTimeout(600);
+}
+
+// An inverted T: a base 60 (x) × 30 (z), a wall 4 thick and 80 high on its middle, 100 deep along y.
+const T_PROFILE = [[0, 0], [60, 0], [60, 30], [32, 30], [32, 110], [28, 110], [28, 30], [0, 30]];
+const tPart = (scale = 1) => {
+  const m = prism(T_PROFILE, 100, [30, 25]);
+  return { positions: m.positions.map((x) => x * scale), indices: m.indices };
+};
+
+/** A binary STL of a mesh, as a file to open. */
+function stlFile(name, { positions: P, indices: I }) {
+  const n = I.length / 3;
+  const buffer = Buffer.alloc(84 + 50 * n);
+  buffer.writeUInt32LE(n, 80);
+  for (let f = 0; f < n; f++) for (let c = 0; c < 3; c++) for (let k = 0; k < 3; k++) buffer.writeFloatLE(P[3 * I[3 * f + c] + k], 84 + 50 * f + 12 + 12 * c + 4 * k);
+  return { name, mimeType: 'application/octet-stream', buffer };
+}
+
+/** A field of the costing typed in (then left: its change). */
+async function setField(page, selector, value) {
+  await page.waitForSelector(selector);
+  await page.fill(selector, String(value));
+  await page.dispatchEvent(selector, 'change');
 }
 
 /** What the parting card says of the orientation. */
@@ -285,4 +309,57 @@ describe('orientation by casting process (dist/)', { skip: !existsSync(join(DIST
     assert.deepEqual(errors, []);
     await context.close();
   });
+
+  test('the costing and the 3D page agree at once: the draw direction and its blank the same whatever the island retained', { timeout: 2 * CAD_TIMEOUT }, async () => {
+    const { context, page, errors } = await newPage();
+    // Islands rated so that low pressure and the gravity die CG4 are close: when the process ranked the draw
+    // directions, each one was the better under the other's orientation, and the costing and the 3D page
+    // retained them in turn for ever (some 30 times a second).
+    await page.click('.tab[data-page="parametres"]');
+    for (const [code, quality] of Object.entries({ SSP: 0.01, CG1: 0.01, CG2: 0.01, CG3: 0.01, CG5: 0.01, CG4: 7, BPR: 7.83 })) {
+      await setField(page, `#page-parametres [data-bind="s.processes.${code}.qualite"]`, quality);
+    }
+    await page.click('.tab[data-page="chiffrage"]');
+    await setField(page, '#page-chiffrage [data-bind="q.volumeAnnuel"]', 100);
+    await page.click('.tab[data-page="viewer"]');
+    // The inverted T scaled × 2.03: drawn across it (X), the base up for a gravity die (no island retained yet).
+    await open(page, stlFile('T.stl', tPart(2.03)));
+    await settled(page, GRAVITY_DEFAULT, '-Z');
+    const gravity = await page.evaluate(() => window.reader3d.part().parts[0].orientedSize);
+    assert.deepEqual(gravity, [223.3, 203, 121.8]);
+    // What the costing tells the 3D page, each time.
+    await page.evaluate(() => {
+      const api = window.reader3d;
+      const setProcess = api.setProcess;
+      window.told = [];
+      api.setProcess = (key, info) => {
+        const changed = setProcess.call(api, key, info);
+        window.told.push({ key, info, changed });
+        return changed;
+      };
+    });
+    await page.click('.tab[data-page="chiffrage"]');
+    // Settled: nothing told for 3 s, within a minute.
+    let told = [];
+    for (let quiet = 0, k = 0; quiet < 3; k++) {
+      assert.ok(k < 60, `still told after a minute: ${told.length} times`);
+      await page.waitForTimeout(1000);
+      const now = await page.evaluate(() => window.told);
+      quiet = now.length === told.length ? quiet + 1 : 0;
+      told = now;
+    }
+    assert.ok(told.length <= 20, `told ${told.length} times`);
+    assert.deepEqual(told.filter((x) => x.changed).map((x) => x.info.code), ['BPR'], 'one island retained, not one then the other in turn');
+    // The 3D page: low pressure, the same draw direction and blank (up along it: the T is even across).
+    await page.click('.tab[data-page="viewer"]');
+    await settled(page, LOW_PRESSURE, '+X');
+    assert.equal(await page.textContent('#parting-axis'), 'X');
+    assert.deepEqual(await page.evaluate(() => window.reader3d.part().parts[0].orientedSize), gravity);
+    // Told the same again: nothing changes, nothing drawn or proposed again.
+    const last = told.at(-1);
+    assert.equal(await page.evaluate(([key, info]) => window.reader3d.setProcess(key, info), [last.key, last.info]), false);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
 });

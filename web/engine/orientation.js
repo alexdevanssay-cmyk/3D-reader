@@ -35,7 +35,10 @@
 // ~ t, the time ~ modulus²): the sections that are heavy and freeze last
 // weigh the most. Two senses within UP_TIE of the best: the shorter side
 // vertical (a lower metallostatic head and fill height), then + before -,
-// then u before v.
+// then u before v. The feeding chooses g for a draw direction, never the
+// direction: the die block and the undercuts depend on the part and d only,
+// so parting.js proposes the same d (and blank) whatever the process; the
+// process decides which way is up.
 //
 // Plain JavaScript without bare imports: it runs in the parting worker
 // (parting.js, partworker.js) and on the page (a line drawn by hand, the
@@ -59,9 +62,9 @@ export const DIE_DEFAULTS = Object.freeze({
 // Two senses of g whose scores differ by less than this are tied.
 export const UP_TIE = 0.02;
 // Ranking of the draw directions (parting.js): steel masses within this share
-// of the larger, feeding scores within this, are equal.
+// of the larger are equal. The feeding score does not rank them: it chooses
+// the casting up of the direction (and on a horizontal plane its sense) only.
 export const STEEL_TIE = 0.05;
-export const FEED_TIE = 0.05;
 // Rectangles of areas within this share of the least are the same size (the
 // rounding of float positions; the sides of a regular polygon).
 const AREA_TIE = 1e-6;
@@ -556,9 +559,8 @@ export function blockFrame(om, direction) {
  *
  * options -- process ({plan, alimentation}), die (normalizeDie), thickness
  *   (inscribed diameter per triangle: c_T in place of c_V), up
- * Returns {summary, steel (kg), feed (the score of the chosen g, positive
- * when better for the feeding: s for a top feed, -s for a bottom feed), side
- * ("+u", "-u", "+v", "-v", "+d", "-d"), up, frame}. The summary (JSON, mm):
+ * Returns {summary, steel (kg), side ("+u", "-u", "+v", "-v", "+d", "-d"),
+ * up, frame}. The summary (JSON, mm):
  *   process {plan, alimentation}
  *   up (g, unit), up_axis ("+Z", "-X" or its components), up_side,
  *   upper_half_down (a horizontal plane whose up is -d: the upper half, +d,
@@ -632,7 +634,7 @@ export function orientationFor(om, direction, { process = null, die = null, thic
     choices: choices.map((x) => ({ side: x.side, up: roundVec(x.g), score: round(x.s, 4), extent_mm: round(x.H, 2) })),
     centroids_mm: { area: model(om.centroids.area), feeding: model(feeder) },
   };
-  return { summary, steel: block.steel_kg, feed: chosen.e, side: chosen.side, up: chosen.g, frame };
+  return { summary, steel: block.steel_kg, side: chosen.side, up: chosen.g, frame };
 }
 
 /**

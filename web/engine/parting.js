@@ -30,19 +30,21 @@
 // only the triangles of its cell, and one walk gives both senses.
 //
 // The orientation of each direction for the casting process (orientation.js):
-// its die block (the steel blank) and the direction up when the metal is cast;
-// they rank the directions too (proposeParting).
+// its die block (the steel blank), which ranks the directions too
+// (proposeParting), and the direction up when the metal is cast, which does
+// not: the die and its undercuts depend on the part and the draw direction,
+// not on where the metal comes in; the process decides which way is up.
 //
 // Plain JavaScript without bare imports: it runs in the parting worker
 // (partworker.js) and on the page (faces reassigned by hand).
 
-import { FEED_TIE, STEEL_TIE, normalizeDie, normalizeProcess, orientationFor, orientationKey, orientationMesh } from './orientation.js';
+import { STEEL_TIE, normalizeDie, normalizeProcess, orientationFor, orientationKey, orientationMesh } from './orientation.js';
 import { edgeNeighbours, weld } from './thickness.js';
 
 // 3: the line on curved faces and long thin CAD triangles (silhouettes,
-// shadows); the directions ranked by their die block and their feeding for
-// the process too, each with its orientation; d turned so that up is +d on a
-// horizontal parting plane.
+// shadows); the directions ranked by their die block too, each with its
+// orientation for the process; d turned so that up is +d on a horizontal
+// parting plane.
 export const PARTING_VERSION = 3;
 
 // Half of the mould of a triangle: none (an undercut), upper (+d), lower (-d).
@@ -2127,17 +2129,20 @@ const LINE_RANK = { planar: 0, stepped: 1, warped: 2 };
 
 /**
  * Ranking of two directions: less undercut first; then less steel in the die
- * block (within STEEL_TIE of the larger: equal); then the massive sections
- * on the feeding side of the process (the feeding score of the up direction
- * chosen, within FEED_TIE: equal); then the simpler parting line (a
- * non-planar one only when it removes undercuts: a dearer die); then less
- * zero-draft surface; then the larger projected area for the height of the
- * part (a shallower mould).
+ * block (within STEEL_TIE of the larger: equal); then the simpler parting
+ * line (a non-planar one only when it removes undercuts: a dearer die); then
+ * less zero-draft surface; then the larger projected area for the height of
+ * the part (a shallower mould). Not the feeding of the casting process: the
+ * die and its undercuts depend on the part and the draw direction, not on
+ * where the metal comes in; the process only decides which way is up (the
+ * casting up of the direction chosen, orientation.js). So the direction, its
+ * die blank and its undercuts are the same whatever the process: the costing,
+ * which sizes the die of every island from that blank, cannot retain another
+ * island because of the orientation the island it retained causes.
  */
 function better(a, b, total) {
   if (Math.abs(a.undercut - b.undercut) > UNDERCUT_TIE * total) return a.undercut - b.undercut;
   if (a.steel != null && b.steel != null && Math.abs(a.steel - b.steel) > STEEL_TIE * Math.max(a.steel, b.steel)) return a.steel - b.steel;
-  if (a.feed != null && b.feed != null && Math.abs(a.feed - b.feed) > FEED_TIE) return b.feed - a.feed;
   const pa = LINE_RANK[a.kind] ?? 0, pb = LINE_RANK[b.kind] ?? 0;
   if (pa !== pb) return pa - pb;
   if (Math.abs(a.zeroDraft - b.zeroDraft) > ZERO_DRAFT_TIE * total) return a.zeroDraft - b.zeroDraft;
@@ -2742,11 +2747,13 @@ function orientDirection(om, d, options, orient) {
  * positions, indices -- its mesh (mm); not modified
  * draftDeg -- faces closer than this to the draw direction have no draft
  * process -- {plan: "vertical" | "horizontal", alimentation: "haut" | "bas"}
- *            (orientation.js; default: gravity, vertical plane, top feed)
+ *            (orientation.js; default: gravity, vertical plane, top feed):
+ *            the casting up of each candidate, on a horizontal plane the
+ *            sense of d; not the direction proposed (better)
  * die -- the die block options {marges, densite, cavities} (default: those of
  *        the costing, orientation.js DIE_DEFAULTS)
  * thickness -- inscribed diameter per triangle (the thickness card), or null:
- *        the feeding score from the volume centroid
+ *        the feeding score (the casting up) from the volume centroid
  * Returns {proposal, side, flags, plane, segments}: the JSON proposal
  * {status, axis, direction, candidate_index, candidates [...], sampled,
  * method, process, die, options_key, ... the figures of the direction chosen,
@@ -2784,7 +2791,8 @@ export function proposeParting(positions, indices, { draftDeg = DEFAULT_DRAFT_DE
     progress();
     return item;
   });
-  const key = (e) => ({ undercut: e.areas.undercut, steel: e.o.steel, feed: e.o.feed, zeroDraft: e.areas.zeroDraft, ratio: e.height > 0 ? e.areas.projected / e.height : 0, kind: e.line?.kind ?? null });
+  // The same keys whatever the process: the sense of d (up = +d on a horizontal plane) changes none of them.
+  const key = (e) => ({ undercut: e.areas.undercut, steel: e.o.steel, zeroDraft: e.areas.zeroDraft, ratio: e.height > 0 ? e.areas.projected / e.height : 0, kind: e.line?.kind ?? null });
   if (sampled) {
     // The planarity of the lines of the best ones (as little undercut as the least): on every triangle.
     const least = Math.min(...evaluated.map((e) => e.areas.undercut));

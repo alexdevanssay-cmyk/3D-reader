@@ -59,6 +59,8 @@ const rect = (pts) => minAreaRect(Float64Array.from(pts, (p) => p[0]), Float64Ar
 // An inverted T: a base 60 (x) × 30 (z), 30 thick, a wall 4 thick and 80 high on its middle, 100 deep along y.
 const T_PROFILE = [[0, 0], [60, 0], [60, 30], [32, 30], [32, 110], [28, 110], [28, 30], [0, 30]];
 const tPart = () => prism(T_PROFILE, 100, [30, 25]);
+// A base plate 200 (x) × 30 (z) under a wall 4 thick and 40 high on its middle (200 deep along y).
+const WIDE_PROFILE = [[0, 0], [200, 0], [200, 30], [102, 30], [102, 70], [98, 70], [98, 30], [0, 30]];
 
 /** The centre (xyz) of each triangle. */
 const centres = ({ positions: P, indices: I }) => Array.from({ length: I.length / 3 }, (_, f) => [0, 1, 2].map((k) => (P[3 * I[3 * f] + k] + P[3 * I[3 * f + 1] + k] + P[3 * I[3 * f + 2] + k]) / 3));
@@ -178,7 +180,7 @@ describe('die block', () => {
   });
 });
 
-describe('draw directions ranked by their die block and their feeding', () => {
+describe('draw directions ranked by their die block, oriented by their feeding', () => {
   test('a plate 200 × 100 × 10 turned 30° about Z: drawn along Z, its block 200 × 100 × 10 along its sides, not its box', () => {
     const plate = voxels(() => true, [20, 10, 1], { size: 10 });
     const c = Math.cos(30 * deg), s = Math.sin(30 * deg);
@@ -233,23 +235,63 @@ describe('draw directions ranked by their die block and their feeding', () => {
     assert.deepEqual([gravity.orientation.raw_mm, gravity.orientation.feeding_basis], [[110, 100, 60], 'volume_centroid']);
     assert.ok(gravity.orientation.feeding_score > 0.1, String(gravity.orientation.feeding_score));
     assert.deepEqual(gravity.process, { plan: 'vertical', alimentation: 'haut' });
-    // Low pressure: a horizontal plane, drawn along Z with the base on the -d side, at the bottom (g = +d).
-    const low = proposeParting(t.positions, t.indices, { process: LOW_PRESSURE }).proposal;
+    // A base plate 200 × 200 × 30 under a wall 4 thick and 40 high: drawn along Z whatever the process (the
+    // least steel, the least zero-draft surface), on a horizontal plane in the sense whose up is +d.
+    const plate = prism(WIDE_PROFILE, 200, [100, 20]);
+    // Low pressure: the base on the -d side, at the bottom near the feed (g = +d = +Z).
+    const low = proposeParting(plate.positions, plate.indices, { process: LOW_PRESSURE }).proposal;
     assert.deepEqual([low.direction, low.orientation.up, low.orientation.up_side, low.orientation.upper_half_down], [[0, 0, 1], [0, 0, 1], '+d', false]);
-    assert.ok(low.orientation.feeding_score < -0.1, 'massive down');
+    assert.ok(low.orientation.feeding_score < -0.05, 'massive down');
     // Gravity on a horizontal plane: the base up, d turned over so that the upper half is on top.
-    const horizontal = proposeParting(t.positions, t.indices, { process: GRAVITY_HORIZONTAL }).proposal;
-    assert.deepEqual([horizontal.axis, horizontal.direction, horizontal.orientation.up, horizontal.orientation.up_side], ['-Z', [0, 0, -1], [0, 0, -1], '+d']);
-    assert.ok(horizontal.orientation.feeding_score > 0.1, 'massive up');
-    // Its halves: the base (z < 30) in the upper one, along -Z.
-    const { side } = proposeParting(t.positions, t.indices, { process: GRAVITY_HORIZONTAL });
-    centres(t).forEach((c, f) => {
-      if (c[2] < 1e-9) assert.equal(side[f], SIDE_UPPER, `triangle ${f} under the base`);
+    const horizontal = proposeParting(plate.positions, plate.indices, { process: GRAVITY_HORIZONTAL });
+    const h = horizontal.proposal;
+    assert.deepEqual([h.axis, h.direction, h.orientation.up, h.orientation.up_side], ['-Z', [0, 0, -1], [0, 0, -1], '+d']);
+    assert.ok(h.orientation.feeding_score > 0.05, 'massive up');
+    // Its halves: the base (its underside, z = 0) in the upper one, along -Z.
+    centres(plate).forEach((c, f) => {
+      if (c[2] < 1e-9) assert.equal(horizontal.side[f], SIDE_UPPER, `triangle ${f} under the base`);
     });
+    // The same block either way.
+    assert.deepEqual([low.orientation.raw_mm, h.orientation.raw_mm], [[200, 200, 70], [200, 200, 70]]);
     // Every candidate carries its orientation.
-    for (const p of [gravity, low, horizontal]) {
+    for (const p of [gravity, low, h]) {
       for (const x of p.candidates) for (const key of ['up', 'block_axes', 'raw_mm', 'die_block_mm', 'steel_kg', 'feeding_score', 'process']) assert.ok(key in x.orientation, key);
     }
+  });
+
+  test('the draw direction, its die blank and its undercuts the same whatever the process: the feeding only chooses up', () => {
+    // Parts whose up differs with the process, and whose candidates weigh as much steel (within 5 %): the T, the
+    // T upright (the wall down), the inverted T of a costing scaled × 2.03. Their feeding used to rank the
+    // directions too (across the T for gravity, along Z for a horizontal plane): the costing, which sizes the
+    // die of every island from the blank of the 3D page, then retained another island under each orientation.
+    const scaled = (m, k) => ({ positions: m.positions.map((x) => x * k), indices: m.indices });
+    const parts = {
+      T: tPart(),
+      upright: prism(T_PROFILE.map(([x, z]) => [x, 110 - z]).reverse(), 100, [30, 85]),
+      costing: scaled(tPart(), 2.03),
+    };
+    const profiles = [null, GRAVITY_HORIZONTAL, LOW_PRESSURE];
+    const axis = (d) => d.map((x) => Math.abs(x));
+    for (const [name, m] of Object.entries(parts)) {
+      const ps = profiles.map((process) => proposeParting(m.positions, m.indices, { process }).proposal);
+      const [first] = ps;
+      for (const p of ps.slice(1)) {
+        const label = `${name}, ${p.process.plan}-${p.process.alimentation}`;
+        // The same axis (on a horizontal plane in the sense whose up is +d), the same blank, undercuts and ranking.
+        assert.deepEqual(axis(p.direction), axis(first.direction), label);
+        assert.deepEqual(p.orientation.raw_mm, first.orientation.raw_mm, label);
+        assert.deepEqual([p.orientation.block_axes.u, p.orientation.block_axes.v, p.orientation.die_block_mm, p.orientation.steel_kg],
+          [first.orientation.block_axes.u, first.orientation.block_axes.v, first.orientation.die_block_mm, first.orientation.steel_kg], label);
+        assert.deepEqual([p.undercut_area_mm2, p.zero_draft_area_mm2, p.parting.kind], [first.undercut_area_mm2, first.zero_draft_area_mm2, first.parting.kind], label);
+        assert.deepEqual(p.ranking.map((k) => axis(p.candidates[k].direction)), first.ranking.map((k) => axis(first.candidates[k].direction)), label);
+      }
+      // Across the T (the least steel); up by the process: the base up for gravity, a horizontal plane up along +d.
+      assert.deepEqual(first.direction, [1, 0, 0], name);
+      const base = name === 'upright' ? ['+u', [0, 0, 1]] : ['-u', [0, 0, -1]];
+      assert.deepEqual([first.orientation.up_side, first.orientation.up], base, name);
+      assert.deepEqual(ps.slice(1).map((p) => p.orientation.up_side), ['+d', '+d'], name);
+    }
+    assert.deepEqual(proposeParting(parts.costing.positions, parts.costing.indices, { process: LOW_PRESSURE }).proposal.orientation.raw_mm, [223.3, 203, 121.8]);
   });
 
   test('the thickness of each triangle, when given, in place of the volume centroid', () => {
@@ -419,9 +461,11 @@ describe('risers and feed along up', () => {
 
   test('fed from below (low pressure): no riser, a feed point under the massive zone, on the -g side', () => {
     const t = tPart();
-    const p = proposeParting(t.positions, t.indices, { process: LOW_PRESSURE });
-    const o = p.proposal.orientation;
-    const parting = { direction: p.proposal.direction, side: p.side, segments: p.segments, up: o.up, process: o.process };
+    // Drawn along Z (chosen by hand: the T is proposed across, along X), in the sense whose up is +d: the base down.
+    const p = evaluateParting(t.positions, t.indices, [0, 0, -1], { process: LOW_PRESSURE, orient: true });
+    const o = p.summary.orientation;
+    const parting = { direction: p.summary.direction, side: p.side, segments: p.segments, up: o.up, process: o.process };
+    assert.deepEqual([parting.direction, o.up], [[0, 0, 1], [0, 0, 1]]);
     const f = proposeFeeding(t.positions, t.indices, { parting, density: 2.7 });
     assert.deepEqual([f.mode, f.up, f.process, f.risers], ['bottom', [0, 0, 1], LOW_PRESSURE, []]);
     assert.equal(f.feed_points.length, f.zones.filter((z) => z.needs_riser).length);
