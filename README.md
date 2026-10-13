@@ -89,7 +89,8 @@ hand" of `web/app.js`:
 - **Closing, editing**: the loop's first point clicked (or *Fermer la boucle*, Enter) closes
   the loop and ends the placing; *Nouvelle boucle* draws another one (a bore through the parting plane
   needs its own: the outer loop alone does not split the part). Points are dragged,
-  deleted (Suppr), added in the middle of a segment ("+"); undo and redo (Ctrl+Z, Ctrl+Y);
+  deleted (Suppr; while placing, a click on the last point placed takes it off), added
+  in the middle of a segment ("+"); undo and redo (Ctrl+Z, Ctrl+Y);
   *Aligner* moves the points of a loop to one height typed in (hand-placed points are never
   exactly level), its line then planar.
 - **Halves**: the loops cut the surface into parts (union-find of its vertices, the edges
