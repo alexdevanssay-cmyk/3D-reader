@@ -397,3 +397,28 @@ test("a riser deleted by hand: the hot spot left without one is a risk; an ingat
   assert.equal(context.bodies[0].feeding.hot_spots_without_riser, 1);
   assert.equal(context.bodies[0].feeding.status, "manual");
 });
+
+test("the wall thickness measured is kept at every level of the compaction, the last resort included", () => {
+  const semantic = buildSemantic3D({
+    file: "casting.step", kind: "cad", engine: "browser", source_unit: "mm",
+    summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 },
+    bodies: [body({ thickness: { method: "ray", min: 4, median: 5, max: 40, sphere: { min: 3.04, median: 5.12, max: 6.48 }, wall: { min: 3.96, median: 5, max: 8 } } })],
+  });
+  const context = buildAIContext(semantic, { task: "manufacturing_analysis" });
+  const measured = { status: "measured", min_mm: 4, min_method: "wall", median_mm: 5.1, max_mm: 6.5 };
+  for (const maxChars of [1, 500, 1500, 3000]) {
+    const compact = compactAIContext(context, { maxChars });
+    assert.ok(compact.compaction.level >= 7, `budget ${maxChars}: level ${compact.compaction.level}`);
+    assert.deepEqual(compact.bodies[0].thickness, measured, `budget ${maxChars}`);
+  }
+  // With room: the foundry evidence itself (and no brief copy).
+  const roomy = compactAIContext(context, { maxChars: 1e6 });
+  assert.equal(roomy.bodies[0].foundry.evidence.thickness.min_mm, 3.96);
+  // Not computed: said so, so that the AI asks for « Analyser les épaisseurs » rather than a CAD measurement.
+  const none = buildAIContext(buildSemantic3D({
+    file: "casting.step", kind: "cad", engine: "browser", source_unit: "mm",
+    summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 },
+    bodies: [body()],
+  }), { task: "manufacturing_analysis" });
+  assert.deepEqual(compactAIContext(none, { maxChars: 1 }).bodies[0].thickness, { status: "not_computed" });
+});

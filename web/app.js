@@ -3735,6 +3735,21 @@ function addPoint(i, d, hit, at) {
   changed(i, d);
 }
 
+/** The last point placed clicked again: taken off with its segment (one step to undo), the placing going on from the point before; a loop emptied stays open. */
+function removeLastPoint(i, d) {
+  const loop = openLoop(d);
+  if (!loop?.points.length) return;
+  pushHistory(d);
+  loop.points.pop();
+  loop.segs.pop();
+  loop.paths.pop();
+  d.inputs.delete(`${d.current}:${loop.segs.length}`);
+  d.selected = null;
+  d.result = null;
+  d.closeHover = false;
+  changed(i, d);
+}
+
 /** The loop drawn closed (its last point joined to point 1): placing stops; every loop closed, the halves proposed and applied. */
 function closeLoop(i, d) {
   const p = partingOf();
@@ -4123,9 +4138,9 @@ function markerAt(i, d, at, hits) {
 
 /**
  * A click on the 3D view while drawing (handled here: true). Choosing the
- * axis by a face; placing an arc's centre; placing points (point 1 closes
- * the loop, a point clicked is selected, else a point is added); the halves
- * (a part given to the chape chosen).
+ * axis by a face; placing an arc's centre; placing points (the last point
+ * placed taken off, point 1 closes the loop, a point clicked is selected,
+ * else a point is added); the halves (a part given to the chape chosen).
  */
 function drawClick({ p, i, d }, hits, at) {
   p.message = null;
@@ -4154,11 +4169,17 @@ function drawClick({ p, i, d }, hits, at) {
     setSegmentCentre(i, d, loop, seg, hit.point.toArray());
     return true;
   }
-  if (d.stage === "points" && nearFirst(i, openLoop(d), hits, at)) {
+  const marker = markerAt(i, d, at, hits);
+  // The last point of the loop being placed clicked (pressed, not dragged): taken off. With one point, it is point 1 too.
+  const open = openLoop(d);
+  if (open && marker?.loop === d.current && marker.k === open.points.length - 1 && !drawUi.drag?.moved) {
+    removeLastPoint(i, d);
+    return true;
+  }
+  if (d.stage === "points" && nearFirst(i, open, hits, at)) {
     closeLoop(i, d);
     return true;
   }
-  const marker = markerAt(i, d, at, hits);
   if (marker) {
     d.selected = marker;
     changed(i, d);
