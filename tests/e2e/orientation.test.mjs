@@ -63,6 +63,19 @@ function stlFile(name, { positions: P, indices: I }) {
   return { name, mimeType: 'application/octet-stream', buffer };
 }
 
+/** An OBJ of meshes, a body each (the faces of a material each, as trimesh groups them), as a file to open. */
+function objFile(name, objects) {
+  const vertices = [], faces = [];
+  let first = 1;
+  for (const { name: object, positions: P, indices: I } of objects) {
+    for (let i = 0; i < P.length; i += 3) vertices.push(`v ${P[i]} ${P[i + 1]} ${P[i + 2]}`);
+    faces.push(`o ${object}`, `usemtl ${object}`);
+    for (let f = 0; f < I.length; f += 3) faces.push(`f ${I[f] + first} ${I[f + 1] + first} ${I[f + 2] + first}`);
+    first += P.length / 3;
+  }
+  return { name, mimeType: 'text/plain', buffer: Buffer.from(`${[...vertices, ...faces].join('\n')}\n`) };
+}
+
 /** A field of the costing typed in (then left: its change). */
 async function setField(page, selector, value) {
   await page.waitForSelector(selector);
@@ -358,6 +371,39 @@ describe('orientation by casting process (dist/)', { skip: !existsSync(join(DIST
     // Told the same again: nothing changes, nothing drawn or proposed again.
     const last = told.at(-1);
     assert.equal(await page.evaluate(([key, info]) => window.reader3d.setProcess(key, info), [last.key, last.info]), false);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('every body proposed again for its process, whichever body the card shows (an open one)', { timeout: 2 * CAD_TIMEOUT }, async () => {
+    const { context, page, errors } = await newPage();
+    // An open square (body 0: the groups of an OBJ are read last first) beside the inverted T (body 1).
+    const square = { positions: Float32Array.from([-100, 0, 0, -50, 0, 0, -50, 50, 0, -100, 50, 0]), indices: Uint32Array.from([0, 1, 2, 0, 2, 3]) };
+    await open(page, objFile('T et plaque.obj', [{ name: 'T', ...tPart() }, { name: 'plaque', ...square }]));
+    assert.deepEqual(await page.evaluate(() => window.reader3d.part().parts.map((b) => b.closed)), [false, true]);
+    const body = () => page.evaluate(() => {
+      const o = window.reader3d.semantic?.bodies?.[1]?.parting?.orientation;
+      return { plan: o?.process?.plan, feeding: window.reader3d.semantic?.bodies?.[1]?.feeding?.process?.plan, margin: o?.margins_mm?.longueur, block: o?.die_block_mm };
+    });
+    await page.waitForFunction(() => window.reader3d.semantic?.bodies?.[1]?.feeding?.process?.plan === 'vertical', null, { timeout: 120_000 });
+    // The card on the open body: nothing to show.
+    await page.click('#bodies tr[data-index="0"] td.name');
+    await page.waitForFunction(() => document.getElementById('parting-main').hidden && !document.getElementById('parting-status').hidden);
+    // Low pressure retained in the costing for the T: proposed again, its risers placed again (fed from below).
+    await retain(page, 'BPR');
+    await page.click('.tab[data-page="viewer"]');
+    await page.waitForFunction(() => {
+      const b = window.reader3d.semantic?.bodies?.[1];
+      return b?.parting?.orientation?.process?.plan === 'horizontal' && b?.feeding?.process?.plan === 'horizontal';
+    }, null, { timeout: 120_000 });
+    assert.deepEqual(await body(), { plan: 'horizontal', feeding: 'horizontal', margin: 60, block: [230, 220, 160] });
+    assert.ok(await page.evaluate(() => document.getElementById('parting-main').hidden), 'the card still on the open body');
+    // The margins of the dies changed in Paramètres: proposed again with them.
+    await page.click('.tab[data-page="parametres"]');
+    await setField(page, '#page-parametres [data-bind="s.tooling.marges.longueur"]', 80);
+    await page.click('.tab[data-page="viewer"]');
+    await page.waitForFunction(() => window.reader3d.semantic?.bodies?.[1]?.parting?.orientation?.margins_mm?.longueur === 80, null, { timeout: 120_000 });
+    assert.deepEqual(await body(), { plan: 'horizontal', feeding: 'horizontal', margin: 80, block: [270, 220, 160] });
     assert.deepEqual(errors, []);
     await context.close();
   });

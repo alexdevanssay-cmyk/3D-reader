@@ -273,9 +273,9 @@ below}:
   plane the sense of *d*). The costing, which sizes the die of every in-house island from
   that blank, thus cannot retain another island because of the orientation the retained
   one causes. The proposals are kept with the results of the file for their process and
-  die options; a change of either proposes the body again. A direction chosen by hand
-  gets its orientation too; a line drawn by hand is never turned over (its upper half at
-  the bottom is said, « chape supérieure en bas »).
+  die options; a change of either proposes the body again (each body, whichever the card
+  shows). A direction chosen by hand gets its orientation too; a line drawn by hand is
+  never turned over (its upper half at the bottom is said, « chape supérieure en bas »).
 - **Risers and feed** along *g* (feeding.js): risers on the faces turned up along *g*;
   the ingate low along *g*, never at the top; fed from below, a feed point per massive
   zone at the lowest point of the part under its hot spot, through the lower die.

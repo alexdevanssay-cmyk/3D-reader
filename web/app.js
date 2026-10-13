@@ -2724,6 +2724,10 @@ function renderParting() {
   syncDrawView(partingOf(r), partingBody()); // drawing by hand: left when its body is no longer the card's (or no model); the view's controls
   if (!r) return;
   const p = partingOf(r);
+  // Every body proposed for other options than its own now (its process, the
+  // die margins) proposed again: whichever body the card shows, an open one or
+  // none too (before the card stops there, below).
+  reproposeStale(r);
   const i = partingBody();
   const field = i >= 0 ? partingField(i) : null;
   const named = r.bodies.length > 1 && i >= 0;
@@ -6720,7 +6724,7 @@ document.addEventListener("keydown", (e) => {
 // a body is proposed for its process and the margins of the dies of the
 // costing (the worker ranks the draw directions by their die block, the same
 // whatever the process, and orients each one for the process: up when cast),
-// again when they change.
+// again when they change, whichever body the card shows (renderParting).
 // Shown on the card: the process, the direction up when the metal is cast
 // (« haut de coulée »: by the feeding rule, again with the wall thickness
 // once computed, or chosen by hand; on a horizontal plane, another up turns
@@ -7251,11 +7255,10 @@ const brutKg = (c) => (Number.isFinite(c.orientation?.steel_kg) ? fmtNum(c.orien
 
 /**
  * The process, the casting up and the die blank of body i on the parting
- * card (renderParting); the proposals of other options asked for again.
+ * card (renderParting, which asks for the proposals of other options again).
  */
 function renderOrientation(p, i, field) {
   const r = state.result;
-  reproposeStale(r);
   const proc = processOf(i, r);
   $("parting-process-line").textContent = processText(proc);
   const select = $("parting-process-select");
