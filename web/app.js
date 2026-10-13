@@ -114,13 +114,17 @@ const state = {
   bounds: new THREE.Box3(),
 };
 
+// False while the page of the 3D view is hidden (another tab of the bar): nothing is drawn then.
+let viewShown = true;
+
 function resize() {
   const { clientWidth: w, clientHeight: h } = viewport;
   // The page hidden (another tab of the bar): nothing to fit, the camera and the
   // canvas kept as they are. A view 0 wide would leave the camera an aspect of 0,
   // every point projected to x = NaN, until the first frame after the page is
   // shown again (a script asking reader3d.screenOf before it got {x: NaN}).
-  if (!w || !h) return;
+  viewShown = Boolean(w && h);
+  if (!viewShown) return;
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
@@ -151,14 +155,19 @@ resize();
 renderer.setAnimationLoop(() => {
   stepTurn(); // the part turned by the arrows of the drawing by hand, animated
   controls.update();
+  // Its page hidden: the canvas keeps its size (see resize()), so drawing it at
+  // every frame would cost the GPU for nothing while another page is shown.
+  if (!viewShown) return;
   syncCaps();
   renderer.render(scene, camera);
   drawFrame(); // the numbers of its points, where they are on the view
 });
 // Drawn again as soon as the view changes size (the panel's splitter dragged,
-// panels.js): the canvas resized after the frame was drawn would stay blank, or
-// stretched, until the next one.
-new ResizeObserver(() => renderer.render(scene, camera)).observe(viewport);
+// panels.js; its page shown again): the canvas resized after the frame was drawn
+// would stay blank, or stretched, until the next one.
+new ResizeObserver(() => {
+  if (viewShown) renderer.render(scene, camera);
+}).observe(viewport);
 
 // ---------------------------------------------------------------- loading
 
