@@ -116,8 +116,13 @@ const state = {
 
 function resize() {
   const { clientWidth: w, clientHeight: h } = viewport;
+  // The page hidden (another tab of the bar): nothing to fit, the camera and the
+  // canvas kept as they are. A view 0 wide would leave the camera an aspect of 0,
+  // every point projected to x = NaN, until the first frame after the page is
+  // shown again (a script asking reader3d.screenOf before it got {x: NaN}).
+  if (!w || !h) return;
   renderer.setSize(w, h, false);
-  camera.aspect = w / Math.max(h, 1);
+  camera.aspect = w / h;
   camera.updateProjectionMatrix();
   controls.handleResize();
   // The parting line as wide in pixels at any size of the view.
@@ -4033,16 +4038,20 @@ function raycastAt(x, y) {
   return raycaster.intersectObjects(state.meshes.filter((m) => m.visible), false).filter((h) => !sectionOn || sectionPlane.distanceToPoint(h.point) >= 0);
 }
 
-/** Where a point of the model is on the page ({x, y} client pixels), or null behind the camera. */
+/** Where a point of the model is on the page ({x, y} client pixels), or null: behind the camera, or the 3D view not shown (another page). */
 function screenOf(point) {
   if (!Array.isArray(point) || point.length < 3) return null;
+  const rect = renderer.domElement.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
   camera.updateMatrixWorld();
   const v = vec3(point);
   const forward = camera.getWorldDirection(new THREE.Vector3());
   if (v.clone().sub(camera.position).dot(forward) <= 0) return null;
   v.project(camera);
-  const rect = renderer.domElement.getBoundingClientRect();
-  return { x: rect.left + ((v.x + 1) / 2) * rect.width, y: rect.top + ((1 - v.y) / 2) * rect.height };
+  const x = rect.left + ((v.x + 1) / 2) * rect.width;
+  const y = rect.top + ((1 - v.y) / 2) * rect.height;
+  // (Never NaN for a click: a point or a camera not finite is nowhere on the page.)
+  return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
 }
 
 /** Millimetres per pixel of the view at the depth of a point. */
@@ -6480,7 +6489,7 @@ window.reader3d = {
   get view() {
     return { position: camera.position.toArray(), up: camera.up.toArray(), target: controls.target.toArray() };
   },
-  /** Where a point of the model ([x, y, z] mm) is on the page: {x, y} in client pixels, or null behind the camera. */
+  /** Where a point of the model ([x, y, z] mm) is on the page: {x, y} in client pixels, or null behind the camera or with the 3D view not shown. */
   screenOf(point) {
     return screenOf(point);
   },
