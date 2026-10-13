@@ -89,6 +89,8 @@ const SAMPLE_FIRST = 4; // its first points all agree (both senses): the triangl
 const R2A = 0.7548776662466927; // 1/g, 1/g² (g the plastic number): a low-discrepancy sequence in the unit square
 const R2B = 0.5698402909980532;
 const SAMPLE_INSET = 0.98; // the points pulled towards the centre, off the edges
+/** The sequence of the points of a triangle (see classify), for the slides (slides.js) to cast from the same points. */
+export const SAMPLE_POINTS = { R2A, R2B, INSET: SAMPLE_INSET };
 // A flat face along d (normals within 0.5°, joined by their edges) is split
 // between the halves when each has more than this share of it (and than
 // UNDERCUT_TIE of the surface): a line across it along its triangles.
@@ -221,8 +223,8 @@ export function parseTriple(text) {
 
 // ------------------------------------------------------------------ candidates
 
-/** Eigenvectors of a symmetric 3×3 matrix (Jacobi), largest eigenvalue first. */
-function eigenvectors(m) {
+/** Eigenvectors of a symmetric 3×3 matrix (xx, xy, xz, yy, yz, zz; Jacobi), largest eigenvalue first. */
+export function eigenvectors(m) {
   const a = [[m[0], m[1], m[2]], [m[1], m[3], m[4]], [m[2], m[4], m[5]]];
   const v = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
   for (let sweep = 0; sweep < 50; sweep++) {
