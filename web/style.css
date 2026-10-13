@@ -318,6 +318,40 @@ table.parting-segments .parting-seg-error td { color: var(--error-text); font-si
 #parting-draw-halves .parting-controls > span:first-child { color: var(--muted); }
 #parting-draw-parts { margin: 6px 0 0; }
 .parting-draw-level input { width: 80px; }
+/* Three checks in the head of the parting line card: its title kept on one line, the checks under it when they do not fit beside. */
+#parting-card > .card-head-toggle > h3 { flex: 1 0 auto; }
+/* Slides and probable cores of the definition shown (a section of the parting line card that folds). */
+.parting-sub { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.parting-sub > summary { cursor: pointer; font-weight: 600; font-size: 14px; display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; list-style: none; }
+.parting-sub > summary::-webkit-details-marker { display: none; }
+/* Its chevron, as the cards' (panels.js): down while open, right while folded. */
+.parting-sub > summary::before {
+  content: ""; flex: none; width: 6px; height: 6px; margin: 0 4px 2px 1px; align-self: center;
+  border-right: 1.8px solid var(--muted); border-bottom: 1.8px solid var(--muted); transform: rotate(45deg); transition: transform .15s;
+}
+.parting-sub:not([open]) > summary::before { transform: rotate(-45deg); }
+.parting-sub > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+@media (prefers-reduced-motion: reduce) { .parting-sub > summary::before { transition: none; } }
+.parting-sub > summary strong { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--muted); font-variant-numeric: tabular-nums; }
+#slides-status { margin: 6px 0 0; }
+#slides-warn { margin: 6px 0 0; color: var(--warn); }
+#slides-hint { margin: 6px 0 0; color: var(--accent); }
+#slides-retry { margin-top: 6px; }
+/* Long labels and values (the cores and why): each value under its label. */
+#page-viewer #slides-stats { grid-template-columns: minmax(0, 1fr); gap: 0 12px; }
+#page-viewer #slides-stats dd { text-align: left; margin-bottom: 6px; white-space: normal; overflow-wrap: break-word; }
+.slides-scroll { overflow-x: auto; max-width: 100%; }
+table.slides-table { margin-top: 8px; }
+table.slides-table td:first-child { white-space: nowrap; }
+table.slides-table td .swatch { margin-right: 4px; }
+table.slides-table select { max-width: 100%; font-size: 12px; padding: 1px 2px; }
+table.slides-table tr.selected td { background: color-mix(in srgb, var(--select) 22%, transparent); }
+.slide-tag { display: inline-block; margin-left: 4px; padding: 0 5px; border: 1px solid var(--border); border-radius: 999px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.slide-tag.warn { color: var(--warn); border-color: var(--warn); }
+#slides-slide, #slides-zone { padding: 6px 8px; border-radius: 6px; background: color-mix(in srgb, var(--select) 12%, transparent); }
+#slides-slide > span, #slides-zone > span { flex: 1 1 100%; }
+#slides-slide label, #slides-zone label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+#slides-slide select, #slides-zone select { min-width: 0; max-width: 100%; }
 
 /* The 3D view while drawing by hand: the arrows that turn the part about the axis, at mid-height on the left and
    right edges; the step (1/4 … 1/32 of a turn) at the bottom right; the essential actions at the bottom left; the
@@ -432,6 +466,10 @@ table.feeding-risers tr.selected td { background: color-mix(in srgb, var(--selec
 .cf > input, .cf > select, .cf > output { font-size: 14px; color: var(--text); }
 .cf > output { padding: 5px 0; font-weight: 600; font-variant-numeric: tabular-nums; }
 .cf small { font-size: 11px; }
+/* Under « Tiroirs du moule »: the count of the 3D analysis and « Utiliser ». */
+.cslides { margin: 2px 0 10px; line-height: 1.7; }
+.cslides.cmsg { padding: 6px 10px; }
+.cslides button { margin-left: 4px; }
 .cf small .cauto { color: var(--text); font-size: 12px; font-weight: 600; }
 .crow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
 /* The shared network folder: a long folder name or error wraps within a phone's width. */

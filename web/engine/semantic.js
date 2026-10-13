@@ -1133,6 +1133,8 @@ function semanticBody(body, index) {
     },
     // Draw direction and parting line (parting.js), proposed or defined by hand, when computed.
     ...(body.parting ? {parting:body.parting} : {}),
+    // Its undercuts grouped into slides (slides.js), proposed or edited by hand, when computed.
+    ...(body.slides ? {slides:body.slides} : {}),
     // Risers and ingate (feeding.js), proposed from the hot spots or placed by hand, when computed.
     ...(body.feeding ? {feeding:body.feeding} : {}),
     features,

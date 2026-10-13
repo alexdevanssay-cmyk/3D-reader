@@ -102,6 +102,20 @@ hand" of `web/app.js`:
   browser, as is a drawing not finished (a draft). Halves are per triangle: on a coarse
   mesh their boundary zigzags by a triangle along the line (the line itself is exact; the
   area of the triangles it crosses is exported as `seam_area_mm2`).
+- **Slides** ("tiroirs"), part *Tiroirs et noyaux* of the parting line card: the undercuts
+  of the definition shown (proposed, chosen, reassigned or drawn by hand) grouped into
+  zones, each tested by lines of sight along the lateral directions that could pull a
+  slide out of it (in the parting plane or tilted up to 45°), and the zones grouped into
+  slides, one per pull direction ("direction de sortie"), with the stroke ("course",
+  depth along the pull + 5 mm) and the size of each; the probable cores (what no slide
+  releases, a closed cavity), the zones a half could form (to rework at the parting line)
+  and the markings under 1.5 mm deep apart. Each slide in a colour of its own on the 3D
+  view (the first one in the yellow of the undercuts) with an arrow along its pull
+  direction (*Tiroirs* turns them off). Zones are moved to another slide, made cores or
+  ignored by a click, slides merged or turned to another direction that releases all
+  their zones; kept per part in the browser (and carried over to another definition of
+  the same draw direction). The count is proposed to « Tiroirs du moule » of the costing.
+  See [Slides: method and limits](#slides-method-and-limits).
 - **Risers and gating** ("masselottes et attaque de coulée"), card *Masselottes et attaque
   de coulée*: the hot spots and the feeding zones read from the inscribed spheres, a riser
   proposed on each zone no other one can feed (where, open on top or blind on the side,
@@ -147,7 +161,11 @@ hand" of `web/app.js`:
   valeur » (then traced as « estimation IA validée »). « Banc d'essai IA » backtests that
   estimate on the history (each record left out of its own similar parts) against the
   formula: mean errors by island and source, paced for the free quota of the gateway,
-  resumable, exported as CSV.
+  resumable, exported as CSV. Under « Tiroirs du moule » of an in-house die, the slides
+  of the 3D analysis (per part × the cavities of the die) are proposed with « Utiliser N
+  tiroirs »: used only by that click (traced « analyse 3D validée »), a value typed is
+  never replaced, and a change of the parting line, of the slides or of the cavities
+  since is shown with the value kept.
 - **Shared network folder** (Chrome or Edge; chosen once per PC in *Paramètres*): a
   folder of the company network where every PC writes, and reads, the results of its 3D
   analyses (`analyses-3d`: a part analysed on one PC opens at once on another, wall
@@ -168,6 +186,39 @@ hand" of `web/app.js`:
 - Units: everything is reported in mm / mm² / mm³ (switchable to cm³, dm³, m³, in³).
   CAD files are converted from their own unit automatically. Mesh files have no unit,
   so choose it (auto = mm, or metres for glTF, or the unit stored in 3MF/DAE).
+
+## Slides: method and limits
+
+`web/engine/slides.js` groups the undercuts of the parting definition shown for a body
+into slides, in a worker of its own (`slideworker.js`, which keeps the last body's mesh
+and hierarchy: another definition of the same body only casts its lines); never kept with
+the results of the file, recomputed in seconds:
+
+- **Zones.** The undercut triangles (those painted yellow) joined by a vertex are regions;
+  each is tested along one pool of at most 64 directions: the axes of the die in the
+  parting plane and a 15° sweep between them, the frame axes, the mean normal and the axis
+  of each region, up to 45° out of the plane (« incliné » from 1°). A point of it frees
+  along a direction when a line of sight from it meets nothing (a face turned against the
+  pull would be dragged: never). A direction freeing 95 % of a region makes it one zone;
+  else a cover by triangle splits it between at most 4 directions (a groove round a
+  column: two half shells), and a region covered less than 80 % is a probable core.
+- **Kinds.** A zone shallower than 1.5 mm along its pulls and under 2 % of the surface is
+  a marking, ignored; one a half could form, that no slide in the plane forms with draft,
+  is to rework at the parting line (a stepped line, faces reassigned); the others are slide
+  zones.
+- **Slides.** The direction releasing the most zones takes them all, until none is left;
+  stroke = the zone's extent along the pull + 5 mm (conservative for half shells), size =
+  its face across the pull; tags « petit : usinage ? » (under 6 × 6 mm), « course
+  longue » (over 120 mm), « une chape pourrait la former ». More than 4 slides, or
+  undercuts over 30 % of the surface: a warning, nothing truncated. The 128 largest
+  regions are analysed, the others listed and left yellow.
+- **The same input gives the same result**: fixed seeds, points drawn by area, every tie
+  ruled; the lines cast are bounded whatever the size of the mesh.
+
+Limits: an aid, not a die design. The stroke is not priced; the slides' own draft and
+their room in the die are not checked; the probable cores give no core mass nor core box
+to the costing (the box « Noyaux sable » is never ticked from here). The count goes to
+« Tiroirs du moule » only by « Utiliser » on the Chiffrage page.
 
 ## Risers and gating: method and limits
 
@@ -326,6 +377,8 @@ web/                   the web interface (static site)
     parting.js         draw direction and parting line of cast parts
     parting-draw.js    the parting line drawn by hand (lines laid on the surface, halves by part)
     partworker.js      its worker (partclient.js: main-thread API)
+    slides.js          slides (« tiroirs »): the undercuts grouped by pull direction, probable cores
+    slideworker.js     its worker (slideclient.js: main-thread API)
     feeding.js         risers and ingate of cast parts (feeding zones, moduli)
     feedworker.js      its worker (feedclient.js: main-thread API)
   chiffrage/           costing pages: workbook reader, cost model, routes, UI

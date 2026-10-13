@@ -18,6 +18,7 @@ import * as store from "./store.js";
 import { PROPOSAL_FIELDS, sameValue, valueLabel } from "./ai-apply.js";
 import * as network from "../network-folder.js";
 import { forgetRead, pendingCount, syncFeedback, writeFeedback } from "./feedback.js";
+import { adoptSlides, adoptedMessage, forgetSlidesAdoption, slidesLineModel, slidesProposal, undoSlides, undoneMessage } from "./slides3d.js";
 
 let el = null;
 let page = "chiffrage";
@@ -270,7 +271,9 @@ export function applyAIValues(target, proposals, origin = {}, { dryRun = false }
       const was = record[champ];
       // Not from a value reset by another island: what was there before was for that one.
       const keep = was && sameValue(piece[champ] ?? null, was.valeur) && (!["procede", "finition", ...ROUTE_FIELDS].includes(champ) || (was.procede === procede && was.cle !== "piece.ilot"));
-      record[champ] = { valeur, avant: keep ? was.avant : piece[champ] ?? null, procede, date, provider: origin.provider ?? null, model: origin.model ?? null, message: origin.message ?? null, cle, ...extra };
+      // A second one keeps the count of the 3D analysis the first replaced, back with an undo.
+      const earlier = keep && was.tiroirs3D ? { tiroirs3D: was.tiroirs3D } : {};
+      record[champ] = { valeur, avant: keep ? was.avant : piece[champ] ?? null, procede, date, provider: origin.provider ?? null, model: origin.model ?? null, message: origin.message ?? null, cle, ...earlier, ...extra };
       piece[champ] = valeur;
     };
     if (islandSet) {
@@ -280,8 +283,9 @@ export function applyAIValues(target, proposals, origin = {}, { dryRun = false }
     }
     for (const x of changes) {
       if (islandSet && ["procede", "finition"].includes(x.champ)) continue;
-      // An adopted estimate of the cycle replaced: kept with the record, back with an undo.
-      write(x.champ, x.apres, x.cle, x.champ === "cycle" && piece.cycleIA ? { cycleIA: piece.cycleIA } : {});
+      // An adopted estimate of the cycle, or count of slides of the 3D analysis, replaced: kept with the record, back with an undo.
+      write(x.champ, x.apres, x.cle, x.champ === "cycle" && piece.cycleIA ? { cycleIA: piece.cycleIA }
+        : x.champ === "outillageTiroirs" && piece.tiroirs3D ? { tiroirs3D: piece.tiroirs3D } : {});
     }
     // Cores checked by this application: a first core to describe, as the casting card does (taken back with an undo).
     if (changes.some((x) => x.champ === "noyaux" && x.apres === true) && !piece.cores?.length) {
@@ -289,6 +293,7 @@ export function applyAIValues(target, proposals, origin = {}, { dryRun = false }
       record.noyaux.cores = structuredClone(piece.cores);
     }
     forgetAdoption(piece);
+    forgetSlidesAdoption(piece);
     const list = [...changes, ...consequences].map(changeText).join(" ; ");
     q.analysesIA = [...(q.analysesIA ?? []), { date, provider: origin.provider ?? null, model: origin.model ?? null, question: "Appliquer les valeurs au chiffrage", answer: `Appliqué à « ${name} » : ${list}.`, verified: true, tache: "application_ia" }];
     out.saved = store.saveQuote(q) !== false;
@@ -341,11 +346,13 @@ export function undoAIValues(target, { message: answer = null } = {}) {
     if (a.avant === null) delete piece[champ];
     else piece[champ] = a.avant;
     if (champ === "cycle" && a.cycleIA) piece.cycleIA = a.cycleIA;
+    if (champ === "outillageTiroirs" && a.tiroirs3D) piece.tiroirs3D = a.tiroirs3D;
     if (champ === "noyaux" && a.cores && json(piece.cores) === json(a.cores)) delete piece.cores;
     undone.push({ champ, label, avant: a.valeur, apres: a.avant, unite: fieldOf(champ)?.unite ?? "" });
   }
   if (!Object.keys(record).length) delete piece.valeursIA;
   forgetAdoption(piece);
+  forgetSlidesAdoption(piece);
   const name = target.name ?? target.key;
   const list = undone.map(changeText).join(" ; ");
   q.analysesIA = [...(q.analysesIA ?? []), { date: new Date().toISOString(), provider: null, model: null, question: "Annuler l'application des valeurs de l'IA", answer: `Annulé pour « ${name} » : ${list || "aucune valeur (modifiées depuis)"}.`, verified: true, tache: "application_ia" }];
@@ -511,6 +518,7 @@ function onChange(event) {
       piece.cores = [{ ...newCore(0, poids), ...(piece.sableKg > 0 ? { masse: piece.sableKg } : {}) }];
     }
     forgetAdoption(piece);
+    forgetSlidesAdoption(piece);
     forgetAIValues(piece);
     store.saveQuote(q);
   } else {
@@ -551,9 +559,12 @@ async function onClick(event) {
     piece.finition = action === "auto" ? "auto" : button.dataset.finition;
     piece.cycle = piece.empreintes = piece.miseAuMille = piece.mode = null;
     forgetAdoption(piece);
+    forgetSlidesAdoption(piece);
     forgetAIValues(piece);
     store.saveQuote(q);
     render();
+  } else if (action === "use-slides-3d" || action === "undo-slides-3d" || action === "keep-slides-3d") {
+    slidesAction(action);
   } else if (action === "cavities" || action === "cavities-auto") {
     retainCavities(action === "cavities" ? Number(button.dataset.n) : null);
     render();
@@ -1587,6 +1598,7 @@ function toolingCard(r) {
           ? field("Vendu à part", `<output>${eur(route.outillage * (1 + (q.margeOutillage || 0)), 0)} HT</output>`, "non compris dans le prix pièce (voir le détail du chiffrage)")
           : field("Amorti par pièce", `<output>${amortised === null ? "—" : eur(amortised, 3)}</output>`, `sur ${nf(r.part.volumeTotal, 0)} pièces du programme, compris dans le prix pièce`)}
       </div>
+      ${t ? slidesLine(r) : ""}
       ${t ? `<p class="small muted">Méthode du classeur « Outillage fonderie » : moule ${nf(t.block.L, 0)} × ${nf(t.block.W, 0)} × ${nf(t.block.H, 0)} mm = encombrement de la pièce + marges, poids × coefficient, heures d'usinage, de scan et d'ajustage par tranche de poids, étude et FAO selon la complexité. Taux et tableaux dans Paramètres.</p>` : ""}
       ${route.boxes.length ? `<h4>Boîtes à noyau</h4>
       <div class="cscroll"><table class="ctable">
@@ -1596,6 +1608,42 @@ function toolingCard(r) {
         <tfoot><tr><td><strong>Total outillage</strong></td><td class="muted small">moule ${total(route.outillageMoule)} + boîtes à noyau ${total(route.outillage - route.outillageMoule)}</td><td class="num"><strong>${total(route.outillage)}</strong></td></tr></tfoot>
       </table></div>` : ""}
     </section>`;
+}
+
+/**
+ * Under « Tiroirs du moule »: the slides of the 3D analysis (slides3d.js),
+ * their count per part × the cavities, and « Utiliser » (never applied
+ * without that click); once used, « Ne plus utiliser l'analyse 3D », and a
+ * change of the analysis since shown, the value kept.
+ */
+function slidesLine(r) {
+  const m = slidesLineModel(r, { defaut: settings.tooling?.tiroirs ?? 0 });
+  if (!m) return "";
+  const buttons = m.buttons.map((b) => ` <button type="button" class="small" data-action="${esc(b.action)}">${esc(b.label)}</button>`).join("");
+  return `<p class="cslides small${m.warn ? " cmsg warn" : ""}" data-slides-3d>${m.warn ? "⚠ " : ""}${esc(m.text)}${buttons}</p>`;
+}
+
+/** « Utiliser », « Ne plus utiliser l'analyse 3D », « Garder » of the slides of the 3D analysis, for the piece shown. */
+function slidesAction(action) {
+  const c = compute();
+  const r = c?.results.find((x) => x.piece.key === currentKey);
+  const proposal = r ? slidesProposal(r.piece, r.route) : null;
+  if (!proposal) return;
+  const piece = pieceStore(r.piece.key);
+  const defaut = settings.tooling?.tiroirs ?? 0;
+  if (action === "use-slides-3d") {
+    if (proposal.status !== "ready") return;
+    const record = adoptSlides(piece, r.inputs, proposal);
+    message = { kind: "ok", text: adoptedMessage(record, { defaut }) };
+  } else if (action === "undo-slides-3d") {
+    const record = undoSlides(piece);
+    if (record) message = { kind: "ok", text: undoneMessage(record) };
+  } else if (action === "keep-slides-3d") {
+    // The value stays, as a value typed in.
+    delete piece.tiroirs3D;
+  }
+  store.saveQuote(q);
+  render();
 }
 
 /**
@@ -2032,6 +2080,7 @@ export function retainCavities(n) {
   piece.empreintes = n;
   if (n !== null) piece.cycle = piece.outillagePrix = null;
   forgetAdoption(piece);
+  forgetSlidesAdoption(piece);
   forgetAIValues(piece);
   store.saveQuote(q);
   const after = compute()?.results.find((x) => x.piece.key === r.piece.key)?.route;

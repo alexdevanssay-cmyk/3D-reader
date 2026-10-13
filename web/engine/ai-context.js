@@ -71,6 +71,36 @@ function partingContext(p) {
 }
 
 /**
+ * The slides of a body (slides.js via the semantic contract), compact: how
+ * many slides, probable cores, zones to rework at the parting line and
+ * details ignored; each slide's direction and stroke, each core's area and
+ * why. Not computed yet (or failed): its status only.
+ */
+function slidesContext(s) {
+  if (s.status !== "proposed" && s.status !== "manual") return { status: s.status ?? null };
+  return {
+    status: s.status,
+    count: s.count ?? null,
+    cores: s.cores ?? null,
+    parting_zones: s.parting_zones ?? null,
+    ignored: s.ignored ?? null,
+    edited: !!s.edited,
+    slides: (s.slides ?? []).map((x) => ({
+      id: x.id, axis: x.axis,
+      ...(x.angle_deg != null ? { angle_deg: x.angle_deg } : {}),
+      ...(x.tilt_deg != null ? { tilt_deg: x.tilt_deg, tilt_up: x.tilt_up ?? null } : {}),
+      stroke_mm: x.stroke_mm, zones: Array.isArray(x.zones) ? x.zones.length : x.zones ?? null,
+    })),
+    cores_detail: (s.cores_detail ?? []).map(({ id, area_mm2, reason }) => ({ id, area_mm2, reason })),
+  };
+}
+
+/** The slides in short (a compacted context): their count, the probable cores, the zones to rework at the parting line. */
+function shortSlides(s) {
+  return { status: s.status ?? null, count: s.count ?? null, cores: s.cores ?? null, parting_zones: s.parting_zones ?? null };
+}
+
+/**
  * The risers and ingate of a body (feeding.js via the semantic contract),
  * compact: where each riser stands, its kind and size, the hot spot and the
  * modulus it feeds; the ingate; the casting yield.
@@ -133,6 +163,7 @@ function bodyContext(body, task) {
     topology: body.topology ?? null,
     geometry: body.geometry ?? {},
     ...(body.parting ? { parting: partingContext(body.parting) } : {}),
+    ...(body.slides ? { slides: slidesContext(body.slides) } : {}),
     ...(body.feeding ? { feeding: feedingSummary(body.feeding) } : {}),
     // Through and blind holes measured on the mesh, in short (semantic.js holeSummary).
     ...(body.holes ? { holes: body.holes } : {}),
@@ -408,6 +439,7 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
       metrics: roundDeep(body.metrics),
       geometry: { ...roundDeep(geometry), analytic_surface_count: Array.isArray(analytic_surfaces) ? analytic_surfaces.length : 0 },
       ...(body.parting ? { parting: body.parting } : {}),
+      ...(body.slides ? { slides: body.slides } : {}),
       ...(body.feeding ? { feeding: body.feeding } : {}),
       ...(holes ? { holes } : {}),
       relation_counts: relationCounts(body.relations),
@@ -477,6 +509,7 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   if (bodies3.some((b) => b.feeding)) omitted.push("risers one by one (counted, the largest kept)");
   const bodies4 = bodies3.map((b) => ({
     ...b,
+    ...(b.slides ? { slides: shortSlides(b.slides) } : {}),
     ...(b.feeding ? { feeding: shortFeeding(b.feeding) } : {}),
     ...(b.manufacturing ? { manufacturing: {
       process_candidates: b.manufacturing.process_candidates,
@@ -531,7 +564,7 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   // 7: only the largest bodies in detail.
   const byVolume = [...bodies6].sort((a, b) => (b.metrics?.volume_mm3 ?? 0) - (a.metrics?.volume_mm3 ?? 0));
   const detailed = new Set(byVolume.slice(0, detailedBodies).map((b) => b.id));
-  const brief = (b) => ({ id: b.id, name: b.name, role: b.role, metrics: { volume_mm3: b.metrics?.volume_mm3 ?? null, surface_area_mm2: b.metrics?.surface_area_mm2 ?? null, bbox_size_mm: b.metrics?.bbox_mm?.size ?? null }, ...(b.parting ? { parting: b.parting } : {}), ...(b.feeding ? { feeding: b.feeding } : {}), feature_count: b._features.length });
+  const brief = (b) => ({ id: b.id, name: b.name, role: b.role, metrics: { volume_mm3: b.metrics?.volume_mm3 ?? null, surface_area_mm2: b.metrics?.surface_area_mm2 ?? null, bbox_size_mm: b.metrics?.bbox_mm?.size ?? null }, ...(b.parting ? { parting: b.parting } : {}), ...(b.slides ? { slides: b.slides } : {}), ...(b.feeding ? { feeding: b.feeding } : {}), feature_count: b._features.length });
   if (context.bodies.length > detailedBodies) {
     omitted.push(`details of the ${context.bodies.length - detailedBodies} smallest bodies`);
     out = build(bodies6.map((b) => (detailed.has(b.id) ? b : brief(b))), 7);
