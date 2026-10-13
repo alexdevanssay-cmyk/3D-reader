@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { before, describe, test } from 'node:test';
 
 import { readCostingWorkbook } from '../../web/chiffrage/workbook.js';
-import { defaultQuote, saveBase, saveIndices, saveQuote } from '../../web/chiffrage/store.js';
+import { defaultQuote, loadQuote, saveBase, saveIndices, saveQuote } from '../../web/chiffrage/store.js';
 import { SOURCES } from '../../web/chiffrage/provenance.js';
 import { checkProposals } from '../../web/chiffrage/ai-apply.js';
 import {
@@ -190,6 +190,33 @@ describe('the slides of the 3D analysis in the costing', () => {
     assert.equal(r.trace['piece.outillage.tiroirs'].source.type, 'saisie');
   });
 
+  test('another count applied from the AI over the one validated, then that application undone: « analyse 3D validée » again', () => {
+    let r = computed({ procede: 'CG3' });
+    const piece = { procede: 'CG3' };
+    const record = adoptSlides(piece, r.inputs, slidesProposal(r.piece, r.route), DATE);
+    r = computed(piece);
+    assert.equal(r.trace['piece.outillage.tiroirs'].source.type, 'geometrie_validee');
+    const target = { tab: 1, file: 'slides.step', key: KEY };
+    const done = ui.applyAIValues(target, [{ cle: 'piece.outillage.tiroirs', valeur: 3 }], { date: DATE, message: 'm1' });
+    assert.deepEqual(done.applied.map((x) => [x.champ, x.avant, x.apres]), [['outillageTiroirs', 2, 3]]);
+    let saved = loadQuote(base, indices).pieces[KEY];
+    assert.deepEqual([saved.outillageTiroirs, saved.tiroirs3D], [3, undefined]);
+    assert.equal(ui.compute().results.find((x) => x.piece.key === KEY).trace['piece.outillage.tiroirs'].source.type, 'ia_appliquee');
+    // Undone: the count validated back, and its record with it.
+    assert.deepEqual(ui.undoAIValues(target, { message: 'm1' }).undone.map((x) => [x.champ, x.avant, x.apres]), [['outillageTiroirs', 3, 2]]);
+    saved = loadQuote(base, indices).pieces[KEY];
+    assert.deepEqual([saved.outillageTiroirs, saved.tiroirs3D, saved.valeursIA], [2, record, undefined]);
+    r = ui.compute().results.find((x) => x.piece.key === KEY);
+    assert.equal(r.trace['piece.outillage.tiroirs'].source.type, 'geometrie_validee');
+    assert.deepEqual(slidesLineModel(r).buttons, [{ action: 'undo-slides-3d', label: 'Ne plus utiliser l\'analyse 3D' }]);
+    // Applied twice, the second undone: the count validated back too, with its record.
+    ui.applyAIValues(target, [{ cle: 'piece.outillage.tiroirs', valeur: 3 }], { date: DATE, message: 'm2' });
+    ui.applyAIValues(target, [{ cle: 'piece.outillage.tiroirs', valeur: 5 }], { date: DATE, message: 'm3' });
+    assert.deepEqual(ui.undoAIValues(target, { message: 'm3' }).undone.map((x) => [x.champ, x.avant, x.apres]), [['outillageTiroirs', 5, 2]]);
+    saved = loadQuote(base, indices).pieces[KEY];
+    assert.deepEqual([saved.outillageTiroirs, saved.tiroirs3D], [2, record]);
+  });
+
   test('0 slide: conform to the default; a value typed or another default: « Utiliser 0 tiroir »', () => {
     const none = { ...BRIEF, count: 0, cores: 0, parting_zones: 1, slides: [] };
     let r = computed({ procede: 'CG3' }, p3d(none));
@@ -197,6 +224,9 @@ describe('the slides of the 3D analysis in the costing', () => {
     assert.equal(line.text, 'Analyse 3D : 0 tiroir par pièce, plan de joint Z proposé : conforme à la valeur par défaut. 0 tiroir : les contre-dépouilles sont des noyaux probables, des détails ignorés ou à reprendre au plan de joint.');
     assert.deepEqual(line.buttons, []);
     assert.deepEqual(divergences(r.trace['piece.outillage.tiroirs']), []);
+    // A closed cavity: the count conform, then the probable core.
+    line = slidesLineModel(computed({ procede: 'CG3' }, p3d({ ...none, cores: 1, parting_zones: 0 })));
+    assert.equal(line.text.split('. ')[0], 'Analyse 3D : 0 tiroir par pièce, plan de joint Z proposé : conforme à la valeur par défaut ; 1 noyau probable (non compté)');
     r = computed({ procede: 'CG3', outillageTiroirs: 2 }, p3d(none));
     line = slidesLineModel(r);
     assert.match(line.text, /^Analyse 3D : 0 tiroir par pièce, plan de joint Z proposé \(saisi : 2\)\./);
@@ -237,13 +267,19 @@ describe('the slides of the 3D analysis in the costing', () => {
     assert.equal(slidesProposal({ slides: undefined }, r.route).status, 'none');
   });
 
-  test('the AI: the count of the analysis per part accepted from analyse_3d (0 too), the die\'s from the trace; another refused', () => {
+  test('the AI: the die\'s count from analyse_3d, the part\'s × its cavities in the trace (0 too), or from the trace; another refused', () => {
     const proposal = (valeur, source = 'analyse_3d') => ({ piece: 'A', index: 0, cle: 'piece.outillage.tiroirs', champ: 'outillageTiroirs', valeur, unite: '', source, justification: '', refus: null });
-    const sent = (count) => ({ bodies: [{ slides: { status: 'proposed', count } }] });
+    const cavities = (n) => ({ pieces: [{ nom: 'A', valeurs: { 'piece.empreintes': { valeur: n } } }] });
+    const sent = (count, n = 1) => ({ bodies: [{ slides: { status: 'proposed', count } }], costing_trace: cavities(n) });
+    const absent = 'mesure absente de l\'analyse de la pièce pour cette clé';
     assert.deepEqual(checkProposals([proposal(2)], sent(2)).map((p) => [p.valeur, p.refus]), [[2, null]]);
     assert.deepEqual(checkProposals([proposal(0)], sent(0)).map((p) => [p.valeur, p.refus]), [[0, null]]);
-    assert.deepEqual(checkProposals([proposal(3)], sent(2)).map((p) => p.refus), ['mesure absente de l\'analyse de la pièce pour cette clé']);
-    // The die's count (× cavities): the alternative of the trace sent.
+    assert.deepEqual(checkProposals([proposal(3)], sent(2)).map((p) => p.refus), [absent]);
+    // 2 cavities: 4 slides for the die; the part's 2 is not the die's.
+    assert.deepEqual(checkProposals([proposal(4), proposal(2)], sent(2, 2)).map((p) => [p.valeur, p.refus]), [[4, null], [2, absent]]);
+    // The cavities not in the trace sent (compacted): no count of the die from the analysis.
+    assert.deepEqual(checkProposals([proposal(2)], { bodies: [{ slides: { status: 'proposed', count: 2 } }] }).map((p) => p.refus), [absent]);
+    // The die's count: the alternative of the trace sent.
     const trace = { pieces: [{ nom: 'A', valeurs: { 'piece.outillage.tiroirs': { valeur: 0, autres_sources: [{ source: 'géométrie 3D', valeur: 4 }] } } }] };
     assert.deepEqual(checkProposals([proposal(4, 'trace')], { ...sent(2), costing_trace: trace }).map((p) => [p.valeur, p.refus]), [[4, null]]);
   });

@@ -263,7 +263,9 @@ export function applyAIValues(target, proposals, origin = {}, { dryRun = false }
       const was = record[champ];
       // Not from a value reset by another island: what was there before was for that one.
       const keep = was && sameValue(piece[champ] ?? null, was.valeur) && (!["procede", "finition", ...ROUTE_FIELDS].includes(champ) || (was.procede === procede && was.cle !== "piece.ilot"));
-      record[champ] = { valeur, avant: keep ? was.avant : piece[champ] ?? null, procede, date, provider: origin.provider ?? null, model: origin.model ?? null, message: origin.message ?? null, cle, ...extra };
+      // A second one keeps the count of the 3D analysis the first replaced, back with an undo.
+      const earlier = keep && was.tiroirs3D ? { tiroirs3D: was.tiroirs3D } : {};
+      record[champ] = { valeur, avant: keep ? was.avant : piece[champ] ?? null, procede, date, provider: origin.provider ?? null, model: origin.model ?? null, message: origin.message ?? null, cle, ...earlier, ...extra };
       piece[champ] = valeur;
     };
     if (islandSet) {
@@ -273,8 +275,9 @@ export function applyAIValues(target, proposals, origin = {}, { dryRun = false }
     }
     for (const x of changes) {
       if (islandSet && ["procede", "finition"].includes(x.champ)) continue;
-      // An adopted estimate of the cycle replaced: kept with the record, back with an undo.
-      write(x.champ, x.apres, x.cle, x.champ === "cycle" && piece.cycleIA ? { cycleIA: piece.cycleIA } : {});
+      // An adopted estimate of the cycle, or count of slides of the 3D analysis, replaced: kept with the record, back with an undo.
+      write(x.champ, x.apres, x.cle, x.champ === "cycle" && piece.cycleIA ? { cycleIA: piece.cycleIA }
+        : x.champ === "outillageTiroirs" && piece.tiroirs3D ? { tiroirs3D: piece.tiroirs3D } : {});
     }
     // Cores checked by this application: a first core to describe, as the casting card does (taken back with an undo).
     if (changes.some((x) => x.champ === "noyaux" && x.apres === true) && !piece.cores?.length) {
@@ -335,6 +338,7 @@ export function undoAIValues(target, { message: answer = null } = {}) {
     if (a.avant === null) delete piece[champ];
     else piece[champ] = a.avant;
     if (champ === "cycle" && a.cycleIA) piece.cycleIA = a.cycleIA;
+    if (champ === "outillageTiroirs" && a.tiroirs3D) piece.tiroirs3D = a.tiroirs3D;
     if (champ === "noyaux" && a.cores && json(piece.cores) === json(a.cores)) delete piece.cores;
     undone.push({ champ, label, avant: a.valeur, apres: a.avant, unite: fieldOf(champ)?.unite ?? "" });
   }

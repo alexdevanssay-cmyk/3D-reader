@@ -163,7 +163,8 @@ export function slidesLineModel(r, { defaut = 0 } = {}) {
     const differs = typed !== null ? ` (saisi : ${typed})` : !sameValue(used, proposal.value) && used !== 0 ? ` (par défaut : ${used})` : "";
     const cores = proposal.cores > 0 ? ` ; ${proposal.cores} noyau${proposal.cores > 1 ? "x" : ""} probable${proposal.cores > 1 ? "s" : ""} (non compté${proposal.cores > 1 ? "s" : ""})` : "";
     const conform = typed === null && sameValue(used, proposal.value) ? " : conforme à la valeur par défaut" : "";
-    text = `Analyse 3D : ${tiroirs(n)} par pièce${detail}, ${parting}${differs}${cores}${conform}.`;
+    // The conformity said of the count, before the cores (not counted).
+    text = `Analyse 3D : ${tiroirs(n)} par pièce${detail}, ${parting}${differs}${conform}${cores}.`;
     if (!conform) use();
   }
   const notes = [];
