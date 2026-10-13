@@ -106,7 +106,8 @@ function pushMaterial() {
  * (Paramètres: plan de joint, alimentation) and the margins and steel density
  * of the dies, to the 3D page (app.js setProcess): the parting of the body is
  * proposed for that process, its die block with these margins. At each
- * drawing of the page; the 3D page does nothing when nothing changed.
+ * drawing of the page; the 3D page does nothing when nothing changed. An
+ * error of the 3D page is its own: logged, the page drawn all the same.
  */
 function pushProcesses(results = null) {
   const setProcess = window.reader3d?.setProcess;
@@ -125,7 +126,11 @@ function pushProcesses(results = null) {
     if (r.piece.index === undefined) continue; // the piece typed in: no 3D model
     const code = r.route?.process ?? null;
     const p = code ? settings.processes[code] : null;
-    setProcess(r.piece.key, { code: p ? code : null, famille: p?.famille ?? null, orientation: p?.orientation ?? null, die });
+    try {
+      setProcess(r.piece.key, { code: p ? code : null, famille: p?.famille ?? null, orientation: p?.orientation ?? null, die });
+    } catch (err) {
+      console.warn("Island retained not told to the 3D page", err);
+    }
   }
 }
 

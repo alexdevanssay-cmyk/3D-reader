@@ -408,4 +408,34 @@ describe('orientation by casting process (dist/)', { skip: !existsSync(join(DIST
     await context.close();
   });
 
+  test('a malformed entry kept in this browser: the process chosen all the same and kept; an error of the 3D page does not stop the costing', { timeout: 2 * CAD_TIMEOUT }, async () => {
+    const { context, page, errors } = await newPage();
+    // Entries of another version or edited by hand: a part that is not an object, bodies that are not one.
+    await page.evaluate(() => localStorage.setItem('reader3d.orientation.v1', JSON.stringify({
+      parts: { stale: null, text: 'x', list: [1, 2], old: { bodies: 'x', savedAt: 'yesterday' }, kept: { bodies: { 0: null, 1: { process: { plan: 'horizontal', alimentation: 'haut' } } }, savedAt: 1 } },
+    })));
+    await open(page, stlFile('T.stl', tPart()));
+    await settled(page, GRAVITY_DEFAULT, '-Z');
+    await page.selectOption('#parting-process-select', 'horizontal-bas');
+    await settled(page, 'Procédé : Basse pression — plan de joint horizontal, alimentation par le bas (choisi pour cette pièce)', '+X');
+    // Kept for the part; the malformed entries left out, the others kept.
+    const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('reader3d.orientation.v1')));
+    const ours = Object.entries(saved.parts).filter(([id]) => id.startsWith('sha256:'));
+    assert.equal(ours.length, 1);
+    assert.deepEqual(ours[0][1].bodies, { 0: { process: { plan: 'horizontal', alimentation: 'bas' } } });
+    assert.deepEqual(Object.keys(saved.parts).filter((id) => !id.startsWith('sha256:')).sort(), ['kept', 'old']);
+    assert.deepEqual([saved.parts.kept.bodies, saved.parts.old.bodies], [{ 1: { process: { plan: 'horizontal', alimentation: 'haut' } } }, {}]);
+    // A 3D page that fails when told the island retained: the costing drawn all the same.
+    await page.evaluate(() => {
+      window.reader3d.setProcess = () => {
+        throw new Error('3D page broken');
+      };
+    });
+    await page.click('.tab[data-page="chiffrage"]');
+    await setField(page, '#page-chiffrage [data-bind="q.client"]', 'ACME');
+    await page.waitForFunction(() => document.querySelector('#page-chiffrage [data-bind="q.client"]')?.value === 'ACME');
+    assert.match(await page.textContent('#page-chiffrage'), /Outillage/);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
 });

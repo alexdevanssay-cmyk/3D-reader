@@ -6754,20 +6754,37 @@ const validProcess = (p) => !!p && PLANS.includes(p.plan) && FEEDS.includes(p.al
 
 let orientMemory = null; // the choices of this visit, when this browser's storage refuses them
 
+const isRecord = (x) => !!x && typeof x === "object" && !Array.isArray(x);
+
+/**
+ * What this browser keeps, in that shape whatever was read (another version,
+ * edited by hand, cut short): a part or a body that is not an object left out,
+ * a part without its bodies given none, its savedAt a number.
+ */
+function orientClean(saved) {
+  if (!isRecord(saved)) return {};
+  const parts = {};
+  for (const [id, entry] of Object.entries(isRecord(saved.parts) ? saved.parts : {})) {
+    if (!isRecord(entry)) continue;
+    const bodies = Object.fromEntries(Object.entries(isRecord(entry.bodies) ? entry.bodies : {}).filter(([, v]) => isRecord(v)));
+    parts[id] = { ...entry, bodies, savedAt: Number.isFinite(entry.savedAt) ? entry.savedAt : 0 };
+  }
+  return { ...saved, parts };
+}
+
 function orientSaved() {
   if (orientMemory) return orientMemory;
   try {
-    const saved = JSON.parse(localStorage.getItem(ORIENT_KEY));
-    return saved && typeof saved === "object" ? saved : {};
+    return orientClean(JSON.parse(localStorage.getItem(ORIENT_KEY)));
   } catch {
     return {};
   }
 }
 
 function orientWrite(all) {
-  const parts = all.parts ?? {};
+  const parts = isRecord(all.parts) ? all.parts : {};
   // The latest parts only.
-  const ids = Object.keys(parts).sort((a, b) => (parts[b].savedAt ?? 0) - (parts[a].savedAt ?? 0));
+  const ids = Object.keys(parts).sort((a, b) => (parts[b]?.savedAt ?? 0) - (parts[a]?.savedAt ?? 0));
   for (const id of ids.slice(ORIENT_PARTS)) delete parts[id];
   dieRead = null;
   try {
@@ -6790,7 +6807,7 @@ function orientOf(r = state.result) {
   let o = orientings.get(r);
   if (!o) {
     const bodies = orientSaved().parts?.[partIdOf(r)]?.bodies ?? {};
-    o = { kept: new Map(Object.entries(bodies).map(([k, v]) => [Number(k), v ?? {}])), oriented: new WeakMap(), proposing: new Map(), failed: new Map() };
+    o = { kept: new Map(Object.entries(bodies).map(([k, v]) => [Number(k), v])), oriented: new WeakMap(), proposing: new Map(), failed: new Map() };
     orientings.set(r, o);
   }
   return o;
@@ -6806,11 +6823,12 @@ function orientKeep(i, patch, r = state.result) {
   const partId = partIdOf(r);
   if (!partId) return;
   const all = orientSaved();
-  const parts = (all.parts ??= {});
-  const entry = parts[partId] ?? { bodies: {} };
-  if (Object.keys(next).length) entry.bodies[i] = next;
-  else delete entry.bodies[i];
-  if (Object.keys(entry.bodies).length) parts[partId] = { ...entry, savedAt: Date.now() };
+  const parts = isRecord(all.parts) ? all.parts : (all.parts = {});
+  const entry = isRecord(parts[partId]) ? parts[partId] : {};
+  const bodies = isRecord(entry.bodies) ? { ...entry.bodies } : {};
+  if (Object.keys(next).length) bodies[i] = next;
+  else delete bodies[i];
+  if (Object.keys(bodies).length) parts[partId] = { ...entry, bodies, savedAt: Date.now() };
   else delete parts[partId];
   orientWrite(all);
 }
