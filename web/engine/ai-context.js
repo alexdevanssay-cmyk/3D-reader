@@ -384,6 +384,22 @@ function shortFoundry(foundry) {
 }
 
 /**
+ * The wall thickness of a body in short: kept at every level of the
+ * compaction, the last resort included. A measured fact the AI must have:
+ * without it, it asks for a thickness analysis that was already done.
+ * {status: "measured", min_mm, min_method, median_mm, max_mm}, or
+ * {status: "not_computed"} (« Analyser les épaisseurs » not run for this body).
+ */
+function thicknessBrief(b) {
+  const t = b.foundry?.evidence?.thickness ?? b.foundry?.thickness ?? null;
+  const r1 = (v) => (finite(v) ? Math.round(v * 10) / 10 : null);
+  if (t?.status === "measured") return { status: "measured", min_mm: r1(t.min_mm), min_method: t.min_method ?? null, median_mm: r1(t.median_mm), max_mm: r1(t.max_mm) };
+  const f = b.manufacturing?.functional_thickness;
+  if (f?.status === "measured") return { status: "measured", min_mm: r1(f.minimum_wall_thickness_mm), min_method: null, median_mm: null, max_mm: null };
+  return { status: "not_computed" };
+}
+
+/**
  * A smaller copy of an AI context (buildAIContext) for a model with a small
  * context window (the gateway's budget, a local LLM): the same facts, less
  * detail, until its JSON fits in `maxChars`. What is given up first is what
@@ -564,7 +580,7 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   // 7: only the largest bodies in detail.
   const byVolume = [...bodies6].sort((a, b) => (b.metrics?.volume_mm3 ?? 0) - (a.metrics?.volume_mm3 ?? 0));
   const detailed = new Set(byVolume.slice(0, detailedBodies).map((b) => b.id));
-  const brief = (b) => ({ id: b.id, name: b.name, role: b.role, metrics: { volume_mm3: b.metrics?.volume_mm3 ?? null, surface_area_mm2: b.metrics?.surface_area_mm2 ?? null, bbox_size_mm: b.metrics?.bbox_mm?.size ?? null }, ...(b.parting ? { parting: b.parting } : {}), ...(b.slides ? { slides: b.slides } : {}), ...(b.feeding ? { feeding: b.feeding } : {}), feature_count: b._features.length });
+  const brief = (b) => ({ id: b.id, name: b.name, role: b.role, metrics: { volume_mm3: b.metrics?.volume_mm3 ?? null, surface_area_mm2: b.metrics?.surface_area_mm2 ?? null, bbox_size_mm: b.metrics?.bbox_mm?.size ?? null }, ...(b.parting ? { parting: b.parting } : {}), ...(b.slides ? { slides: b.slides } : {}), ...(b.feeding ? { feeding: b.feeding } : {}), thickness: thicknessBrief(b), feature_count: b._features.length });
   if (context.bodies.length > detailedBodies) {
     omitted.push(`details of the ${context.bodies.length - detailedBodies} smallest bodies`);
     out = build(bodies6.map((b) => (detailed.has(b.id) ? b : brief(b))), 7);
@@ -574,7 +590,13 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   // 8: every body reduced to its metrics and feature counts; the feature groups and foundry screen of the largest one.
   omitted.push("per-body foundry and manufacturing details (kept for the largest body only)");
   const largest = byVolume[0]?.id;
-  const level8 = (b) => (b.id === largest ? { ...brief(b), ...(b.holes ? { holes: b.holes } : {}), feature_groups: b.feature_groups, foundry: b.foundry } : brief(b));
+  // The thickness given once, by brief(b): not again in the foundry screen of the largest body.
+  const withoutThickness = (foundry) => {
+    if (!foundry) return foundry;
+    const { thickness, ...rest } = foundry;
+    return rest;
+  };
+  const level8 = (b) => (b.id === largest ? { ...brief(b), ...(b.holes ? { holes: b.holes } : {}), feature_groups: b.feature_groups, foundry: withoutThickness(b.foundry) } : brief(b));
   out = build(bodies6.map(level8), 8);
   if (size(out) <= maxChars) return out;
 
