@@ -197,8 +197,26 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     const volume = await page.textContent('#total-volume');
     await page.evaluate(() => window.reader3d.computeThickness());
     const min = await page.textContent('#thick-min');
-    // Kept results are written in the background.
-    await page.waitForTimeout(500);
+    // Kept results are written in the background: the thickness in a transaction of its own,
+    // after the analysis's, queued with those of the parting line and the risers proposed when
+    // the model opened, each needing turns of the page's thread (over a second on a loaded
+    // machine). A reload drops a write not finished: waited for until it reads back (a read
+    // waits for the writes begun before it).
+    for (const end = Date.now() + 30_000; ; await page.waitForTimeout(100)) {
+      const keys = await page.evaluate(async () => {
+        const db = await new Promise((resolve, reject) => {
+          const req = indexedDB.open('reader3d-cache');
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+        const store = db.transaction('data', 'readonly').objectStore('data');
+        const keys = await new Promise((resolve) => (store.getAllKeys().onsuccess = (e) => resolve(e.target.result)));
+        db.close();
+        return keys.map(String);
+      });
+      if (keys.some((k) => k.endsWith('#thickness'))) break;
+      assert.ok(Date.now() < end, 'thickness not kept');
+    }
 
     // Opened again after a reload of the page: the same results, at once, thickness included.
     await page.reload();
