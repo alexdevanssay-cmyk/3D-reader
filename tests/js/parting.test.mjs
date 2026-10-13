@@ -6,9 +6,10 @@ import { describe, test } from 'node:test';
 
 import {
   BLOCK_GRID, REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_UPPER, applyOverrides, axisLabel, canonicalAxis, evaluateParting, faceRegions,
-  lineMesh, lineSummary, mouldBlocks, parseDirection, partingLine, proposeParting, sameDirection, sampleByArea,
+  lineMesh, lineShape, lineSummary, mouldBlocks, parseDirection, partingLine, proposeParting, sameDirection, sampleByArea,
 } from '../../web/engine/parting.js';
-import { LEVEL, SIDE_NONE, TRAPPED, ZERO_DRAFT } from '../../web/engine/parting.js';
+import { LEVEL, SHADOW, SIDE_NONE, SILHOUETTE, TRAPPED, ZERO_DRAFT } from '../../web/engine/parting.js';
+import { BRACKET, MUSHROOM, PEG, mushroom, peg, zBracket } from './curved-mesh.mjs';
 import { approx } from './helpers.mjs';
 import { PLATE, castPlate } from './plate-mesh.mjs';
 
@@ -492,6 +493,294 @@ describe('flat faces along the draw direction (a CAD body: flat faces cut into l
     assert.ok(onTop > 0);
     const back = partingLine(line, applyOverrides(base.side, region, {}), [0, 1, 0], { flags: base.flags, plane: base.plane, height: base.summary.mould_height_mm });
     assert.deepEqual(lineSummary(back), base.summary.parting);
+  });
+});
+
+/**
+ * The shape of a line from its pieces (ends within 1e-4 mm), its pieces in a
+ * straight row merged into runs: `reversals`, the points where two runs turn
+ * back by more than 135° (a zigzag along long triangles, a spike round one);
+ * `teeth`, the runs shorter than 3 mm at such a point (a notch, a tooth along
+ * the short edges of triangles); `combs`, the runs (1 mm long at least) along
+ * another within 3° and 1 mm of it over half their length (the parallel lines
+ * of a comb across a band of long thin triangles, the two sides of a spike).
+ */
+function shapeOfLine(segments) {
+  const m = segments.length / 6;
+  const key = (j) => `${Math.round(segments[j] * 1e4)},${Math.round(segments[j + 1] * 1e4)},${Math.round(segments[j + 2] * 1e4)}`;
+  const at = (j) => [segments[j], segments[j + 1], segments[j + 2]];
+  const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const len = (a) => Math.hypot(...a);
+  const other = (j) => (j % 6 === 0 ? j + 3 : j - 3);
+  const ends = new Map();
+  for (let j = 0; j < segments.length; j += 3) (ends.get(key(j)) ?? ends.set(key(j), []).get(key(j))).push(j);
+  // Runs: pieces in a row (turning by less than 1°) merged.
+  const root = Int32Array.from({ length: m }, (_, k) => k);
+  const find = (k) => (root[k] === k ? k : (root[k] = find(root[k])));
+  const bends = [];
+  for (const list of ends.values()) {
+    if (list.length !== 2) continue;
+    const [u, v] = list.map((j) => sub(at(other(j)), at(j)));
+    const turn = dot(u, v) / (len(u) * len(v));
+    if (turn < -Math.cos(Math.PI / 180)) root[find(list[0] / 6 | 0)] = find(list[1] / 6 | 0);
+    else bends.push([list[0], list[1], turn]);
+  }
+  const length = new Float64Array(m);
+  for (let k = 0; k < m; k++) length[find(k)] += len(sub(at(6 * k + 3), at(6 * k)));
+  let reversals = 0;
+  const teeth = new Set();
+  for (const [a, b, turn] of bends) {
+    if (turn <= Math.cos(Math.PI / 4)) continue;
+    reversals++;
+    for (const j of [a, b]) if (length[find(j / 6 | 0)] < 3) teeth.add(find(j / 6 | 0));
+  }
+  // The ends of each run: the ends of its pieces not inside it.
+  const runEnds = new Map();
+  for (let j = 0; j < segments.length; j += 3) {
+    const r = find(j / 6 | 0);
+    const list = ends.get(key(j));
+    if (list.length === 2 && find(list[0] / 6 | 0) === find(list[1] / 6 | 0)) continue;
+    (runEnds.get(r) ?? runEnds.set(r, []).get(r)).push(at(j));
+  }
+  const runs = [...runEnds].filter(([r, e]) => e.length === 2 && length[r] >= 1).map(([, [a, b]]) => ({ a, b, l: len(sub(b, a)) }));
+  // A run along a longer one: within 3° of it, over half its length, 1 mm off it at most.
+  const along = (s, t) => {
+    const u = sub(t.b, t.a).map((x) => x / t.l), w = sub(s.b, s.a);
+    if (Math.abs(dot(u, w)) < Math.cos((3 * Math.PI) / 180) * s.l) return false;
+    const ta = dot(sub(s.a, t.a), u), tb = dot(sub(s.b, t.a), u);
+    const overlap = Math.min(Math.max(ta, tb), t.l) - Math.max(Math.min(ta, tb), 0);
+    const off = (p, tp) => len(sub(sub(p, t.a), u.map((x) => x * tp)));
+    return overlap >= s.l / 2 && Math.max(off(s.a, ta), off(s.b, tb)) < 1;
+  };
+  const comb = new Uint8Array(runs.length);
+  for (let i = 0; i < runs.length; i++) {
+    for (let k = i + 1; k < runs.length; k++) {
+      const [s, t] = runs[i].l < runs[k].l ? [runs[i], runs[k]] : [runs[k], runs[i]];
+      if (along(s, t)) comb[i] = comb[k] = 1;
+    }
+  }
+  const combs = comb.reduce((n, c) => n + c, 0);
+  return { reversals, teeth: teeth.size, combs };
+}
+
+/** Faces (B-rep) whose triangles are in both halves; undercuts (SIDE_NONE) left out. */
+function facesSplit(face, side) {
+  const halves = new Map();
+  face.forEach((r, f) => {
+    if (side[f] === SIDE_NONE) return;
+    (halves.get(r) ?? halves.set(r, new Set()).get(r)).add(side[f]);
+  });
+  return [...halves].filter(([, s]) => s.size > 1).map(([r]) => r);
+}
+
+describe('curved faces and faces along the draw direction of a CAD body (long, thin, grazing triangles)', () => {
+  test('flat walls along d across the frame: one half each, not one long triangle in two (no zigzag, no comb, no small loop)', () => {
+    // The Z bracket turned 20° about Z: n·d of the long triangles of its caps
+    // (exact planes along Z) is off 0 by up to ±1e-5 (float32 positions);
+    // compared with a tie of 1e-6, one triangle in two went to the lower
+    // half: a warped line of 945 mm in 4 loops, zigzagging across the caps
+    // (17 points turning back). Now the line of the bracket unturned: round
+    // the bottom face, up the web under the upper flange, round its
+    // underside.
+    for (const turn of [20, 0]) {
+      const part = zBracket({ turn });
+      const { summary, side, segments } = evaluateParting(part.positions, part.indices, [0, 0, 1]);
+      const label = `turned ${turn}°`;
+      assert.deepEqual([summary.parting.kind, summary.parting.loops, summary.parting.levels_mm], ['stepped', 1, [0, 22]], label);
+      approx(summary.parting.length_mm, 2 * 46 + 40 + 2 * 22 + 2 * 34 + 40, 0, 1e-6, `${label}: length`);
+      assert.deepEqual(shapeOfLine(segments), { reversals: 0, teeth: 0, combs: 0 }, label);
+      assert.equal(looseEnds(segments), 0, label);
+      assert.deepEqual(facesSplit(part.face, side), [], label);
+      // Its caps (faces 0 and 1) in the upper half, whole.
+      part.face.forEach((r, f) => r < 2 && assert.equal(side[f], SIDE_UPPER, `${label}: cap triangle ${f}`));
+    }
+  });
+
+  test('a boss with 0.5° of draft meshed in staggered rows: no undercut on it, all of it in the upper half', () => {
+    // The facets of its rows lean by about ±1°; the lines along +d from the
+    // middle of one met the top of the boss, whose outline stands off them by
+    // the sagitta of its facets (more than its draft takes in): 456.8 mm² of
+    // undercut on the boss. Now from off its surface by that stand-off.
+    const part = zBracket({ turn: 0 });
+    const boss = part.faces - 2; // its cone, then its top
+    const { summary, side, flags } = evaluateParting(part.positions, part.indices, [0, 0, 1]);
+    assert.equal(summary.undercut_area_mm2, 0);
+    part.face.forEach((r, f) => {
+      if (r < boss) return;
+      assert.ok(flags[f] & REACH_UP, `triangle ${f}`);
+      assert.equal(side[f], SIDE_UPPER, `triangle ${f}`);
+    });
+    // Its wall without draft for 1°: zero draft.
+    approx(summary.zero_draft_area_mm2, 4208, 0, 0.05, 'zero draft');
+  });
+
+  test('across a curved face, the line along its silhouette (n·d = 0 between the corners of its triangles), not along their staggered edges', () => {
+    // The bracket turned 20° drawn along X (and Y): the halves meet on the
+    // boss down two generators of its cone. Along the edges of its staggered
+    // rows the line was up to 1.8 mm off them, in teeth. (Along X the line
+    // turns back once, by 159°, where the edge of the boss's shadow on the
+    // flange meets the edge of the cap at 20°: the corner of a wedge of the
+    // flange 25 mm long, not a tooth.)
+    const part = zBracket();
+    const { x, y, r } = BRACKET.boss;
+    const t = (20 * Math.PI) / 180;
+    const cx = Math.cos(t) * x - Math.sin(t) * y, cy = Math.sin(t) * x + Math.cos(t) * y;
+    for (const d of [[1, 0, 0], [0, 1, 0]]) {
+      const { summary, segments, flags } = evaluateParting(part.positions, part.indices, d);
+      let along = 0, worst = 0;
+      for (let i = 0; i < segments.length; i += 6) {
+        const ends = [i, i + 3].map((j) => [segments[j], segments[j + 1], segments[j + 2]]);
+        if (!ends.every((p) => p[2] > 30.2 && p[2] < 41.8 && Math.abs(Math.hypot(p[0] - cx, p[1] - cy) - r) < 0.5)) continue;
+        along += Math.hypot(ends[1][0] - ends[0][0], ends[1][1] - ends[0][1], ends[1][2] - ends[0][2]);
+        for (const p of ends) worst = Math.max(worst, Math.abs((p[0] - cx) * d[0] + (p[1] - cy) * d[1]));
+      }
+      assert.ok(along > 20, `${d}: ${along} mm on the boss`);
+      assert.ok(worst < 0.01, `${d}: ${worst} mm off the silhouette`);
+      assert.ok([...flags].some((f) => f & SILHOUETTE), `${d}: triangles cut by the silhouette`);
+      const { teeth, combs } = shapeOfLine(segments);
+      assert.deepEqual([teeth, combs, looseEnds(segments)], [0, 0, 0], String(d));
+      assert.equal(summary.parting.loops, 1, String(d));
+    }
+  });
+
+  test('the edge of a shadow across a fan of long triangles: straight across them, not a staircase along their edges', () => {
+    // The cap of the mushroom overhangs its base beyond x = 30: along Z, its
+    // underside over the base is an undercut (joined to the upper half), the
+    // rest of it the lower half. The line between them went along the long
+    // triangles of the cap's underside, up to 5 mm off x = 30; now across
+    // them where the lines of sight change.
+    const part = mushroom();
+    const { summary, segments, flags } = evaluateParting(part.positions, part.indices, [0, 0, 1]);
+    const { stem, cap } = MUSHROOM;
+    let across = 0, worst = 0;
+    for (let i = 0; i < segments.length; i += 6) {
+      const ends = [i, i + 3].map((j) => [segments[j], segments[j + 1], segments[j + 2]]);
+      // Pieces on the underside (z = 25), not along its rim.
+      const mid = [0, 1].map((k) => (ends[0][k] + ends[1][k]) / 2);
+      if (!ends.every((p) => Math.abs(p[2] - stem.top) < 1e-4) || Math.hypot(mid[0] - stem.x, mid[1] - stem.y) > cap.r - 0.05) continue;
+      across += Math.hypot(ends[1][0] - ends[0][0], ends[1][1] - ends[0][1]);
+      for (const p of ends) worst = Math.max(worst, Math.abs(p[0] - 30));
+    }
+    // The chord x = 30 of the underside (a 72-gon of radius 25): 39.944 mm
+    // (it was 58 mm in steps, 8.5 mm off x = 30 at worst).
+    approx(across, 39.944, 0, 0.05, 'across the underside');
+    assert.ok(worst < 0.2, `${worst} mm off x = 30`);
+    assert.ok([...flags].some((f) => f & SHADOW));
+    assert.deepEqual([summary.parting.kind, summary.parting.loops, looseEnds(segments)], ['stepped', 2, 0]);
+    assert.deepEqual(shapeOfLine(segments), { reversals: 0, teeth: 0, combs: 0 });
+    approx(summary.undercut_area_mm2, 3212.5, 0, 0.05, 'undercut');
+  });
+
+  test('the edge of a shadow across the long strips of a cylinder, obliquely: a curve across them, not a comb along them', () => {
+    // The peg over the ledge: its underside over the ledge an undercut, beyond
+    // it the lower half. Each strip of the cylinder (two triangles 50 mm long)
+    // was in two, one triangle undercut and the other in the lower half: the
+    // undercut joined to the lower half for its long border with it (the
+    // long edges of the strips), the line round it along the wall and spikes
+    // along the strips (518 mm in all). Now the undercut in the upper half
+    // (its border with the lower one across the strips, not along them) and
+    // the line along the edge of the ledge's shadow, x = 25 + 0.4 y.
+    const part = peg();
+    const { summary, segments } = evaluateParting(part.positions, part.indices, [0, 0, 1]);
+    const { ledge, peg: g } = PEG;
+    const front = (y) => (ledge.front[0] + ledge.front[1]) / 2 + ((ledge.front[1] - ledge.front[0]) / (2 * PEG.wall.y)) * y;
+    let across = 0, worst = 0;
+    for (let i = 0; i < segments.length; i += 6) {
+      const ends = [i, i + 3].map((j) => [segments[j], segments[j + 1], segments[j + 2]]);
+      // Not on the wall (x = 0), the end of the peg (x = 50), the bottom.
+      assert.ok(!ends.every((p) => Math.abs(p[0]) < 1e-4 && p[2] > 1e-4), `a piece on the wall: ${ends}`);
+      if (!ends.every((p) => p[0] > 1 && p[0] < g.length - 1 && p[2] > 1e-4)) continue;
+      across += Math.hypot(ends[1][0] - ends[0][0], ends[1][1] - ends[0][1], ends[1][2] - ends[0][2]);
+      for (const p of ends) worst = Math.max(worst, Math.abs(p[0] - front(p[1])));
+    }
+    // The plane x = 25 + 0.4 y across the facets of the underside between those
+    // next to its silhouettes (z = 30): 21.9 mm; across those too: 26.0 mm.
+    const chord = (from, to) => {
+      let sum = 0;
+      for (let k = from; k < to; k++) {
+        const at = (i) => {
+          const a = (2 * Math.PI * i) / g.segments, y = g.r * Math.cos(a), z = g.z + g.r * Math.sin(a);
+          return [front(y), y, z];
+        };
+        const [p, q] = [at(k), at(k + 1)];
+        sum += Math.hypot(q[0] - p[0], q[1] - p[1], q[2] - p[2]);
+      }
+      return sum;
+    };
+    assert.ok(across > chord(13, 23) && across < chord(12, 24), `${across} mm across the underside`);
+    assert.ok(worst < 0.15, `${worst} mm off the edge of the shadow`);
+    assert.deepEqual([summary.parting.loops, looseEnds(segments)], [2, 0]);
+    assert.deepEqual(shapeOfLine(segments), { reversals: 0, teeth: 0, combs: 0 });
+    approx(summary.parting.length_mm, 271.1, 0, 0.5, 'length');
+  });
+
+  test('a planar line across cylinders along d: on their silhouettes, the edges between their facets there', () => {
+    // The mushroom along X and Y: the silhouettes of its stem and of the rim
+    // of its cap are generators through their vertices (x = 15, y = 0). The
+    // planar line was one facet of the stem off them (x = 13.45, y = -1.55):
+    // a facet facing -d in the upper half.
+    const part = mushroom();
+    for (const [d, level] of [[[1, 0, 0], 15], [[0, 1, 0], 0]]) {
+      const { summary, plane } = evaluateParting(part.positions, part.indices, d);
+      assert.equal(summary.parting.kind, 'planar', String(d));
+      approx(plane, level, 0, 1e-9, `${d}: plane`);
+      approx(summary.parting.length_mm, 256, 0, 0.05, `${d}: length`);
+    }
+  });
+
+  test('a stepped line whose climbs are cut into short pieces (a silhouette across a fine mesh): still stepped, at its levels', () => {
+    // Round a 40 × 40 square at z = 0 on two sides and z = 10 on the other
+    // two, climbing in pieces 0.1 mm high: each piece level within the
+    // tolerance (0.5 mm), their heights chained from 0 to 10 in one level
+    // (warped). The levels are each within the tolerance of their lowest run.
+    const pieces = [];
+    const to = (a, b) => pieces.push(...a, ...b);
+    const climb = (x, y, up) => {
+      for (let k = 0; k < 100; k++) to([x, y, up ? k / 10 : 10 - k / 10], [x, y, up ? (k + 1) / 10 : 10 - (k + 1) / 10]);
+    };
+    to([0, 0, 0], [40, 0, 0]);
+    climb(40, 0, true);
+    to([40, 0, 10], [40, 40, 10]);
+    to([40, 40, 10], [0, 40, 10]);
+    climb(0, 40, false);
+    to([0, 40, 0], [0, 0, 0]);
+    const shape = lineShape(Float64Array.from(pieces), [0, 0, 1], { height: 10, loops: 1 });
+    assert.equal(shape.kind, 'stepped');
+    assert.equal(shape.levels.length, 2);
+    approx(shape.levels[0], 0, 0, 0.01, 'low level');
+    approx(shape.levels[1], 10, 0, 0.01, 'high level');
+  });
+
+  test('the line of a split cut by silhouettes and shadows: the same from partingLine on the halves and flags (as the page draws it), closed with a face moved by hand', () => {
+    for (const [part, d] of [[zBracket(), [1, 0, 0]], [mushroom(), [0, 0, 1]], [peg(), [0, 0, 1]]]) {
+      const { summary, side, flags, plane, segments } = evaluateParting(part.positions, part.indices, d);
+      const line = lineMesh(part.positions, part.indices);
+      const again = partingLine(line, side, d, { flags, plane, height: summary.mould_height_mm });
+      assert.deepEqual(lineSummary(again), summary.parting);
+      assert.deepEqual(again.segments, segments);
+      // Every face moved to the other half in turn: a closed line.
+      const { region, count } = faceRegions(part.positions, part.indices, { brep: true });
+      for (let face = 0; face < count; face++) {
+        const fixed = Uint8Array.from(region, (r) => (r === face ? 1 : 0));
+        const half = side[region.indexOf(face)] === SIDE_UPPER ? SIDE_LOWER : SIDE_UPPER;
+        const moved = applyOverrides(side, region, { [face]: half });
+        const l = partingLine(line, moved, d, { flags, plane, fixed, height: summary.mould_height_mm });
+        assert.equal(looseEnds(l.segments), 0, `${d}: face ${face} moved`);
+      }
+    }
+  });
+
+  test('the same halves and line twice, whatever the order of the corners of the triangles', () => {
+    const part = zBracket();
+    const I = part.indices;
+    const base = evaluateParting(part.positions, I, [1, 0, 0]);
+    assert.deepEqual(evaluateParting(part.positions, I, [1, 0, 0]).segments, base.segments);
+    const reordered = Uint32Array.from(I, (_, i) => I[i - (i % 3) + [1, 2, 0][i % 3]]);
+    const other = evaluateParting(part.positions, reordered, [1, 0, 0]);
+    assert.deepEqual(other.summary, base.summary);
+    assert.deepEqual(other.side, base.side);
+    assert.deepEqual(other.flags, base.flags);
   });
 });
 
