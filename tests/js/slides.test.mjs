@@ -318,6 +318,47 @@ describe('undercuts grouped into slides', () => {
     assert.deepEqual([t.reference_axis, t.angle_deg, t.tilt_deg, t.stroke_mm, t.tags.inclined], ['+Y', 20, null, 35, false]);
   });
 
+  test('a part turned a hair in its assembly, off an axis of the frame or of the sweep: the same slides, pulled along its walls', () => {
+    // A line along a wall a hair off the direction cast drifts back into the wall: the region's own direction is in the pool.
+    const holed = () => plate({ S: 30, H: 20, sections: [{ r: 10, top: 20, bottom: 0 }] });
+    for (const [name, mesh, d, count] of [
+      ['plate 0.05° about X', turn(holed(), X, 0.05), X, 1],
+      ['cast plate 0.05° about X', turn(castPlate(), X, 0.05), X, 1],
+      ['B 0.02° about Z', turn(meshB(), Z, 0.02, [25, 15, 10]), Z, 2],
+      ['A 0.02° about Z', turn(meshA(), Z, 0.02, [25, 15, 10]), Z, 1],
+      ['C 0.02° about Z', turn(meshC(), Z, 0.02, [25, 15, 10]), Z, 1],
+      ['B 0.5° about Z', turn(meshB(), Z, 0.5, [25, 15, 10]), Z, 2],
+      ['B 15.02° about Z', turn(meshB(), Z, 15.02, [25, 15, 10]), Z, 2],
+      ['A 30.02° about Z', turn(meshA(), Z, 30.02, [25, 15, 10]), Z, 1],
+    ]) {
+      const { analysis, view } = run(mesh, d, { name });
+      assert.equal(view.slides.length, count, `${name}: ${view.slides.map((s) => s.axis).join(', ')}`);
+      assert.equal(view.counts.cores, 0, name);
+      assert.ok(analysis.zones.every((z) => !z.split), `${name}: no region split`);
+    }
+    const { view } = run(turn(meshB(), Z, 0.02, [25, 15, 10]), Z, { name: 'B 0.02°' });
+    assert.deepEqual(view.slides.map((s) => [s.axis, s.area_mm2, s.stroke_mm]), [['-X', 500, 15], ['X', 500, 15]]);
+  });
+
+  test('cross, elbow and tee bores turned 20° about the draw direction: one slide along each branch, whatever the tessellation', () => {
+    const bores = {
+      cross: (x, y, z) => !(z >= 2 && z < 4 && ((x >= 3 && x < 5) || (y >= 3 && y < 5))),
+      elbow: (x, y, z) => !(z >= 2 && z < 4 && ((x < 5 && y >= 3 && y < 5) || (x >= 3 && x < 5 && y >= 3))),
+      tee: (x, y, z) => !(z >= 2 && z < 4 && ((y >= 3 && y < 5) || (x >= 3 && x < 5 && y >= 3))),
+    };
+    for (const [name, filled] of Object.entries(bores)) {
+      for (const subdivide of [1, 3]) {
+        const { analysis, view } = run(turn(block(filled, [8, 8, 6], { subdivide }), Z, 20, [20, 20, 15]), Z, { name: `${name} ${subdivide}` });
+        assert.equal(analysis.stats.regions, 1, name);
+        assert.equal(view.slides.length, 2, `${name}, subdivided ${subdivide}: ${view.slides.map((s) => s.axis).join(', ')}`);
+        assert.ok(view.slides.every((s) => s.angle_deg === 20 && s.tilt_deg == null), `${name}: ${view.slides.map((s) => `${s.reference_axis} ${s.angle_deg}`).join(', ')}`);
+        assert.ok(Math.abs(dot(view.slides[0].direction, view.slides[1].direction)) < 1e-6, `${name}: square to each other`);
+      }
+    }
+    const { view } = run(turn(block(bores.cross, [8, 8, 6]), Z, 20, [20, 20, 15]), Z, { name: 'cross' });
+    assert.deepEqual(view.slides.map((s) => [s.reference_axis, s.angle_deg, s.area_mm2, s.stroke_mm]), [['+X', 20, 1300, 45], ['+Y', 20, 1300, 45]]);
+  });
+
   test('a pocket tilted out of the plane: an inclined slide up to 45°, a core beyond', () => {
     for (const deg of [20, 40]) {
       const { view } = run(turn(meshPocket(), X, deg, [30, 20, 20]), Z, { name: `pocket ${deg}°` });

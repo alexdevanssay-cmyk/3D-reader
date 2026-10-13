@@ -5,16 +5,17 @@
 //
 // The undercut triangles joined by a vertex are regions. Each region is
 // tested along every direction of one pool: the axes of the die in the
-// parting plane and a sweep between them, the axes of the frame, the mean
-// normal and the axis of each region, up to 45° out of the plane. A line of
-// sight from a point of it, moved off the surface along its normal, that
-// meets no other triangle along s: s frees that point (a face turned against
-// s would be dragged: never). A direction that frees 95 % of a region makes
-// it one zone; else a greedy cover on its triangles splits it between
-// directions, and a region covered less than 80 % is a probable core
-// (« noyau »). Zones a half could form are to rework at the parting line,
-// shallow small ones are markings, ignored. The other zones are grouped into
-// slides: a greedy set cover by the direction that releases the most zones.
+// parting plane and a sweep between them, the axes of the frame, the
+// directions along the walls, the mean normal and the axis of each region,
+// up to 45° out of the plane. A line of sight from a point of it, moved off
+// the surface along its normal, that meets no other triangle along s: s
+// frees that point (a face turned against s would be dragged: never). A
+// direction that frees 95 % of a region makes it one zone; else a greedy
+// cover on its triangles splits it between directions, and a region covered
+// less than 80 % is a probable core (« noyau »). Zones a half could form are
+// to rework at the parting line, shallow small ones are markings, ignored.
+// The other zones are grouped into slides: a greedy set cover by the
+// direction that releases the most zones.
 //
 // One bounding volume hierarchy per body (thickness.js rayCaster), kept by
 // the worker between definitions; the lines cast are bounded whatever the
@@ -82,6 +83,9 @@ const TRIANGLE_POINTS = 4; // a triangle along s: free when at least TRIANGLE_FR
 const TRIANGLE_FREE = 2;
 const MEAN_NORMAL_MIN = 0.05; // a region's mean normal, a direction of the pool when at least this long
 const PROJECTED_MIN = 0.2; // a direction projected on the parting plane, kept when at least this long
+const OWN_SAME = 1 - 1e-12; // a region's own direction: dropped only for a direction this close (cosine)
+const WALL_BIN_DEG = 0.5; // the normals of a region in the parting plane, by bins of this angle about d…
+const WALL_SHARE = 0.1; // …those holding this share of its area: its walls
 const FLAT_DEG = 1; // a tilt or an angle under this: none
 const HALF_SHARE = 0.8; // the half of a zone: its neighbours in one half over this share
 const HALF_FORMABLE = 0.95; // a zone a half could form: to rework at the parting line…
@@ -472,20 +476,62 @@ export function analyseSlides(prepared, input, options = {}) {
   }
 
   // The pool of directions: the sweep in the plane (the die axes at 0, 90,
-  // 180, 270°), the axes of the frame, then each region's mean normal and
-  // axis (the eigenvector of the least moment of its normals), as they are
-  // and projected on the plane; within 1° of an axis of the frame, that axis.
+  // 180, 270°), the axes of the frame, then for each region the directions
+  // along its walls in the plane, its mean normal and axis (the eigenvector
+  // of the least moment of its normals), as they are and projected on the
+  // plane; within 1° of an axis of the frame, that axis. A region's own
+  // direction is kept as it is too, unless one nearly the same is there (or
+  // another region's within sameDirDeg): a line along a wall a hair off the
+  // direction cast drifts back into the wall (a part turned a little in its
+  // assembly would get a slide per wall).
   const pool = [];
   const sameCos = Math.cos(O.sameDirDeg * DEG);
-  const add = (t, source) => {
+  const put = (s, source, own) => {
     if (pool.length >= O.maxDirections) return;
+    const tilt = tiltOf(s, d);
+    if (tilt > O.maxTiltDeg + 1e-9) return;
+    if (pool.some((e) => dot(e.s, s) > (own && !e.own ? OWN_SAME : sameCos))) return;
+    pool.push({ s, source, own, tilt, die: dieAxisOf(s, u, v), frame: frameAxis(s) });
+  };
+  const add = (t, source) => {
     const n = normalize(t);
     if (!n) return;
     const s = snapDirection(n);
-    const tilt = tiltOf(s, d);
-    if (tilt > O.maxTiltDeg + 1e-9) return;
-    if (pool.some((e) => dot(e.s, s) > sameCos)) return;
-    pool.push({ s, source, tilt, die: dieAxisOf(s, u, v), frame: frameAxis(s) });
+    const own = source === "zone";
+    if (!own || dot(s, n) < OWN_SAME) put(s, source, false);
+    if (own) put(n, source, true);
+  };
+  /**
+   * The directions along the walls of a region in the parting plane: the
+   * mean of its normals in each bin (WALL_BIN_DEG about d) holding WALL_SHARE
+   * of its area, turned by 0, 90, 180 and 270° about d. The axes of the bores
+   * and slots it is made of: a cross, an elbow or a tee needs one per branch.
+   */
+  const wallDirections = (R) => {
+    const bins = new Map();
+    const width = WALL_BIN_DEG * DEG;
+    const count = Math.round(360 / WALL_BIN_DEG);
+    for (const f of R.tris) {
+      const p = flatten([N[3 * f], N[3 * f + 1], N[3 * f + 2]], d);
+      const len = Math.hypot(p[0], p[1], p[2]);
+      if (len < PROJECTED_MIN) continue;
+      // Bins centred on the multiples of their width from u: the walls along the die axes in the middle of theirs.
+      const k = ((Math.round(Math.atan2(dot(p, v), dot(p, u)) / width) % count) + count) % count;
+      const b = bins.get(k) ?? { area: 0, sum: [0, 0, 0] };
+      const a = areas[f] / len;
+      b.area += areas[f];
+      for (let c = 0; c < 3; c++) b.sum[c] += a * p[c];
+      bins.set(k, b);
+    }
+    const out = [];
+    for (const k of [...bins.keys()].sort((a, b) => a - b)) {
+      const b = bins.get(k);
+      const w = b.area >= WALL_SHARE * R.area ? normalize(b.sum) : null;
+      if (!w) continue;
+      const r = cross(d, w);
+      out.push(w, r, w.map((x) => -x), r.map((x) => -x));
+    }
+    return out;
   };
   // Tilts within 1e-6° are equal (the rounding of directions in the plane).
   const byTilt = (a, b) => (Math.abs(a.tilt - b.tilt) > 1e-6 ? a.tilt - b.tilt : 0);
@@ -500,6 +546,7 @@ export function analyseSlides(prepared, input, options = {}) {
   }
   for (let k = 0; k < 3; k++) for (const sign of [1, -1]) add([0, 1, 2].map((i) => (i === k ? sign : 0)), "frame");
   for (const R of regions) {
+    for (const t of wallDirections(R)) add(t, "zone");
     const list = [];
     if (Math.hypot(R.m[0], R.m[1], R.m[2]) >= MEAN_NORMAL_MIN) list.push(R.m);
     const e = eigenvectors(R.M)[2];
