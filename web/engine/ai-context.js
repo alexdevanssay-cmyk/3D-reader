@@ -188,6 +188,8 @@ function shortFeeding(f) {
     gate: f.gate ? { position_mm: f.gate.position_mm, section_mm2: f.gate.section_mm2 } : null,
     yield: f.yield ?? null,
     ...(f.hot_spots_without_riser ? { hot_spots_without_riser: f.hot_spots_without_riser } : {}),
+    // Fed from below: no riser by design, the feed points counted (as feedingSummary).
+    ...(f.mode === "bottom" ? { mode: "bottom", feed_points: f.feed_points ?? 0 } : {}),
   };
 }
 

@@ -238,6 +238,9 @@ describe('orientation by casting process (dist/)', { skip: !existsSync(join(DIST
     // The foundry screen and the AI context: fed from below, not an ingate off the parting line.
     assert.ok(!s.foundry.risks.some((r) => r.code === 'gate_off_parting_line'));
     assert.equal(s.foundry.rules.gating, 'proposed_bottom_feed');
+    // No riser by design: the feed points sized by the modulus, not risers.
+    assert.equal(s.foundry.rules.risering, 'none_bottom_feed');
+    assert.ok(s.foundry.evidence.confirmed.includes('feed_points_sized_by_modulus') && !s.foundry.evidence.confirmed.includes('risers_proposed_from_geometry'));
     assert.deepEqual([s.foundry.evidence.process.plan, s.foundry.evidence.orientation.up_axis], ['horizontal', '+Z']);
     assert.deepEqual([s.ai.process.island, s.ai.orientation.up_axis, s.ai.orientation.die_block_mm, s.ai.feeding.mode], ['BPR', '+Z', [220, 180, 120], 'bottom']);
     await page.check('#feeding-show');

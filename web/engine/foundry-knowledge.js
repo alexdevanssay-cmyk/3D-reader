@@ -443,8 +443,12 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
   // Risers and ingate proposed from the geometry (feeding.js) or placed by
   // hand: a starting point, to be validated; a hot spot needing a riser left
   // without one is a likely shrinkage.
+  // Fed from below (low pressure) without a riser: the feed points, sized from
+  // the modulus of their zones, are the feeding, not risers.
+  const bottomFeedOnly = feedingKnown && feeding.mode === "bottom" && feeding.riser_count === 0;
   if (feedingKnown) {
-    confirmedEvidence.push(feeding.risers_status === "manual" ? "risers_placed_manually" : "risers_proposed_from_geometry");
+    confirmedEvidence.push(bottomFeedOnly ? "feed_points_sized_by_modulus"
+      : feeding.risers_status === "manual" ? "risers_placed_manually" : "risers_proposed_from_geometry");
     if (feeding.gate?.on_parting_line) confirmedEvidence.push("gate_on_parting_line");
     if (feeding.gate?.bottom_feed) confirmedEvidence.push("bottom_feed_through_lower_die");
     if (feeding.hot_spots_without_riser.length) {
@@ -489,7 +493,7 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
         : slides.count === 0 && slides.cores === 0 ? "none_needed" : "proposed_from_undercut_regions",
     hot_spots: feedingKnown ? "located_by_inscribed_sphere_feeding_zones" : thickness.status === "measured" ? "screened_by_thickness_distribution" : "not_available",
     directional_solidification: feedingKnown ? "screened_by_section_necks_not_simulated" : "not_simulated",
-    risering: !feedingKnown ? "not_sized" : feeding.risers_status === "manual" ? "placed_manually" : "proposed_by_modulus_heuristic",
+    risering: !feedingKnown ? "not_sized" : bottomFeedOnly ? "none_bottom_feed" : feeding.risers_status === "manual" ? "placed_manually" : "proposed_by_modulus_heuristic",
     gating: !feedingKnown || !feeding.gate ? "not_sized" : feeding.gate.source === "manual" ? "placed_manually" : feeding.gate.bottom_feed ? "proposed_bottom_feed" : "proposed_on_parting_line",
     filling: "not_simulated",
     porosity: "not_simulated",

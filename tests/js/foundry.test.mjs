@@ -461,6 +461,18 @@ test("low pressure: the process and the orientation in the die beside the partin
   assert.ok(!risks.some(r => r.code === "gate_off_parting_line"));
   assert.equal(rules.gating, "proposed_bottom_feed");
   assert.ok(evidence.confirmed.includes("bottom_feed_through_lower_die"));
+  // No riser by design: the feed points sized from the modulus, not risers proposed from the geometry.
+  assert.equal(rules.risering, "none_bottom_feed");
+  assert.ok(evidence.confirmed.includes("feed_points_sized_by_modulus"));
+  assert.ok(!evidence.confirmed.some((x) => /^risers_/.test(x)), evidence.confirmed.join(", "));
+  // A riser placed by hand beside the feed: risers again.
+  const withRiser = buildSemantic3D({
+    file: "casting.step", kind: "cad", engine: "browser",
+    summary: { volume: 120000, area: 24000, bodies: 1, solids: 1 },
+    bodies: [body({ feeding: feeding({ status: "manual", risers_status: "manual", risers: feeding().risers.slice(0, 1), gate: feed, feed_points: [feed], mode: "bottom" }) })],
+  }).bodies[0].foundry;
+  assert.equal(withRiser.rules.risering, "placed_manually");
+  assert.ok(withRiser.evidence.confirmed.includes("risers_placed_manually") && !withRiser.evidence.confirmed.includes("feed_points_sized_by_modulus"));
   // The AI context: beside the parting (its keys as before), the process and the orientation in short.
   const context = buildAIContext(semantic, { task: "general" });
   const ai = context.bodies[0];
@@ -468,8 +480,11 @@ test("low pressure: the process and the orientation in the die beside the partin
   assert.deepEqual(ai.process, { plan: "horizontal", alimentation: "bas", source: "costing", island: "BPR" });
   assert.deepEqual(ai.orientation, { up: [0, 0, 1], up_axis: "+Z", up_source: "feeding", block_axes: { u: [1, 0, 0], v: [0, 1, 0], d: [0, 0, 1] }, raw_mm: [100, 80, 40], die_block_mm: [220, 200, 140], steel_kg: 48, feeding_score: -0.02, feeding_basis: "volume_centroid" });
   assert.deepEqual([ai.feeding.mode, ai.feeding.feed_points, ai.feeding.gate.bottom_feed, ai.feeding.risers.length], ["bottom", 2, true, 0]);
+  assert.deepEqual([ai.foundry.rules.risering, ai.foundry.evidence.confirmed.includes("feed_points_sized_by_modulus")], ["none_bottom_feed", true]);
   // Compacted: the orientation in short (the process folded in), then left out at the last resort, said so.
   const four = compactAIContext(context, { maxChars: 1 });
+  // The feeding in short says it is fed from below too, its feed points counted (no riser by design).
+  assert.deepEqual([four.bodies[0].feeding.riser_count, four.bodies[0].feeding.mode, four.bodies[0].feeding.feed_points], [0, "bottom", 2]);
   assert.equal(four.bodies[0].orientation, undefined);
   assert.ok(four.compaction.omitted.includes("orientation in the die"));
   const levels = Array.from({ length: 50 }, (_, k) => compactAIContext(context, { maxChars: 1000 + 250 * k }).bodies[0].orientation).filter(Boolean);
