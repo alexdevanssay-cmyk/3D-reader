@@ -283,6 +283,7 @@
           <span class="card-checks">
             <label class="check" data-i18n-title="parting.show.title" title="Show on the 3D view: the parting line in red, the undercuts in yellow, the halves of the mould as translucent blocks (the upper one blue, the lower one green) and the draw direction; the other bodies faded"><input type="checkbox" id="parting-show"> <span data-i18n="parting.show">Show</span></label>
             <label class="check" data-i18n-title="parting.blocks.title" title="The halves of the mould as translucent blocks round the part: the upper one blue, the lower one green; they meet along the parting surface"><input type="checkbox" id="parting-blocks" checked> <span data-i18n="parting.blocks">Mould halves</span></label>
+            <label class="check" data-i18n-title="slides.show.title" title="Colour each slide on the 3D view (the first one in the yellow of the undercuts), with an arrow along its pull direction"><input type="checkbox" id="parting-slides-show" checked> <span data-i18n="slides.show">Slides</span></label>
           </span>
         </div>
         <p class="small muted" id="parting-body" hidden></p>
@@ -371,6 +372,30 @@
           </div>
           <p class="small" id="parting-hint" hidden></p>
           <button id="parting-reset" class="small" type="button" data-i18n="parting.reset">Back to the proposal</button>
+          <!-- Slides and probable cores of the definition shown (engine/slides.js). -->
+          <details id="slides" class="parting-sub" open>
+            <summary><span data-i18n="slides.title">Slides and cores</span> <strong id="slides-peek"></strong></summary>
+            <p class="small" id="slides-status" hidden></p>
+            <button id="slides-retry" class="small" type="button" hidden data-i18n="slides.retry">Retry</button>
+            <div id="slides-main" hidden>
+              <div class="parting-head"><span data-i18n="slides.count">Slides proposed</span> <strong id="slides-n">—</strong> <span id="slides-origin" class="parting-origin"></span></div>
+              <p class="small warn" id="slides-warn" hidden></p>
+              <div class="slides-scroll"><table class="parting-candidates slides-table" id="slides-table">
+                <thead><tr><th data-i18n="slides.col.slide">Slide</th><th data-i18n="slides.col.direction">Pull direction</th><th class="num" data-i18n="slides.col.stroke">Stroke</th><th class="num" data-i18n="slides.col.size">Size</th><th class="num" data-i18n="slides.col.zones">Zones</th></tr></thead>
+                <tbody></tbody>
+              </table></div>
+              <div id="slides-slide" class="parting-controls" hidden></div>
+              <dl class="stats" id="slides-stats"></dl>
+              <div class="parting-controls">
+                <button id="slides-edit" class="small toggle" type="button" data-i18n="slides.edit" data-i18n-title="slides.edit.title" title="Click a coloured zone on the 3D view: change its slide, make it a core, or ignore it">Edit the zones</button>
+                <button id="slides-reset" class="small" type="button" data-i18n="slides.reset">Back to the proposed slides</button>
+                <button id="slides-costing" class="small" type="button" data-i18n="slides.costing">See in the costing</button>
+              </div>
+              <div id="slides-zone" class="parting-controls" hidden></div>
+              <p class="small" id="slides-hint" hidden></p>
+              <p class="muted small" data-i18n="slides.note">Grouped from the undercuts by lines of sight along the possible pull directions (in the parting plane, or tilted up to 45°): one slide per pull direction. Ignored: details less than 1.5 mm deep. Zones no slide releases: probable cores. Stroke = depth along the pull + 5 mm. An aid, not a die design. Proposed to the costing (Tiroirs du moule), never applied without you; changes are kept in this browser for this part.</p>
+            </div>
+          </details>
           <p class="parting-legend small" id="parting-legend"></p>
           <p class="muted small" data-i18n="parting.note">Proposed from the geometry (lines of sight along the draw direction): an aid, not a die design. A definition made by hand is kept in this browser for this part.</p>
         </div>
