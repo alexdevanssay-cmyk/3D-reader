@@ -216,12 +216,19 @@ describe('undercuts grouped into slides', () => {
     assert.deepEqual(view.slides.map((s) => [s.axis, s.depth_mm, s.stroke_mm, s.size_mm]), [['X', 20, 25, [40, 4]], ['-X', 20, 25, [40, 4]]]);
     assert.equal(analysis.sampled.split_sampled, 0);
 
-    // Finer, the budget of the split spent: its triangles classified on 2048 drawn by area, the others to their neighbours' side.
-    const fine = run(revolve([[20, -15], [20, -2], [15, -2], [15, 2], [20, 2], [20, 15]], 256, { poles: [-15, 15] }), Z, { options: { splitRayBudget: 0 }, name: 'J fine' });
+    // Finer, the budget of the split short (1536 triangles × 24 directions × 4 points): its triangles classified on
+    // as many drawn by area as it pays for (1041), the others to their neighbours' side.
+    const fine = run(revolve([[20, -15], [20, -2], [15, -2], [15, 2], [20, 2], [20, 15]], 256, { poles: [-15, 15] }), Z, { options: { splitRayBudget: 100_000 }, name: 'J fine' });
     assert.equal(fine.analysis.sampled.split_sampled, 1);
+    assert.ok(fine.analysis.stats.split_rays <= 100_000, String(fine.analysis.stats.split_rays));
     assert.equal(fine.analysis.zones.length, 2);
     for (const z of fine.analysis.zones) approx(z.area_mm2, fine.analysis.undercut_area_mm2 / 2, 0.01, 0, 'half shell, sampled');
     assert.deepEqual(fine.view.slides.map((s) => s.axis), ['X', '-X']);
+    // The budget spent: classified on the points it was ranked on, no line more.
+    const spent = run(revolve([[20, -15], [20, -2], [15, -2], [15, 2], [20, 2], [20, 15]], 256, { poles: [-15, 15] }), Z, { options: { splitRayBudget: 0 }, name: 'J fine, spent' });
+    assert.deepEqual([spent.analysis.sampled.split_sampled, spent.analysis.stats.split_rays], [1, 0]);
+    for (const z of spent.analysis.zones) approx(z.area_mm2, spent.analysis.undercut_area_mm2 / 2, 0.05, 0, 'half shell, on the ranking');
+    assert.deepEqual(spent.view.slides.map((s) => s.axis), ['X', '-X']);
   });
 
   test('cross bores: one region split into +X and +Y halves', () => {
@@ -481,6 +488,27 @@ describe('undercuts grouped into slides', () => {
 });
 
 describe('bounded cost', () => {
+  test('grooves round a column, more than the budget of the split pays for: the lines cast within it', () => {
+    // 12 grooves of 768 triangles, each split into two half shells; 24 directions tested: 73 728 lines planned each.
+    const profile = [[20, 0]];
+    for (let g = 0; g < 12; g++) profile.push([20, 2 + 4 * g], [15, 2 + 4 * g], [15, 4 + 4 * g], [20, 4 + 4 * g]);
+    profile.push([20, 50]);
+    const mesh = revolve(profile, 128, { poles: [0, 50] });
+    // Two classified whole, one on as many triangles as the rest pays for, the others on the points they were ranked on.
+    for (const [budget, sampled] of [[200_000, 10], [0, 12]]) {
+      const { analysis } = run(mesh, Z, { options: { splitRayBudget: budget }, name: `12 grooves, ${budget}` });
+      assert.equal(analysis.stats.regions, 12);
+      assert.equal(analysis.sampled.split_sampled, sampled);
+      assert.ok(analysis.stats.split_rays <= budget, String(analysis.stats.split_rays));
+      assert.equal(analysis.zones.length, 24);
+      assert.ok(analysis.zones.every((z) => z.kind === 'slide' && z.split));
+    }
+    // The budget enough: every triangle classified, the two halves +X and -X.
+    const full = run(mesh, Z, { name: '12 grooves, budget enough' });
+    assert.equal(full.analysis.sampled.split_sampled, 0);
+    assert.deepEqual(full.view.slides.map((s) => [s.axis, s.zones.length]), [['X', 12], ['-X', 12]]);
+  });
+
   test('2.3 million triangles: the same slides, the lines cast bounded', (t) => {
     const coarse = run(meshB(), Z, { name: 'B coarse' });
     const t0 = performance.now();

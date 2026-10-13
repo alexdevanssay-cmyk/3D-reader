@@ -19,8 +19,10 @@
 //
 // One bounding volume hierarchy per body (thickness.js rayCaster), kept by
 // the worker between definitions; the lines cast are bounded whatever the
-// size of the mesh (points drawn by area, fixed seeds): the same input gives
-// the same result, whatever the order or the winding of the triangles.
+// size of the mesh and the number of regions split (points drawn by area,
+// fixed seeds; past the budget, a region split is classified on the points it
+// was ranked on): the same input gives the same result, whatever the order or
+// the winding of the triangles.
 //
 // The grouping, the edits by hand and their persistence (effectiveSlides,
 // editSlides, matchSlideState) are pure functions of the analysis (JSON):
@@ -78,7 +80,8 @@ const ALONG = 1e-6; // |n·s| below: a face along the line, not crossed
 const DRAWS_MIN = 32;
 const DRAWS_MAX = 256;
 const DRAWS_PER_TRIANGLE = 4;
-const SPLIT_DRAWS = 2048; // triangles drawn by area of a region too large to classify every triangle of
+const SPLIT_DRAWS = 2048; // triangles drawn by area of a region too large to classify every triangle of (at most)…
+const SPLIT_DRAWS_MIN = 128; // …the budget left paying for fewer: the points it was ranked on instead
 const TRIANGLE_POINTS = 4; // a triangle along s: free when at least TRIANGLE_FREE of these points are
 const TRIANGLE_FREE = 2;
 const MEAN_NORMAL_MIN = 0.05; // a region's mean normal, a direction of the pool when at least this long
@@ -656,10 +659,15 @@ export function analyseSlides(prepared, input, options = {}) {
     const picks = sampleByArea(regionAreas, draws[rank], SEED + rank);
     const drawn = new Int32Array(nTri);
     const freed = new Int32Array(pool.length);
-    for (const i of picks) {
-      const f = R.tris[i];
-      pointOf(f, drawn[i]++, pt);
-      for (let k = 0; k < pool.length; k++) if (!against(f, pool[k].s) && free(f, pt, pool[k].s)) freed[k]++;
+    const pickFree = new Uint8Array(picks.length * pool.length); // what each draw found: a region split past the budget is classified on it
+    for (let p = 0; p < picks.length; p++) {
+      const f = R.tris[picks[p]];
+      pointOf(f, drawn[picks[p]]++, pt);
+      for (let k = 0; k < pool.length; k++) {
+        if (against(f, pool[k].s) || !free(f, pt, pool[k].s)) continue;
+        freed[k]++;
+        pickFree[p * pool.length + k] = 1;
+      }
     }
     const drawShare = Array.from(freed, (n) => n / picks.length);
     const base = { tris: R.tris, stats: R, enclosed: R.enclosed, core: null, split: false, partial: null, cover: null };
@@ -670,8 +678,9 @@ export function analyseSlides(prepared, input, options = {}) {
     }
 
     // No single direction frees it: each triangle classified along the
-    // directions that free some of it (on triangles drawn by area when the
-    // budget left is short), then a greedy cover.
+    // directions that free some of it (on triangles drawn by area, as many as
+    // the budget left pays for, when it is short; spent, on the points the
+    // region was ranked on), then a greedy cover.
     const tested = [];
     drawShare.forEach((sh, k) => sh >= TESTED_SHARE && tested.push(k));
     const nTest = tested.length;
@@ -682,19 +691,37 @@ export function analyseSlides(prepared, input, options = {}) {
       return;
     }
     let list;
+    let ranked = false; // classified on the draws of its ranking
+    const triFree = new Uint8Array(nTri * nTest);
     if (nTri * nTest * TRIANGLE_POINTS <= splitLeft) {
       list = Int32Array.from({ length: nTri }, (_, i) => i);
       splitLeft -= nTri * nTest * TRIANGLE_POINTS;
     } else {
+      const fits = Math.floor(splitLeft / (nTest * TRIANGLE_POINTS));
       const seen = new Uint8Array(nTri);
-      for (const i of sampleByArea(regionAreas, SPLIT_DRAWS, SEED + 1000 + rank)) seen[i] = 1;
+      if (fits >= SPLIT_DRAWS_MIN) {
+        // As many triangles drawn by area as the budget left pays for.
+        for (const i of sampleByArea(regionAreas, Math.min(SPLIT_DRAWS, fits), SEED + 1000 + rank)) seen[i] = 1;
+      } else {
+        // The budget spent: the triangles drawn to rank it, classified on those points, no line more (free along
+        // a direction when half of their points are, as TRIANGLE_FREE of TRIANGLE_POINTS).
+        ranked = true;
+        const hits = new Uint16Array(nTri * nTest);
+        for (let p = 0; p < picks.length; p++) {
+          for (let t = 0; t < nTest; t++) hits[picks[p] * nTest + t] += pickFree[p * pool.length + tested[t]];
+        }
+        for (let i = 0; i < nTri; i++) {
+          if (!drawn[i]) continue;
+          seen[i] = 1;
+          for (let t = 0; t < nTest; t++) if (2 * hits[i * nTest + t] >= drawn[i]) triFree[i * nTest + t] = 1;
+        }
+      }
       const distinct = [];
       for (let i = 0; i < nTri; i++) if (seen[i]) distinct.push(i);
       list = Int32Array.from(distinct);
-      splitLeft = Math.max(0, splitLeft - list.length * nTest * TRIANGLE_POINTS);
+      if (!ranked) splitLeft = Math.max(0, splitLeft - list.length * nTest * TRIANGLE_POINTS);
       splitSampled++;
     }
-    const triFree = new Uint8Array(nTri * nTest);
     const classified = new Uint8Array(nTri);
     let classifiedArea = 0;
     const cast0 = rays;
@@ -702,6 +729,7 @@ export function analyseSlides(prepared, input, options = {}) {
       const f = R.tris[i];
       classified[i] = 1;
       classifiedArea += regionAreas[i];
+      if (ranked) continue;
       for (let j = 0; j < TRIANGLE_POINTS; j++) pointOf(f, j, points[j]);
       for (let t = 0; t < nTest; t++) {
         const s = pool[tested[t]].s;
