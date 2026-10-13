@@ -28,6 +28,18 @@ const DIST = join(ROOT, 'dist');
 const CAD_TIMEOUT = 180_000;
 
 /**
+ * The card's body cast in a gravity die with a horizontal parting plane (the
+ * process of the parting card; by default a vertical one, up across the draw
+ * direction): up when cast along the draw direction, the risers on top along
+ * it, as this test reads them. Kept for the part; once the risers are placed
+ * for it.
+ */
+async function horizontalPlane(page, body = 0) {
+  await page.selectOption('#parting-process-select', 'horizontal-haut');
+  await page.waitForFunction((i) => window.reader3d.semantic?.bodies?.[i]?.feeding?.process?.plan === 'horizontal', body, { timeout: 120_000 });
+}
+
+/**
  * An OBJ of the union of cubes `size` mm (cells x, y, z of an nx × ny × nz
  * grid where filled(x, y, z)), each body a material (parting.test.mjs).
  */
@@ -318,6 +330,8 @@ describe('slides (dist/)', { skip: !existsSync(join(DIST, 'index.html')) && 'run
   test('the zones edited: no longer once the slides are gone (the card folded leaves the view), nor once a riser is placed (the zones coloured again); a face reassigned, the half of the slide', { timeout: 2 * CAD_TIMEOUT }, async () => {
     const { context, page, errors } = await newPage();
     await open(page, { name: 'two_slots.obj', mimeType: 'text/plain', buffer: twoSlots() });
+    // The riser placed on top along Z, not on the front face before the camera.
+    await horizontalPlane(page);
     await candidate(page, 'Z');
     await slidesReady(page, 1);
     const active = (id) => page.evaluate((x) => document.getElementById(x).classList.contains('active'), id);

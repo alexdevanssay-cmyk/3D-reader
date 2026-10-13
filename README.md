@@ -33,8 +33,9 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   shows the hot spots at wall junctions) and *ray* (distance to the opposite wall).
 - **Parting line** ("plan de joint") of cast parts, card *Plan de joint*: the draw direction
   proposed from the geometry (candidates: dominant face normals, the frame axes, the
-  principal axes; ranked by undercut area, then a planar line, then the faces without
-  draft), each face classified by lines of sight along the direction (upper half, lower
+  principal axes; ranked by undercut area, then the steel of the die block, then the
+  massive sections on the feeding side of the casting process, then a planar line, then
+  the faces without draft), each face classified by lines of sight along the direction (upper half, lower
   half, undercut for a core or slide), and the parting line, planar or stepped/warped with
   its height range. Shown on the 3D view: the parting line as a thick red line drawn over
   everything, the undercuts in yellow, the other faces in light grey (lighter without
@@ -103,6 +104,22 @@ hand" of `web/app.js`:
   browser, as is a drawing not finished (a draft). Halves are per triangle: on a coarse
   mesh their boundary zigzags by a triangle along the line (the line itself is exact; the
   area of the triangles it crosses is exported as `seam_area_mm2`).
+- **Mould orientation by casting process**, in the parting line card: the process of the
+  part comes from the costing (the island retained for its piece: « Coquille gravité »
+  CG1…CG5 a vertical parting plane, poured from the top; « Basse pression » BPR a
+  horizontal one, the upper die moving, fed from below; each island's orientation is a
+  setting of *Paramètres*, « Plan de joint » and « Alimentation »), else a gravity die
+  with a vertical plane (said « par défaut : aucun îlot retenu »), and can be chosen for
+  the part (*Procédé pour cette pièce*, kept in the browser; « Revenir au procédé du
+  chiffrage »). The draw direction is proposed for it, and the card shows the direction up
+  when the metal is cast (*Haut de coulée*: the massive sections on the feeding side,
+  again with the wall thickness once computed, or chosen by hand; on a horizontal plane,
+  the other side turns the halves over) and the die blank (« brut de coquille »: the
+  smallest block round the part along its draw direction plus the margins of the
+  costing, one cavity, with its steel; a « Brut (kg) » column for each candidate). On the
+  3D view an arrow « haut » and, *Brut* checked, the blank as a grey wire box. The
+  costing sizes the die block of an in-house die from that oriented blank. See
+  [Mould orientation by casting process](#mould-orientation-by-casting-process-method-and-limits).
 - **Slides** ("tiroirs"), part *Tiroirs et noyaux* of the parting line card: the undercuts
   of the definition shown (proposed, chosen, reassigned or drawn by hand) grouped into
   zones, each tested by lines of sight along the lateral directions that could pull a
@@ -119,9 +136,10 @@ hand" of `web/app.js`:
   See [Slides: method and limits](#slides-method-and-limits).
 - **Risers and gating** ("masselottes et attaque de coulée"), card *Masselottes et attaque
   de coulée*: the hot spots and the feeding zones read from the inscribed spheres, a riser
-  proposed on each zone no other one can feed (where, open on top or blind on the side,
-  D × H, volume and mass), the ingate on the parting line (position, section, why), the
-  casting yield. Shown on the 3D view; risers added, moved, resized or deleted and the
+  proposed on each zone no other one can feed (where, open on top along the casting up or
+  blind on the side, D × H, volume and mass), the ingate on the parting line (position,
+  section, why), the casting yield; fed from below (low pressure), no riser but a feed
+  point through the lower die under each massive zone. Shown on the 3D view; risers added, moved, resized or deleted and the
   ingate placed by a click (kept per part in the browser). See
   [Risers and gating](#risers-and-gating-method-and-limits).
 - **Through and blind holes** of CAD solids, measured on the geometry: each hole (a
@@ -148,7 +166,8 @@ hand" of `web/app.js`:
 - **Costing of cast parts** (tabs *Chiffrage* and *Paramètres*, in French): import the
   SAB costing workbook (.xlsm) and the metal prices file (sheet « Suivi indice »); the
   page recomputes the hourly costs of the profit centres and the cost price (PRI) and
-  sale price of the part like the workbook does, proposes the three best manufacturing
+  sale price of the part like the workbook does (the die block of an in-house die sized
+  from the part oriented in its die by the 3D page, traced as such), proposes the three best manufacturing
   routes (casting island × finishing) by quality / price from the geometry of the 3D model
   (weight, thinnest wall, hot spots, modulus, size), and exports the quote to Excel.
   Casting parameters are drop-down lists; TRS, islands and methods are settings kept in
@@ -221,6 +240,46 @@ their room in the die are not checked; the probable cores give no core mass nor 
 to the costing (the box « Noyaux sable » is never ticked from here). The count goes to
 « Tiroirs du moule » only by « Utiliser » on the Chiffrage page.
 
+## Mould orientation by casting process: method and limits
+
+`web/engine/orientation.js` (pure, in the parting worker) orients a draw direction *d*
+for a process profile {parting plane vertical | horizontal, feeding from the top | from
+below}:
+
+- **Die blank.** The part's vertices projected on the plane square to *d*, their convex
+  hull (Andrew's monotone chain) and its minimum-area rectangle (rotating calipers) give
+  the axes *u*, *v* of the block and its sides *a* ≥ *b*; *c* is the extent along *d*. The
+  block is sized as the costing sizes a die (`chiffrage/tooling.js` dieSize), oriented:
+  L = a + 2 margins, l = n b + (n − 1) between cavities + 2 margins, h = c + 2 margins,
+  its steel L l h × the steel density (the margins and density of *Paramètres*; one
+  cavity on the 3D page). A part turned in space gets its own block, not the envelope of
+  the frame.
+- **Up when cast** (*g*). A horizontal parting plane: *g* = ±*d*, *d* turned so that the
+  upper die is on top (*g* = +*d*); a vertical one: *g* one of ±*u*, ±*v* (the block on
+  an edge). Chosen by the feeding: s(g) = ((c_V − c_A) · g) / H_g, c_V the centroid of the
+  solid, c_A that of its surface, H_g the extent along *g* (thick sections hold more volume
+  for their surface: s > 0 puts them towards +g); poured from the top wants s high (the
+  massive sections up, under the risers), fed from below s low (down, near the feed). With
+  the wall thickness (the inscribed diameter t of each triangle), c_T = Σ area t³ centre /
+  Σ area t³ in place of c_V. Ties: the shorter side upright, then + before −, then u
+  before v.
+- **Ranking** of the draw directions: undercut area first, then the steel of the block
+  (within 5 %), then the feeding score (within 0.05), then as before. The proposals are
+  kept with the results of the file for their process and die options; a change of either
+  proposes the body again. A direction chosen by hand gets its orientation too; a line
+  drawn by hand is never turned over (its upper half at the bottom is said, « chape
+  supérieure en bas »).
+- **Risers and feed** along *g* (feeding.js): risers on the faces turned up along *g*;
+  the ingate low along *g*, never at the top; fed from below, a feed point per massive
+  zone at the lowest point of the part under its hot spot, through the lower die.
+
+The process, the up chosen and the island the costing told last are kept per part in the
+browser (`reader3d.orientation.v1`). The parting export, the semantic contract, the
+foundry screen and the AI context carry `process` and `orientation` (up, block axes, raw
+and die block sizes, steel, feeding score and its basis). Limits: the blank is a block
+round one cavity (no runner, sprue nor cooling in it); tilt pouring, the layout of several
+cavities beyond « side by side » and the thermal design of the die are out of scope.
+
 ## Risers and gating: method and limits
 
 `web/engine/feeding.js` proposes where to feed a cast part (gravity die or sand) from its
@@ -241,20 +300,24 @@ risers and the ingate are placed for the parting line shown in a second worker o
   joined by one end: between the ball, *D*/6, and the long bar, *D*/4; heuristic).
 - **Risers**: a cylinder H = 1.5 D whose modulus, its contact face excluded (M = 3D/14), is
   at least 1.2 × the zone's (Wlodawer); open on top over the hot spot (on a face of it
-  turned up, its footprint held by the part, along the draw direction, +Z without a parting
-  line), or blind on the side at the parting line when the hot spot is closer to the joint
+  turned up, its footprint held by the part, along the casting up of the orientation, the
+  draw direction without one, +Z without a parting line), or, on a horizontal parting
+  plane, blind on the side at the parting line when the hot spot is closer to the joint
   (beside the part, both its ends cool: M = 3D/16).
   Zones under 1 % of the volume get none (a local cooling or a chill); 8 risers at most,
   the largest moduli first, the zones left listed as hot spots without a riser.
 - **Ingate**: on the outer outline of the parting line, not next to an undercut, the lowest
-  along the draw direction (bottom filling), not under a riser, in the thickest wall
+  along the casting up (bottom filling; never at the top of a vertical plane), not under a riser, in the thickest wall
   there, by the shortest way into the part; thickness 0.7 × that wall, width 3 × the
   thickness (heuristics). The yield part / (part + risers + ingate) is for information:
   the sprue and runners are not designed.
+- **Fed from below** (low pressure): no riser; a feed point through the lower die per zone
+  that needs feeding, the main one first, at the lowest point of the part under its hot
+  spot, round, its modulus D/4 at least 1.1 × the zone's (a riser's neck; heuristic).
 
 Limits: an aid to the running and feeding system, not a simulation of filling or
 solidification (no alloy, temperatures, die cooling, feeding distances, chills, insulating
-sleeves, nor low-pressure feeding through the ingate); the thresholds are documented
+sleeves, nor the pressure cycle of a low-pressure die); the thresholds are documented
 heuristics or textbook factors, to be confirmed with the foundry or a simulation. The
 foundry screen marks risering and gating "proposed" or "placed_manually", never sized by
 a solver, and flags a hot spot left without a riser.
@@ -376,6 +439,7 @@ web/                   the web interface (static site)
     cache.js           results kept in the browser (IndexedDB)
     shared-cache.js    the same results in the shared network folder (gzip container)
     parting.js         draw direction and parting line of cast parts
+    orientation.js     the die blank and the casting up of a draw direction, by casting process
     parting-draw.js    the parting line drawn by hand (lines laid on the surface, halves by part)
     partworker.js      its worker (partclient.js: main-thread API)
     slides.js          slides (« tiroirs »): the undercuts grouped by pull direction, probable cores

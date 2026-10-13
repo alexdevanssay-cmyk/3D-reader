@@ -284,6 +284,7 @@
             <label class="check" data-i18n-title="parting.show.title" title="Show on the 3D view: the parting line in red, the undercuts in yellow, the halves of the mould as translucent blocks (the upper one blue, the lower one green) and the draw direction; the other bodies faded"><input type="checkbox" id="parting-show"> <span data-i18n="parting.show">Show</span></label>
             <label class="check" data-i18n-title="parting.blocks.title" title="The halves of the mould as translucent blocks round the part: the upper one blue, the lower one green; they meet along the parting surface"><input type="checkbox" id="parting-blocks" checked> <span data-i18n="parting.blocks">Mould halves</span></label>
             <label class="check" data-i18n-title="slides.show.title" title="Colour each slide on the 3D view (the first one in the yellow of the undercuts), with an arrow along its pull direction"><input type="checkbox" id="parting-slides-show" checked> <span data-i18n="slides.show">Slides</span></label>
+            <label class="check" data-i18n-title="orient.brut.show.title" title="The die blank on the 3D view: the smallest block round the part along its draw direction, plus the margins of the costing (one cavity), in grey wire"><input type="checkbox" id="parting-brut"> <span data-i18n="orient.brut.show">Blank</span></label>
           </span>
         </div>
         <p class="small muted" id="parting-body" hidden></p>
@@ -295,10 +296,34 @@
             <strong id="parting-axis">—</strong>
             <span id="parting-origin" class="parting-origin"></span>
           </div>
+          <!-- The casting process of the body (the island retained in the costing, or chosen here) and the orientation of the part in its die: up when cast, the die blank (engine/orientation.js). -->
+          <div id="parting-process" class="parting-process">
+            <p class="small" id="parting-process-line"></p>
+            <div class="parting-controls">
+              <label class="parting-select" data-i18n-title="orient.process.choose.title" title="The casting process the die of this part is oriented for; by default the island retained in the costing">
+                <span data-i18n="orient.process.choose">Process for this part</span>
+                <select id="parting-process-select">
+                  <option value="vertical-haut" data-i18n="orient.process.gravityVertical">Gravity die · vertical plane</option>
+                  <option value="horizontal-haut" data-i18n="orient.process.gravityHorizontal">Gravity die · horizontal plane</option>
+                  <option value="horizontal-bas" data-i18n="orient.process.lowPressure">Low pressure</option>
+                </select>
+              </label>
+              <button id="parting-process-reset" class="small" type="button" data-i18n="orient.process.reset" hidden>Back to the costing's process</button>
+            </div>
+            <div class="parting-controls">
+              <label class="parting-select" data-i18n-title="orient.up.title" title="The direction that is up when the metal is cast: chosen so that the thick sections are on the feeding side (under the risers when poured from the top, near the feed when fed from below)">
+                <span data-i18n="orient.up">Casting up</span>
+                <select id="parting-up"></select>
+              </label>
+              <button id="parting-flip" class="small" type="button" data-i18n="orient.flip" hidden>Swap the halves</button>
+            </div>
+            <p class="small" id="parting-up-note" hidden></p>
+            <dl class="stats" id="parting-orient"></dl>
+          </div>
           <dl class="stats" id="parting-stats"></dl>
           <p class="muted small" id="parting-sampled" hidden></p>
           <table class="parting-candidates" id="parting-candidates">
-            <thead><tr><th></th><th data-i18n="parting.col.axis">Axis</th><th class="num" data-i18n="parting.col.undercut">Undercuts</th><th class="num" data-i18n="parting.col.zeroDraft">No draft</th><th data-i18n="parting.col.line">Line</th></tr></thead>
+            <thead><tr><th></th><th data-i18n="parting.col.axis">Axis</th><th class="num" data-i18n="parting.col.undercut">Undercuts</th><th class="num" data-i18n="parting.col.zeroDraft">No draft</th><th data-i18n="parting.col.line">Line</th><th class="num" data-i18n="orient.col.brut" data-i18n-title="orient.col.brut.title" title="Steel of the die blank of this direction (one cavity, the margins of the costing)">Blank (kg)</th></tr></thead>
             <tbody></tbody>
           </table>
           <div class="parting-controls">
@@ -416,6 +441,7 @@
             <strong id="feeding-count">—</strong>
             <span id="feeding-origin" class="parting-origin"></span>
           </div>
+          <p class="small" id="feeding-mode" hidden></p>
           <table class="parting-candidates feeding-risers" id="feeding-risers">
             <thead><tr><th data-i18n="feeding.col.riser">Riser</th><th class="num" data-i18n="feeding.col.zone" data-i18n-title="feeding.col.zone.title" title="Feeding zone and the inscribed diameter of its hot spot">Zone</th><th class="num" data-i18n="feeding.col.modulus" data-i18n-title="feeding.col.modulus.title" title="Modulus of the zone (V/A, mm)">Modulus</th><th class="num" data-i18n="feeding.col.size">D × H</th><th class="num" data-i18n="feeding.col.weight">Volume</th></tr></thead>
             <tbody></tbody>
