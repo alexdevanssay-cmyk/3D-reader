@@ -66,9 +66,10 @@ export function mount(targets) {
   document.addEventListener("reader3d-part", () => {
     if (!el.chiffrage.hidden) render();
   });
-  // The shared folder chosen or granted in the IA page: checked again, its retours d'expérience read.
+  // The shared folder chosen or granted in the IA page: checked again, its retours d'expérience read
+  // (one changed by a button of the Paramètres row is checked once, after that button's action).
   document.addEventListener(network.CHANGED, () => {
-    if (!el.chiffrage.hidden || !el.parametres.hidden) refreshNetwork();
+    if (!netActing && (!el.chiffrage.hidden || !el.parametres.hidden)) refreshNetwork();
   });
   return { show, setTab, forgetTab };
 }
@@ -2662,6 +2663,7 @@ let netSync = null; // the last reading (syncFeedback), with the records it brou
 let netFeedback = null; // {ref, state: "writing" | "written" | "pending", name, error}
 let netChecking = null;
 let netAgain = false; // asked again while checking (a button of the row, the folder changed): once more after it
+let netActing = 0; // buttons of the row at work: the folder they change is checked once after them (networkAction), not at its change too
 
 /** The folder checked again, its retours d'expérience read and merged when it is accessible; the rows that show them drawn again. */
 function refreshNetwork() {
@@ -2794,6 +2796,7 @@ function feedbackNetHtml() {
 
 /** The buttons of the row of the shared folder (Paramètres). */
 async function networkAction(action) {
+  netActing++;
   try {
     if (action === "network-choose") {
       const handle = await network.chooseSharedFolder();
@@ -2812,6 +2815,8 @@ async function networkAction(action) {
     }
   } catch (err) {
     if (err?.name !== "AbortError") message = { kind: "error", text: `Dossier réseau partagé : ${err?.message || err}` };
+  } finally {
+    netActing--;
   }
   netFolder = null;
   render();
