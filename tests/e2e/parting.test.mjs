@@ -782,6 +782,118 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     await context.close();
   });
 
+  test('dessin manuel : un clic sur le dernier point posé le retire (annulable), le placement continue ; glissé, il se déplace ; caché ou la boucle fermée, il reste', { timeout: 2 * CAD_TIMEOUT }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    // A block 60 × 40 × 20 mm, drawn along Z.
+    await page.setInputFiles('#file-input', { name: 'box.obj', mimeType: 'text/plain', buffer: voxelsObj([['a', () => true]], [12, 8, 4], 5) });
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
+    const hint = () => page.textContent('#parting-hint');
+    const stage = () => page.evaluate(() => document.getElementById('parting-card').dataset.draw ?? '');
+    const labels = () => page.$$eval('#draw-labels span', (s) => s.map((x) => x.textContent));
+    const names = async () => (await segmentRows(page)).map((r) => r.name);
+    const blur = () => page.evaluate(() => document.activeElement?.blur());
+    await page.click('#parting-draw');
+    assert.equal(await page.inputValue('#parting-draw-plane'), 'Z');
+
+    // 1. A single point clicked: taken off, still placing (point 1 next); Ctrl+Z puts it back, Ctrl+Y takes it off again.
+    const [front, right, back, left] = [[[30, 0, 10], [0, -1, 0]], [[60, 20, 10], [1, 0, 0]], [[30, 40, 10], [0, 1, 0]], [[0, 20, 10], [-1, 0, 0]]];
+    await faceToward(page, ...front);
+    await clickModel(page, front[0]);
+    assert.deepEqual(await labels(), ['1']);
+    assert.match(await hint(), /^Point 2 : .* ; cliquez sur le dernier point pour le retirer\.$/);
+    await clickModel(page, front[0]);
+    assert.deepEqual(await labels(), []);
+    assert.equal(await stage(), 'points');
+    assert.match(await hint(), /placer le point 1\b/);
+    await blur();
+    await page.keyboard.press('Control+z');
+    assert.deepEqual(await labels(), ['1']);
+    await page.keyboard.press('Control+y');
+    assert.deepEqual(await labels(), []);
+
+    // 2. Four points round the part, the last one clicked: three left, still placing; « Annuler » puts it back,
+    // « Rétablir » takes it off again. The next click adds point 4, its segment from point 3.
+    for (const [p, n] of [front, right, back, left]) {
+      await faceToward(page, p, n);
+      await clickModel(page, p);
+    }
+    assert.deepEqual(await names(), ['1-2', '2-3', '3-4']);
+    await clickModel(page, left[0]);
+    assert.deepEqual(await labels(), ['1', '2', '3']);
+    assert.deepEqual(await names(), ['1-2', '2-3']);
+    assert.equal(await stage(), 'points');
+    assert.match(await hint(), /^Point 4 : cliquez sur la pièce/);
+    await page.click('#parting-draw-undo');
+    assert.deepEqual(await names(), ['1-2', '2-3', '3-4']);
+    await page.click('#parting-draw-redo');
+    assert.deepEqual(await names(), ['1-2', '2-3']);
+    await clickModel(page, [0, 10, 10]);
+    assert.deepEqual(await labels(), ['1', '2', '3', '4']);
+    const length34 = async () => Number((await segmentRows(page))[2].length.replace(' mm', '').replace(',', '.'));
+    const added = (await segmentRows(page))[2];
+    // (Round the corner: 30 mm along the back face, 30 along the left one.)
+    assert.deepEqual([added.name, added.type], ['3-4', 'straight']);
+    assert.ok(Math.abs((await length34()) - 60) < 2, `3-4 from point 3: ${added.length}`);
+
+    // 3. The last point pressed and dragged: moved along the face, not taken off.
+    const from = await page.evaluate(() => window.reader3d.screenOf([0, 10, 10]));
+    const to = await page.evaluate(() => window.reader3d.screenOf([0, 25, 10]));
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(to.x, to.y, { steps: 8 });
+    await page.mouse.up();
+    await page.waitForFunction((l) => document.querySelector('#parting-draw-segments tr[data-seg="0:2"] td:nth-child(3)').textContent !== l, added.length);
+    assert.ok(Math.abs((await length34()) - 45) < 2, `point 4 dragged: ${(await segmentRows(page))[2].length}`);
+    assert.deepEqual(await labels(), ['1', '2', '3', '4']);
+
+    // 4. Turned away, the last point behind the part: a click beside it is on the part in front, a point added there.
+    await faceToward(page, ...right);
+    const behind = await page.evaluate(() => window.reader3d.screenOf([0, 25, 10]));
+    await page.mouse.click(behind.x + 6, behind.y);
+    assert.deepEqual(await labels(), ['1', '2', '3', '4', '5']);
+    await blur();
+    await page.keyboard.press('Control+z');
+    assert.deepEqual(await labels(), ['1', '2', '3', '4']);
+
+    // 5. The loop closed (Enter): placing stopped, a click on the last point selects it, nothing taken off.
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.getElementById('parting-origin').textContent === 'dessin manuel', null, { timeout: 30_000 });
+    assert.equal(await stage(), 'halves');
+    await faceToward(page, ...left);
+    await clickModel(page, [0, 25, 10]);
+    assert.deepEqual(await labels(), ['1', '2', '3', '4']);
+    assert.deepEqual(await names(), ['1-2', '2-3', '3-4', '4-1']);
+    assert.equal(await page.textContent('#parting-draw-point-label'), 'Point 4 :');
+    assert.equal(await stage(), 'halves');
+
+    // 6. A second loop: its single point clicked, taken off, still placing it (loop 1 kept); point 4, of the loop
+    // closed, only selected.
+    await page.click('#parting-draw-new');
+    await clickModel(page, [0, 15, 15]);
+    assert.deepEqual(await labels(), ['1', '2', '3', '4', '5']);
+    await clickModel(page, [0, 25, 10]);
+    assert.deepEqual(await labels(), ['1', '2', '3', '4', '5']);
+    assert.equal(await page.textContent('#parting-draw-point-label'), 'Point 4 :');
+    await clickModel(page, [0, 15, 15]);
+    assert.deepEqual(await labels(), ['1', '2', '3', '4']);
+    assert.equal(await stage(), 'points');
+    assert.match(await hint(), /placer le point 5\b/);
+    assert.deepEqual(await names(), ['1-2', '2-3', '3-4', '4-1']);
+    await clickModel(page, [0, 15, 15]);
+    assert.deepEqual(await labels(), ['1', '2', '3', '4', '5']);
+
+    // 7. In English.
+    await page.selectOption('#language', 'en');
+    assert.match(await hint(), /^Point 6: .*; click the last point to remove it\.$/);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
   test('dessin manuel, bloc percé : la boucle extérieure seule ne sépare pas la pièce ; une boucle dans le trou en plus, deux parties', { timeout: 2 * CAD_TIMEOUT }, async () => {
     const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' });
     const page = await context.newPage();
