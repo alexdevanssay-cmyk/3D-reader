@@ -63,6 +63,10 @@ function partingContext(p) {
     zero_draft_share: p.zero_draft_share ?? null,
     planar: line?.planar ?? null,
     ...(line?.planar === false ? { kind: line.kind, height_range_mm: line.height_range_mm } : {}),
+    // Drawn by hand on the part: how many loops, how many of its segments are arcs (not the list of its segments).
+    ...(p.source === "drawn"
+      ? { source: "drawn", drawn_loops: p.drawn?.loops ?? null, curved_segments: (p.drawn?.segments ?? []).filter((s) => s.type === "curved").length }
+      : {}),
   };
 }
 
@@ -130,6 +134,8 @@ function bodyContext(body, task) {
     geometry: body.geometry ?? {},
     ...(body.parting ? { parting: partingContext(body.parting) } : {}),
     ...(body.feeding ? { feeding: feedingSummary(body.feeding) } : {}),
+    // Through and blind holes measured on the mesh, in short (semantic.js holeSummary).
+    ...(body.holes ? { holes: body.holes } : {}),
     relations: body.relations ?? [],
     features: features.map(featureContext),
     quality: body.quality ?? {},
@@ -238,11 +244,26 @@ function roundDeep(value) {
   return value;
 }
 
-/** A feature without its evidence lists: its kind, status and main dimensions. */
+/**
+ * A feature without its evidence lists: its kind, status and main
+ * dimensions; for a hole measured on the mesh, through or blind, its depth
+ * (or length) and axis; undetermined, why.
+ */
 function slimFeature(feature) {
   const out = { feature_id: feature.feature_id, type: feature.type, status: feature.status, confidence: round(feature.confidence, 2) };
   if (feature.subtype) out.subtype = feature.subtype;
-  for (const k of DIMENSION_KEYS) if (finite(feature.geometry?.[k])) out[k] = round(feature.geometry[k]);
+  const g = feature.geometry ?? {};
+  for (const k of DIMENSION_KEYS) if (finite(g[k])) out[k] = round(g[k]);
+  if (typeof g.through === "boolean") {
+    out.through = g.through;
+    for (const k of g.through ? ["length_mm"] : ["depth_mm", "tip_depth_mm"]) if (finite(g[k])) out[k] = round(g[k]);
+    if (g.bottom) out.bottom = g.bottom;
+    if (Array.isArray(g.axis)) out.axis = g.axis.map((x) => round(x, 4));
+    if (Array.isArray(g.hole_diameters_mm)) out.hole_diameters_mm = g.hole_diameters_mm.map((x) => round(x));
+  } else if (g.uncertain_reason) {
+    out.through = null;
+    out.uncertain_reason = g.uncertain_reason;
+  }
   return out;
 }
 
@@ -257,10 +278,12 @@ function featureGroups(features) {
   const groups = new Map();
   for (const f of features) {
     const key = `${f.type}|${f.subtype ?? ""}`;
-    const g = groups.get(key) ?? { type: f.type, ...(f.subtype ? { subtype: f.subtype } : {}), count: 0, evidenced: 0, provisional: 0, diameters_mm: new Set(), radii_mm: new Set() };
+    const g = groups.get(key) ?? { type: f.type, ...(f.subtype ? { subtype: f.subtype } : {}), count: 0, evidenced: 0, provisional: 0, diameters_mm: new Set(), radii_mm: new Set(), depths_mm: new Set() };
     g.count++;
     if (f.status === "provisional") g.provisional++;
     else g.evidenced++;
+    // Blind holes measured on the mesh: their depths too.
+    if (f.geometry?.through === false && finite(f.geometry.depth_mm)) g.depths_mm.add(round(f.geometry.depth_mm, 2));
     if (f.type === "fillet_feature_candidate") {
       // A fillet is sized by its radius: an R5 rounded edge is no Ø10.
       const r = f.geometry?.radius_mm ?? f.geometry?.minor_radius_mm;
@@ -271,10 +294,11 @@ function featureGroups(features) {
     }
     groups.set(key, g);
   }
-  return [...groups.values()].map(({ diameters_mm, radii_mm, ...rest }) => ({
+  return [...groups.values()].map(({ diameters_mm, radii_mm, depths_mm, ...rest }) => ({
     ...rest,
     ...sizeList(diameters_mm, "diameters_mm", "more_diameters"),
     ...sizeList(radii_mm, "radii_mm", "more_radii"),
+    ...sizeList(depths_mm, "depths_mm", "more_depths"),
   }));
 }
 
@@ -286,8 +310,15 @@ function relationCounts(relations) {
 
 // Features that repeat other fields of their body: the closed solid (quality),
 // the kinds of surfaces (geometry), the fill ratio (metrics), the cylinders
-// bounded by planes (relation_counts).
+// bounded by planes (relation_counts). The cylinder of a hole measured on the
+// mesh repeats its hole feature too (see repeats).
 const REPEATED_FEATURES = new Set(["closed_solid", "cylindrical_geometry", "planar_geometry", "low_fill_ratio_geometry", "cylindrical_boundary_relation"]);
+
+/** The features of a body (context features) that repeat other fields of it: REPEATED_FEATURES, the cylinders of measured holes. */
+function repeats(features) {
+  const holes = new Set(features.filter((f) => f.type === "hole_feature_candidate" && f.geometry?.measured === true).map((f) => f.geometry.surface_index));
+  return (f) => REPEATED_FEATURES.has(f.type) || (f.type === "cylindrical_feature_candidate" && f.geometry?.measured === true && holes.has(f.geometry.surface_index));
+}
 
 // The provisional features listed first when not all fit: the bores and holes,
 // then the patterns, pockets and fillets, then the bosses; the other candidates
@@ -328,7 +359,8 @@ function shortFoundry(foundry) {
  * matters least: the geometry of the part comes first, then how it is made by
  * the right process, then the machining plan and its times. Levels:
  *   1 the per-surface geometry and the evidence lists left out, the foundry
- *     knowledge common to every body given once;
+ *     knowledge and the note on the measured holes common to every body
+ *     given once;
  *   2 what repeats other fields or the instructions: the features repeating
  *     their body (counted), the notes of every analysis, the reasoning rules,
  *     the foundry knowledge and screens in short;
@@ -351,8 +383,17 @@ function shortFoundry(foundry) {
 export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6 } = {}) {
   const size = (o) => JSON.stringify(o).length;
   let common = {};
+  // The note on the holes, given once when every body has the same: a body
+  // measured and one not (an open mesh) each keep theirs.
+  const holesNotes = new Set(context.bodies.map((body) => body.holes?.note).filter(Boolean));
+  const holesNote = holesNotes.size === 1 ? [...holesNotes][0] : null;
   const bodies1 = context.bodies.map((body) => {
     const { analytic_surfaces, ...geometry } = body.geometry ?? {};
+    let holes = body.holes ?? null;
+    if (holes?.note && holesNote) {
+      const { note, ...own } = holes;
+      holes = own;
+    }
     let foundry = body.foundry ?? null;
     if (foundry) {
       const { sources, simulation_boundary, confidence_policy, engineering_inputs, ...own } = foundry;
@@ -368,6 +409,7 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
       geometry: { ...roundDeep(geometry), analytic_surface_count: Array.isArray(analytic_surfaces) ? analytic_surfaces.length : 0 },
       ...(body.parting ? { parting: body.parting } : {}),
       ...(body.feeding ? { feeding: body.feeding } : {}),
+      ...(holes ? { holes } : {}),
       relation_counts: relationCounts(body.relations),
       features: (body.features ?? []).map(slimFeature),
       ...(body.manufacturing ? { manufacturing: roundDeep(body.manufacturing) } : {}),
@@ -383,6 +425,7 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
     ...top,
     bodies: strip(bodies),
     foundry_common: Object.keys(common).length ? common : undefined,
+    holes_note: holesNote ?? undefined,
     compaction: { level, omitted: [...omitted], original_body_count: context.bodies.length },
   });
 
@@ -403,13 +446,15 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
     };
   }
   const bodies2 = bodies1.map((b) => {
-    const repeated = b._features.filter((f) => REPEATED_FEATURES.has(f.type));
+    const repeat = repeats(b._features);
+    const repeated = b._features.filter(repeat);
+    const ids = new Set(repeated.map((f) => f.feature_id));
     return {
       ...b,
-      features: b.features.filter((f) => !REPEATED_FEATURES.has(f.type)),
+      features: b.features.filter((f) => !ids.has(f.feature_id)),
       ...(repeated.length ? { repeated_features: countBy(repeated, (f) => f.type) } : {}),
       ...(b.foundry ? { foundry: shortFoundry(b.foundry) } : {}),
-      _features: b._features.filter((f) => !REPEATED_FEATURES.has(f.type)),
+      _features: b._features.filter((f) => !repeat(f)),
     };
   });
   out = build(bodies2, 2);
@@ -496,7 +541,7 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   // 8: every body reduced to its metrics and feature counts; the feature groups and foundry screen of the largest one.
   omitted.push("per-body foundry and manufacturing details (kept for the largest body only)");
   const largest = byVolume[0]?.id;
-  const level8 = (b) => (b.id === largest ? { ...brief(b), feature_groups: b.feature_groups, foundry: b.foundry } : brief(b));
+  const level8 = (b) => (b.id === largest ? { ...brief(b), ...(b.holes ? { holes: b.holes } : {}), feature_groups: b.feature_groups, foundry: b.foundry } : brief(b));
   out = build(bodies6.map(level8), 8);
   if (size(out) <= maxChars) return out;
 

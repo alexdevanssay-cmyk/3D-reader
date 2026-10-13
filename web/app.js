@@ -1,18 +1,27 @@
 import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { TrackballControls } from "three/addons/controls/TrackballControls.js";
+import { LineMaterial } from "three/addons/lines/LineMaterial.js";
+import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
 import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.js";
 import { engravingMask, thicknessHistogram, thicknessStats } from "./engine/thickness.js";
 import { summarize } from "./engine/summary.js";
 import { buildSemantic3D, SEMANTIC_VERSION } from "./engine/semantic.js";
 import { buildAIContext, AI_CONTEXT_VERSION } from "./engine/ai-context.js";
 import {
-  PARTING_VERSION, REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_NONE, SIDE_UPPER, ZERO_DRAFT,
-  applyOverrides, faceRegions, lineMesh, lineSummary, parseDirection, partingLine, sameDirection, snapDirection,
+  PARTING_VERSION, REACH_DOWN, REACH_UP, SIDE_UPPER, ZERO_DRAFT,
+  applyOverrides, faceRegions, lineMesh, lineSummary, mouldBlocks, parseDirection, partingLine, sameDirection, snapDirection,
 } from "./engine/parting.js";
+import { SIDE_LOWER, SIDE_NONE, axisLabel, parseTriple } from "./engine/parting.js";
+import {
+  MAX_LOOPS, MAX_POINTS, alignPoints, arcDefault, arcFromCentre, arcGeometry, drawMesh, drawnParting, layArc, layStraight, parseDrawing,
+  reviveDrawing, rotateAbout, segmentName, segmentPlane, serializeDrawing, surfacePoint, turnSign,
+} from "./engine/parting-draw.js";
 import {
   FEEDING_VERSION, METHOD as FEEDING_METHOD, feedingContext, feedingYield, feeds, gateFromPoint, hotSpotsWithoutRiser,
   resizeRiser, riserFromPoint,
 } from "./engine/feeding.js";
+import { capOrders, capQuad, planeCutsBox } from "./section.js";
 
 // ---------------------------------------------------------------- units
 
@@ -51,7 +60,8 @@ function fmtMass(mm3, density) {
 // ---------------------------------------------------------------- scene
 
 const viewport = $("viewport");
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+// A stencil buffer: the section closes the solids it cuts (syncCaps; three.js 0.180 has none by default).
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, stencil: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.localClippingEnabled = true;
 viewport.appendChild(renderer.domElement);
@@ -61,9 +71,23 @@ const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 1e7);
 camera.up.set(0, 0, 1); // CAD convention: Z is up
 camera.position.set(1, -1, 1);
 
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.screenSpacePanning = true;
+// Trackball: the model turns freely in every direction (an orbit stops at the poles,
+// half a turn over the top); the camera's up turns with it.
+const controls = new TrackballControls(camera, renderer.domElement);
+controls.rotateSpeed = 2;
+controls.zoomSpeed = 1.2;
+controls.panSpeed = 0.8;
+controls.dynamicDampingFactor = 0.2; // a little inertia after the mouse is released
+controls.keys = []; // no A/S/D keys held for rotate/zoom/pan: they are typed in the fields of the page
+// Where the view is on the page, read again at each drag: the bar above it may have wrapped since.
+renderer.domElement.addEventListener("pointerdown", () => controls.handleResize(), true);
+
+/** The view stopped where it is: no turn, zoom or pan left from the inertia of the last drag (TrackballControls 0.180 fields). */
+function stopInertia() {
+  controls._lastAngle = 0;
+  controls._zoomStart.copy(controls._zoomEnd);
+  controls._panStart.copy(controls._panEnd);
+}
 
 scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.6));
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.8);
@@ -90,11 +114,25 @@ const state = {
   bounds: new THREE.Box3(),
 };
 
+// False while the page of the 3D view is hidden (another tab of the bar): nothing is drawn then.
+let viewShown = true;
+
 function resize() {
   const { clientWidth: w, clientHeight: h } = viewport;
+  // The page hidden (another tab of the bar): nothing to fit, the camera and the
+  // canvas kept as they are. A view 0 wide would leave the camera an aspect of 0,
+  // every point projected to x = NaN, until the first frame after the page is
+  // shown again (a script asking reader3d.screenOf before it got {x: NaN}).
+  viewShown = Boolean(w && h);
+  if (!viewShown) return;
   renderer.setSize(w, h, false);
-  camera.aspect = w / Math.max(h, 1);
+  camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  controls.handleResize();
+  // The parting line as wide in pixels at any size of the view.
+  for (const mesh of state.meshes) mesh.userData.partingOverlay?.userData.line?.material.resolution.set(w, h);
+  // Likewise the lines of the drawing by hand.
+  for (const mesh of state.meshes) for (const key of ["drawOverlay", "drawHover"]) mesh.userData[key]?.traverse((o) => o.material?.resolution?.set(w, h));
 }
 new ResizeObserver(resize).observe(viewport);
 resize();
@@ -106,11 +144,30 @@ resize();
   new ResizeObserver(measure).observe(topbar);
   measure();
 }
+// The bottom of the tool bar of the 3D view (it wraps on a narrow window): --toolbar-h, under which the hint of the drawing by hand stands.
+{
+  const toolbar = viewport.querySelector(".toolbar");
+  const measure = () => viewport.style.setProperty("--toolbar-h", `${toolbar.offsetTop + toolbar.offsetHeight}px`);
+  new ResizeObserver(measure).observe(toolbar);
+  measure();
+}
 
 renderer.setAnimationLoop(() => {
+  stepTurn(); // the part turned by the arrows of the drawing by hand, animated
   controls.update();
+  // Its page hidden: the canvas keeps its size (see resize()), so drawing it at
+  // every frame would cost the GPU for nothing while another page is shown.
+  if (!viewShown) return;
+  syncCaps();
   renderer.render(scene, camera);
+  drawFrame(); // the numbers of its points, where they are on the view
 });
+// Drawn again as soon as the view changes size (the panel's splitter dragged,
+// panels.js; its page shown again): the canvas resized after the frame was drawn
+// would stay blank, or stretched, until the next one.
+new ResizeObserver(() => {
+  if (viewShown) renderer.render(scene, camera);
+}).observe(viewport);
 
 // ---------------------------------------------------------------- loading
 
@@ -145,6 +202,9 @@ function clearModel() {
   state.meshes = [];
   state.edges = [];
   state.selected = -1;
+  // The hooks of the view for scripts and tests: nothing faded, no parting shown.
+  noteFaded();
+  $("parting-card").dataset.overlay = $("parting-card").dataset.undercuts = "";
 }
 
 /**
@@ -696,7 +756,8 @@ function renderBodies() {
     const tr = document.createElement("tr");
     tr.dataset.index = i;
     if (i === state.selected) tr.classList.add("selected");
-    const color = state.meshes[i].material.color.getHexString();
+    // Its own colour (the material's is grey when faded, white when coloured by triangle).
+    const color = (state.meshes[i].userData.color ?? state.meshes[i].material.color).getHexString();
 
     const vis = document.createElement("input");
     vis.type = "checkbox";
@@ -967,22 +1028,55 @@ const VIEWS = {
   right: new THREE.Vector3(1, 0, 0),
 };
 
+/**
+ * The pose of the view looking at `centre` from along `dir` (unit, towards
+ * the camera), `up` its up, far enough to see a sphere of `radius`, the key
+ * light above it: {position, up, target, light, near, far}.
+ */
+function viewPose(dir, up, centre, radius) {
+  const dist = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.05;
+  return {
+    position: centre.clone().addScaledVector(dir, dist).toArray(),
+    up: up.toArray(),
+    target: centre.toArray(),
+    light: centre.clone().add(new THREE.Vector3(radius, -radius * 2, radius * 3)).toArray(),
+    near: dist / 1000,
+    far: dist * 100,
+  };
+}
+
+/** The view in a pose ({position, up, target, light}, near and far when given). */
+function applyPose(pose) {
+  camera.position.fromArray(pose.position);
+  camera.up.fromArray(pose.up);
+  controls.target.fromArray(pose.target);
+  keyLight.position.fromArray(pose.light);
+  if (pose.near) {
+    camera.near = pose.near;
+    camera.far = pose.far;
+    camera.updateProjectionMatrix();
+  }
+}
+
+/** The camera looking at `centre` from along `dir`, `up` its up, the whole of a sphere of `radius` seen. */
+function placeCamera(dir, up, centre, radius) {
+  applyPose(viewPose(dir, up, centre, radius));
+  stopInertia();
+  controls.update();
+}
+
 function setView(name) {
   if (state.bounds.isEmpty()) return;
+  finishTurn(); // a turn by the arrows of the drawing by hand ends first
   const center = state.bounds.getCenter(new THREE.Vector3());
   const radius = state.bounds.getSize(new THREE.Vector3()).length() / 2 || 1;
-  const dist = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.05;
   const dir = (VIEWS[name] || camera.position.clone().sub(controls.target)).clone().normalize();
-  // A camera looking straight down Z needs a different up vector.
-  camera.up.set(0, 0, 1);
-  if (Math.abs(dir.z) > 0.999) camera.up.set(0, 1, 0);
-  camera.position.copy(center).addScaledVector(dir, dist);
-  camera.near = dist / 1000;
-  camera.far = dist * 100;
-  camera.updateProjectionMatrix();
-  controls.target.copy(center);
-  keyLight.position.copy(center).add(new THREE.Vector3(radius, -radius * 2, radius * 3));
-  controls.update();
+  // A named view stands upright (Z up; looking straight down Z, Y up); "Recadrer" keeps the turn of the view.
+  if (VIEWS[name]) {
+    camera.up.set(0, 0, 1);
+    if (Math.abs(dir.z) > 0.999) camera.up.set(0, 1, 0);
+  } else if (Math.abs(camera.up.clone().normalize().dot(dir)) > 0.999) camera.up.set(0, 0, 1);
+  placeCamera(dir, camera.up, center, radius);
 }
 
 function updateSection() {
@@ -1002,6 +1096,201 @@ function updateSection() {
   // Keeps points where n·p + c >= 0
   sectionPlane.normal.copy(n);
   sectionPlane.constant = sectionFlip ? -pos : pos;
+}
+
+// The section closes the solids it cuts: each closed body shown (not an open
+// one, nor one faded, nor one whose triangles the analysis had to turn round
+// or found twice: see countable), each riser and the ingate gets a cap lying
+// in the section plane, drawn where the plane is inside it. The stencil
+// buffer counts per pixel the back faces of the solid clipped by the plane up
+// and its front faces down, along the whole ray (no depth test): what is left
+// is non-zero where the ray meets the plane inside the solid (three.js
+// webgl_clipping_stencil). One solid after the other (increasing render
+// orders), each cap resetting the count wherever it is drawn: solids of
+// different colours do not mix. The caps share one rectangle, over all the
+// solids cut: the same depths, so that where solids overlap the cap drawn
+// later wins (LessEqual), never a mix of both. A cap is the solid's colour,
+// darker (the neutral grey of the parting display, the grey of no value under
+// the thickness colours); opaque, drawn after the opaque bodies and before
+// the translucent overlays; translucent for a body seen through (a thickness
+// highlight), then only from the side removed (from the side kept, the faces
+// in front of the cut write no depth: the cap would be drawn over them). The
+// halves of the mould are a display round the part, not material: cut, not
+// capped. The caps are not in state.meshes: a click on a cut selects the body
+// cut, but places nothing on the faces hidden behind it (onCut). Followed at
+// each frame (syncCaps): the plane moved or flipped, another model or tab,
+// the risers or the ingate changed, a body shown or hidden; nothing drawn
+// without the section.
+const capGroup = new THREE.Group();
+scene.add(capGroup);
+let caps = []; // {target, kind ("body" | "riser" | "gate"), geometry, translucent, group, stencil, cap}
+const CAP_SHADE = 0.75; // a body's cut darker than its faces: material, not a face
+const CAP_GLOW = 0.4;
+const CAP_SEE_THROUGH = 0.45;
+const capColor = new THREE.Color();
+const capBox = new THREE.Box3();
+const capSpan = new THREE.Box3(); // the boxes of the solids cut
+// The rectangle of every cap, and the plane and the box it was set for.
+const capGeometry = new THREE.BufferGeometry();
+capGeometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(12), 3));
+capGeometry.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(12), 3));
+capGeometry.setIndex([0, 1, 2, 0, 2, 3]);
+let capGeometryAt = null;
+// What the analysis notes when it had to turn triangles round (meshanalysis.js, reader3d/mesh.py).
+const WINDING_REPAIRED = "Inconsistent triangle orientation was repaired";
+
+/** The materials counting a solid's faces: its back faces up, its front faces down; [opaque pass, translucent pass]. */
+const capCounters = [false, true].map((transparent) => [
+  [THREE.BackSide, THREE.IncrementWrapStencilOp],
+  [THREE.FrontSide, THREE.DecrementWrapStencilOp],
+].map(([side, op]) => new THREE.MeshBasicMaterial({
+  side, transparent, colorWrite: false, depthWrite: false, depthTest: false, clippingPlanes: [sectionPlane],
+  stencilWrite: true, stencilFunc: THREE.AlwaysStencilFunc, stencilFail: op, stencilZFail: op, stencilZPass: op,
+})));
+
+/** Whether an object is drawn: it and its parents visible, in the scene. */
+function shownInScene(o) {
+  for (; o; o = o.parent) {
+    if (!o.visible) return false;
+    if (o === scene) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the stencil can count a closed body's triangles: each face of the
+ * solid once, all wound alike (meshanalysis.js mesh.countable). A triangle
+ * turned round or drawn twice would leave a count where the plane is outside
+ * the solid: a cap in its holes. Results without the flag (kept by an older
+ * version, or of the server engine): not when the winding was repaired.
+ */
+function countable(body) {
+  return body.mesh?.countable ?? !body.notes?.includes(WINDING_REPAIRED);
+}
+
+/** The solids the section closes, in drawing order: the bodies, then the risers and the ingate (over them where they meet). */
+function capTargets() {
+  if (!sectionOn || state.bounds.isEmpty()) return [];
+  const bodies = [], markers = [];
+  for (const mesh of state.meshes) {
+    if (!shownInScene(mesh)) continue;
+    const body = state.result?.bodies[mesh.userData.index];
+    if (body?.closed && countable(body) && !mesh.userData.faded) {
+      bodies.push({ target: mesh, kind: "body", geometry: mesh.userData.indexed ?? mesh.geometry, translucent: mesh.material.transparent });
+    }
+    mesh.userData.feedingOverlay?.traverse((o) => {
+      if (o.userData.cap && o.visible) markers.push({ target: o, kind: o.userData.cap, geometry: o.geometry, translucent: false });
+    });
+  }
+  return [...bodies, ...markers];
+}
+
+/** The caps of these solids, those before freed. */
+function buildCaps(want) {
+  for (const { cap } of caps) cap.material.dispose();
+  capGroup.clear();
+  const orders = capOrders(want.length);
+  caps = want.map((w, k) => {
+    const [countOrder, capOrder] = orders[k];
+    const stencil = capCounters[w.translucent ? 1 : 0].map((material) => {
+      const m = new THREE.Mesh(w.geometry, material);
+      m.matrixAutoUpdate = false; // the solid's place, copied at each frame
+      m.renderOrder = countOrder;
+      return m;
+    });
+    // Drawn where the count is not 0, which it sets back to 0 wherever it is drawn (seen from either
+    // side; flat: in one pass, also when translucent).
+    const cap = new THREE.Mesh(capGeometry, new THREE.MeshStandardMaterial({
+      metalness: 0.15, roughness: 0.55, side: THREE.DoubleSide, forceSinglePass: true, // lit as the bodies are
+      transparent: w.translucent, opacity: w.translucent ? CAP_SEE_THROUGH : 1, depthWrite: !w.translucent,
+      stencilWrite: true, stencilRef: 0, stencilFunc: THREE.NotEqualStencilFunc,
+      stencilFail: THREE.ReplaceStencilOp, stencilZFail: THREE.ReplaceStencilOp, stencilZPass: THREE.ReplaceStencilOp,
+    }));
+    cap.renderOrder = capOrder;
+    cap.frustumCulled = false;
+    const group = new THREE.Group();
+    group.add(...stencil, cap);
+    capGroup.add(group);
+    return { ...w, group, stencil, cap };
+  });
+}
+
+/**
+ * The colour of a solid's cap: a riser's or the ingate's own (opaque, where
+ * their faces are translucent); a body's own, darker (the neutral grey of the
+ * parting display, the grey of no value under the thickness colours).
+ */
+function capColorOf({ target, kind }) {
+  if (kind !== "body") return capColor.copy(target.material.color);
+  if (target.userData.parting) capColor.copy(PARTING_FACE);
+  else if (target.material.vertexColors) capColor.copy(NO_VALUE);
+  else capColor.copy(target.userData.color);
+  return capColor.multiplyScalar(CAP_SHADE);
+}
+
+/** The caps as the view now is (before each frame): built again when the solids changed, else put on the plane where it cuts them. */
+function syncCaps() {
+  const want = capTargets();
+  if (want.length !== caps.length || want.some((w, k) => w.target !== caps[k].target || w.geometry !== caps[k].geometry || w.translucent !== caps[k].translucent)) buildCaps(want);
+  const { normal, constant } = sectionPlane;
+  // The camera on the side kept: the cut is behind the solid's faces, which a translucent cap would be drawn over.
+  const fromKept = sectionPlane.distanceToPoint(camera.position) >= 0;
+  capSpan.makeEmpty();
+  for (const entry of caps) {
+    const { target, geometry, group, stencil, cap } = entry;
+    target.updateWorldMatrix(true, false);
+    if (!geometry.boundingBox) geometry.computeBoundingBox();
+    capBox.copy(geometry.boundingBox).applyMatrix4(target.matrixWorld);
+    group.visible = !(entry.translucent && fromKept) && planeCutsBox(normal.toArray(), constant, { min: capBox.min.toArray(), max: capBox.max.toArray() });
+    if (!group.visible) continue;
+    capSpan.union(capBox);
+    for (const m of stencil) {
+      m.matrix.copy(target.matrixWorld);
+      m.matrixWorldNeedsUpdate = true;
+    }
+    cap.material.color.copy(capColorOf(entry));
+    // A body's glow when selected; a riser or the ingate lit from within a little: its own colour at any angle, where a lit face would turn brown.
+    if (entry.kind === "body") cap.material.emissive.copy(target.material.emissive);
+    else cap.material.emissive.copy(capColor).multiplyScalar(CAP_GLOW);
+  }
+  // The rectangle of the caps, on the plane over the boxes of the solids cut: set again when either moved.
+  const now = [normal.x, normal.y, normal.z, constant, ...capSpan.min.toArray(), ...capSpan.max.toArray()];
+  if (!capSpan.isEmpty() && !(capGeometryAt && now.every((x, k) => x === capGeometryAt[k]))) {
+    const quad = capQuad(now.slice(0, 3), constant, { min: capSpan.min.toArray(), max: capSpan.max.toArray() });
+    if (quad) {
+      capGeometryAt = now;
+      const { position, normal: normals } = capGeometry.attributes;
+      position.array.set(quad);
+      for (let k = 0; k < 4; k++) normals.setXYZ(k, normal.x, normal.y, normal.z);
+      position.needsUpdate = normals.needsUpdate = true;
+    }
+  }
+  // What the section closes, for scripts and tests: "body riser gate"…
+  const shown = caps.filter((c) => c.group.visible).map((c) => c.kind).join(" ");
+  if (viewport.dataset.caps !== shown) viewport.dataset.caps = shown;
+}
+
+const cutNormals = new THREE.Matrix3();
+const cutFace = new THREE.Vector3();
+
+/**
+ * Whether a ray from the camera meets the cut of a body (its cap) before
+ * these hits (on the side the section keeps, nearest first): from the side
+ * removed, it crosses the plane inside a body capped, counted as the stencil
+ * does (that body's back faces kept up, its front faces down: not 0).
+ */
+function onCut(hits, ray) {
+  if (!sectionOn || sectionPlane.distanceToPoint(ray.origin) >= 0) return false;
+  return caps.some(({ kind, target, group }) => {
+    if (kind !== "body" || !group.visible) return false;
+    cutNormals.getNormalMatrix(target.matrixWorld);
+    let count = 0;
+    for (const h of hits) {
+      if (h.object !== target || !h.face) continue;
+      count += cutFace.copy(h.face.normal).applyMatrix3(cutNormals).dot(ray.direction) > 0 ? 1 : -1;
+    }
+    return count !== 0;
+  });
 }
 
 // ---------------------------------------------------------------- events
@@ -1116,8 +1405,12 @@ renderer.domElement.addEventListener("pointerup", (e) => {
   const hits = raycaster
     .intersectObjects(state.meshes.filter((m) => m.visible), false)
     .filter((h) => !sectionOn || sectionPlane.distanceToPoint(h.point) >= 0);
-  if (feedingClick(hits) || partingClick(hits)) return;
-  select(hits.length ? hits[0].object.userData.index : -1);
+  // On the cut of a body: no riser, ingate nor face of the parting line on the faces it hides; the body still selected.
+  const seen = onCut(hits, raycaster.ray) ? [] : hits;
+  if (feedingClick(seen) || partingClick(seen, { x: e.clientX, y: e.clientY })) return;
+  // Through the bodies faded: the first body seen there (a faded one where nothing else is behind it).
+  const hit = hits.find((h) => !h.object.userData.faded) ?? hits[0];
+  select(hit ? hit.object.userData.index : -1);
 });
 
 // Drag and drop anywhere on the page.
@@ -1209,6 +1502,7 @@ const thick = {
   tol: null, // mm
   max: null, // mm, top of the colour scale
   userMax: false, // the scale was set by hand
+  scale: null, // {area, total}: the histogram drawn over the scale, drawn again alone when the card changes width
 };
 const HIGHLIGHT = new THREE.Color(0xff00ff);
 const NO_VALUE = new THREE.Color(0x9aa0aa);
@@ -1312,6 +1606,7 @@ function thickQuantiles(fractions) {
 /** A new model is shown: forget the previous thicknesses, recompute if in use. */
 function thicknessNewModel(kept = null) {
   thick.results = null;
+  thick.scale = null;
   thick.markCache = new Map();
   thick.minOverride = null;
   thick.pending = null;
@@ -1398,23 +1693,65 @@ async function ensureThickness() {
 // through, even those inside or behind.
 const HIGHLIGHT_FADE = 0.15;
 
-/** Opaque or translucent material: its own look back, or see-through for a highlight. */
+// A body other than the card's while the parting line or the risers of that
+// body are shown: translucent light grey, so that its overlays read through.
+const FADED = new THREE.Color(0xd3d6da);
+const FADED_LOOK = { transparent: true, opacity: 0.2, depthWrite: false };
+
+/**
+ * Opaque or translucent material: its own look back, see-through for a
+ * highlight, or faded ("faded": behind a body that coincides with it, two
+ * versions of a part, it gives way).
+ */
 function setSeeThrough(mesh, on) {
   const m = mesh.material;
   const look = mesh.userData.look;
-  const want = on ? { transparent: true, opacity: 1, depthWrite: false } : look;
+  const want = on === "faded" ? FADED_LOOK : on ? { transparent: true, opacity: 1, depthWrite: false } : look;
+  mesh.userData.faded = on === "faded";
+  m.polygonOffsetFactor = m.polygonOffsetUnits = on === "faded" ? 4 : 1;
   if (m.transparent === want.transparent && m.opacity === want.opacity && m.depthWrite === want.depthWrite) return;
   Object.assign(m, want);
   m.needsUpdate = true;
 }
 
-/** A mesh in its own colour: its indexed geometry back. */
+/** A body faded: its own geometry, translucent light grey. */
+function fadeBody(mesh) {
+  plainColors(mesh);
+  mesh.material.color.copy(FADED);
+  setSeeThrough(mesh, "faded");
+}
+
+/**
+ * The body whose overlays are shown (its parting line, or its risers and
+ * ingate), the others faded; -1: none (or that body unchecked in the list:
+ * hidden with its overlays, the others keep their own look).
+ */
+function overlayBody() {
+  const i = partingBody();
+  if (i < 0 || !state.meshes[i]?.visible) return -1;
+  if (partingShown()) return i;
+  const f = feedingOf();
+  return f?.show && feedingField(i) ? i : -1;
+}
+
+/** How many bodies are faded, on the 3D view (for scripts and tests). */
+const noteFaded = () => (viewport.dataset.faded = String(state.meshes.filter((mesh) => mesh.userData.faded).length));
+
+/** The bodies not faded as they should be (the overlays shown or hidden, another body on the card). */
+function fadeStale() {
+  const i = overlayBody();
+  return state.meshes.some((mesh, j) => !!mesh.userData.faded !== (i >= 0 && j !== i));
+}
+
+/** A mesh in its own colour: its indexed geometry back (and its colour, after being faded). */
 function plainColors(mesh) {
-  if (!mesh.userData.indexed) return;
-  mesh.geometry = mesh.userData.indexed;
-  mesh.material.vertexColors = false;
-  mesh.material.color.copy(mesh.userData.color);
-  mesh.material.needsUpdate = true;
+  const m = mesh.material;
+  if (mesh.userData.indexed) mesh.geometry = mesh.userData.indexed;
+  m.color.copy(mesh.userData.color);
+  if (m.vertexColors) {
+    m.vertexColors = false;
+    m.needsUpdate = true;
+  }
 }
 
 /**
@@ -1447,7 +1784,10 @@ function applyThickness() {
   const active = (thick.colors || thick.highlight) && thick.results;
   // Not by thickness: the parting line when it is shown.
   if (!active && partingShown()) return applyParting();
+  // The risers of a body shown: the other bodies faded.
+  const overlay = overlayBody();
   state.meshes.forEach((mesh, i) => {
+    if (overlay >= 0 && i !== overlay) return fadeBody(mesh);
     const values = thickValues(i);
     setSeeThrough(mesh, active && thick.highlight);
     if (!active) return plainColors(mesh);
@@ -1476,6 +1816,7 @@ function applyThickness() {
     }
     showFlat(mesh, geom);
   });
+  noteFaded();
 }
 
 /** Lettering / fine details below the floor, in brackets: "(0,6 mm : écritures…)". */
@@ -1524,6 +1865,7 @@ function renderThickness() {
     const banded = Float32Array.from(values, (v) => (v >= lo && v <= hi ? 1 : 2));
     band += thicknessHistogram(geom.attributes.position.array, geom.index.array, banded, 1, 3).area[1];
   });
+  thick.scale = { area, total };
   drawScale(area, total);
 
   const stats = thickStats();
@@ -1736,7 +2078,8 @@ $("thick-max").addEventListener("change", (e) => {
     if (canvas.hasPointerCapture(e.pointerId)) pick(e);
   });
 }
-new ResizeObserver(() => thick.results && renderThickness()).observe($("thick-scale"));
+// The card wider or narrower (the panel's splitter dragged, the card folded): the scale only, its histogram kept.
+new ResizeObserver(() => thick.results && thick.scale && drawScale(thick.scale.area, thick.scale.total)).observe($("thick-scale"));
 
 // ---------------------------------------------------------------- parting line
 
@@ -1749,14 +2092,23 @@ new ResizeObserver(() => thick.results && renderThickness()).observe($("thick-sc
 // definition is kept per part (the SHA-256 of its file) in this browser.
 const PARTING_KEY = "reader3d.parting.v1";
 const PARTING_PARTS = 200; // parts whose definition by hand is kept, the latest
-const PARTING_COLORS = {
-  [SIDE_UPPER]: new THREE.Color(0x4f86d9),
-  [SIDE_LOWER]: new THREE.Color(0x52a861),
-  [SIDE_NONE]: new THREE.Color(0xe0302a), // undercut
-};
-const PARTING_LINE = 0xffc400;
+// On the 3D view: the halves of the mould are translucent blocks round the
+// body (the upper one blue, the lower one green) and its faces a neutral
+// light grey (lighter without draft), the undercuts yellow, the parting line
+// red and a few pixels wide over everything.
+const PARTING_FACE = new THREE.Color(0xaeb3b9);
+const PARTING_UNDERCUT = new THREE.Color(0xffcf00);
+const PARTING_LINE = 0xe8141b;
+const PARTING_LINE_PX = 4;
+const PARTING_UPPER = 0x2f6fde;
+const PARTING_LOWER = 0x2c9c4c;
+const PARTING_BLOCK_OPACITY = 0.2;
 const PARTING_ARROW = 0x1f5fd0;
 const WHITE = new THREE.Color(0xffffff);
+// Order of the translucent overlays (after the bodies faded): the blocks, then the risers and the ingate (inside the upper block), the parting line last.
+const ORDER_BLOCKS = 1;
+const ORDER_MARKERS = 2;
+const ORDER_LINE = 3;
 
 const partClient = () => (partClient.module ??= import("./engine/partclient.js"));
 
@@ -1765,14 +2117,15 @@ const partClient = () => (partClient.module ??= import("./engine/partclient.js")
 // (body -> its faces and edges), evaluated (directions classified), show,
 // mode ("pick" | "assign" | null), busy (directions being classified), seq
 // (the choices made on the card: a direction classified after a later
-// choice is not applied), message, restored}.
+// choice is not applied), message, restored, draw (body -> its drawing by
+// hand, see "drawing by hand"; mode "draw"), drawBody (the body drawn on)}.
 const partings = new WeakMap();
 
 function partingOf(r = state.result) {
   if (!r) return null;
   let p = partings.get(r);
   if (!p) {
-    p = { results: null, pending: null, percent: null, error: null, current: new Map(), geom: new Map(), evaluated: new Map(), show: false, mode: null, busy: 0, seq: 0, message: null, restored: false };
+    p = { results: null, pending: null, percent: null, error: null, current: new Map(), geom: new Map(), evaluated: new Map(), show: false, mode: null, busy: 0, seq: 0, message: null, restored: false, draw: new Map(), drawBody: -1 };
     partings.set(r, p);
   }
   return p;
@@ -1819,7 +2172,7 @@ const partingShown = () => {
   return !!(p?.show && partingField(partingBody()));
 };
 
-// ---- definitions kept in this browser: {part id: {savedAt, bodies: {index: {direction, source, candidate, overrides, faces}}}}
+// ---- definitions kept in this browser: {part id: {savedAt, bodies: {index: {direction, source, candidate, overrides, faces, drawing}}, drafts: {index: drawing}}}
 
 function partingSaved() {
   try {
@@ -1830,13 +2183,17 @@ function partingSaved() {
   }
 }
 
-function savePartingDef(partId, body, def) {
+/** The definition of a body kept (null: forgotten); with `draft`, its drawing by hand not applied (kept beside). */
+function savePartingDef(partId, body, def, { draft = false } = {}) {
   if (!partId) return;
   const all = partingSaved();
   const entry = all[partId] ?? { bodies: {} };
-  if (def) entry.bodies[body] = def;
-  else delete entry.bodies[body];
-  if (Object.keys(entry.bodies).length) all[partId] = { ...entry, savedAt: Date.now() };
+  entry.bodies ??= {};
+  const kept = draft ? (entry.drafts ??= {}) : entry.bodies;
+  if (def) kept[body] = def;
+  else delete kept[body];
+  if (entry.drafts && !Object.keys(entry.drafts).length) delete entry.drafts;
+  if (Object.keys(entry.bodies).length || entry.drafts) all[partId] = { ...entry, savedAt: Date.now() };
   else delete all[partId];
   // The latest parts only.
   const ids = Object.keys(all).sort((a, b) => (all[b].savedAt ?? 0) - (all[a].savedAt ?? 0));
@@ -1942,15 +2299,20 @@ function partingAbandon(r) {
  * Body i defined by hand: a direction (its classification `base`) and faces
  * reassigned ({face: SIDE_UPPER | SIDE_LOWER}); the line follows the
  * boundary between the halves. The proposal itself, no face moved: no longer
- * a definition by hand.
+ * a definition by hand. `drawn`: the line drawn by hand ({drawing, result}
+ * of drawnParting, source "drawn"), whatever its direction.
  */
-function setPartingDefinition(i, { base, source, overrides = {}, candidate = null }) {
+function setPartingDefinition(i, { base, source, overrides = {}, candidate = null, drawn = null }) {
   const r = state.result;
   const p = partingOf(r);
   const res = p.results[i];
   const moved = Object.keys(overrides).length;
   p.message = null;
-  if (!moved && sameDirection(base.direction, res.proposal.direction)) {
+  if (drawn) {
+    const { field, def } = drawnDefinition(i, base, drawn);
+    p.current.set(i, field);
+    savePartingDef(partIdOf(r), i, def);
+  } else if (!moved && sameDirection(base.direction, res.proposal.direction)) {
     p.current.delete(i);
     savePartingDef(partIdOf(r), i, null);
   } else {
@@ -1970,6 +2332,7 @@ function setPartingDefinition(i, { base, source, overrides = {}, candidate = nul
     p.current.set(i, { manual: true, source, overrides, candidate, base, direction: base.direction, summary: { ...base.summary, parting: line }, side, flags: base.flags, plane: base.plane, segments, fixed });
     savePartingDef(partIdOf(r), i, { direction: base.direction, source, candidate, overrides, faces });
   }
+  if (!drawn) keepDrawing(i); // a drawing by hand replaced: kept as a draft
   applyParting();
   renderParting();
   // The risers and the ingate placed again for it (those placed by hand stay).
@@ -1984,6 +2347,7 @@ function resetParting(i) {
   p.mode = null;
   p.message = null;
   savePartingDef(partIdOf(state.result), i, null);
+  keepDrawing(i); // a drawing by hand replaced: kept as a draft
   applyParting();
   renderParting();
   refreshFeeding();
@@ -1995,7 +2359,9 @@ async function restoreParting() {
   const p = partingOf(r);
   if (!p?.results || p.restored) return;
   p.restored = true;
-  const defs = partingSaved()[partIdOf(r)]?.bodies ?? {};
+  const entry = partingSaved()[partIdOf(r)];
+  restoreDrafts(p, entry?.drafts); // the drawings by hand not applied, to go on with
+  const defs = entry?.bodies ?? {};
   for (const [key, def] of Object.entries(defs)) {
     const i = Number(key);
     if (!p.results[i] || !Array.isArray(def?.direction) || def.direction.length !== 3) continue;
@@ -2008,6 +2374,8 @@ async function restoreParting() {
         p.restored = false; // finished when its tab is shown again
         return;
       }
+      // A line drawn by hand: its points, its segments and its halves rebuilt (else its direction only).
+      if (def.source === "drawn" && restoreDrawing(i, def, base)) continue;
       let overrides = def.overrides ?? {};
       // Another tessellation of the part (its faces numbered otherwise): only the direction.
       if (Object.keys(overrides).length && def.faces !== partingGeometry(i).count) overrides = {};
@@ -2034,6 +2402,8 @@ function partingExport(r, i) {
       source: cur.source,
       candidate_index: cur.candidate,
       reassigned_faces: Object.keys(cur.overrides).length,
+      // Drawn by hand: the undercuts are those of the halves given by part; its loops and segments.
+      ...(cur.drawn ? { undercut_basis: "drawn_halves", drawn: cur.drawn } : {}),
       proposed: { axis: res.proposal.axis, direction: res.proposal.direction },
       candidates, ranking, sampled, method, version, draft_angle_deg, surface_area_mm2, triangles,
     },
@@ -2053,10 +2423,53 @@ function removePartingOverlay(mesh) {
   mesh.userData.partingOverlay = null;
 }
 
+// The halves of the mould of a parting line (mouldBlocks), by its segments: computed once.
+const blocksKept = new WeakMap();
+
+/** The halves of the mould round body i for its parting `field` (null: none). */
+function partingBlocks(i, field) {
+  let blocks = blocksKept.get(field.segments);
+  if (blocks === undefined) {
+    const line = field.summary.parting;
+    // A planar line: flat at its level. Without a line, the body is in one
+    // half: under it (the upper half forms it), else over it.
+    const level = line?.planar ? line.level_mm : line?.kind ? null : field.side.includes(SIDE_UPPER) ? -Infinity : Infinity;
+    blocks = mouldBlocks(bodyArrays(i).positions, field.direction, { segments: field.segments, level });
+    blocksKept.set(field.segments, blocks);
+  }
+  return blocks;
+}
+
+/** A translucent block of a half of the mould, with faint edges so that it reads as a block. */
+function blockMeshes({ positions, indices, edges: outline }, color, half) {
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geom.setIndex(new THREE.BufferAttribute(indices, 1));
+  geom.computeVertexNormals();
+  const block = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
+    color, transparent: true, opacity: PARTING_BLOCK_OPACITY, depthWrite: false, side: THREE.DoubleSide,
+    flatShading: true, roughness: 0.9, clippingPlanes: [sectionPlane],
+  }));
+  const lines = new THREE.BufferGeometry();
+  lines.setAttribute("position", new THREE.BufferAttribute(outline, 3));
+  const edges = new THREE.LineSegments(lines, new THREE.LineBasicMaterial({
+    color, transparent: true, opacity: 0.5, depthWrite: false, clippingPlanes: [sectionPlane],
+  }));
+  for (const o of [block, edges]) {
+    o.renderOrder = ORDER_BLOCKS;
+    o.userData.own = true;
+    o.userData.half = half;
+  }
+  return [block, edges];
+}
+
 /**
- * The parting of the card's body on the 3D view ("Show"): the two halves
- * tinted, lighter where the faces have no draft, the undercuts in red, the
- * parting line, and an arrow along the draw direction of the upper half.
+ * The parting of the card's body on the 3D view ("Show"): the halves of the
+ * mould as translucent blocks round it (the upper one blue, the lower one
+ * green; "Mould halves" unchecked: none), their interface along the parting
+ * surface; its faces in light grey, lighter where they have no draft, the
+ * undercuts in yellow; the parting line in red, thick, over everything; an
+ * arrow along the draw direction of the upper half. The other bodies faded.
  */
 function applyParting() {
   // Shown before: its colours to take back (else the view is left as it is).
@@ -2065,24 +2478,34 @@ function applyParting() {
   const p = partingOf();
   const i = partingBody();
   const field = p?.show && i >= 0 ? partingField(i) : null;
+  const card = $("parting-card");
+  card.dataset.overlay = card.dataset.undercuts = "";
   if (!field) {
     if (!shown) return;
     state.meshes.forEach((mesh) => (mesh.userData.parting = false));
     return applyThickness(); // its own colours back, or the thickness
   }
   const color = new THREE.Color();
+  let undercuts = 0;
+  // While drawing by hand on it: the colours of the drawing, its own line and points, no blocks.
+  const drawn = drawShown(i);
+  if (drawn) drawn.shownTint = drawn.stage === "halves" ? drawn.tint : null;
+  // The card's body unchecked in the list (hidden, with its overlays): the others in their own look, not faded.
+  const fade = state.meshes[i].visible;
   state.meshes.forEach((mesh, j) => {
-    setSeeThrough(mesh, false);
     mesh.userData.parting = j === i;
-    if (j !== i) return plainColors(mesh);
+    if (j !== i) return fade ? fadeBody(mesh) : (setSeeThrough(mesh, false), plainColors(mesh));
+    setSeeThrough(mesh, false);
     const geom = flatGeometry(mesh);
     const colors = geom.attributes.color.array;
     const triangles = colors.length / 12;
     for (let f = 0; f < triangles; f++) {
-      // Undercuts in red, unless moved to a half by hand.
-      const undercut = !(field.flags[f] & (REACH_UP | REACH_DOWN)) && !field.fixed?.[f];
-      color.copy(PARTING_COLORS[undercut ? SIDE_NONE : field.side[f]] ?? PARTING_COLORS[SIDE_NONE]);
-      if (field.flags[f] & ZERO_DRAFT && !undercut) color.lerp(WHITE, 0.45);
+      // Undercuts in yellow, unless moved to a half by hand (drawn by hand: those of its halves).
+      let undercut = field.undercut ? field.undercut[f] === 1 : !(field.flags[f] & (REACH_UP | REACH_DOWN)) && !field.fixed?.[f];
+      color.copy(undercut ? PARTING_UNDERCUT : PARTING_FACE);
+      if (field.flags[f] & ZERO_DRAFT && !undercut) color.lerp(WHITE, 0.5);
+      if (drawn) undercut = drawFaceColour(drawn, f, color);
+      if (undercut) undercuts++;
       for (let k = 0; k < 3; k++) {
         colors[12 * f + 4 * k] = color.r;
         colors[12 * f + 4 * k + 1] = color.g;
@@ -2090,25 +2513,39 @@ function applyParting() {
         colors[12 * f + 4 * k + 3] = 1;
       }
     }
+    if (drawn) drawSeamColours(drawn, i, colors);
     showFlat(mesh, geom);
   });
+  noteFaded();
   const mesh = state.meshes[i];
   const group = new THREE.Group();
-  const lineGeom = new THREE.BufferGeometry();
-  lineGeom.setAttribute("position", new THREE.BufferAttribute(field.segments, 3));
-  const lines = new THREE.LineSegments(lineGeom, new THREE.LineBasicMaterial({ color: PARTING_LINE, clippingPlanes: [sectionPlane] }));
-  lines.userData.own = true;
-  group.add(lines);
-  // The arrow above the body, along the direction.
+  const blocks = $("parting-blocks").checked && !drawn ? partingBlocks(i, field) : null;
+  if (blocks) group.add(...blockMeshes(blocks.lower, PARTING_LOWER, "lower"), ...blockMeshes(blocks.upper, PARTING_UPPER, "upper"));
+  if (field.segments.length && !drawn) {
+    // Width in pixels (the resolution: the size of the view, kept by resize()); drawn last, over the blocks.
+    const material = new LineMaterial({ color: PARTING_LINE, linewidth: PARTING_LINE_PX, transparent: true, clippingPlanes: [sectionPlane] });
+    material.resolution.set(viewport.clientWidth, viewport.clientHeight);
+    const line = new LineSegments2(new LineSegmentsGeometry().setPositions(field.segments), material);
+    line.renderOrder = ORDER_LINE;
+    line.userData.own = true;
+    group.add(line);
+    group.userData.line = line;
+  }
+  // The arrow above the body (above the upper block), along the direction.
   const { min, max, size } = state.result.bodies[i].bbox;
   const centre = new THREE.Vector3(...min.map((v, k) => (v + max[k]) / 2));
   const d = new THREE.Vector3(...field.direction);
   const reach = Math.max(...size);
   const along = Math.abs(d.x) * size[0] + Math.abs(d.y) * size[1] + Math.abs(d.z) * size[2];
   const length = 0.35 * reach;
-  group.add(new THREE.ArrowHelper(d, centre.clone().addScaledVector(d, along / 2 + 0.05 * reach), length, PARTING_ARROW, 0.3 * length, 0.15 * length));
+  // (While drawing: the rotation axis of the drawing instead.)
+  if (!drawn) group.add(new THREE.ArrowHelper(d, centre.clone().addScaledVector(d, along / 2 + (blocks?.margin ?? 0) + 0.05 * reach), length, PARTING_ARROW, 0.3 * length, 0.15 * length));
   mesh.add(group);
   mesh.userData.partingOverlay = group;
+  // What the view shows, for scripts and tests: "line", "lower", "upper"; the triangles in yellow.
+  card.dataset.overlay = group.children.flatMap((o) => (o.isLineSegments2 ? ["line"] : o.isMesh && o.userData.half ? [o.userData.half] : [])).join(" ");
+  card.dataset.undercuts = String(undercuts);
+  applyDrawOverlay(); // the drawing by hand ("drawing", "axis")
 }
 
 /** The parting line no longer shown (the thickness is coloured instead). */
@@ -2121,11 +2558,31 @@ function partingOff() {
     removePartingOverlay(mesh);
     mesh.userData.parting = false; // coloured by the thickness next
   });
+  const card = $("parting-card");
+  card.dataset.overlay = card.dataset.undercuts = "";
   renderParting();
 }
 
-/** A click on the 3D view while picking a face or reassigning faces: handled here (true), the selection unchanged. */
-function partingClick(hits) {
+/**
+ * The point clicked on body i: the first of the ray on it, through the
+ * bodies faded in front of it (another body, two versions of a part one over
+ * the other); null when the ray does not meet it, or meets first a body that
+ * is not faded (opaque: the face clicked is that body's).
+ */
+function cardHit(hits, i) {
+  for (const h of hits) {
+    if (h.object.userData.index === i) return h;
+    if (!h.object.userData.faded) return null;
+  }
+  return null;
+}
+
+/**
+ * A click on the 3D view while picking a face, reassigning faces or drawing
+ * by hand (`at`: where, in client pixels): handled here (true), the
+ * selection unchanged.
+ */
+function partingClick(hits, at = null) {
   const p = partingOf();
   if (!p?.mode) return false;
   const i = partingBody();
@@ -2137,9 +2594,11 @@ function partingClick(hits) {
     renderParting();
     return false;
   }
-  const hit = hits[0];
-  if (!hit) return true;
-  if (hit.object.userData.index !== i) {
+  const drawing = drawActive();
+  if (drawing) return drawClick(drawing, hits, at);
+  if (!hits.length) return true;
+  const hit = cardHit(hits, i);
+  if (!hit) {
     p.message = t("parting.otherBody");
     renderParting();
     return true;
@@ -2152,37 +2611,50 @@ function partingClick(hits) {
   return true;
 }
 
-/** Draw direction from a face picked on the 3D view: its outward normal (that face upwards). */
-async function pickPartingFace(i, f) {
-  const r = state.result;
-  const { positions: P, indices: I } = bodyArrays(i);
+/** Normal (not unit) of triangle t of a mesh (positions P, indices I), by the winding of its corners. */
+function triangleNormal(P, I, t) {
+  const a = 3 * I[3 * t], b = 3 * I[3 * t + 1], c = 3 * I[3 * t + 2];
+  const u = [P[b] - P[a], P[b + 1] - P[a + 1], P[b + 2] - P[a + 2]];
+  const v = [P[c] - P[a], P[c + 1] - P[a + 1], P[c + 2] - P[a + 2]];
+  return [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+}
+
+/** 1, or -1 when the triangles of body i turn inwards (by the sign of its enclosed volume): computed once into partingGeometry(i).outward. */
+function partingOutward(i) {
   const g = partingGeometry(i);
-  // The normal of its B-rep face (or region) when planar, else of the triangle; outwards.
-  const normal = (t) => {
-    const a = 3 * I[3 * t], b = 3 * I[3 * t + 1], c = 3 * I[3 * t + 2];
-    const u = [P[b] - P[a], P[b + 1] - P[a + 1], P[b + 2] - P[a + 2]];
-    const v = [P[c] - P[a], P[c + 1] - P[a + 1], P[c + 2] - P[a + 2]];
-    return [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
-  };
   if (g.outward == null) {
+    const { positions: P, indices: I } = bodyArrays(i);
     let volume = 0;
     for (let t = 0; t < I.length / 3; t++) {
-      const n = normal(t);
+      const n = triangleNormal(P, I, t);
       volume += P[3 * I[3 * t]] * n[0] + P[3 * I[3 * t] + 1] * n[1] + P[3 * I[3 * t] + 2] * n[2];
     }
     g.outward = volume < 0 ? -1 : 1;
   }
+  return g.outward;
+}
+
+/** The outward normal (not unit) of the face of triangle f of body i: its B-rep face (or region) when planar, else the triangle. */
+function faceNormal(i, f) {
+  const { positions: P, indices: I } = bodyArrays(i);
+  const g = partingGeometry(i);
+  const outward = partingOutward(i);
   const sum = [0, 0, 0];
   let area = 0;
   for (let t = 0; t < g.region.length; t++) {
     if (g.region[t] !== g.region[f]) continue;
-    const n = normal(t);
+    const n = triangleNormal(P, I, t);
     for (let k = 0; k < 3; k++) sum[k] += n[k];
     area += Math.hypot(...n);
   }
   const planar = area > 0 && Math.hypot(...sum) > 0.999 * area;
-  const n = (planar ? sum : normal(f)).map((x) => x * g.outward);
-  const d = snapDirection(n);
+  return (planar ? sum : triangleNormal(P, I, f)).map((x) => x * outward);
+}
+
+/** Draw direction from a face picked on the 3D view: its outward normal (that face upwards). */
+async function pickPartingFace(i, f) {
+  const r = state.result;
+  const d = snapDirection(faceNormal(i, f));
   if (!d) return;
   const p = partingOf(r);
   const seq = ++p.seq;
@@ -2236,6 +2708,7 @@ function renderParting() {
   card.hidden = !r;
   // A crosshair while placing on the 3D view (here, or a riser or the ingate).
   renderer.domElement.style.cursor = feedingOf(r)?.mode ? "crosshair" : "";
+  syncDrawView(partingOf(r), partingBody()); // drawing by hand: left when its body is no longer the card's (or no model); the view's controls
   if (!r) return;
   const p = partingOf(r);
   const i = partingBody();
@@ -2254,6 +2727,7 @@ function renderParting() {
   $("parting-retry").hidden = !(p.error && !p.pending);
   $("parting-show").checked = p.show && !!field;
   $("parting-show").disabled = !field;
+  $("parting-blocks").disabled = !field;
   $("parting-main").hidden = !field;
   if (!field) return;
   if (p.mode) renderer.domElement.style.cursor = "crosshair";
@@ -2262,7 +2736,7 @@ function renderParting() {
   const res = p.results[i];
   $("parting-axis").textContent = s.axis;
   const origin = $("parting-origin");
-  origin.textContent = t(field.manual ? "parting.manual" : "parting.proposed");
+  origin.textContent = t(field.drawn ? drawnOrigin(p, i, field) : field.manual ? "parting.manual" : "parting.proposed");
   origin.classList.toggle("manual", field.manual);
   const draft = s.draft_angle_deg ?? res.proposal.draft_angle_deg;
   const rows = [
@@ -2273,6 +2747,7 @@ function renderParting() {
     [t("parting.height"), `${fmtNum(s.mould_height_mm, 2)} mm`],
     [t("parting.projected"), fmtArea(s.projected_area_mm2)],
     ...(Object.keys(field.overrides).length ? [[t("parting.reassigned"), String(Object.keys(field.overrides).length)]] : []),
+    ...(field.drawn ? [[t("parting.draw.stats"), drawnStats(field.drawn)]] : []),
   ];
   setHtml($("parting-stats"), rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join(""));
   const sampled = res.proposal.sampled;
@@ -2295,11 +2770,12 @@ function renderParting() {
 
   $("parting-pick").classList.toggle("active", p.mode === "pick");
   $("parting-assign").classList.toggle("active", p.mode === "assign");
-  const hint = p.message ?? (p.mode === "pick" ? t("parting.pick.hint") : p.mode === "assign" ? t("parting.assign.hint", { target: $("parting-target").selectedOptions[0]?.textContent ?? "" }) : "");
+  const hint = p.message ?? (p.mode === "draw" ? drawHint(i) : p.mode === "pick" ? t("parting.pick.hint") : p.mode === "assign" ? t("parting.assign.hint", { target: $("parting-target").selectedOptions[0]?.textContent ?? "" }) : "");
   $("parting-hint").hidden = !hint;
   $("parting-hint").textContent = hint;
   $("parting-reset").disabled = !field.manual;
-  $("parting-legend").innerHTML = t("parting.legend");
+  $("parting-legend").innerHTML = t(p.mode === "draw" ? "parting.draw.legend" : "parting.legend");
+  renderDrawPanel(p, i, field, hint); // the drawing by hand: its panel, its controls on the view, the other ways locked
 }
 
 $("parting-show").addEventListener("change", (e) => {
@@ -2314,6 +2790,10 @@ $("parting-show").addEventListener("change", (e) => {
   applyParting();
   renderParting();
 });
+// The halves of the mould shown or not (the line and the colours stay); for every part of this page.
+$("parting-blocks").addEventListener("change", () => {
+  if (partingShown()) applyParting();
+});
 $("parting-retry").addEventListener("click", () => {
   const p = partingOf();
   if (!p) return;
@@ -2325,8 +2805,8 @@ $("parting-candidates").addEventListener("click", async (e) => {
   const row = e.target.closest("[data-candidate]");
   const i = partingBody();
   const p = partingOf();
-  // Not taken: the radio clicked is not checked (the browser checks it before this runs).
-  if (!row || !p?.results?.[i] || p.busy) {
+  // Not taken: the radio clicked is not checked (the browser checks it before this runs). Not while drawing by hand.
+  if (!row || !p?.results?.[i] || p.busy || p.mode === "draw") {
     e.preventDefault();
     return;
   }
@@ -2350,10 +2830,11 @@ $("parting-candidates").addEventListener("click", async (e) => {
   htmlShown.delete($("parting-candidates").tBodies[0]);
   renderParting();
 });
-/** Turn a mode of the 3D view on or off; reassigning faces shows the halves. */
+/** Turn a mode of the 3D view on or off; reassigning faces and drawing by hand show the halves. */
 function setPartingMode(mode) {
   const p = partingOf();
   if (!p) return;
+  const was = p.mode;
   p.mode = p.mode === mode ? null : mode;
   p.message = null;
   const f = feedingOf();
@@ -2361,15 +2842,18 @@ function setPartingMode(mode) {
     f.mode = null;
     renderFeeding();
   }
-  if (p.mode === "assign" && !p.show) {
+  if ((p.mode === "assign" || p.mode === "draw") && !p.show) {
     p.show = true;
     if (thick.colors || thick.highlight) {
       thick.colors = thick.highlight = false;
       renderThickness();
     }
-    applyParting();
+    if (p.mode === "assign") applyParting();
   }
+  // Drawing by hand: entered (its plane, its view, its colours), or left (the definition shown as usual).
+  if (p.mode === "draw") return enterDrawing();
   renderParting();
+  if (was === "draw") applyParting();
 }
 $("parting-pick").addEventListener("click", () => setPartingMode("pick"));
 $("parting-assign").addEventListener("click", () => setPartingMode("assign"));
@@ -2401,6 +2885,2321 @@ $("parting-vector").addEventListener("keydown", (e) => {
 $("parting-reset").addEventListener("click", () => {
   const i = partingBody();
   if (i >= 0) resetParting(i);
+});
+
+// ---- drawing by hand
+
+// The parting line drawn by hand ("Dessin manuel", engine/parting-draw.js).
+// A plane is chosen (X, Y, Z, a normal typed, or a face clicked): its normal
+// through the centre of the body is the rotation axis, and the draw direction
+// of the line drawn (+axis: the upper half). The two arrows of the 3D view
+// turn the part about that axis by 1/4 to 1/32 of a turn (the camera turns
+// the other way: the model, its overlays and the section stay in their
+// frame) without leaving the drawing. Points clicked on the part are joined
+// by lines laid on its surface: "droit" at the height of the points round the
+// part, "courbe" an arc of a radius typed in, its centre movable. The loop
+// closes on point 1 (or "Fermer la boucle", Enter) and the placing stops; the
+// parts of the surface it splits go to the chapes by a click on each part
+// (never by face), and the definition is applied as any other one: the red
+// line, the undercuts, the blocks, the risers placed again. A drawing not
+// applied (a draft) and an applied one are kept per part in this browser.
+
+const DRAW_SELECTED = 0xffd23f;
+const DRAW_INACTIVE = 0x8a8f96;
+const DRAW_FAILED = 0xf08a24;
+const DRAW_LINE_PX = 4;
+const DRAW_MARKER_PX = 10;
+const DRAW_BIG_PX = 14;
+const DRAW_PICK_PX = 10; // a point within this many pixels of the pointer: selected, or dragged
+const DRAW_CLOSE_PX = 12; // point 1 within this many pixels: the loop closes
+const DRAW_MOVE_PX = 4; // a press that moves less is a click
+const DRAW_HISTORY = 100;
+const DRAW_CACHE = 500;
+const DRAW_TILT = (20 * Math.PI) / 180; // the side view: the camera this much above the plane
+const TURN_KEY = "reader3d.turnStep";
+const TURN_STEPS = [4, 8, 16, 32];
+const TURN_MS = 250;
+const VIEW_MS = 300;
+const HOVER_SLOW_MS = 25; // a hover slower than this: only once the pointer rests
+const HOVER_REST_MS = 120;
+const DRAFT_MS = 500;
+const AXES = { X: [1, 0, 0], Y: [0, 1, 0], Z: [0, 0, 1] };
+const UPPER_TINT = new THREE.Color(PARTING_UPPER);
+const LOWER_TINT = new THREE.Color(PARTING_LOWER);
+
+const reducedMotion = () => !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+const easeInOutCubic = (s) => (s < 0.5 ? 4 * s * s * s : 1 - (-2 * s + 2) ** 3 / 2);
+const vec3 = (a) => new THREE.Vector3(a[0], a[1], a[2]);
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const dist3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+const round = (v, digits) => Math.round(v * 10 ** digits) / 10 ** digits + 0;
+
+/** The step of a click on an arrow (1/step of a turn), kept in this browser: 4, 8, 16 or 32. */
+function loadTurnStep() {
+  try {
+    const step = Number(localStorage.getItem(TURN_KEY));
+    return TURN_STEPS.includes(step) ? step : 4;
+  } catch {
+    return 4;
+  }
+}
+
+// The view while drawing: {active (a drawing shown), step, pointer (the last
+// position over the view), hoverFrame and hoverTimer (a hover pending), slow
+// (hover only after a rest), drag (a point dragged), pressed (a pointer
+// button down), draft (its saving pending), labels (the numbers of the
+// points: {p, t, el})}.
+const drawUi = { active: false, step: loadTurnStep(), pointer: null, hoverFrame: 0, hoverTimer: 0, slow: false, drag: null, pressed: false, draft: null, labels: [] };
+
+// The turn of the view about the axis, from the pose `base` (the camera's
+// position, up and target, the key light): k thirty-seconds of a turn of the
+// part (the camera turns the other way), `shown` where the animation is (from
+// `from` at t0). view: the side view animating ({from, to, t0, d}).
+const turn = { base: null, axis: null, centre: null, k: 0, shown: 0, from: 0, t0: 0, running: false, lastPose: null, view: null };
+
+// ---- the drawing
+
+/** The drawing drawn on the 3D view: {p, i, d}, or null. */
+function drawActive() {
+  const p = partingOf();
+  if (p?.mode !== "draw") return null;
+  const i = p.drawBody;
+  const d = p.draw.get(i);
+  return d && !d.dormant && i === partingBody() ? { p, i, d } : null;
+}
+
+/** The drawing shown on body i (its colours on the view), or null. */
+function drawShown(i) {
+  const active = drawActive();
+  return active && active.i === i ? active.d : null;
+}
+
+/** What the drawing needs of body i (drawMesh: welded vertices, neighbours, normals), built once. */
+function drawGeometry(i) {
+  const g = partingGeometry(i);
+  g.draw ??= drawMesh(g.line, { outward: partingOutward(i) });
+  return g.draw;
+}
+
+const drawPoints = (d) => (d.dormant ? d.points : d.loops.reduce((n, loop) => n + loop.points.length, 0));
+const allClosed = (d) => d.loops.length > 0 && d.loops.every((loop) => loop.closed);
+const stageOf = (d) => (allClosed(d) ? "halves" : "points");
+const segCount = (loop) => (loop.closed ? loop.points.length : Math.max(0, loop.points.length - 1));
+const segName = (d, L, K) => segmentName(d.loops, L, K);
+const laidOk = (d) => d.loops.every((loop) => loop.paths.length === segCount(loop) && loop.paths.every((path) => path?.status === "ok"));
+
+/** The loop being drawn (open), or null. */
+function openLoop(d) {
+  const loop = d.loops[d.current];
+  return loop && !loop.closed ? loop : null;
+}
+
+/** The number of point k of loop L, counted on from one loop to the next. */
+function pointNumber(d, L, k) {
+  let n = 0;
+  for (let j = 0; j < L; j++) n += d.loops[j].points.length;
+  return n + k + 1;
+}
+
+/** The components of a direction as typed ("0 0 1", decimal comma in French). */
+const axisText = (v) => v.map((x) => fmtNum(Math.abs(x) < 5e-7 ? 0 : x, 3)).join(" ");
+
+/** The plane of a new drawing from a direction: X, Y or Z when along one (its sense kept), else its normal typed. */
+function defaultPlane(direction) {
+  const axis = snapDirection(direction) ?? [0, 0, 1];
+  const k = axis.findIndex((x) => Math.abs(x) === 1);
+  return { plane: k >= 0 ? "XYZ"[k] : "vector", axis, vector: axisText(axis) };
+}
+
+/**
+ * A new drawing on body i, its axis along `direction`: {plane, vector (the
+ * normal typed), axis, centre (of the body's box), nt, stage ("axis-face" |
+ * "points" | "halves"), sub (null | {kind: "centre", loop, seg}), loops
+ * [{points (SurfacePoints), segs (SegSpecs), paths (Paths laid), closed}],
+ * current (the loop drawn), seeds [{p, t, side}], swap, target (the chape
+ * of the next part clicked), selected ({loop, k}), history and future
+ * (snapshots: undo, redo), result (drawnParting of the points as they are),
+ * tint (the last one applied: the colours of the halves), base (the
+ * classification of the axis), inputs (per segment, a radius or a centre
+ * typed in and not applied), messages}.
+ */
+function newDrawing(i, direction) {
+  const { min, max } = state.result.bodies[i].bbox;
+  return {
+    v: 1,
+    ...defaultPlane(direction),
+    centre: min.map((v, k) => (v + max[k]) / 2),
+    nt: drawGeometry(i).nt,
+    stage: "points",
+    sub: null,
+    prev: null,
+    loops: [],
+    current: 0,
+    seeds: [],
+    swap: false,
+    target: SIDE_UPPER,
+    selected: null,
+    hoverSeg: null,
+    closeHover: false,
+    history: [],
+    future: [],
+    result: null,
+    tint: null,
+    shownTint: null,
+    base: null,
+    baseFor: null,
+    basePromise: null,
+    inputs: new Map(),
+    alignFor: null,
+  };
+}
+
+/** A drawing read back (reviveDrawing) as one to go on with, its segments not laid yet. */
+function drawingFrom(i, revived) {
+  const d = newDrawing(i, revived.axis);
+  d.plane = revived.plane;
+  d.axis = snapDirection(revived.axis) ?? d.axis;
+  d.vector = axisText(d.axis);
+  d.loops = revived.loops.map((loop) => ({ points: loop.points, segs: loop.segs, paths: loop.segs.map(() => null), closed: loop.closed }));
+  d.seeds = revived.seeds;
+  d.swap = revived.swap;
+  const open = d.loops.findIndex((loop) => !loop.closed);
+  d.current = open >= 0 ? open : Math.max(0, d.loops.length - 1);
+  d.stage = stageOf(d);
+  return d;
+}
+
+/** A draft kept (dormant: read, not yet on the mesh) made a drawing to go on with, its segments laid. */
+function reviveDormant(i, parsed) {
+  const dm = drawGeometry(i);
+  const d = drawingFrom(i, reviveDrawing(dm, parsed));
+  layAll(dm, d);
+  partingOf().draw.set(i, d);
+  return d;
+}
+
+/** The drafts kept for the part (drawings not applied): taken back, dormant until drawn on. */
+function restoreDrafts(p, drafts) {
+  for (const [key, json] of Object.entries(drafts ?? {})) {
+    const i = Number(key);
+    if (!p.results?.[i] || p.draw.has(i)) continue;
+    const parsed = parseDrawing(json);
+    if (parsed) p.draw.set(i, { dormant: parsed, points: parsed.loops.reduce((n, loop) => n + loop.points.length, 0) });
+  }
+}
+
+/**
+ * The drawn definition kept for body i put back: its points on the mesh as
+ * it is now, its segments laid, its halves with its seeds. Not rebuilt (a
+ * segment not laid, the loops no longer splitting the part): its direction
+ * only, the drawing kept to fix (a draft). True: done.
+ */
+function restoreDrawing(i, def, base) {
+  const p = partingOf();
+  const parsed = parseDrawing(def.drawing);
+  const fallback = () => {
+    setPartingDefinition(i, { base, source: "vector" });
+    p.message = parsed ? t("parting.draw.notRestored") : null;
+    renderParting();
+    return true;
+  };
+  if (!parsed) return fallback();
+  const dm = drawGeometry(i);
+  const d = drawingFrom(i, reviveDrawing(dm, parsed));
+  d.base = base;
+  d.baseFor = d.axis.join(",");
+  d.basePromise = Promise.resolve(base);
+  layAll(dm, d);
+  // A draft kept beside it: the newer drawing, the one to go on with.
+  const draft = p.draw.get(i);
+  if (!draft) p.draw.set(i, d);
+  const result = allClosed(d) && laidOk(d)
+    ? drawnParting(dm, engineDrawing(d), { axis: d.axis, flags: base.flags, height: base.summary.mould_height_mm, bodyCentre: d.centre })
+    : null;
+  if (!result?.ok) {
+    if (!draft) saveDraftNow(i);
+    return fallback();
+  }
+  d.result = d.tint = result;
+  setPartingDefinition(i, { base, source: "drawn", drawn: { drawing: d, result } });
+  return true;
+}
+
+/** The drawing as drawnParting takes it (its segments laid). */
+function engineDrawing(d) {
+  return { loops: d.loops.map(({ points, segs, paths, closed }) => ({ points, segs, paths, closed })), seeds: d.seeds, swap: d.swap };
+}
+
+/** What undo and redo go back to: the plane, the axis, the points, the segments, the seeds. */
+function drawSnapshot(d) {
+  return JSON.stringify({
+    plane: d.plane, vector: d.vector, axis: d.axis,
+    loops: d.loops.map((loop) => ({ points: loop.points, segs: loop.segs, closed: loop.closed })),
+    seeds: d.seeds, swap: d.swap, current: d.current,
+  });
+}
+
+/** Before a change: the drawing as it was, to undo (100 at most); nothing to redo. */
+function pushHistory(d, snapshot = drawSnapshot(d)) {
+  d.history.push(snapshot);
+  if (d.history.length > DRAW_HISTORY) d.history.shift();
+  d.future = [];
+}
+
+/** The drawing as a snapshot has it (undo, redo, a drag cancelled): its paths from the cache. */
+function restoreSnapshot(i, d, snapshot) {
+  const s = JSON.parse(snapshot);
+  const axisChanged = !sameDirection(s.axis, d.axis);
+  Object.assign(d, { plane: s.plane, vector: s.vector, axis: s.axis, seeds: s.seeds, swap: s.swap, current: s.current });
+  d.loops = s.loops.map((loop) => ({ points: loop.points, segs: loop.segs, paths: loop.segs.map(() => null), closed: loop.closed }));
+  d.selected = null;
+  d.sub = null;
+  d.result = null;
+  d.inputs.clear();
+  d.stage = stageOf(d);
+  layAll(drawGeometry(i), d);
+  if (axisChanged) {
+    finishTurn();
+    turn.base = null;
+    drawBase(i, d).catch(() => {});
+    drawingView(d);
+  }
+  changed(i, d, { apply: true, recolour: axisChanged });
+}
+
+function undoDrawing() {
+  const active = drawActive();
+  if (!active?.d.history.length || drawUi.drag) return;
+  const { p, i, d } = active;
+  p.message = null;
+  d.future.push(drawSnapshot(d));
+  restoreSnapshot(i, d, d.history.pop());
+}
+
+function redoDrawing() {
+  const active = drawActive();
+  if (!active?.d.future.length || drawUi.drag) return;
+  const { p, i, d } = active;
+  p.message = null;
+  d.history.push(drawSnapshot(d));
+  restoreSnapshot(i, d, d.future.pop());
+}
+
+// ---- segments
+
+const vecKey = (v) => (v ? v.join(",") : "");
+
+/** What a path laid depends on: its ends, its spec, the axis. */
+function layKey(A, B, spec, axis) {
+  const s = spec.kind === "arc" ? `a${spec.radius}|${vecKey(spec.toward)}` : `s${spec.via}|${vecKey(spec.m)}|${spec.method ?? ""}`;
+  return `${vecKey(A.p)}|${A.t}|${vecKey(B.p)}|${B.t}|${s}|${vecKey(axis)}`;
+}
+
+/** A path kept for the body (the latest 500): undo and redo lay nothing again. */
+function cachePath(dm, key, path) {
+  dm.paths ??= new Map();
+  dm.paths.delete(key);
+  dm.paths.set(key, path);
+  if (dm.paths.size > DRAW_CACHE) dm.paths.delete(dm.paths.keys().next().value);
+}
+
+/**
+ * Segment K of loop L laid on the surface (from the cache when it was laid
+ * already): an arc, or a straight line whose plane and sense found are kept
+ * in its spec, so that it is laid again the same whatever the view.
+ */
+function laySegment(dm, d, L, K) {
+  const loop = d.loops[L];
+  const n = loop.points.length;
+  const A = loop.points[K], B = loop.points[(K + 1) % n];
+  const spec = loop.segs[K];
+  const key = layKey(A, B, spec, d.axis);
+  let path = dm.paths?.get(key);
+  if (!path) {
+    path = spec.kind === "arc" ? layArc(dm, A, B, spec) : layStraight(dm, A, B, { axis: d.axis, prefer: camera.position.toArray(), spec });
+  }
+  cachePath(dm, key, path);
+  if (spec.kind !== "arc" && path.status === "ok") {
+    if (path.method === "edges") {
+      spec.method = "edges";
+      spec.m = null;
+    } else {
+      delete spec.method;
+      spec.via = path.via === -1 ? -1 : 1;
+      spec.m = path.m;
+    }
+    cachePath(dm, layKey(A, B, spec, d.axis), path);
+  }
+  loop.paths[K] = path;
+  return path;
+}
+
+/** Every segment not laid yet, laid. */
+function layAll(dm, d) {
+  d.loops.forEach((loop, L) => {
+    loop.paths.length = segCount(loop);
+    for (let K = 0; K < loop.paths.length; K++) if (!loop.paths[K]) laySegment(dm, d, L, K);
+  });
+}
+
+const straightSpec = () => ({ kind: "straight", via: 1, m: null });
+
+/** A segment whose ends moved: a straight one finds its plane again; an arc keeps its radius and side (straight when the radius is now too small). */
+function respec(d, L, K) {
+  const loop = d.loops[L];
+  const spec = loop.segs[K];
+  loop.paths[K] = null;
+  if (spec.kind !== "arc") {
+    loop.segs[K] = straightSpec();
+    return null;
+  }
+  const A = loop.points[K], B = loop.points[(K + 1) % loop.points.length];
+  if (dist3(A.p, B.p) / 2 > spec.radius * (1 + 1e-9)) {
+    loop.segs[K] = straightSpec();
+    return t("parting.draw.toStraight", { seg: segName(d, L, K) });
+  }
+  return null;
+}
+
+/** The segments of loop L ending or starting at point k. */
+function segmentsAt(loop, k) {
+  const n = loop.points.length;
+  const out = [];
+  if (loop.closed) out.push((k - 1 + n) % n, k);
+  else {
+    if (k > 0) out.push(k - 1);
+    if (k < n - 1) out.push(k);
+  }
+  return [...new Set(out)].filter((K) => K >= 0 && K < segCount(loop));
+}
+
+/** The message of a segment not laid. */
+function segmentError(d, L, K, path) {
+  const loop = d.loops[L];
+  const name = segName(d, L, K);
+  if (path.error === "radius_too_small") {
+    const chord = dist3(loop.points[K].p, loop.points[(K + 1) % loop.points.length].p);
+    return t("parting.draw.radiusSmall", { min: fmtNum(chord / 2, 2), seg: name, chord: fmtNum(chord, 2) });
+  }
+  return t(path.error === "arc_off_surface" ? "parting.draw.arcOff" : "parting.draw.failed", { seg: name });
+}
+
+/**
+ * Whether a segment is on the parting line: one of its pieces (along the
+ * edges: most of its length) between parts given to different chapes (or a
+ * part not known), as drawnParting tells its pieces apart.
+ */
+function segmentActive(result, L, K) {
+  const path = result.paths[L]?.[K];
+  const pr = result.split.pieceRegions[L]?.[K];
+  if (!path || !pr) return true; // not in that result (a segment added since)
+  const side = result.regionSide;
+  const x = path.xyz;
+  let apart = 0, together = 0, unknown = false, any = false;
+  for (let j = 0; j < path.tri.length; j++) {
+    const len = Math.hypot(x[3 * j + 3] - x[3 * j], x[3 * j + 4] - x[3 * j + 1], x[3 * j + 5] - x[3 * j + 2]);
+    if (!len) continue;
+    const r1 = pr[2 * j], r2 = pr[2 * j + 1];
+    if (r1 < 0 || r2 < 0) unknown = true;
+    else if (side[r1] !== side[r2]) {
+      apart += len;
+      any = true;
+    } else together += len;
+  }
+  return path.method === "edges" ? unknown || (apart + together > 0 && apart >= together) : unknown || any;
+}
+
+// ---- applying
+
+/** The classification of the drawing's axis (in the worker; the proposal's at once): its flags, its height, once per axis. */
+function drawBase(i, d) {
+  const key = d.axis.join(",");
+  if (d.baseFor !== key) {
+    const r = state.result;
+    d.baseFor = key;
+    d.base = null;
+    d.basePromise = partingDirection(i, d.axis).then((base) => {
+      if (d.baseFor === key) {
+        d.base = base;
+        // The core zones of that axis in yellow (one colouring).
+        if (r === state.result && drawShown(i) === d) applyParting();
+      }
+      return base;
+    });
+    d.basePromise.catch((err) => {
+      if (d.baseFor === key) d.baseFor = null;
+      if (!err.cancelled) showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
+    });
+  }
+  return d.basePromise;
+}
+
+/**
+ * The drawing applied once every loop is closed and every segment laid: its
+ * halves (drawnParting), then the definition of the body (red line, yellow
+ * undercuts, blocks, risers placed again). The loops not splitting the part:
+ * said, nothing applied (the definition before stays).
+ */
+async function applyDrawing(i, d) {
+  const r = state.result;
+  const p = partingOf(r);
+  if (!allClosed(d)) return;
+  if (!laidOk(d)) {
+    d.result = null;
+    renderParting();
+    return;
+  }
+  const seq = ++p.seq;
+  let base;
+  try {
+    base = await drawBase(i, d);
+  } catch {
+    return;
+  }
+  if (r !== state.result || seq !== p.seq || p.draw.get(i) !== d || !allClosed(d) || !laidOk(d)) return;
+  const result = drawnParting(drawGeometry(i), engineDrawing(d), {
+    axis: d.axis, flags: base.flags, height: base.summary.mould_height_mm, bodyCentre: d.centre, prefer: camera.position.toArray(),
+  });
+  d.result = result;
+  if (!result.ok) {
+    d.tint = null;
+    if (d.shownTint) applyParting();
+    else applyDrawOverlay();
+    renderParting();
+    return;
+  }
+  d.tint = result;
+  setPartingDefinition(i, { base, source: "drawn", drawn: { drawing: d, result } });
+  saveDraftNow(i); // applied as it is: no draft (at once: a reload right after finds none)
+}
+
+/**
+ * The definition of body i drawn by hand: {field (p.current), def (kept in
+ * this browser)}. Its side has the undercuts as SIDE_NONE, as the other
+ * definitions have them: the ingate is placed away from them.
+ */
+function drawnDefinition(i, base, { drawing: d, result }) {
+  const saved = serializeDrawing(d, d.nt);
+  const info = drawnInfo(d, result);
+  return {
+    field: {
+      manual: true, source: "drawn", overrides: {}, candidate: null, base, direction: base.direction,
+      summary: { ...base.summary, undercut_area_mm2: result.figures.undercut_area_mm2, undercut_share: result.figures.undercut_share, parting: lineSummary(result.shape) },
+      side: result.side.map((s, f) => (result.undercut[f] ? SIDE_NONE : s)),
+      flags: base.flags, plane: null, segments: result.segments, fixed: null, undercut: result.undercut,
+      drawing: saved, drawn: info, drawSnap: drawSnapshot(d),
+    },
+    def: { direction: base.direction, source: "drawn", candidate: null, overrides: {}, faces: null, drawing: saved },
+  };
+}
+
+/** The drawing as the exports give it: its loops, points, axis, segments (each on the parting line or not) and parts. */
+function drawnInfo(d, result) {
+  const segments = [];
+  d.loops.forEach((loop, L) => loop.paths.forEach((path, K) => {
+    const spec = loop.segs[K];
+    const arc = spec.kind === "arc" ? arcGeometry(loop.points[K].p, loop.points[(K + 1) % loop.points.length].p, spec) : null;
+    segments.push({
+      name: segName(d, L, K),
+      type: arc ? "curved" : "straight",
+      method: path.method,
+      length_mm: round(path.length, 1),
+      ...(arc && !arc.error ? { radius_mm: round(arc.radius, 2), centre_mm: arc.centre.map((x) => round(x, 2)) } : {}),
+      on_parting_line: segmentActive(result, L, K),
+    });
+  }));
+  const f = result.figures;
+  return {
+    loops: d.loops.length,
+    points: drawPoints(d),
+    rotation_axis: d.axis.map((x) => round(x, 6)),
+    segments,
+    parts: f.parts,
+    upper_parts: f.upper_parts,
+    lower_parts: f.lower_parts,
+    seam_area_mm2: f.seam_area_mm2,
+    core_excluded: f.core_excluded,
+  };
+}
+
+/** The row "Dessin manuel" of the card. */
+function drawnStats(info) {
+  return t("parting.draw.stats.value", {
+    points: info.points, segments: info.segments.length, arcs: info.segments.filter((s) => s.type === "curved").length, loops: info.loops, parts: info.parts,
+  });
+}
+
+/** The drawing of body i not the one applied (changed since, or never applied). */
+function drawEdited(p, i) {
+  const d = p.draw.get(i);
+  if (!d || !drawPoints(d)) return false;
+  const cur = p.current.get(i);
+  return d.dormant || cur?.source !== "drawn" || cur.drawSnap !== drawSnapshot(d);
+}
+
+/** The origin of a drawn definition: "dessin manuel", or "(modification en cours)" while its drawing differs. */
+const drawnOrigin = (p, i) => (drawEdited(p, i) ? "parting.drawn.editing" : "parting.drawn");
+
+/** After a change of the drawing: its overlay (its colours when they change), the card, its draft; applied again when asked and closed. */
+function changed(i, d, { apply = false, recolour = false } = {}) {
+  const tint = d.stage === "halves" ? d.tint : null;
+  if (recolour || tint !== d.shownTint) applyParting();
+  else applyDrawOverlay();
+  renderParting();
+  scheduleDraft(i);
+  if (apply && allClosed(d)) applyDrawing(i, d);
+}
+
+// ---- kept in this browser
+
+/** The drawing of body i kept as a draft in a while (or forgotten: applied as it is, or cleared). */
+function scheduleDraft(i) {
+  const r = state.result;
+  const partId = partIdOf(r);
+  if (!partId) return;
+  const key = `${partId}|${i}`;
+  if (drawUi.draft?.key !== key) flushDraft(); // another body's, saved first
+  if (drawUi.draft) clearTimeout(drawUi.draft.timer);
+  const write = () => {
+    drawUi.draft = null;
+    writeDraft(r, partId, i);
+  };
+  drawUi.draft = { key, timer: setTimeout(write, DRAFT_MS), write };
+}
+
+/** The draft pending saved now. */
+function flushDraft() {
+  const pending = drawUi.draft;
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pending.write();
+}
+
+/** The draft of body i saved now (or forgotten). */
+function saveDraftNow(i) {
+  scheduleDraft(i);
+  flushDraft();
+}
+
+// The page left (reloaded, closed): the draft pending saved first.
+window.addEventListener("pagehide", flushDraft);
+
+/** Body i's definition replaced by another one (a candidate, a face, a direction, the proposal): its drawing by hand kept as a draft. */
+function keepDrawing(i) {
+  const d = partingOf()?.draw.get(i);
+  if (d && !d.dormant && drawPoints(d)) saveDraftNow(i);
+}
+
+function writeDraft(r, partId, i) {
+  const p = partingOf(r);
+  const d = p.draw.get(i);
+  if (d?.dormant) return; // kept as it was read
+  const keep = d && drawPoints(d) > 0 && drawEdited(p, i);
+  savePartingDef(partId, i, keep ? serializeDrawing(d, d.nt) : null, { draft: true });
+}
+
+// ---- entering, leaving
+
+/** Drawing by hand on the card's body: its drawing taken back (else a new one, along the direction shown), the side view. */
+function enterDrawing() {
+  const p = partingOf();
+  const i = partingBody();
+  const field = i >= 0 ? partingField(i) : null;
+  if (!field) {
+    p.mode = null;
+    return renderParting();
+  }
+  let d = p.draw.get(i);
+  if (d?.dormant) d = reviveDormant(i, d.dormant);
+  if (!d) {
+    d = newDrawing(i, field.direction);
+    p.draw.set(i, d);
+  }
+  p.drawBody = i;
+  d.sub = null;
+  d.prev = null;
+  d.closeHover = false;
+  d.stage = stageOf(d);
+  drawBase(i, d).catch(() => {});
+  renderParting(); // the view's controls on
+  drawingView(d);
+  applyParting();
+  resumeHalves(i, d);
+}
+
+/**
+ * A closed drawing taken back without its halves (a draft, a drawing not
+ * restored): its halves once its axis is classified, shown (or why there
+ * are none), not applied: the definition stays until the drawing changes.
+ */
+function resumeHalves(i, d) {
+  if (d.result || !allClosed(d) || !laidOk(d)) return;
+  const r = state.result;
+  const key = d.axis.join(",");
+  drawBase(i, d).then((base) => {
+    if (r !== state.result || drawShown(i) !== d || d.result || d.axis.join(",") !== key || !allClosed(d) || !laidOk(d)) return;
+    d.result = drawnParting(drawGeometry(i), engineDrawing(d), { axis: d.axis, flags: base.flags, height: base.summary.mould_height_mm, bodyCentre: d.centre });
+    d.tint = d.result.ok ? d.result : null;
+    applyParting();
+    renderParting();
+  }).catch(() => {});
+}
+
+/** Drawing by hand left ("Terminer", Esc, the toggle, another mode): the drawing kept, the definition shown as usual. */
+function leaveDrawing() {
+  const p = partingOf();
+  if (p?.mode !== "draw") return;
+  p.mode = null;
+  p.message = null;
+  renderParting(); // the view as before (syncDrawView)
+  applyParting();
+}
+
+/**
+ * The view's side of the drawing, from renderParting: the drawing left when
+ * its body is no longer the card's (another one selected, unchecked) or not
+ * shown; while drawing, the view turns without inertia (precise); left: its
+ * turn ended, its overlay and its controls gone, its draft saved.
+ */
+function syncDrawView(p, i) {
+  if (p?.mode === "draw" && (i < 0 || i !== p.drawBody || !p.show || !partingField(i))) {
+    p.mode = null;
+    p.message = null;
+  }
+  const active = drawActive();
+  if (!!active === drawUi.active) return;
+  drawUi.active = !!active;
+  if (active) {
+    controls.staticMoving = true;
+    stopInertia();
+    return;
+  }
+  endDrag(null, false);
+  finishTurn();
+  turn.base = null;
+  controls.staticMoving = false;
+  stopInertia();
+  hideHover();
+  for (const mesh of state.meshes) removeDrawOverlay(mesh);
+  $("draw-labels").replaceChildren();
+  drawUi.labels = [];
+  $("draw-overlay").hidden = true;
+  delete viewport.dataset.turn;
+  delete viewport.dataset.turning;
+  flushDraft();
+}
+
+// ---- the axis
+
+/** The plane chosen in the list: X, Y, Z (the axis at once), "vector" (typed, then Apply), "face" (a face clicked next). */
+function drawPlaneChosen(plane) {
+  const active = drawActive();
+  if (!active) return;
+  const { p, i, d } = active;
+  p.message = null;
+  if (plane === "face") {
+    d.prev = { plane: d.plane };
+    d.plane = "face";
+    d.stage = "axis-face";
+    finishTurn();
+    hideHover();
+    renderParting();
+    return;
+  }
+  if (plane === "vector") {
+    d.plane = "vector";
+    d.vector ||= axisText(d.axis);
+    if (d.stage === "axis-face") d.stage = stageOf(d);
+    renderParting();
+    $("parting-draw-vector").focus();
+    return;
+  }
+  const k = "XYZ".indexOf(plane);
+  if (k < 0) return;
+  // Its sense: that of the direction shown when along the same axis, else +.
+  const along = [d.axis, partingField(i)?.direction].find((v) => v && Math.abs(v[k]) === 1);
+  const sign = along ? Math.sign(along[k]) : 1;
+  changeAxis(i, d, AXES[plane].map((x) => x * sign + 0), { plane });
+}
+
+/** The normal typed for "Manuel", applied. */
+function applyDrawVector() {
+  const active = drawActive();
+  if (!active) return;
+  const { p, i, d } = active;
+  const text = $("parting-draw-vector").value;
+  const v = parseDirection(text);
+  if (!v) {
+    p.message = t("parting.vector.invalid");
+    return renderParting();
+  }
+  p.message = null;
+  changeAxis(i, d, v, { plane: "vector", vector: text });
+}
+
+/**
+ * Another rotation axis (the draw direction): the points stay, every segment
+ * laid again in planes found anew, the side view along it, the turn from
+ * there; its classification asked for, the halves proposed again once it
+ * comes (the parts chosen along the axis before forgotten: undone with it).
+ */
+function changeAxis(i, d, axis, { plane = d.plane, vector = null } = {}) {
+  const same = d.axis && sameDirection(axis, d.axis);
+  if (same) {
+    d.plane = plane;
+    if (vector != null) d.vector = vector;
+    d.stage = stageOf(d);
+    d.prev = null;
+    renderParting();
+    return applyDrawOverlay();
+  }
+  pushHistory(d);
+  // The chapes chosen per part were along the axis before (upper: towards +axis): proposed again along this one.
+  d.seeds = [];
+  d.swap = false;
+  d.target = SIDE_UPPER;
+  d.plane = plane;
+  d.vector = vector ?? axisText(axis);
+  d.axis = axis;
+  d.prev = null;
+  d.stage = stageOf(d);
+  for (const loop of d.loops) {
+    loop.segs = loop.segs.map((s) => (s.kind === "arc" ? { ...s, straight: null } : straightSpec()));
+    loop.paths = loop.paths.map(() => null);
+  }
+  d.result = null;
+  d.inputs.clear();
+  layAll(drawGeometry(i), d);
+  finishTurn();
+  turn.base = null;
+  drawBase(i, d).catch(() => {});
+  drawingView(d);
+  changed(i, d, { apply: true, recolour: true });
+}
+
+// ---- points
+
+/** A point clicked on the part (hit: its triangle and its point), joined to the one before by a straight line laid on the surface. */
+function addPoint(i, d, hit, at) {
+  const p = partingOf();
+  const dm = drawGeometry(i);
+  const before = drawSnapshot(d);
+  if (drawPoints(d) >= MAX_POINTS) {
+    p.message = t("parting.draw.maxPoints", { max: MAX_POINTS });
+    return renderParting();
+  }
+  if (!openLoop(d)) {
+    const open = d.loops.findIndex((loop) => !loop.closed);
+    if (open >= 0) d.current = open;
+    else if (d.loops.length >= MAX_LOOPS) {
+      p.message = t("parting.draw.maxLoops");
+      return renderParting();
+    } else {
+      d.loops.push({ points: [], segs: [], paths: [], closed: false });
+      d.current = d.loops.length - 1;
+    }
+  }
+  const loop = openLoop(d);
+  const sp = surfacePoint(dm, hit.faceIndex, hit.point.toArray());
+  const prev = loop.points.at(-1);
+  if (prev) {
+    const s = at ? screenOf(prev.p) : null;
+    if (dist3(prev.p, sp.p) <= Math.max(1e-4 * dm.diag, 0.2) || (s && Math.hypot(s.x - at.x, s.y - at.y) <= DRAW_MOVE_PX)) {
+      p.message = t("parting.draw.same");
+      return renderParting();
+    }
+  }
+  pushHistory(d, before);
+  loop.points.push(sp);
+  d.selected = null;
+  d.result = null;
+  d.stage = "points";
+  if (loop.points.length > 1) {
+    loop.segs.push(straightSpec());
+    loop.paths.push(null);
+    const K = loop.points.length - 2;
+    const path = laySegment(dm, d, d.current, K);
+    if (path.status !== "ok") p.message = segmentError(d, d.current, K, path);
+    else if (path.method === "edges") p.message = t("parting.draw.edges.msg", { seg: segName(d, d.current, K) });
+  }
+  changed(i, d);
+}
+
+/** The loop drawn closed (its last point joined to point 1): placing stops; every loop closed, the halves proposed and applied. */
+function closeLoop(i, d) {
+  const p = partingOf();
+  const loop = openLoop(d);
+  if (!loop) return;
+  if (loop.points.length < 3) {
+    p.message = t("parting.draw.min3");
+    return renderParting();
+  }
+  pushHistory(d);
+  loop.segs.push(straightSpec());
+  loop.paths.push(null);
+  loop.closed = true;
+  d.result = null;
+  const K = loop.points.length - 1;
+  const path = laySegment(drawGeometry(i), d, d.current, K);
+  p.message = path.status !== "ok" ? segmentError(d, d.current, K, path) : null;
+  d.closeHover = false;
+  d.selected = null;
+  hideHover();
+  if (allClosed(d)) {
+    d.stage = "halves";
+    d.target = SIDE_UPPER;
+  }
+  changed(i, d, { apply: true });
+}
+
+/** Another loop (a bore through the parting plane needs its own), once every loop is closed. */
+function newLoop() {
+  const active = drawActive();
+  if (!active || !allClosed(active.d)) return;
+  const { p, i, d } = active;
+  if (d.loops.length >= MAX_LOOPS) {
+    p.message = t("parting.draw.maxLoops");
+    return renderParting();
+  }
+  p.message = null;
+  pushHistory(d);
+  d.loops.push({ points: [], segs: [], paths: [], closed: false });
+  d.current = d.loops.length - 1;
+  d.stage = "points";
+  d.selected = null;
+  d.result = null; // that of the loops before: applied again once this one is closed
+  changed(i, d);
+}
+
+/** Point k of loop L deleted: its two segments made one straight one; a closed loop of fewer than 3 points opened again, an empty one gone. */
+function deletePoint(i, d, { loop: L, k }) {
+  const loop = d.loops[L];
+  if (!loop?.points[k]) return;
+  pushHistory(d);
+  const n = loop.points.length;
+  loop.points.splice(k, 1);
+  if (loop.closed) {
+    loop.segs.splice(k, 1);
+    loop.paths.splice(k, 1);
+    const K = (k - 1 + n - 1) % (n - 1); // the segment now joining the points on either side
+    if (n - 1 > 0) {
+      loop.segs[K] = straightSpec();
+      loop.paths[K] = null;
+    }
+    if (loop.points.length < 3) {
+      loop.closed = false;
+      loop.segs = Array.from({ length: Math.max(0, loop.points.length - 1) }, straightSpec);
+      loop.paths = loop.segs.map(() => null);
+      d.current = L;
+    }
+  } else if (n > 1) {
+    const K = k === n - 1 ? k - 1 : k;
+    loop.segs.splice(K, 1);
+    loop.paths.splice(K, 1);
+    if (k > 0 && k < n - 1) {
+      loop.segs[k - 1] = straightSpec();
+      loop.paths[k - 1] = null;
+    }
+  }
+  if (!loop.points.length) {
+    d.loops.splice(L, 1);
+    d.current = Math.max(0, Math.min(d.current, d.loops.length - 1));
+    const open = d.loops.findIndex((x) => !x.closed);
+    if (open >= 0) d.current = open;
+  }
+  d.selected = null;
+  d.sub = null;
+  d.result = null;
+  d.inputs.clear();
+  d.stage = stageOf(d);
+  layAll(drawGeometry(i), d);
+  changed(i, d, { apply: true });
+}
+
+/** A point added in the middle of segment K of loop L (by length): two straight lines, or two arcs about the same centre. */
+function splitSegment(i, d, L, K) {
+  const loop = d.loops[L];
+  const path = loop.paths[K];
+  if (!path || path.status !== "ok") return;
+  if (drawPoints(d) >= MAX_POINTS) {
+    partingOf().message = t("parting.draw.maxPoints", { max: MAX_POINTS });
+    return renderParting();
+  }
+  const dm = drawGeometry(i);
+  // The point at half its length, on the triangle of that piece.
+  const x = path.xyz;
+  let walked = 0, mid = null;
+  for (let j = 0; j < path.tri.length && !mid; j++) {
+    const a = [x[3 * j], x[3 * j + 1], x[3 * j + 2]], b = [x[3 * j + 3], x[3 * j + 4], x[3 * j + 5]];
+    const len = dist3(a, b);
+    if (len > 0 && walked + len >= path.length / 2) {
+      const s = (path.length / 2 - walked) / len;
+      mid = surfacePoint(dm, path.tri[j], a.map((v, k) => v + (b[k] - v) * s));
+    }
+    walked += len;
+  }
+  if (!mid) return;
+  pushHistory(d);
+  const spec = loop.segs[K];
+  const A = loop.points[K], B = loop.points[(K + 1) % loop.points.length];
+  let first = straightSpec(), second = straightSpec();
+  if (spec.kind === "arc") {
+    const geo = arcGeometry(A.p, B.p, spec);
+    const c1 = geo.error ? null : arcFromCentre(A.p, mid.p, geo.centre, spec.toward);
+    const c2 = geo.error ? null : arcFromCentre(mid.p, B.p, geo.centre, spec.toward);
+    if (c1 && !c1.error) first = { kind: "arc", radius: c1.radius, toward: c1.toward, straight: null };
+    if (c2 && !c2.error) second = { kind: "arc", radius: c2.radius, toward: c2.toward, straight: null };
+  }
+  loop.points.splice(K + 1, 0, mid);
+  loop.segs.splice(K, 1, first, second);
+  loop.paths.splice(K, 1, null, null);
+  d.selected = null;
+  d.sub = null;
+  d.result = null;
+  d.inputs.clear();
+  layAll(dm, d);
+  changed(i, d, { apply: true });
+}
+
+/** The points of loop L moved to height h along the axis (alignPoints): its straight segments laid again, level all round. */
+function alignLoop(i, d, L, h) {
+  const p = partingOf();
+  const loop = d.loops[L];
+  if (!loop) return;
+  const dm = drawGeometry(i);
+  const { points, missed } = alignPoints(dm, loop.points, d.axis, h);
+  pushHistory(d);
+  loop.points = points;
+  loop.segs = loop.segs.map((s) => (s.kind === "arc" ? s : straightSpec()));
+  loop.paths = loop.paths.map(() => null);
+  d.result = null;
+  d.inputs.clear();
+  layAll(dm, d);
+  p.message = missed.length ? t("parting.draw.alignMissed", { list: missed.map((k) => pointNumber(d, L, k)).join(", ") }) : null;
+  changed(i, d, { apply: true });
+}
+
+/**
+ * The loop whose points could be aligned to one height: closed, its points
+ * within a few millimetres of each other along the axis (at most 5 % of
+ * the mould height, 2 mm) but not at one height already: {L, median}.
+ */
+function alignCandidate(d) {
+  const height = d.base?.summary.mould_height_mm ?? 0;
+  const limit = Math.max(0.05 * height, 2);
+  for (let L = 0; L < d.loops.length; L++) {
+    const loop = d.loops[L];
+    if (!loop.closed) continue;
+    const h = loop.points.map((sp) => dot3(sp.p, d.axis)).sort((a, b) => a - b);
+    const span = h.at(-1) - h[0];
+    if (span > 1e-3 && span <= limit) return { L, median: h[h.length >> 1] };
+  }
+  return null;
+}
+
+/** How a height along the axis is shown: the coordinate of the frame along an axis of it (X, -Z…: its sign), else along the axis. */
+function heightFrame(axis) {
+  const k = axis.findIndex((x) => Math.abs(x) === 1);
+  return k >= 0 ? { name: "XYZ"[k], sign: axis[k] } : { name: axisLabel(axis), sign: 1 };
+}
+
+// ---- the halves
+
+/** A part of the part clicked: given to the chape chosen (Partie supérieure / inférieure); a core can be given to neither. */
+function seedPart(i, d, hit) {
+  const p = partingOf();
+  const label = d.result?.ok ? d.result.split.label[hit.faceIndex] : null;
+  if (label === -1) {
+    p.message = t("parting.draw.core");
+    return renderParting();
+  }
+  pushHistory(d);
+  d.seeds.push({ p: hit.point.toArray(), t: hit.faceIndex, side: d.target });
+  changed(i, d, { apply: true });
+}
+
+/** "Inverser les chapes": the proposal swapped, and every part chosen given to the other chape. */
+function swapHalves() {
+  const active = drawActive();
+  if (!active) return;
+  const { p, i, d } = active;
+  p.message = null;
+  pushHistory(d);
+  d.swap = !d.swap;
+  d.seeds = d.seeds.map((s) => ({ ...s, side: s.side === SIDE_UPPER ? SIDE_LOWER : SIDE_UPPER }));
+  changed(i, d, { apply: true });
+}
+
+/** "Effacer le tracé": the drawing and its draft gone (once confirmed when a loop is closed), the proposal back if it was applied. */
+function clearDrawing() {
+  const active = drawActive();
+  if (!active) return;
+  const { p, i, d } = active;
+  if (d.loops.some((loop) => loop.closed) && !confirm(t("parting.draw.clear.confirm", { points: drawPoints(d) }))) return;
+  const fresh = newDrawing(i, d.axis);
+  Object.assign(fresh, { plane: d.plane, vector: d.vector, base: d.base, baseFor: d.baseFor, basePromise: d.basePromise });
+  p.draw.set(i, fresh);
+  p.message = null;
+  hideHover();
+  saveDraftNow(i); // the draft gone
+  if (p.current.get(i)?.source === "drawn") {
+    p.seq++; // a drawing being applied is not
+    p.current.delete(i);
+    savePartingDef(partIdOf(state.result), i, null);
+    refreshFeeding();
+  }
+  applyParting();
+  renderParting();
+}
+
+// ---- segments edited in the table
+
+/** A segment turned "droit" or "courbe": an arc of the default radius (the chord: 60°) in the plane of its line; back to its straight line. */
+function setSegmentType(i, d, L, K, type) {
+  const loop = d.loops[L];
+  const spec = loop?.segs[K];
+  if (!spec || (type === "arc") === (spec.kind === "arc")) return;
+  pushHistory(d);
+  const A = loop.points[K], B = loop.points[(K + 1) % loop.points.length];
+  if (type === "arc") {
+    const m = spec.m ?? segmentPlane(drawGeometry(i), A, B, d.axis);
+    const arc = arcDefault(A, B, m, d.axis, d.centre);
+    loop.segs[K] = { kind: "arc", radius: arc.radius, toward: arc.toward, straight: { via: spec.via, m: spec.m, method: spec.method } };
+  } else {
+    const back = spec.straight ?? {};
+    loop.segs[K] = { kind: "straight", via: back.via === -1 ? -1 : 1, m: back.m ?? null, ...(back.method ? { method: back.method } : {}) };
+  }
+  loop.paths[K] = null;
+  d.inputs.delete(`${L}:${K}`);
+  d.sub = null;
+  d.result = null;
+  layAll(drawGeometry(i), d);
+  changed(i, d, { apply: true });
+}
+
+/** The radius typed for an arc: at least half the chord (else not applied, said), at most 1 km; its side kept. */
+function setSegmentRadius(i, d, L, K, text) {
+  const loop = d.loops[L];
+  const spec = loop?.segs[K];
+  if (spec?.kind !== "arc") return;
+  const key = `${L}:${K}`;
+  const R = Number(String(text).trim().replace(",", "."));
+  const A = loop.points[K], B = loop.points[(K + 1) % loop.points.length];
+  const chord = dist3(A.p, B.p);
+  if (!Number.isFinite(R) || R < (chord / 2) * (1 - 1e-9)) {
+    d.inputs.set(key, { radius: text, error: t("parting.draw.radiusSmall", { min: fmtNum(chord / 2, 2), seg: segName(d, L, K), chord: fmtNum(chord, 2) }) });
+    return renderParting();
+  }
+  pushHistory(d);
+  loop.segs[K] = { ...spec, radius: Math.min(R, 1e6) };
+  loop.paths[K] = null;
+  d.inputs.delete(key);
+  d.result = null;
+  layAll(drawGeometry(i), d);
+  changed(i, d, { apply: true });
+}
+
+/** The centre of an arc typed or clicked: brought onto the bisector plane of its chord (its plane turning about the chord to it). */
+function setSegmentCentre(i, d, L, K, centre, text = null) {
+  const p = partingOf();
+  const loop = d.loops[L];
+  const spec = loop?.segs[K];
+  if (spec?.kind !== "arc") return;
+  const key = `${L}:${K}`;
+  const A = loop.points[K], B = loop.points[(K + 1) % loop.points.length];
+  const arc = centre ? arcFromCentre(A.p, B.p, centre, spec.toward) : { error: "centre_invalid" };
+  if (arc.error) {
+    d.inputs.set(key, { centre: text ?? "", error: t("parting.draw.centreInvalid", { seg: segName(d, L, K) }) });
+    return renderParting();
+  }
+  pushHistory(d);
+  loop.segs[K] = { ...spec, radius: Math.min(arc.radius, 1e6), toward: arc.toward };
+  loop.paths[K] = null;
+  d.inputs.delete(key);
+  d.result = null;
+  layAll(drawGeometry(i), d);
+  p.message = arc.moved ? t("parting.draw.centreMoved", { seg: segName(d, L, K) }) : null;
+  changed(i, d, { apply: true });
+}
+
+/** '⇄' (a straight line round the other side of the part) or '⇅' (an arc's centre on the other side). */
+function flipSegment(i, d, L, K) {
+  const loop = d.loops[L];
+  const spec = loop.segs[K];
+  if (!spec) return;
+  if (spec.kind !== "arc" && !spec.m) return;
+  pushHistory(d);
+  loop.segs[K] = spec.kind === "arc" ? { ...spec, toward: spec.toward.map((x) => -x + 0) } : { ...spec, via: spec.via === -1 ? 1 : -1 };
+  loop.paths[K] = null;
+  d.result = null;
+  layAll(drawGeometry(i), d);
+  changed(i, d, { apply: true });
+}
+
+// ---- clicks on the 3D view
+
+/** The bodies under a point of the page (client pixels), the cut-away side of the section left out. */
+function raycastAt(x, y) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  const ndc = new THREE.Vector2(((x - rect.left) / rect.width) * 2 - 1, -((y - rect.top) / rect.height) * 2 + 1);
+  camera.updateMatrixWorld();
+  raycaster.setFromCamera(ndc, camera);
+  return raycaster.intersectObjects(state.meshes.filter((m) => m.visible), false).filter((h) => !sectionOn || sectionPlane.distanceToPoint(h.point) >= 0);
+}
+
+/** Where a point of the model is on the page ({x, y} client pixels), or null: behind the camera, or the 3D view not shown (another page). */
+function screenOf(point) {
+  if (!Array.isArray(point) || point.length < 3) return null;
+  const rect = renderer.domElement.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  camera.updateMatrixWorld();
+  const v = vec3(point);
+  const forward = camera.getWorldDirection(new THREE.Vector3());
+  if (v.clone().sub(camera.position).dot(forward) <= 0) return null;
+  v.project(camera);
+  const x = rect.left + ((v.x + 1) / 2) * rect.width;
+  const y = rect.top + ((1 - v.y) / 2) * rect.height;
+  // (Never NaN for a click: a point or a camera not finite is nowhere on the page.)
+  return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+}
+
+/** Millimetres per pixel of the view at the depth of a point. */
+function pixelSize(point) {
+  const depth = vec3(point).sub(camera.position).dot(camera.getWorldDirection(new THREE.Vector3()));
+  return (2 * Math.max(depth, 0) * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2))) / Math.max(viewport.clientHeight, 1);
+}
+
+/** A point of the drawing not hidden by the part: nothing of the card's body under the pointer, or not further than it (a marker's width). */
+function pointSeen(dm, point, hit) {
+  if (!hit) return true;
+  const tol = Math.max(2 * DRAW_MARKER_PX * pixelSize(point), 0.01 * dm.diag);
+  return camera.position.distanceTo(vec3(point)) <= hit.distance + tol;
+}
+
+/**
+ * A click (or the pointer) closing the loop: point 1 within 12 px of it and
+ * not hidden by the part (point 1 behind the part never takes a click on
+ * the front), or the point of the part under it within a marker's width of
+ * point 1.
+ */
+function nearFirst(i, loop, hits, at) {
+  if (!loop || loop.closed || loop.points.length < 3 || !at) return false;
+  const dm = drawGeometry(i);
+  const first = loop.points[0].p;
+  const hit = cardHit(hits, i);
+  const tol = Math.max(2 * DRAW_MARKER_PX * pixelSize(first), 0.01 * dm.diag);
+  const s = screenOf(first);
+  if (s && Math.hypot(s.x - at.x, s.y - at.y) <= DRAW_CLOSE_PX && pointSeen(dm, first, hit)) return true;
+  return !!hit && hit.point.distanceTo(vec3(first)) <= tol;
+}
+
+/** The point of the drawing under the pointer (within 10 px, seen): {loop, k}, or null. */
+function markerAt(i, d, at, hits) {
+  if (!at) return null;
+  const dm = drawGeometry(i);
+  const hit = cardHit(hits, i);
+  let best = null, bestDistance = DRAW_PICK_PX;
+  d.loops.forEach((loop, L) => loop.points.forEach((sp, k) => {
+    const s = screenOf(sp.p);
+    if (!s) return;
+    const off = Math.hypot(s.x - at.x, s.y - at.y);
+    if (off <= bestDistance && pointSeen(dm, sp.p, hit)) {
+      best = { loop: L, k };
+      bestDistance = off;
+    }
+  }));
+  return best;
+}
+
+/**
+ * A click on the 3D view while drawing (handled here: true). Choosing the
+ * axis by a face; placing an arc's centre; placing points (point 1 closes
+ * the loop, a point clicked is selected, else a point is added); the halves
+ * (a part given to the chape chosen).
+ */
+function drawClick({ p, i, d }, hits, at) {
+  p.message = null;
+  const hit = cardHit(hits, i);
+  // Another body under the pointer, not faded: to select first. Nothing there: the point selected no longer.
+  const elsewhere = () => {
+    if (hits.length) p.message = t("parting.otherBody");
+    else if (d.selected) {
+      d.selected = null;
+      changed(i, d);
+      return true;
+    }
+    renderParting();
+    return true;
+  };
+  if (d.stage === "axis-face") {
+    if (!hit) return elsewhere();
+    const n = snapDirection(faceNormal(i, hit.faceIndex));
+    if (n) changeAxis(i, d, n, { plane: "face" });
+    return true;
+  }
+  if (d.sub?.kind === "centre") {
+    const { loop, seg } = d.sub;
+    if (!hit) return elsewhere();
+    d.sub = null;
+    setSegmentCentre(i, d, loop, seg, hit.point.toArray());
+    return true;
+  }
+  if (d.stage === "points" && nearFirst(i, openLoop(d), hits, at)) {
+    closeLoop(i, d);
+    return true;
+  }
+  const marker = markerAt(i, d, at, hits);
+  if (marker) {
+    d.selected = marker;
+    changed(i, d);
+    return true;
+  }
+  if (!hit) return elsewhere();
+  if (d.stage === "halves") seedPart(i, d, hit);
+  else addPoint(i, d, hit, at);
+  return true;
+}
+
+// ---- pointer: a point dragged, the next segment previewed
+
+const drawCanvas = renderer.domElement;
+
+window.addEventListener("pointerdown", () => (drawUi.pressed = true), true);
+window.addEventListener("pointerup", () => (drawUi.pressed = false), true);
+window.addEventListener("pointercancel", () => (drawUi.pressed = false), true);
+window.addEventListener("blur", () => (drawUi.pressed = false));
+
+// Captured on the way down, before the trackball's own listener: a click or a
+// drag sees the turn ended; a point pressed is dragged, the view not turned.
+drawCanvas.addEventListener("pointerdown", (e) => {
+  const active = drawActive();
+  if (!active) return;
+  finishTurn();
+  hideHover();
+  const { i, d } = active;
+  if (e.button !== 0 || d.sub || d.stage === "axis-face") return;
+  const at = { x: e.clientX, y: e.clientY };
+  // (The part under the pointer looked for only near a point: a large mesh takes a while.)
+  const near = d.loops.some((loop) => loop.points.some((sp) => {
+    const s = screenOf(sp.p);
+    return s && Math.hypot(s.x - at.x, s.y - at.y) <= DRAW_PICK_PX;
+  }));
+  const marker = near ? markerAt(i, d, at, raycastAt(at.x, at.y)) : null;
+  if (!marker) return;
+  controls.enabled = false;
+  drawCanvas.setPointerCapture(e.pointerId);
+  drawUi.drag = { ...marker, i, d, pointerId: e.pointerId, from: at, at, moved: false, frame: 0, before: drawSnapshot(d), messages: [] };
+}, true);
+
+drawCanvas.addEventListener("pointermove", (e) => {
+  drawUi.pointer = { x: e.clientX, y: e.clientY };
+  const drag = drawUi.drag;
+  if (drag && e.pointerId === drag.pointerId) {
+    if (!drag.moved && Math.hypot(e.clientX - drag.from.x, e.clientY - drag.from.y) <= DRAW_MOVE_PX) return;
+    drag.moved = true;
+    drag.at = { x: e.clientX, y: e.clientY };
+    drag.frame ||= requestAnimationFrame(() => {
+      drag.frame = 0;
+      dragTo(drag);
+    });
+    return;
+  }
+  if (e.buttons || !drawUi.active) return;
+  scheduleHover();
+});
+drawCanvas.addEventListener("pointerup", (e) => endDrag(e, true));
+drawCanvas.addEventListener("pointercancel", (e) => endDrag(e, false));
+drawCanvas.addEventListener("lostpointercapture", (e) => endDrag(e, true));
+drawCanvas.addEventListener("pointerleave", () => {
+  drawUi.pointer = null;
+  if (!drawUi.drag) hideHover();
+});
+
+/** The point dragged where the pointer is on the part: its segments laid again at once. */
+function dragTo(drag) {
+  const { i, d } = drag;
+  if (drawShown(i) !== d) return;
+  const hit = cardHit(raycastAt(drag.at.x, drag.at.y), i);
+  const loop = d.loops[drag.loop];
+  if (!hit || !loop?.points[drag.k]) return;
+  const dm = drawGeometry(i);
+  loop.points[drag.k] = surfacePoint(dm, hit.faceIndex, hit.point.toArray());
+  drag.messages = segmentsAt(loop, drag.k).map((K) => respec(d, drag.loop, K)).filter(Boolean);
+  d.result = null;
+  d.inputs.clear();
+  layAll(dm, d);
+  applyDrawOverlay();
+}
+
+/** The drag ended: kept (undoable, applied again) or cancelled (Esc); the trackball back in every case. */
+function endDrag(e, commit) {
+  controls.enabled = true;
+  const drag = drawUi.drag;
+  if (!drag || (e && e.pointerId !== drag.pointerId)) return;
+  drawUi.drag = null;
+  if (drag.frame) {
+    cancelAnimationFrame(drag.frame);
+    if (commit) dragTo(drag);
+  }
+  if (drawCanvas.hasPointerCapture?.(drag.pointerId)) drawCanvas.releasePointerCapture(drag.pointerId);
+  if (!drag.moved || drawShown(drag.i) !== drag.d) return;
+  if (!commit) return restoreSnapshot(drag.i, drag.d, drag.before);
+  pushHistory(drag.d, drag.before);
+  partingOf().message = drag.messages[0] ?? null;
+  changed(drag.i, drag.d, { apply: true });
+}
+
+/** The next segment previewed under the pointer (once per frame; after a rest when slow). */
+function scheduleHover() {
+  const active = drawActive();
+  if (!active || active.d.stage !== "points" || active.d.sub || !openLoop(active.d)?.points.length || !drawUi.pointer || turn.running || turn.view || drawUi.drag) {
+    hideHover();
+    return;
+  }
+  if (drawUi.slow) {
+    hideHover();
+    clearTimeout(drawUi.hoverTimer);
+    drawUi.hoverTimer = setTimeout(runHover, HOVER_REST_MS);
+    return;
+  }
+  drawUi.hoverFrame ||= requestAnimationFrame(() => {
+    drawUi.hoverFrame = 0;
+    runHover();
+  });
+}
+
+function runHover() {
+  const active = drawActive();
+  const loop = active && active.d.stage === "points" && !active.d.sub ? openLoop(active.d) : null;
+  const at = drawUi.pointer;
+  if (!loop?.points.length || !at || turn.running || turn.view || drawUi.drag) return hideHover();
+  const started = performance.now();
+  const { i, d } = active;
+  const dm = drawGeometry(i);
+  const hits = raycastAt(at.x, at.y);
+  const close = nearFirst(i, loop, hits, at);
+  const hit = cardHit(hits, i);
+  const last = loop.points.at(-1);
+  const options = { axis: d.axis, prefer: camera.position.toArray(), quick: true };
+  let path = null;
+  if (close) path = layStraight(dm, last, loop.points[0], options);
+  else if (hit) path = layStraight(dm, last, surfacePoint(dm, hit.faceIndex, hit.point.toArray()), options);
+  showHover(i, path, close ? loop.points[0].p : null);
+  drawUi.slow = performance.now() - started > HOVER_SLOW_MS;
+  if (close !== d.closeHover) {
+    d.closeHover = close;
+    renderParting();
+  }
+  drawCanvas.style.cursor = close ? "pointer" : "crosshair";
+}
+
+// ---- turning the part about the axis (the camera turns)
+
+/** The pose of the view: the camera's position, up and target, the key light. */
+function currentPose() {
+  return { position: camera.position.toArray(), up: camera.up.toArray(), target: controls.target.toArray(), light: keyLight.position.toArray() };
+}
+
+/** Two poses the same (the camera not moved since: within 1e-9 of the distance, its up within 1e-12). */
+function samePose(a, b) {
+  if (!a || !b) return false;
+  const distance = dist3(a.position, a.target) || 1;
+  return dist3(a.position, b.position) <= 1e-9 * distance && dist3(a.target, b.target) <= 1e-9 * distance && dist3(a.up, b.up) <= 1e-12;
+}
+
+/** The camera's axes: up, towards the viewer, right (for the sense of the arrows). */
+function cameraBasis() {
+  const q = camera.quaternion;
+  return {
+    up: new THREE.Vector3(0, 1, 0).applyQuaternion(q).toArray(),
+    toViewer: new THREE.Vector3(0, 0, 1).applyQuaternion(q).toArray(),
+    right: new THREE.Vector3(1, 0, 0).applyQuaternion(q).toArray(),
+  };
+}
+
+/** The turn from the view as it is now: nothing turned yet. */
+function rebaseTurn(d) {
+  turn.base = currentPose();
+  turn.axis = d.axis.slice();
+  turn.centre = d.centre.slice();
+  turn.k = turn.shown = turn.from = 0;
+  turn.running = false;
+  turn.lastPose = turn.base;
+  showTurnAngle();
+}
+
+/** The view turned by `shown` thirty-seconds of a turn of the part from the base, exactly (four quarters: back at the base). */
+function applyTurn() {
+  const { base, axis, centre } = turn;
+  const angle = (-2 * Math.PI * turn.shown) / 32;
+  const pose = {
+    position: rotateAbout(base.position, centre, axis, angle),
+    target: rotateAbout(base.target, centre, axis, angle),
+    light: rotateAbout(base.light, centre, axis, angle),
+    up: rotateAbout(base.up, [0, 0, 0], axis, angle),
+  };
+  applyPose(pose);
+  stopInertia();
+  controls.update();
+  camera.updateMatrixWorld();
+  turn.lastPose = currentPose();
+}
+
+/** An arrow: the part turned a step to the left (-1) or to the right (+1) about the axis; the drawing goes on. */
+function turnArrow(side) {
+  const active = drawActive();
+  if (!active?.d.axis || active.d.stage === "axis-face") return;
+  const { d } = active;
+  finishView();
+  // The view moved since (a drag, a zoom, a named view, another tab): the turn starts from there.
+  if (!turn.running && (!turn.base || !samePose(currentPose(), turn.lastPose) || !sameDirection(turn.axis, d.axis))) rebaseTurn(d);
+  stopInertia();
+  hideHover();
+  const left = turnSign(turn.axis, cameraBasis());
+  turn.k += (side < 0 ? left : -left) * (32 / drawUi.step);
+  startTurn();
+}
+
+/** "↺ 0°": back to the orientation the turn started from. */
+function resetTurn() {
+  if (!turn.base || turn.view) return finishView();
+  if (!turn.running && !samePose(currentPose(), turn.lastPose)) return;
+  turn.k = 0;
+  startTurn();
+}
+
+function startTurn() {
+  if (reducedMotion()) {
+    turn.shown = turn.k;
+    turn.running = false;
+    applyTurn();
+    afterTurn();
+  } else {
+    turn.from = turn.shown;
+    turn.t0 = performance.now();
+    turn.running = true;
+    viewport.dataset.turning = "1";
+  }
+  showTurnAngle();
+}
+
+/** In the animation loop, before the trackball: the turn (and the side view) where they are by now. */
+function stepTurn() {
+  const now = performance.now();
+  if (turn.view) stepView(now);
+  if (!turn.running) return;
+  const s = Math.min(1, Math.max(0, (now - turn.t0) / TURN_MS));
+  turn.shown = s >= 1 ? turn.k : turn.from + (turn.k - turn.from) * easeInOutCubic(s);
+  applyTurn();
+  if (s >= 1) {
+    turn.running = false;
+    delete viewport.dataset.turning;
+    afterTurn();
+  }
+}
+
+/** The turn (and the side view) at their end at once: a click, a drag, a named view, another tab, another axis. */
+function finishTurn() {
+  finishView();
+  if (!turn.running) return;
+  turn.running = false;
+  turn.shown = turn.k;
+  applyTurn();
+  delete viewport.dataset.turning;
+}
+
+/** A turn ended: the preview of the next segment again where the pointer is. */
+function afterTurn() {
+  if (drawUi.pointer) scheduleHover();
+}
+
+/** The angle turned ("Rotation : 22,5°"), and viewport.dataset.turn for scripts and tests. */
+function showTurnAngle() {
+  const deg = (((turn.k % 32) + 32) % 32) * 11.25;
+  viewport.dataset.turn = String(deg);
+  $("turn-angle").textContent = t("view.turnAngle", { deg: fmtNum(deg, 2) });
+}
+
+/** The step of the arrows chosen (1/4 … 1/32 of a turn), kept in this browser. */
+function setTurnStep(step) {
+  if (!TURN_STEPS.includes(step)) return;
+  drawUi.step = step;
+  try {
+    localStorage.setItem(TURN_KEY, String(step));
+  } catch {
+    // kept for this visit only
+  }
+  renderParting();
+}
+
+/** The orientation of a pose (the camera's local axes), to turn smoothly from one pose to another. */
+function poseQuaternion(pose) {
+  return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().lookAt(vec3(pose.position), vec3(pose.target), vec3(pose.up)));
+}
+
+/** A pose between two (s from 0 to 1): turned, moved and zoomed together. */
+function blendPose(a, b, s) {
+  const q = poseQuaternion(a).slerp(poseQuaternion(b), s);
+  const target = vec3(a.target).lerp(vec3(b.target), s);
+  const da = dist3(a.position, a.target), db = dist3(b.position, b.target);
+  return {
+    position: new THREE.Vector3(0, 0, da + (db - da) * s).applyQuaternion(q).add(target).toArray(),
+    up: new THREE.Vector3(0, 1, 0).applyQuaternion(q).toArray(),
+    target: target.toArray(),
+    light: vec3(a.light).lerp(vec3(b.light), s).toArray(),
+    near: b.near,
+    far: b.far,
+  };
+}
+
+/** A direction square to the axis to look from when the view is along it: the front (-Y), else +X. */
+function sideOf(a) {
+  const ref = Math.abs(a.y) < 0.9 ? new THREE.Vector3(0, -1, 0) : new THREE.Vector3(1, 0, 0);
+  return ref.addScaledVector(a, -ref.dot(a)).normalize();
+}
+
+/**
+ * The side view of the drawing: the axis upright on the screen, the camera
+ * 20° above the plane, from the side it looks from now; animated (300 ms),
+ * then the turn starts from there.
+ */
+function drawingView(d) {
+  if (state.bounds.isEmpty() || !d.axis) return;
+  finishTurn();
+  const a = vec3(d.axis);
+  const eye = camera.position.clone().sub(controls.target);
+  const look = eye.clone().normalize();
+  let h = eye.addScaledVector(a, -eye.dot(a));
+  if (Math.abs(look.dot(a)) > 0.95 || h.lengthSq() === 0) h = sideOf(a);
+  h.normalize();
+  const dir = h.multiplyScalar(Math.cos(DRAW_TILT)).addScaledVector(a, Math.sin(DRAW_TILT));
+  const radius = state.bounds.getSize(new THREE.Vector3()).length() / 2 || 1;
+  const to = viewPose(dir, a, vec3(d.centre), radius);
+  if (reducedMotion()) {
+    applyPose(to);
+    stopInertia();
+    controls.update();
+    rebaseTurn(d);
+    return;
+  }
+  turn.view = { from: { ...currentPose(), near: camera.near, far: camera.far }, to, t0: performance.now(), d };
+}
+
+function stepView(now) {
+  const v = turn.view;
+  const s = Math.min(1, (now - v.t0) / VIEW_MS);
+  if (s >= 1) return finishView();
+  applyPose(blendPose(v.from, v.to, easeInOutCubic(s)));
+  stopInertia();
+}
+
+function finishView() {
+  const v = turn.view;
+  if (!v) return;
+  turn.view = null;
+  applyPose(v.to);
+  stopInertia();
+  controls.update();
+  camera.updateMatrixWorld();
+  rebaseTurn(v.d);
+}
+
+// ---- the 3D view: the line laid, the points, the axis
+
+let drawTextures = null;
+
+/** The round marks of the points: a white dot outlined (tinted by its material), point 1's with a white ring. */
+function markerTextures() {
+  if (drawTextures) return drawTextures;
+  const make = (paint) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 64;
+    paint(canvas.getContext("2d"));
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    return texture;
+  };
+  const disc = (g, r, fill) => {
+    g.beginPath();
+    g.arc(32, 32, r, 0, 2 * Math.PI);
+    g.fillStyle = fill;
+    g.fill();
+  };
+  drawTextures = {
+    dot: make((g) => {
+      disc(g, 30, "#1d2330");
+      disc(g, 22, "#ffffff");
+    }),
+    ring: make((g) => {
+      disc(g, 31, "#1d2330");
+      disc(g, 27, "#ffffff");
+      disc(g, 17, "#e8141b");
+    }),
+  };
+  return drawTextures;
+}
+
+/** Pieces of a path as pairs of points (none of no length) appended to `out`. */
+function pathPairs(path, out) {
+  const x = path.xyz;
+  for (let j = 0; j + 5 < x.length; j += 3) {
+    if (x[j] === x[j + 3] && x[j + 1] === x[j + 4] && x[j + 2] === x[j + 5]) continue;
+    out.push(x[j], x[j + 1], x[j + 2], x[j + 3], x[j + 4], x[j + 5]);
+  }
+  return out;
+}
+
+/** A line of the drawing: pixels wide, over the part, dashed or not; a ghost (opacity 0.25, not hidden by the part) of what went behind it. */
+function drawLine(pairs, { color, width = DRAW_LINE_PX, dashed = false, dash = 1, opacity = 1, ghost = false, order = ORDER_LINE }) {
+  const material = new LineMaterial({
+    color, linewidth: width, transparent: true, opacity: ghost ? 0.25 * opacity : opacity, dashed,
+    depthTest: !ghost, depthWrite: false, clippingPlanes: [sectionPlane],
+  });
+  if (dashed) {
+    material.dashSize = dash;
+    material.gapSize = 0.7 * dash;
+  }
+  material.resolution.set(viewport.clientWidth, viewport.clientHeight);
+  const line = new LineSegments2(new LineSegmentsGeometry().setPositions(pairs), material);
+  if (dashed) line.computeLineDistances();
+  line.renderOrder = ghost ? order - 0.5 : order;
+  return line;
+}
+
+/** The points as round marks, `size` pixels whatever the zoom; a ghost through the part. */
+function drawMarks(points, { size = DRAW_MARKER_PX, color = PARTING_LINE, map = markerTextures().dot, ghost = false }) {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(Float32Array.from(points.flat()), 3));
+  const material = new THREE.PointsMaterial({
+    size, sizeAttenuation: false, map, color, transparent: true, alphaTest: 0.1, opacity: ghost ? 0.25 : 1,
+    depthTest: !ghost, depthWrite: false, clippingPlanes: [sectionPlane],
+  });
+  const marks = new THREE.Points(geometry, material);
+  marks.renderOrder = ghost ? ORDER_LINE + 0.5 : ORDER_LINE + 1;
+  return marks;
+}
+
+function removeDrawOverlay(mesh) {
+  for (const key of ["drawOverlay", "drawHover"]) {
+    const group = mesh.userData[key];
+    if (!group) continue;
+    mesh.remove(group);
+    group.traverse((o) => {
+      o.geometry?.dispose();
+      o.material?.dispose();
+    });
+    mesh.userData[key] = null;
+  }
+}
+
+/**
+ * The drawing on the 3D view (no colouring of the part: a point moved costs
+ * only this): the line laid in red (the pieces off the parting line, the
+ * same chape on both sides, dashed grey; a segment not laid, dashed orange),
+ * the segment hovered in the table or at the point selected in yellow, a
+ * ghost of all of it through the part, the points (point 1 of each loop
+ * with a white ring, the one selected yellow), the centres of the arcs, the
+ * rotation axis dashed through the centre of the part; the numbers of the
+ * points.
+ */
+function applyDrawOverlay() {
+  state.meshes.forEach((mesh) => {
+    const hover = mesh.userData.drawHover;
+    mesh.userData.drawHover = null; // the preview stays
+    removeDrawOverlay(mesh);
+    mesh.userData.drawHover = hover;
+  });
+  const card = $("parting-card");
+  const tags = (card.dataset.overlay || "").split(" ").filter((x) => x && x !== "drawing" && x !== "axis");
+  const active = drawActive();
+  const mesh = active && state.meshes[active.i];
+  if (!mesh || !active.d.axis) {
+    card.dataset.overlay = tags.join(" ");
+    buildLabels(null);
+    return;
+  }
+  const { i, d } = active;
+  card.dataset.draw = d.stage;
+  const dm = drawGeometry(i);
+  const dash = 0.012 * (dm.diag || 1);
+  const group = new THREE.Group();
+  const failed = [], marked = [];
+  const result = d.result?.ok ? d.result : null;
+  // Applied: the pieces on the parting line and those off it, as drawnParting tells them apart; else every piece laid.
+  const red = result ? result.segments : [];
+  const grey = result ? result.inactive : [];
+  const selected = d.selected && d.loops[d.selected.loop]?.points[d.selected.k] ? d.selected : null;
+  const hovered = d.hoverSeg ? d.hoverSeg.split(":").map(Number) : null;
+  d.loops.forEach((loop, L) => loop.paths.forEach((path, K) => {
+    if (!path) return;
+    if (path.status !== "ok") pathPairs(path, failed);
+    else if (!result) pathPairs(path, red);
+    const lit = (hovered && hovered[0] === L && hovered[1] === K) || (selected && selected.loop === L && segmentsAt(loop, selected.k).includes(K));
+    if (lit) pathPairs(path, marked);
+  }));
+  for (const ghost of [true, false]) {
+    if (red.length) group.add(drawLine(red, { color: PARTING_LINE, ghost }));
+    if (grey.length) group.add(drawLine(grey, { color: DRAW_INACTIVE, width: 3, dashed: true, dash, ghost }));
+    if (failed.length) group.add(drawLine(failed, { color: DRAW_FAILED, width: 3, dashed: true, dash, ghost }));
+  }
+  if (marked.length) group.add(drawLine(marked, { color: DRAW_SELECTED, width: 6, order: ORDER_LINE + 0.2 }));
+  // The points: point 1 of each loop bigger, ringed; the one selected yellow.
+  const plain = [], firsts = [], chosen = [];
+  d.loops.forEach((loop, L) => loop.points.forEach((sp, k) => {
+    if (selected && selected.loop === L && selected.k === k) chosen.push(sp.p);
+    else (k === 0 ? firsts : plain).push(sp.p);
+  }));
+  for (const ghost of [true, false]) {
+    if (plain.length) group.add(drawMarks(plain, { ghost }));
+    if (firsts.length) group.add(drawMarks(firsts, { size: DRAW_BIG_PX, color: 0xffffff, map: markerTextures().ring, ghost }));
+    if (chosen.length) group.add(drawMarks(chosen, { size: DRAW_BIG_PX, color: DRAW_SELECTED, ghost }));
+  }
+  // The centres of the arcs: a small cross, thin lines to the ends.
+  const centres = [];
+  d.loops.forEach((loop, L) => loop.segs.forEach((spec, K) => {
+    if (spec?.kind !== "arc" || K >= segCount(loop)) return;
+    const A = loop.points[K].p, B = loop.points[(K + 1) % loop.points.length].p;
+    const geo = arcGeometry(A, B, spec);
+    if (geo.error) return;
+    const c = geo.centre, r = 0.008 * (dm.diag || 1);
+    for (let k = 0; k < 3; k++) {
+      const a = c.slice(), b = c.slice();
+      a[k] -= r;
+      b[k] += r;
+      centres.push(...a, ...b);
+    }
+    centres.push(...c, ...A, ...c, ...B);
+  }));
+  if (centres.length) {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(Float32Array.from(centres), 3));
+    const lines = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: PARTING_ARROW, transparent: true, opacity: 0.8, depthTest: false, clippingPlanes: [sectionPlane] }));
+    lines.renderOrder = ORDER_LINE;
+    group.add(lines);
+  }
+  // The rotation axis through the centre of the part, 1.3 times its diagonal.
+  const size = state.result.bodies[i].bbox.size;
+  const half = 0.65 * Math.hypot(...size);
+  const ends = [-half, half].flatMap((s) => d.centre.map((c, k) => c + s * d.axis[k]));
+  group.add(drawLine(ends, { color: PARTING_ARROW, width: 2, dashed: true, dash: 2 * dash, opacity: 0.85, order: ORDER_LINE - 1 }));
+  mesh.add(group);
+  mesh.userData.drawOverlay = group;
+  card.dataset.overlay = [...tags, ...(drawPoints(d) ? ["drawing"] : []), "axis"].join(" ");
+  buildLabels(d);
+}
+
+/** The preview of the next segment (red, faint; dashed orange when it is not laid), and point 1 ringed when the click would close the loop. */
+function showHover(i, path, first) {
+  hideHover();
+  const mesh = state.meshes[i];
+  if (!mesh) return;
+  const group = new THREE.Group();
+  const pairs = path ? pathPairs(path, []) : [];
+  if (pairs.length) {
+    const ok = path.status === "ok";
+    const dash = 0.012 * (drawGeometry(i).diag || 1);
+    group.add(drawLine(pairs, ok ? { color: PARTING_LINE, width: 3, opacity: 0.5 } : { color: DRAW_FAILED, width: 3, dashed: true, dash, opacity: 0.8 }));
+  }
+  if (first) group.add(drawMarks([first], { size: 22, color: 0xffffff, map: markerTextures().ring }));
+  mesh.add(group);
+  mesh.userData.drawHover = group;
+}
+
+function hideHover() {
+  for (const mesh of state.meshes) {
+    const group = mesh.userData.drawHover;
+    if (!group) continue;
+    mesh.remove(group);
+    group.traverse((o) => {
+      o.geometry?.dispose();
+      o.material?.dispose();
+    });
+    mesh.userData.drawHover = null;
+  }
+}
+
+/** The numbers of the points, as labels of the page placed in the animation loop. */
+function buildLabels(d) {
+  const box = $("draw-labels");
+  drawUi.labels = [];
+  if (!d) return box.replaceChildren();
+  const spans = [];
+  d.loops.forEach((loop, L) => loop.points.forEach((sp, k) => {
+    const span = document.createElement("span");
+    span.textContent = String(pointNumber(d, L, k));
+    if (k === 0) span.classList.add("first");
+    if (d.selected?.loop === L && d.selected.k === k) span.classList.add("selected");
+    spans.push(span);
+    drawUi.labels.push({ p: sp.p, t: sp.t, el: span });
+  }));
+  box.replaceChildren(...spans);
+}
+
+/** After each frame: the labels where their points are; faint on the far side of the part. */
+function drawFrame() {
+  if (!drawUi.active || !drawUi.labels.length) return;
+  const active = drawActive();
+  if (!active) return;
+  const dm = drawGeometry(active.i);
+  const w = viewport.clientWidth, h = viewport.clientHeight;
+  const eye = camera.position;
+  const v = new THREE.Vector3();
+  for (const label of drawUi.labels) {
+    v.set(label.p[0], label.p[1], label.p[2]).project(camera);
+    // Off the view, or on the side of the section cut away.
+    const out = v.z > 1 || v.x < -1.1 || v.x > 1.1 || v.y < -1.1 || v.y > 1.1 || (sectionOn && sectionPlane.distanceToPoint(vec3(label.p)) < 0);
+    label.el.hidden = out;
+    if (out) continue;
+    label.el.style.transform = `translate(${((v.x + 1) / 2) * w}px, ${((1 - v.y) / 2) * h}px) translate(6px, -100%)`;
+    const n = 3 * label.t;
+    const away = dm.normals[n] * (eye.x - label.p[0]) + dm.normals[n + 1] * (eye.y - label.p[1]) + dm.normals[n + 2] * (eye.z - label.p[2]) < 0;
+    label.el.classList.toggle("behind", away);
+  }
+}
+
+/**
+ * The triangles the drawn line crosses, while its halves are tinted: each
+ * corner in the colour of the half most of the triangles round it (off the
+ * line) are in, so that the colour changes across the triangle, along the
+ * line, instead of a whole triangle on one side (a face of a CAD body: two
+ * large triangles, else split along their diagonal).
+ */
+function drawSeamColours(d, i, colors) {
+  const tint = d.shownTint;
+  if (!tint) return;
+  const dm = drawGeometry(i);
+  const { W, areas } = dm;
+  if (!tint.seam) {
+    const seam = new Uint8Array(dm.nt);
+    for (const loop of tint.paths) for (const path of loop) for (const f of path.tri) seam[f] = 1;
+    tint.seam = seam;
+  }
+  // The triangles round each welded vertex (compressed rows), once per body.
+  if (!dm.corners) {
+    const start = new Int32Array(dm.nvW + 1);
+    for (let k = 0; k < W.length; k++) start[W[k] + 1]++;
+    for (let w = 0; w < dm.nvW; w++) start[w + 1] += start[w];
+    const list = new Int32Array(W.length);
+    const fill = start.slice(0, dm.nvW);
+    for (let k = 0; k < W.length; k++) list[fill[W[k]]++] = Math.floor(k / 3);
+    dm.corners = { start, list };
+  }
+  const { start, list } = dm.corners;
+  const color = new THREE.Color();
+  for (let f = 0; f < dm.nt; f++) {
+    if (!tint.seam[f] || tint.undercut[f]) continue;
+    for (let k = 0; k < 3; k++) {
+      const w = W[3 * f + k];
+      let up = 0, down = 0;
+      for (let s = start[w]; s < start[w + 1]; s++) {
+        const g = list[s];
+        if (tint.seam[g]) continue;
+        if (tint.side[g] === SIDE_UPPER) up += areas[g];
+        else if (tint.side[g] === SIDE_LOWER) down += areas[g];
+      }
+      const side = up > down ? SIDE_UPPER : down > up ? SIDE_LOWER : tint.side[f];
+      color.copy(PARTING_FACE);
+      if (side === SIDE_UPPER) color.lerp(UPPER_TINT, 0.35);
+      else if (side === SIDE_LOWER) color.lerp(LOWER_TINT, 0.35);
+      colors[12 * f + 4 * k] = color.r;
+      colors[12 * f + 4 * k + 1] = color.g;
+      colors[12 * f + 4 * k + 2] = color.b;
+    }
+  }
+}
+
+/** The colour of triangle f while drawing (returns whether undercut): the halves tinted once applied, else the core zones of the axis in yellow. */
+function drawFaceColour(d, f, color) {
+  const tint = d.shownTint;
+  if (tint) {
+    if (tint.undercut[f]) {
+      color.copy(PARTING_UNDERCUT);
+      return true;
+    }
+    color.copy(PARTING_FACE);
+    if (tint.side[f] === SIDE_UPPER) color.lerp(UPPER_TINT, 0.35);
+    else if (tint.side[f] === SIDE_LOWER) color.lerp(LOWER_TINT, 0.35);
+    return false;
+  }
+  color.copy(PARTING_FACE);
+  const flags = d.base?.flags;
+  if (!flags) return false;
+  if (!(flags[f] & (REACH_UP | REACH_DOWN))) {
+    color.copy(PARTING_UNDERCUT);
+    return true;
+  }
+  if (flags[f] & ZERO_DRAFT) color.lerp(WHITE, 0.5);
+  return false;
+}
+
+// ---- the card
+
+/** The hint of the drawing: what to do next, or what went wrong. */
+function drawHint(i) {
+  const d = drawShown(i);
+  if (!d) return "";
+  if (d.stage === "axis-face") return t("parting.draw.hint.face");
+  if (d.sub?.kind === "centre") return t("parting.draw.hint.centre", { seg: segName(d, d.sub.loop, d.sub.seg) });
+  if (!d.axis) return t("parting.draw.hint.plane");
+  if (d.stage === "points") {
+    const loop = openLoop(d);
+    if (d.closeHover && loop) return t("parting.draw.hint.closeHover", { segments: loop.points.length });
+    // The number of the next point, and of the first point of its loop (the one closing it).
+    const n = pointNumber(d, d.current, loop ? loop.points.length : 0);
+    if (!loop?.points.length) return t("parting.draw.hint.first", { n, step: `1/${drawUi.step}`, axis: axisLabel(d.axis) });
+    return t("parting.draw.hint.next", { n, first: pointNumber(d, d.current, 0) });
+  }
+  // The halves: a segment not laid, the loops not splitting the part, a warning; else what to do.
+  for (let L = 0; L < d.loops.length; L++) {
+    const K = d.loops[L].paths.findIndex((path) => path && path.status !== "ok");
+    if (K >= 0) return segmentError(d, L, K, d.loops[L].paths[K]);
+  }
+  const messages = d.result?.messages ?? [];
+  const message = messages.find((m) => m.level === "error") ?? messages.find((m) => m.level === "warning" && m.code !== "edges");
+  return message ? t(message.hint, message) : t("parting.draw.hint.halves");
+}
+
+/** A control of the card locked while drawing (or for a drawn line), its title saying why. */
+function lockControl(el, locked, why, titleKey = null) {
+  el.disabled = locked;
+  el.title = locked ? why : titleKey ? t(titleKey) : "";
+}
+
+/** A point as its field shows it to be edited: 2 decimals, the thousands not grouped (parseTriple reads it back). */
+const pointField = (p) => p.map((x) => (Math.abs(x) < 5e-3 ? 0 : x).toLocaleString(locale(), { maximumFractionDigits: 2, useGrouping: false })).join(language() === "fr" ? " ; " : ", ");
+
+/** The rows of the segments: name, type, length, actions; the radius and centre of an arc; an error. */
+function segmentRows(d) {
+  const rows = [];
+  const many = d.loops.length > 1;
+  const result = d.result?.ok ? d.result : null;
+  const selected = d.selected && d.loops[d.selected.loop]?.points[d.selected.k] ? d.selected : null;
+  d.loops.forEach((loop, L) => {
+    if (many) rows.push(`<tr class="loop-head"><td colspan="4">${escapeHtml(t("parting.draw.loop", { n: L + 1 }))}</td></tr>`);
+    for (let K = 0; K < segCount(loop); K++) {
+      const key = `${L}:${K}`;
+      const spec = loop.segs[K];
+      const path = loop.paths[K];
+      const arc = spec?.kind === "arc";
+      const name = segName(d, L, K);
+      const failed = path && path.status !== "ok";
+      const off = result && !failed && !segmentActive(result, L, K);
+      const lit = (selected && selected.loop === L && segmentsAt(loop, selected.k).includes(K)) || d.hoverSeg === key;
+      const length = !path ? "—"
+        : failed ? `<span class="seg-failed">${escapeHtml(t("parting.draw.notLaid"))}</span>`
+        : `${path.method === "edges" ? "≈ " : ""}${escapeHtml(fmtNum(path.length, 1))} mm`;
+      const title = off ? t("parting.draw.inactive.title") : path?.method === "edges" ? t("parting.draw.edges.title") : "";
+      const cls = [lit ? "selected" : "", off ? "inactive" : "", arc ? "seg-arc" : ""].filter(Boolean).join(" ");
+      const button = (action, label, titleKey) => `<button type="button" data-action="${action}" title="${escapeHtml(t(titleKey))}" aria-label="${escapeHtml(`${t(titleKey)} (${name})`)}">${label}</button>`;
+      rows.push(`<tr data-seg="${key}"${cls ? ` class="${cls}"` : ""}${title ? ` title="${escapeHtml(title)}"` : ""}>` +
+        `<td>${escapeHtml(name)}</td>` +
+        `<td><select data-field="type" title="${escapeHtml(t("parting.draw.type.title"))}" aria-label="${escapeHtml(`${t("parting.draw.col.type")} ${name}`)}">` +
+        `<option value="straight"${arc ? "" : " selected"}>${escapeHtml(t("parting.draw.type.straight"))}</option>` +
+        `<option value="arc"${arc ? " selected" : ""}>${escapeHtml(t("parting.draw.type.curved"))}</option></select></td>` +
+        `<td class="num">${length}</td>` +
+        `<td class="seg-actions">${arc ? "" : button("flip", "⇄", "parting.draw.flip.title")}${button("split", "+", "parting.draw.split.title")}</td></tr>`);
+      const typed = d.inputs.get(key);
+      if (arc) {
+        const A = loop.points[K].p, B = loop.points[(K + 1) % loop.points.length].p;
+        const geo = arcGeometry(A, B, spec);
+        const min = Math.ceil((dist3(A, B) / 2) * 100) / 100;
+        const placing = d.sub?.kind === "centre" && d.sub.loop === L && d.sub.seg === K;
+        const radius = typed?.radius ?? String(round(spec.radius, 2));
+        const centre = typed?.centre ?? (geo.error ? "" : pointField(geo.centre));
+        rows.push(`<tr class="seg-arc-edit" data-seg="${key}"><td colspan="4"><div class="seg-edit">` +
+          `<label>${escapeHtml(t("parting.draw.radius"))} <input type="number" data-field="radius" step="0.1" min="${min}" value="${escapeHtml(radius)}"${typed?.radius != null ? ' aria-invalid="true"' : ""}></label>` +
+          `<label>${escapeHtml(t("parting.draw.centre"))} <input type="text" class="seg-centre" data-field="centre" autocomplete="off" placeholder="${escapeHtml(t("parting.draw.centre.placeholder"))}" value="${escapeHtml(centre)}"${typed?.centre != null ? ' aria-invalid="true"' : ""}></label>` +
+          button("centreFlip", "⇅", "parting.draw.centreFlip.title") +
+          `<button type="button" data-action="placeCentre" class="toggle${placing ? " active" : ""}" title="${escapeHtml(t("parting.draw.placeCentre.title"))}">${escapeHtml(t("parting.draw.placeCentre"))}</button>` +
+          `</div></td></tr>`);
+      }
+      const error = typed?.error ?? (failed ? segmentError(d, L, K, path) : null);
+      if (error) rows.push(`<tr class="parting-seg-error" data-seg="${key}"><td colspan="4">${escapeHtml(error)}</td></tr>`);
+    }
+  });
+  return rows.join("");
+}
+
+/**
+ * The drawing's part of the card (from renderParting): the toggle, the
+ * draft kept, the panel (plane, axis, actions, segments, point, halves,
+ * alignment), the other ways of defining the direction locked while drawing,
+ * and the controls on the 3D view.
+ */
+function renderDrawPanel(p, i, field, hint) {
+  const active = drawActive();
+  const d = active?.i === i ? active.d : null;
+  const why = t("parting.draw.locked");
+  lockControl($("parting-pick"), !!d, why, "parting.pick.title");
+  lockControl($("parting-vector"), !!d, why, "parting.vector.title");
+  lockControl($("parting-apply"), !!d, why);
+  // Faces cannot be reassigned on a drawn line: its halves are chosen by part.
+  lockControl($("parting-assign"), !!d || field.source === "drawn", d ? why : t("parting.assign.drawn"), "parting.assign.title");
+  $("parting-target").disabled = !!d || field.source === "drawn";
+  const table = $("parting-candidates");
+  table.classList.toggle("locked", !!d);
+  table.title = d ? why : "";
+  for (const input of table.querySelectorAll("input")) input.disabled = !!d;
+  const card = $("parting-card");
+  if (d) card.dataset.draw = d.stage;
+  else delete card.dataset.draw;
+
+  $("parting-draw").classList.toggle("active", !!d);
+  $("parting-draw").setAttribute("aria-pressed", String(!!d));
+  const kept = p.draw.get(i);
+  const showKept = !d && kept && drawPoints(kept) > 0 && drawEdited(p, i);
+  $("parting-draw-kept").hidden = !showKept;
+  if (showKept) $("parting-draw-kept").textContent = t("parting.draw.kept", { points: drawPoints(kept) });
+  $("parting-draw-panel").hidden = !d;
+  renderViewControls(d, hint);
+  if (!d) return;
+
+  $("parting-draw-plane").value = d.plane;
+  $("parting-draw-vector-row").hidden = d.plane !== "vector";
+  if (document.activeElement !== $("parting-draw-vector")) $("parting-draw-vector").value = d.vector ?? "";
+  $("parting-draw-axis").textContent = d.axis ? t("parting.draw.axis", { axis: axisLabel(d.axis), centre: fmtPoint(d.centre) }) : "";
+  const open = openLoop(d);
+  const canClose = !!open && open.points.length >= 3;
+  for (const [id, off] of [
+    ["parting-draw-undo", !d.history.length], ["draw-undo", !d.history.length], ["parting-draw-redo", !d.future.length],
+    ["parting-draw-close", !canClose], ["draw-close", !canClose], ["parting-draw-new", !allClosed(d) || d.loops.length >= MAX_LOOPS],
+    ["parting-draw-clear", !drawPoints(d)],
+  ]) $(id).disabled = off;
+
+  setHtml($("parting-draw-segments").tBodies[0], segmentRows(d));
+  $("parting-draw-segments").hidden = !d.loops.some((loop) => segCount(loop) > 0);
+
+  const sel = d.selected && d.loops[d.selected.loop]?.points[d.selected.k] ? d.selected : null;
+  $("parting-draw-point").hidden = !sel;
+  if (sel) $("parting-draw-point-label").textContent = t("parting.draw.point", { n: pointNumber(d, sel.loop, sel.k) });
+
+  const halves = d.stage === "halves";
+  $("parting-draw-halves").hidden = !halves;
+  $("parting-draw-upper").classList.toggle("active", d.target === SIDE_UPPER);
+  $("parting-draw-lower").classList.toggle("active", d.target === SIDE_LOWER);
+  const figures = d.result?.ok ? d.result.figures : null;
+  $("parting-draw-parts").hidden = !figures;
+  if (figures) $("parting-draw-parts").textContent = t("parting.draw.parts", { count: figures.parts, upper: figures.upper_parts, lower: figures.lower_parts });
+
+  const align = halves ? alignCandidate(d) : null;
+  $("parting-draw-align").hidden = !align;
+  if (align) {
+    const frame = heightFrame(d.axis);
+    $("parting-draw-align-label").textContent = t("parting.draw.alignLabel", { n: align.L + 1, axis: frame.name });
+    const value = round(frame.sign * align.median, 1);
+    const key = `${align.L}|${value}`;
+    if (d.alignFor !== key && document.activeElement !== $("parting-draw-level")) {
+      d.alignFor = key;
+      $("parting-draw-level").value = String(value);
+    }
+  }
+}
+
+/** The controls on the 3D view: shown while drawing (an axis set), the arrows' and the step's texts, the angle, the hint. */
+function renderViewControls(d, hint) {
+  const on = !!d && !!d.axis && d.stage !== "axis-face";
+  $("draw-overlay").hidden = !on;
+  if (!on) return;
+  $("draw-hint").textContent = hint;
+  const params = { step: `1/${drawUi.step}`, axis: axisLabel(d.axis) };
+  for (const [id, key] of [["turn-left", "view.turnLeft"], ["turn-right", "view.turnRight"]]) {
+    $(id).title = t(key, params);
+    $(id).setAttribute("aria-label", t(key, params));
+  }
+  $("turn-step").setAttribute("aria-label", t("view.turnStep"));
+  for (const button of $("turn-step").querySelectorAll("[data-step]")) {
+    const checked = Number(button.dataset.step) === drawUi.step;
+    button.setAttribute("aria-checked", String(checked));
+    button.tabIndex = checked ? 0 : -1;
+    button.title = t(`view.step.${button.dataset.step}.title`);
+    button.setAttribute("aria-label", t(`view.step.${button.dataset.step}.label`));
+  }
+  for (const id of ["draw-undo", "draw-close", "draw-done"]) $(id).setAttribute("aria-label", $(id).querySelector(".draw-label").textContent);
+  $("turn-reset").setAttribute("aria-label", t("view.turnReset"));
+  showTurnAngle();
+}
+
+// ---- keys
+
+/**
+ * The keys of the drawing (true: handled): ← → turn, Ctrl+Z / Ctrl+Y, Enter
+ * closes, Delete, Esc (a point dragged: put back). Not while typing, nor with
+ * a button pressed, nor on another page than the 3D view.
+ */
+function drawKey(e) {
+  const active = drawActive();
+  // Esc during a drag (its button still pressed): the point back where it was.
+  if (active && drawUi.drag && e.key === "Escape") {
+    endDrag(null, false);
+    e.preventDefault();
+    return true;
+  }
+  if (!active || drawUi.pressed || $("page-viewer").hidden) return false;
+  const el = document.activeElement;
+  if (el && (el.isContentEditable || /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName))) return false;
+  const { p, i, d } = active;
+  const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  const mod = e.ctrlKey || e.metaKey;
+  if (key === "Escape") {
+    if (d.stage === "axis-face") {
+      d.plane = d.prev?.plane ?? d.plane;
+      if (d.plane === "face" && d.axis) d.plane = defaultPlane(d.axis).plane;
+      d.prev = null;
+      d.stage = stageOf(d);
+      renderParting();
+    } else if (d.sub) {
+      d.sub = null;
+      renderParting();
+    } else leaveDrawing();
+    e.preventDefault();
+    return true;
+  }
+  if (mod && !e.altKey && key === "z" && !e.shiftKey) {
+    undoDrawing();
+    e.preventDefault();
+    return true;
+  }
+  if (mod && !e.altKey && (key === "y" || (key === "z" && e.shiftKey))) {
+    redoDrawing();
+    e.preventDefault();
+    return true;
+  }
+  if (mod || e.altKey) return false;
+  if (key === "ArrowLeft" || key === "ArrowRight") {
+    if (el?.closest?.("#turn-step")) return false; // the step chosen with the arrows there
+    turnArrow(key === "ArrowLeft" ? -1 : 1);
+    e.preventDefault();
+    return true;
+  }
+  if (key === "Enter") {
+    if (el?.tagName === "BUTTON") return false;
+    closeLoop(i, d);
+    e.preventDefault();
+    return true;
+  }
+  if (key === "Delete" || key === "Backspace") {
+    const open = openLoop(d);
+    if (d.selected) deletePoint(i, d, d.selected);
+    else if (open?.points.length && d.stage === "points") deletePoint(i, d, { loop: d.current, k: open.points.length - 1 });
+    p.message = null;
+    e.preventDefault();
+    return true;
+  }
+  return false;
+}
+
+// ---- events
+
+/** The drawing shown and its body, for the buttons. */
+const withDrawing = (fn) => () => {
+  const active = drawActive();
+  if (active) fn(active);
+};
+
+$("parting-draw").addEventListener("click", () => setPartingMode("draw"));
+// The plane chosen: the focus leaves the list (← → turn the part, Esc goes back), but to the normal to type.
+$("parting-draw-plane").addEventListener("change", (e) => {
+  drawPlaneChosen(e.target.value);
+  if (e.target.value !== "vector") e.target.blur();
+});
+$("parting-draw-vector-apply").addEventListener("click", applyDrawVector);
+$("parting-draw-vector").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") applyDrawVector();
+});
+$("parting-draw-undo").addEventListener("click", undoDrawing);
+$("parting-draw-redo").addEventListener("click", redoDrawing);
+$("draw-undo").addEventListener("click", undoDrawing);
+for (const id of ["parting-draw-close", "draw-close"]) $(id).addEventListener("click", withDrawing(({ i, d }) => closeLoop(i, d)));
+$("parting-draw-new").addEventListener("click", newLoop);
+$("parting-draw-side").addEventListener("click", withDrawing(({ d }) => drawingView(d)));
+$("parting-draw-clear").addEventListener("click", clearDrawing);
+for (const id of ["parting-draw-done", "draw-done"]) $(id).addEventListener("click", leaveDrawing);
+$("parting-draw-delete").addEventListener("click", withDrawing(({ i, d }) => d.selected && deletePoint(i, d, d.selected)));
+for (const [id, side] of [["parting-draw-upper", SIDE_UPPER], ["parting-draw-lower", SIDE_LOWER]]) {
+  $(id).addEventListener("click", withDrawing(({ p, d }) => {
+    d.target = side;
+    p.message = null;
+    renderParting();
+  }));
+}
+$("parting-draw-swap").addEventListener("click", swapHalves);
+const alignTyped = withDrawing(({ i, d }) => {
+  const align = alignCandidate(d);
+  const value = Number(String($("parting-draw-level").value).trim().replace(",", "."));
+  if (!align || !Number.isFinite(value)) return;
+  alignLoop(i, d, align.L, value * heightFrame(d.axis).sign);
+});
+$("parting-draw-align-apply").addEventListener("click", alignTyped);
+$("parting-draw-level").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") alignTyped();
+});
+
+// The table of the segments: its type, its radius and centre (on change: typing keeps the focus), its buttons; hovered, its line in yellow.
+const segmentOf = (el) => {
+  const row = el.closest("[data-seg]");
+  return row ? row.dataset.seg.split(":").map(Number) : null;
+};
+$("parting-draw-segments").addEventListener("change", (e) => {
+  const active = drawActive();
+  const seg = segmentOf(e.target);
+  if (!active || !seg) return;
+  const { p, i, d } = active;
+  p.message = null;
+  const [L, K] = seg;
+  const field = e.target.dataset.field;
+  if (field === "type") setSegmentType(i, d, L, K, e.target.value);
+  else if (field === "radius") setSegmentRadius(i, d, L, K, e.target.value);
+  else if (field === "centre") setSegmentCentre(i, d, L, K, parseTriple(e.target.value), e.target.value);
+});
+$("parting-draw-segments").addEventListener("click", (e) => {
+  const button = e.target.closest("button[data-action]");
+  const active = drawActive();
+  const seg = button && segmentOf(button);
+  if (!active || !seg) return;
+  const { p, i, d } = active;
+  const [L, K] = seg;
+  p.message = null;
+  const action = button.dataset.action;
+  if (action === "flip" || action === "centreFlip") flipSegment(i, d, L, K);
+  else if (action === "split") splitSegment(i, d, L, K);
+  else if (action === "placeCentre") {
+    d.sub = d.sub?.kind === "centre" && d.sub.loop === L && d.sub.seg === K ? null : { kind: "centre", loop: L, seg: K };
+    hideHover();
+    renderParting();
+  }
+});
+$("parting-draw-segments").addEventListener("mouseover", (e) => {
+  const active = drawActive();
+  const seg = segmentOf(e.target);
+  const key = seg ? seg.join(":") : null;
+  if (!active || active.d.hoverSeg === key) return;
+  active.d.hoverSeg = key;
+  applyDrawOverlay();
+});
+$("parting-draw-segments").addEventListener("mouseleave", () => {
+  const active = drawActive();
+  if (!active?.d.hoverSeg) return;
+  active.d.hoverSeg = null;
+  applyDrawOverlay();
+});
+
+// The arrows and the step on the 3D view (outside the canvas: never a click of the drawing, never the trackball).
+$("turn-left").addEventListener("click", () => turnArrow(-1));
+$("turn-right").addEventListener("click", () => turnArrow(1));
+$("turn-reset").addEventListener("click", resetTurn);
+$("turn-step").addEventListener("click", (e) => {
+  const button = e.target.closest("[data-step]");
+  if (button) setTurnStep(Number(button.dataset.step));
+});
+// A radio group: the arrow keys move the choice.
+$("turn-step").addEventListener("keydown", (e) => {
+  const button = e.target.closest("[data-step]");
+  if (!button || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+  const k = TURN_STEPS.indexOf(Number(button.dataset.step)) + (e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 1);
+  const step = TURN_STEPS[(k + TURN_STEPS.length) % TURN_STEPS.length];
+  setTurnStep(step);
+  $("turn-step").querySelector(`[data-step="${step}"]`)?.focus();
+  e.preventDefault();
 });
 
 // ---------------------------------------------------------------- risers and gating
@@ -2739,9 +5538,9 @@ function feedingClick(hits) {
   const f = feedingOf();
   if (!f?.mode) return false;
   const i = feedingBody();
-  const hit = hits[0];
-  if (!hit) return true;
-  if (hit.object.userData.index !== i) {
+  if (!hits.length) return true;
+  const hit = cardHit(hits, i);
+  if (!hit) {
     f.message = t("feeding.otherBody");
     renderFeeding();
     return true;
@@ -2795,7 +5594,8 @@ function setFeedingMode(mode) {
   f.mode = f.mode === mode ? null : mode;
   f.message = null;
   const p = partingOf();
-  if (f.mode && p?.mode) {
+  if (f.mode && p?.mode === "draw") leaveDrawing();
+  else if (f.mode && p?.mode) {
     p.mode = null;
     renderParting();
   }
@@ -2825,7 +5625,8 @@ function removeFeedingOverlay(mesh) {
  * cylinder for each riser (standing on the part, or beside it at the parting
  * line), the one selected lighter, and an arrow into the part for the
  * ingate; over whatever colours the view shows (the parting line, the
- * thickness).
+ * thickness), drawn after the halves of the mould (inside the upper one).
+ * The other bodies faded while they are shown.
  */
 function applyFeeding() {
   state.meshes.forEach(removeFeedingOverlay);
@@ -2833,6 +5634,9 @@ function applyFeeding() {
   const i = feedingBody();
   const field = f?.show && i >= 0 && state.meshes[i] ? feedingField(i) : null;
   $("feeding-card").dataset.markers = field ? String(field.risers.length + (field.gate ? 1 : 0)) : "0";
+  $("feeding-card").dataset.gateTip = "";
+  // The other bodies faded, or given back (the colours of the view again).
+  if (fadeStale()) applyThickness();
   if (!field) return;
   const mesh = state.meshes[i];
   const group = new THREE.Group();
@@ -2851,8 +5655,10 @@ function applyFeeding() {
     const base = new THREE.Vector3(...riser.position_mm);
     if (riser.offset) base.addScaledVector(new THREE.Vector3(...riser.offset), radius);
     cylinder.position.copy(base).addScaledVector(axis, riser.height_mm / 2);
+    cylinder.renderOrder = ORDER_MARKERS;
     cylinder.userData.own = true;
     cylinder.userData.riser = riser.id;
+    cylinder.userData.cap = "riser"; // a solid: closed by the section (syncCaps)
     group.add(cylinder);
   }
   if (field.gate) {
@@ -2864,19 +5670,29 @@ function applyFeeding() {
     const shaftRadius = Math.max((field.gate.thickness_mm ?? 0) / 2, 0.008 * size);
     const dir = new THREE.Vector3(...field.gate.direction).normalize();
     const tip = new THREE.Vector3(...field.gate.position_mm);
-    const material = new THREE.MeshStandardMaterial({ color: GATE_COLOR, clippingPlanes: [sectionPlane] });
+    // Opaque, but drawn with the translucent overlays: after the halves of the mould, not tinted by them.
+    const material = new THREE.MeshStandardMaterial({ color: GATE_COLOR, transparent: true, opacity: 1, clippingPlanes: [sectionPlane] });
     const cone = new THREE.Mesh(new THREE.ConeGeometry(coneRadius, head, 32), material);
     const shaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftRadius, shaftRadius, length - head, 16), material.clone());
     for (const [part, along] of [[cone, head / 2], [shaft, head + (length - head) / 2]]) {
       // Cone and cylinder along +Y: turned to point along the ingate's direction, back from the tip.
       part.quaternion.setFromUnitVectors(up, dir);
       part.position.copy(tip).addScaledVector(dir, -along);
+      part.renderOrder = ORDER_MARKERS;
       part.userData.own = true;
+      part.userData.cap = "gate";
       group.add(part);
     }
   }
   mesh.add(group);
   mesh.userData.feedingOverlay = group;
+  // Where the tip of the arrow is drawn (mm), for scripts and tests: the cone's apex, on the ingate's point.
+  const cone = group.children.find((o) => o.userData.cap === "gate");
+  if (cone) {
+    cone.updateWorldMatrix(true, false);
+    const apex = cone.localToWorld(new THREE.Vector3(0, cone.geometry.parameters.height / 2, 0));
+    $("feeding-card").dataset.gateTip = JSON.stringify(apex.toArray().map((x) => Math.round(x * 1e4) / 1e4));
+  }
 }
 
 // ---- card
@@ -3084,8 +5900,9 @@ $("feeding-reset").addEventListener("click", () => {
   const i = feedingBody();
   if (i >= 0) resetFeeding(i);
 });
-// Esc stops placing on the 3D view.
+// Esc stops placing on the 3D view. Drawing by hand: its keys (the arrows, Undo, Enter, Delete, Esc).
 document.addEventListener("keydown", (e) => {
+  if (drawKey(e)) return;
   if (e.key !== "Escape") return;
   const f = feedingOf();
   if (!f?.mode) return;
@@ -3126,6 +5943,7 @@ function freeTab() {
 
 /** Put the model of the tab shown aside (its meshes kept, out of the scene). */
 function stashTab(tab) {
+  leaveDrawing(); // drawing by hand: left (the drawing kept), its turn of the view ended
   const option = $("material").selectedOptions[0];
   tab.material = { value: $("material").value, alloy: option?.dataset.alloy ?? null, density: $("density").value };
   modelGroup.clear();
@@ -3179,6 +5997,7 @@ function showTab(tab) {
     camera.far = view.camera.far;
     camera.updateProjectionMatrix();
     controls.target.copy(view.camera.target);
+    stopInertia();
     controls.update();
     Object.assign(thick, view.thick);
     thick.statsHtml = null;
@@ -3674,6 +6493,14 @@ window.reader3d = {
   },
   get status() {
     return document.body.dataset.status ?? "idle";
+  },
+  /** Where the 3D view looks from: the camera's position and up, and the point it turns about (mm). */
+  get view() {
+    return { position: camera.position.toArray(), up: camera.up.toArray(), target: controls.target.toArray() };
+  },
+  /** Where a point of the model ([x, y, z] mm) is on the page: {x, y} in client pixels, or null behind the camera or with the 3D view not shown. */
+  screenOf(point) {
+    return screenOf(point);
   },
   async analyze(input, { name } = {}) {
     state.noPrompt = true; // no memory confirmation dialog for scripts

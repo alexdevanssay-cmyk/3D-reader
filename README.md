@@ -36,10 +36,72 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   principal axes; ranked by undercut area, then a planar line, then the faces without
   draft), each face classified by lines of sight along the direction (upper half, lower
   half, undercut for a core or slide), and the parting line, planar or stepped/warped with
-  its height range. Shown on the 3D view; another candidate, the normal of a face, a typed
-  direction, or faces moved by a click to the upper or lower half define it by hand (kept
-  per part in the browser). The semantic contract, the foundry screen and the AI context
-  carry it, marked proposed or manual.
+  its height range. Shown on the 3D view: the parting line as a thick red line drawn over
+  everything, the undercuts in yellow, the other faces in light grey (lighter without
+  draft), and the two halves of the mould ("chapes") as translucent blocks round the part,
+  the upper one blue and the lower one green, a margin of the larger of 5 mm and 15 % of
+  the part round it (*Mould halves* hides them). The blocks meet flat at the level of a
+  planar line; for a stepped or warped line, on a surface interpolated from the points of
+  the line (a height field of at most 48 × 48 cells, inverse distance weighting), so the
+  interface follows the line near it and goes from one level to the other between its
+  runs. While the parting line or the risers of a body are shown, the other bodies of the
+  model are faded and a click goes through them: it reaches the card's body behind another
+  one (two versions of a part), never through a body drawn opaque. Another candidate, the
+  normal of a face, a typed direction, or faces moved by a click to the upper or lower half
+  define it by hand (kept per part in the browser). The semantic contract, the foundry
+  screen and the AI context carry it, marked proposed or manual.
+  See [Parting line drawn by hand](#parting-line-drawn-by-hand).
+- **Parting line drawn by hand** (*Dessin manuel* in the card): a plane is chosen (X, Y, Z,
+  a normal typed, or a face clicked); its normal through the centre of the part is the
+  rotation axis and the draw direction. Two large arrows on the 3D view turn the part about
+  it by 1/4, 1/8, 1/16 or 1/32 of a turn (the step in a frame at the bottom right) without
+  leaving the drawing; points are clicked on the part, each joined to the one before by a
+  line laid on its surface; clicking point 1 closes the loop and ends the placing. The
+  segments are listed (1-2, 2-3 …), each *droit* or *courbe* (an arc: its radius typed,
+  its centre typed or clicked). The two parts of the surface go to the halves by part
+  ("Partie supérieure" / "Partie inférieure", then a click on that part), never by face.
+
+## Parting line drawn by hand
+
+`web/engine/parting-draw.js` (pure geometry, tested in node) and the block "drawing by
+hand" of `web/app.js`:
+
+- **Axis and turn.** The plane's normal through the centre of the body's box is the
+  rotation axis, and the draw direction of the line drawn (+axis: the upper half). On
+  entering, the view turns to the side (axis upright on the screen, the camera 20° above
+  the plane). The arrows (or ← →) turn the camera, the key light and the target the other
+  way about that axis, exactly from the pose where the turn started (four quarter turns
+  come back to it); the model, the section and the overlays stay in their frame. While
+  drawing, the view has no inertia (precise); it comes back on leaving.
+- **Straight segment ("droit")**: the slice of the display mesh by a plane through the two
+  points, walked from triangle to triangle (exact per triangle): first the plane through
+  them closest to square to the axis (points at one height stay at it round corners,
+  cylinders and drafted walls: a loop clicked at one height is planar), else the normal
+  section (two points on one face: the straight line between them), else those planes
+  turned about the chord; the shorter way round, the plane and the side found kept with the
+  segment ("⇄" takes it round the other side). No plane from one point to the other (a
+  hole between them): along the edges of the mesh (A*, "≈").
+- **Curved segment ("courbe")**: a minor circular arc, radius R ≥ half the chord (60° by
+  default, in the plane of the segment's line: a rise or a dip of the line on a wall round
+  the part, a rounded corner on a face square to the axis), its centre on the bisector
+  plane of the chord (typed or clicked: moved onto it), draped on the surface along the
+  normal of its plane.
+- **Closing, editing**: the loop's first point clicked (or *Fermer la boucle*, Enter) closes
+  the loop and ends the placing; *Nouvelle boucle* draws another one (a bore through the parting plane
+  needs its own: the outer loop alone does not split the part). Points are dragged,
+  deleted (Suppr), added in the middle of a segment ("+"); undo and redo (Ctrl+Z, Ctrl+Y);
+  *Aligner* moves the points of a loop to one height typed in (hand-placed points are never
+  exactly level), its line then planar.
+- **Halves**: the loops cut the surface into parts (union-find of its vertices, the edges
+  crossed by a loop as barriers); the parts are proposed to the halves by what each one
+  can form (the lines of sight of the axis), then chosen by a click on a part (another
+  axis proposes them again: the parts chosen along the one before are forgotten); a passage
+  formed by neither half (a core) is left out when it would join them. Undercuts: the
+  faces a half cannot form, or of no half. The drawn line is applied as any definition by
+  hand (red line, yellow undercuts, blocks, risers placed again) and kept per part in the
+  browser, as is a drawing not finished (a draft). Halves are per triangle: on a coarse
+  mesh their boundary zigzags by a triangle along the line (the line itself is exact; the
+  area of the triangles it crosses is exported as `seam_area_mm2`).
 - **Risers and gating** ("masselottes et attaque de coulée"), card *Masselottes et attaque
   de coulée*: the hot spots and the feeding zones read from the inscribed spheres, a riser
   proposed on each zone no other one can feed (where, open on top or blind on the side,
@@ -47,9 +109,27 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   casting yield. Shown on the 3D view; risers added, moved, resized or deleted and the
   ingate placed by a click (kept per part in the browser). See
   [Risers and gating](#risers-and-gating-method-and-limits).
+- **Through and blind holes** of CAD solids, measured on the geometry: each hole (a
+  cylinder with the material around it, with its counterbore, countersink or drill point)
+  is probed by lines cast along its axis on the closed mesh: open at both ends, a through
+  hole; closed by a bottom at one, a blind hole, with its depth (from the furthest point
+  of its opening) and bottom (flat, drill point). A rounded edge into a cavity still
+  opens; a hole cut in two by a cross bore is one hole; the outside of a boss or a tube
+  round a hole is none. The semantic contract and the AI context give them as measured
+  (`through_hole`, `blind_hole`, operations `drilling` / `drilling_blind`); a hole the
+  lines cannot decide stays provisional, with the reason. Mesh files (STL...) have no
+  hole candidates.
 - Assemblies: one row per part with names and colours from the STEP file, per-part
   volume and share, show/hide, and click a part in 3D to select it.
-- Viewer: orbit, pan, zoom, standard views, wireframe, envelope display, section plane.
+- Viewer: orbit, pan, zoom, standard views, wireframe, envelope display, section plane
+  (the solids it cuts, bodies, risers and ingate, are closed: the cut shows as a solid
+  face, a body's darker than its own colour; open bodies, meshes whose triangles had to be
+  turned round or held duplicates, and the mould halves stay open).
+- Side panel of the 3D view, condensed at will: each card folds to its title (its chevron,
+  a click on the title, or « Tout replier / Tout déplier »), its head's controls still at
+  hand and its key value (volume, mass, thinnest wall) beside the title; the panel's width
+  set by dragging the edge between the view and it (from 260 px to 60 % of the window;
+  arrow keys too, a double-click for the default width). Both are kept in the browser.
 - **Costing of cast parts** (tabs *Chiffrage* and *Paramètres*, in French): import the
   SAB costing workbook (.xlsm) and the metal prices file (sheet « Suivi indice »); the
   page recomputes the hourly costs of the profit centres and the cost price (PRI) and
@@ -244,6 +324,7 @@ web/                   the web interface (static site)
     cache.js           results kept in the browser (IndexedDB)
     shared-cache.js    the same results in the shared network folder (gzip container)
     parting.js         draw direction and parting line of cast parts
+    parting-draw.js    the parting line drawn by hand (lines laid on the surface, halves by part)
     partworker.js      its worker (partclient.js: main-thread API)
     feeding.js         risers and ingate of cast parts (feeding zones, moduli)
     feedworker.js      its worker (feedclient.js: main-thread API)

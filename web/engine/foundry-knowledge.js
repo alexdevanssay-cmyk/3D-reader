@@ -141,6 +141,8 @@ function partingEvidence(body) {
   if (!p || (p.status !== "proposed" && p.status !== "manual") || !finite(p.undercut_area_mm2)) return { status: "not_evaluated" };
   return {
     status: p.status,
+    // How a manual one was defined: a candidate, a face, a direction typed, or "drawn" (the line drawn by hand on the part).
+    source: p.source ?? null,
     axis: p.axis ?? null,
     direction: p.direction ?? null,
     draft_angle_deg: p.draft_angle_deg ?? null,
@@ -270,6 +272,14 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
     .map(f => f.surface_index)
     .filter(i => i != null));
   const pocketCount = features.filter(f => f.type === "pocket_feature_candidate").length;
+  // Holes measured through or blind on the mesh (holes.js): openings, their inside known.
+  // Each once: a counterbored hole has a hole feature per diameter.
+  const measuredHoles = [...new Map(features
+    .filter(f => f.type === "hole_feature_candidate" && f.measured === true)
+    .map(f => [String(f.hole_surfaces ?? f.surface_index), f])).values()];
+  const throughHoles = measuredHoles.filter(f => f.through === true).length;
+  const blindHoles = measuredHoles.length - throughHoles;
+  if (measuredHoles.length) confirmedEvidence.push("holes_measured_through_or_blind");
 
   // With a draw direction, the lines of sight tell openings formed by the
   // die from undercuts: the candidates' review gives way to them.
@@ -278,13 +288,17 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
       "core_or_undercut_review",
       "review",
       "geometric_feature_candidates",
-      "Des faces cylindriques candidates, ouvertures ou bossages (l'intérieur et l'extérieur ne sont pas distingués), peuvent imposer des noyaux, des choix de plan de joint ou des opérations de reprise; l'intention et l'accessibilité restent à confirmer.",
+      measuredHoles.length
+        ? `Des trous mesurés sur la géométrie (${throughHoles} débouchant(s), ${blindHoles} borgne(s)) et les autres faces cylindriques candidates peuvent imposer des noyaux ou des broches, des choix de plan de joint ou des opérations de reprise; l'accessibilité reste à confirmer.`
+        : "Des faces cylindriques candidates, ouvertures ou bossages (l'intérieur et l'extérieur ne sont pas distingués), peuvent imposer des noyaux, des choix de plan de joint ou des opérations de reprise; l'intention et l'accessibilité restent à confirmer.",
       ["sfsa_design_steps","sfsa_handbook_supplement_1"],
     ));
   }
 
   if (partingKnown) {
     confirmedEvidence.push(parting.status === "manual" ? "parting_line_defined_manually" : "parting_line_proposed_from_geometry");
+    // Its points placed on the part by hand, the halves given by part (not classified by lines of sight).
+    if (parting.source === "drawn") confirmedEvidence.push("parting_line_drawn_by_hand");
     if (undercut) {
       risks.push(issue(
         "undercut_requires_core_or_slide",
@@ -402,7 +416,11 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
       parting,
       feeding,
       principal_axes: principalAxes,
-      feature_counts: { cylindrical_opening_or_boss_candidates: cylindricalFaces.size, pocket_candidates: pocketCount },
+      feature_counts: {
+        cylindrical_opening_or_boss_candidates: cylindricalFaces.size,
+        pocket_candidates: pocketCount,
+        ...(measuredHoles.length ? { measured_through_holes: throughHoles, measured_blind_holes: blindHoles } : {}),
+      },
       confirmed: confirmedEvidence,
     },
     rules: ruleStatus,

@@ -93,8 +93,10 @@ button.toggle.active { background: var(--accent); border-color: var(--accent); c
 button.small { font-size: 12px; padding: 3px 8px; }
 
 .layout {
+  position: relative;
   display: grid;
-  grid-template-columns: 1fr 380px;
+  /* --panel-width: set by dragging the splitter (panels.js) */
+  grid-template-columns: minmax(0, 1fr) var(--panel-width, 380px);
   height: calc(100% - var(--topbar-h, 53px));
 }
 
@@ -262,6 +264,7 @@ table.bodies .open { color: var(--warn); }
 .thick-min strong.overridden { color: var(--muted); font-weight: 400; }
 .thick-min-used label { color: var(--text); font-weight: 600; }
 /* Parting line */
+.card-checks { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px 12px; flex-wrap: wrap; }
 .parting-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
 .parting-head > span:first-child { color: var(--muted); }
 .parting-head strong { font-size: 20px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
@@ -284,6 +287,110 @@ table.parting-candidates input { margin: 0; }
 #parting-status, #parting-body { margin: 2px 0 6px; }
 .parting-legend { margin: 8px 0 0; line-height: 1.9; }
 .parting-legend .swatch { margin-left: 4px; margin-right: 3px; }
+/* The parting line drawn by hand: its panel in the card (the plane, the actions, the segments, the halves). */
+.parting-controls button:disabled, .parting-vector input:disabled, table.parting-candidates.locked { opacity: 0.55; cursor: not-allowed; }
+.parting-draw-panel { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.parting-draw-plane { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+.parting-draw-plane select { min-width: 0; max-width: 100%; }
+#parting-draw-axis { margin: 6px 0 0; }
+#parting-draw-kept { margin: 6px 0 0; }
+table.parting-segments { table-layout: fixed; }
+table.parting-segments th:first-child { width: 22%; }
+table.parting-segments th:nth-child(2) { width: 30%; }
+table.parting-segments th:last-child { width: 64px; }
+table.parting-segments tr { cursor: default; }
+table.parting-segments select { max-width: 100%; font-size: 12px; padding: 1px 2px; }
+table.parting-segments td.seg-actions { text-align: right; white-space: nowrap; }
+table.parting-segments td[colspan] { white-space: normal; }
+table.parting-segments td button { font-size: 12px; padding: 1px 6px; min-width: 24px; }
+table.parting-segments tr.selected td, table.parting-segments tr.hovered td { background: color-mix(in srgb, var(--select) 22%, transparent); }
+table.parting-segments tr.inactive td { color: var(--muted); }
+table.parting-segments tr.loop-head td { font-weight: 600; color: var(--muted); background: var(--bg); }
+table.parting-segments tr.seg-arc td { border-bottom: none; }
+table.parting-segments .seg-failed { color: var(--error-text); font-weight: 600; }
+table.parting-segments .seg-edit { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+table.parting-segments .seg-edit label { display: inline-flex; align-items: center; gap: 4px; }
+table.parting-segments .seg-edit input { font-size: 12px; padding: 2px 4px; }
+table.parting-segments .seg-edit input[type="number"] { width: 70px; }
+table.parting-segments .seg-edit .seg-centre { width: 150px; max-width: 100%; }
+table.parting-segments input[aria-invalid="true"] { border-color: var(--error-text); }
+table.parting-segments .parting-seg-error td { color: var(--error-text); font-size: 11px; }
+#parting-draw-halves .parting-controls > span:first-child { color: var(--muted); }
+#parting-draw-parts { margin: 6px 0 0; }
+.parting-draw-level input { width: 80px; }
+
+/* The 3D view while drawing by hand: the arrows that turn the part about the axis, at mid-height on the left and
+   right edges; the step (1/4 … 1/32 of a turn) at the bottom right; the essential actions at the bottom left; the
+   hint at the top; the numbers of the points. Right-side controls at 16 px: clear of the splitter of the panel. */
+.draw-overlay { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+.draw-overlay button { pointer-events: auto; }
+.draw-overlay button:focus-visible, .turn-step button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.turn {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 52px; height: 52px; padding: 0; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--panel) 85%, transparent);
+  border: 1px solid var(--border); color: var(--text);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.15);
+}
+.turn:hover { border-color: var(--accent); color: var(--accent); }
+.turn:active { transform: translateY(-50%) scale(0.94); }
+.turn-left { left: 16px; }
+.turn-right { right: 16px; }
+.turn-step, .draw-actions {
+  position: absolute; bottom: 16px;
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  padding: 4px 6px; border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 85%, transparent);
+  pointer-events: auto;
+}
+/* The frame of the step: the red frame at the bottom right of the user's sketch. */
+.turn-step { right: 16px; border: 2px solid #d23c3c; max-width: calc(100% - 32px); justify-content: flex-end; }
+.turn-step-label { font-size: 12px; color: var(--muted); margin-right: 2px; }
+.turn-step button { font-size: 12px; padding: 3px 6px; min-width: 40px; font-variant-numeric: tabular-nums; }
+.turn-step button[aria-checked="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+.turn-angle { font-size: 12px; color: var(--muted); margin-left: 4px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.draw-actions { left: 16px; border: 1px solid var(--border); }
+.draw-actions button { font-size: 12px; padding: 3px 8px; display: inline-flex; align-items: center; gap: 4px; }
+.draw-actions .draw-icon { font-size: 14px; line-height: 1; }
+.draw-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+.draw-hint {
+  position: absolute; left: 50%; transform: translateX(-50%);
+  top: calc(var(--toolbar-h, 44px) + 8px);
+  margin: 0; max-width: min(70%, 520px); width: max-content;
+  padding: 4px 12px; border-radius: 999px; font-size: 12px; text-align: center;
+  background: color-mix(in srgb, var(--panel) 90%, transparent); color: var(--text);
+  border: 1px solid var(--border); box-shadow: 0 1px 4px rgb(0 0 0 / 0.12);
+}
+.draw-hint:empty { display: none; }
+.draw-labels { position: absolute; inset: 0; overflow: hidden; }
+.draw-labels span {
+  position: absolute; transform: translate(6px, -100%);
+  font: 600 11px/1 system-ui, sans-serif; color: #fff; background: #b8141b;
+  padding: 2px 4px; border-radius: 4px; white-space: nowrap;
+}
+.draw-labels span.first { background: #1d2330; }
+.draw-labels span.selected { background: #c79a00; }
+.draw-labels span.behind { opacity: 0.35; }
+@media (max-width: 900px) {
+  .turn { width: 44px; height: 44px; }
+}
+/* A narrow view (a phone; a narrow window or a wide panel beside it), by the width of the view itself: the arrows
+   smaller, the step without its label, readout and reset (aria-label kept), the actions as icons; the step and the
+   actions side by side at the bottom down to a phone's width. */
+.viewport { container-type: inline-size; }
+@container (max-width: 800px) {
+  .turn { width: 44px; height: 44px; }
+  .turn svg { width: 30px; height: 30px; }
+  .turn-step { padding: 3px 4px; gap: 3px; }
+  .turn-step-label, .turn-angle, .turn-reset { display: none; }
+  .draw-hint { max-width: min(calc(100% - 136px), 520px); font-size: 11px; padding: 3px 10px; border-radius: 12px; }
+  .turn-step button { min-width: 40px; min-height: 36px; padding: 2px 4px; }
+  .draw-actions { padding: 3px 4px; gap: 3px; }
+  .draw-actions button { width: 40px; height: 40px; justify-content: center; padding: 0; }
+  .draw-actions .draw-label { display: none; }
+  .draw-actions .draw-icon { font-size: 18px; }
+}
 /* Risers and gating: the same look as the parting line card. */
 table.feeding-risers { table-layout: fixed; }
 table.feeding-risers th:first-child, table.feeding-risers td:first-child { width: 28%; }
@@ -478,3 +585,79 @@ table.feeding-risers tr.selected td { background: color-mix(in srgb, var(--selec
   .ai-chat { flex: none; max-height: 65vh; }
   .ai-hist-list { flex: none; max-height: 50vh; }
 }
+
+/* "Analyse 3D" panel (panels.js): each card folds to its title, the panel's width is set by dragging
+   the splitter between the 3D view and it. */
+#page-viewer > .panel { container: viewer-panel / inline-size; }
+.card-head.card-head-toggle { justify-content: flex-start; flex-wrap: wrap; gap: 4px 6px; }
+/* The title takes the free space and wraps word by word before the controls of the head (checkboxes, buttons,
+   lists) go to a line of their own, on the right. */
+.card-head-toggle > h3 { flex: 1 1 0; cursor: pointer; user-select: none; }
+.card-head-toggle > :not(.card-toggle, h3, .card-peek) { margin-left: auto; }
+.card-toggle {
+  flex: none; display: inline-grid; place-items: center; width: 22px; height: 22px; margin: -3px 0 -3px -6px; padding: 0;
+  border: none; border-radius: 5px; background: transparent; color: var(--muted);
+}
+.card-toggle:hover { color: var(--text); background: var(--bg); }
+.card-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.card-toggle svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; transition: transform .15s; }
+.card.is-collapsed .card-toggle svg { transform: rotate(-90deg); }
+/* Folded: the head only (its title, its controls), compact; the key value beside the title. */
+.card.is-collapsed { padding-top: 8px; padding-bottom: 8px; }
+.card.is-collapsed > .card-head { margin-bottom: 0; }
+.card.is-collapsed > .card-head select { padding: 2px 6px; font-size: 13px; }
+/* Its warning kept in sight (an open body left out of the volume, a volume estimated): the value beside the title is
+   then not the whole part's. */
+.card.is-collapsed > :not(.card-head, .method.warn) { display: none !important; }
+.card.is-collapsed > .method.warn { margin-top: 4px; }
+/* With its value beside it, the title keeps to one line; the value, never cut, on the right (on the next line in a
+   narrow panel). */
+.card-head-toggle.has-peek > h3 { flex: 0 1 auto; }
+.card-head-toggle.has-peek > .card-peek { flex: 1 0 auto; text-align: right; }
+.card-peek { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; cursor: pointer; white-space: nowrap; }
+.panel-tools { display: flex; justify-content: flex-end; margin: -4px 2px -6px; }
+.panel-fold-all { color: var(--muted); }
+.panel-fold-all:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+/* The splitter: on the panel's edge, a thin grip in the middle; the edge lit while it is hovered or dragged. */
+.panel-splitter { position: absolute; top: 0; bottom: 0; right: var(--panel-width, 380px); width: 12px; margin-right: -6px; z-index: 5; cursor: col-resize; touch-action: none; }
+.panel-splitter:focus { outline: none; }
+.panel-splitter::before { content: ""; position: absolute; top: 0; bottom: 0; left: 5px; width: 2px; background: transparent; transition: background .15s; }
+.panel-splitter::after { content: ""; position: absolute; top: 50%; left: 4px; width: 4px; height: 36px; margin-top: -18px; border-radius: 2px; background: color-mix(in srgb, var(--muted) 45%, transparent); transition: background .15s; }
+.panel-splitter:hover::before, .panel-splitter:focus-visible::before, .panel-resizing .panel-splitter::before { background: var(--accent); }
+.panel-splitter:hover::after, .panel-splitter:focus-visible::after, .panel-resizing .panel-splitter::after { background: var(--accent); }
+.panel-splitter:focus-visible::after { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
+.panel-resizing, .panel-resizing * { cursor: col-resize !important; user-select: none !important; }
+/* High contrast (forced colours): the grip and the lit edge in the system's colours, the focus as an outline. */
+@media (forced-colors: active) {
+  .panel-splitter::before, .panel-splitter::after { forced-color-adjust: none; }
+  .panel-splitter::after { background: CanvasText; }
+  .panel-splitter:hover::before, .panel-splitter:focus-visible::before, .panel-resizing .panel-splitter::before,
+  .panel-splitter:hover::after, .panel-splitter:focus-visible::after, .panel-resizing .panel-splitter::after { background: Highlight; box-shadow: none; }
+  .panel-splitter:focus-visible { outline: 2px solid Highlight; outline-offset: -2px; }
+}
+@media (max-width: 900px) { .panel-splitter { display: none; } }
+/* The bodies' names as wide as the panel lets them be. */
+#page-viewer table.bodies .name { max-width: clamp(48px, calc(100cqw - 200px), 100cqw); }
+/* The statistics, whatever the panel's width: each value whole on one line where it fits (up to 60 % of the width),
+   the labels wrapping first; no short word left alone on a last line. */
+#page-viewer .card .stats { grid-template-columns: minmax(min-content, 1fr) fit-content(calc(60% - 6px)); }
+#page-viewer .card .stats > :is(dt, dd) { text-wrap: pretty; }
+/* The risers' columns as wide as their content, whatever the panel's width (of fixed widths, a heading or a value
+   wider than its column would stick out of the table). */
+#page-viewer .card table.feeding-risers { table-layout: auto; }
+/* The panel at its default width or narrower (up to about 405 px): the lists go to a line of their own when they do
+   not fit, the values of the statistics and the tables' headings wrap. */
+@container viewer-panel (max-width: 380px) {
+  #page-viewer .card .row { flex-wrap: wrap; }
+  #page-viewer .card .row > select { flex: 1 1 140px; }
+  #page-viewer .card .field { min-width: 0; flex-wrap: wrap; }
+  #page-viewer .card .field select { min-width: 0; max-width: 100%; }
+  #page-viewer .card .stats dd { white-space: normal; overflow-wrap: break-word; }
+  #page-viewer .card table.parting-candidates th { white-space: normal; }
+}
+/* A narrow panel: a table too wide for it scrolls. */
+@container viewer-panel (max-width: 320px) {
+  #page-viewer .card table.bodies, #page-viewer .card table.parting-candidates { display: block; overflow-x: auto; }
+  #page-viewer .card table.parting-candidates td { overflow-wrap: normal; }
+}
+@media (prefers-reduced-motion: reduce) { .card-toggle svg, .panel-splitter::before, .panel-splitter::after { transition: none; } }

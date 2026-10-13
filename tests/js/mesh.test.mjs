@@ -418,6 +418,30 @@ test('analysis: the topology for the semantic layer is that of the welded mesh, 
   assert.deepEqual(fin.topology, { vertices: 9, triangles: 13, unique_edges: 20, boundary_edges: 2, non_manifold_edges: 1, degenerate_triangles: 0, watertight: false });
 });
 
+test('analysis: the display triangles of a closed mesh are countable (section caps) when wound alike, once each', () => {
+  assert.equal(mesh(BOX_V, BOX_F).mesh.countable, true);
+  const soup = analyzeMesh('soup', Float32Array.from(BOX_F.flatMap((f) => f.flatMap((i) => BOX_V[i]))), null);
+  assert.equal(soup.mesh.countable, true, 'an unwelded soup');
+  // All turned inwards alike: the caps are drawn where the count is not 0, whichever its sign.
+  assert.equal(mesh(BOX_V, flip(BOX_F, BOX_F.map((_, i) => i))).mesh.countable, true, 'inverted');
+  // A degenerate triangle covers no pixel.
+  assert.equal(mesh(BOX_V, [...BOX_F, [0, 1, 1]]).mesh.countable, true, 'degenerate');
+  // A triangle turned round: repaired on the analysis copy only, the display keeps it.
+  const flipped = mesh(BOX_V, flip(BOX_F, [3]));
+  assert.equal(flipped.closed, true);
+  assert.ok(flipped.notes.includes(REPAIRED));
+  assert.equal(flipped.mesh.countable, false, 'a triangle turned round');
+  assert.deepEqual(flipped.mesh.indices, Uint32Array.from(flip(BOX_F, [3]).flat()), 'the display triangles as read');
+  // A triangle twice, the same way or turned round: dropped from the analysis copy only.
+  for (const twin of [BOX_F[0], [...BOX_F[0]].reverse()]) {
+    const doubled = mesh(BOX_V, [...BOX_F, twin]);
+    assert.equal(doubled.closed, true);
+    assert.equal(doubled.mesh.countable, false, `a triangle twice (${twin})`);
+  }
+  // Open: no cap.
+  assert.equal(mesh(BOX_V, without(BOX_F, [0, 1])).mesh.countable, false, 'open');
+});
+
 test('analysis: vertices are welded on a 1e-8 rounding grid like trimesh merge_vertices', () => {
   // Every other triangle uses shifted copies of the vertices.
   const soup = (shift) => BOX_F.flatMap((f, k) => f.flatMap((i) => BOX_V[i].map((x) => (k % 2 ? x + shift : x))));

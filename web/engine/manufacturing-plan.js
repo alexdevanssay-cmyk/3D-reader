@@ -21,27 +21,44 @@ function sameAxis(a, b, tol = 1e-5) {
   return Math.abs(Math.abs(aa[0]*bb[0] + aa[1]*bb[1] + aa[2]*bb[2]) - 1) <= tol;
 }
 
-function axisKey(axis) {
-  const a = normalizeAxis(axis);
-  return a ? a.map(v => v.toFixed(6)).join(",") : "undetermined";
+/** Key of an axis: either sense alike, or with its sense (`directed`: a unit vector). */
+function axisKey(axis, directed = false) {
+  const a = directed ? axis : normalizeAxis(axis);
+  return a ? a.map(v => (v || 0).toFixed(6)).join(",") : "undetermined";
 }
 
 function operationAxis(operation) {
   return normalizeAxis(operation.accessibility?.tool_axis);
 }
 
+// Operations reached from one side only: a blind hole is drilled from its
+// opening, its tool axis (semantic.js: from the opening into the material) has a sense.
+const ONE_SIDED_OPERATIONS = new Set(["drilling_blind"]);
+
+/** The tool axis of a one-sided operation, with its sense (unit), or null. */
+function directedAxis(operation) {
+  const v = operation.accessibility?.tool_axis;
+  if (!ONE_SIDED_OPERATIONS.has(operation.operation) || !Array.isArray(v) || v.length !== 3 || !v.every(finite)) return null;
+  const n = Math.hypot(v[0], v[1], v[2]);
+  return n > EPS ? v.map(x => x / n) : null;
+}
+
 function setupCompatibility(operations) {
   const groups = [];
   for (const operation of operations) {
     const axis = operationAxis(operation);
-    // The operations without a tool axis share one setup, still to be determined.
+    const sense = axis ? directedAxis(operation) : null;
+    // The operations without a tool axis share one setup, still to be
+    // determined. A one-sided operation joins a setup of its axis whose
+    // sense is its own, or not yet set (operations reached from both sides).
     let group = axis
-      ? groups.find(g => g.axis && sameAxis(axis, g.axis))
+      ? groups.find(g => g.axis && sameAxis(axis, g.axis) && (!sense || !g.sense || g.sense[0]*sense[0] + g.sense[1]*sense[1] + g.sense[2]*sense[2] > 0))
       : groups.find(g => !g.axis);
     if (!group) {
-      group = { axis, operations: [] };
+      group = { axis, sense: null, operations: [] };
       groups.push(group);
     }
+    group.sense ??= sense;
     group.operations.push(operation);
   }
   return groups;
@@ -134,7 +151,8 @@ export function operationDependencyGraph(operations) {
 
 function setupCandidate(group, index) {
   const operations = [...group.operations].sort((a,b) => a.operation_id.localeCompare(b.operation_id));
-  const axis = group.axis;
+  // The sense of its one-sided operations (blind holes, from their opening), else either.
+  const axis = group.sense ?? group.axis;
   const unresolved = [];
   if (!axis) unresolved.push("tool_axis_undetermined");
   if (operations.some(o => o.accessibility?.requires_stock_fixture_analysis)) {
@@ -143,7 +161,7 @@ function setupCandidate(group, index) {
   return {
     setup_id: "setup-" + String(index + 1).padStart(2, "0"),
     tool_axis: axis,
-    axis_key: axisKey(axis),
+    axis_key: axisKey(axis, !!group.sense),
     operation_ids: operations.map(o => o.operation_id),
     feature_ids: [...new Set(operations.flatMap(o => o.feature_ids ?? []))].sort(),
     status: unresolved.length ? "candidate_with_constraints" : "candidate",

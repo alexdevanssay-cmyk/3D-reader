@@ -363,6 +363,10 @@ function parseJsonc(text) {
 
 describe('Codespaces start-up (.devcontainer/devcontainer.json)', { skip: process.platform === 'win32' && 'POSIX shell' }, () => {
   const LOG = '/tmp/reader3d.log';
+  // `sleep 1` between the checks for the server: a tenth of a second, so the 90
+  // checks still give the stand-in server, started in the background, 9 s to
+  // run (an instant `sleep` made them last a few hundred ms in all).
+  const SLEEP = 'exec "$NODE" -e "setTimeout(() => {}, 100)"';
   let config;
   let dir; // one directory per run: stand-in programs, their state and the log
 
@@ -417,7 +421,7 @@ describe('Codespaces start-up (.devcontainer/devcontainer.json)', { skip: proces
   test('postAttachCommand shows why the server did not start, instead of failing silently', () => {
     const result = runPostAttach('failing', {
       curl: 'exit 7', // nothing answers on port 8000
-      sleep: 'exit 0',
+      sleep: SLEEP,
       python: [
         'echo "Traceback (most recent call last):" >&2',
         'echo "ImportError: libGL.so.1: cannot open shared object file: No such file or directory" >&2',
@@ -432,11 +436,13 @@ describe('Codespaces start-up (.devcontainer/devcontainer.json)', { skip: proces
 
   test('postAttachCommand leaves a working server running in the background', () => {
     const result = runPostAttach('working', {
-      // Port 8000 answers from the second check on (the first one is the
-      // "already running?" check, before the server is started).
-      curl: 'n=$(cat "$STUBS/curl.count" 2>/dev/null || echo 0); echo $((n + 1)) > "$STUBS/curl.count"; [ "$n" -ge 1 ]',
-      sleep: 'exit 0',
-      python: 'echo $$ > "$STUBS/python.pid"; echo "Uvicorn running"; exec "$NODE" -e "setTimeout(() => {}, 60000)"',
+      // Port 8000 answers once the stand-in server listens, as a real one does:
+      // not at the "already running?" check, before it is started, nor before
+      // the background process has run, which a busy machine can delay past
+      // the next check (then python.pid and the log were still missing).
+      curl: '[ -e "$STUBS/listening" ]',
+      sleep: SLEEP,
+      python: 'echo $$ > "$STUBS/python.pid"; echo "Uvicorn running"; : > "$STUBS/listening"; exec "$NODE" -e "setTimeout(() => {}, 60000)"',
     });
     assert.equal(result.status, 0, `exit status ${result.status}\n${result.stdout}${result.stderr}`);
     assert.match(result.stdout, /running on port 8000/);
@@ -560,6 +566,37 @@ describe('built site in Chromium', () => {
       const config = await page.evaluate(() => fetch('config.json').then((r) => r.json()));
       assert.equal(config.server, false, 'the static site must not expect the Python server');
       await page.waitForTimeout(500); // let late module errors surface
+      assert.deepEqual(problems, []);
+    } finally {
+      await page.close();
+    }
+  });
+
+  test('the model turns freely: over the top of the view, not stopped at the pole', { timeout: MESH_TIMEOUT }, async () => {
+    const { page, problems } = await openPage();
+    try {
+      await analyzeInPage(page, 'box.stl', MESH_TIMEOUT - 15_000);
+      await page.click('[data-view="front"]');
+      await page.waitForTimeout(300);
+      const box = await page.locator('#viewport canvas').boundingBox();
+      const x = box.x + box.width / 2;
+      // Dragged up: the view goes past the top, the part upside down at some point (an orbit stops at the pole, Z always up).
+      const drag = Math.min(0.35 * box.width, 0.8 * box.height);
+      let lowest = 1;
+      await page.mouse.move(x, box.y + box.height / 2 + drag / 2);
+      await page.mouse.down();
+      for (let i = 1; i <= 30; i++) {
+        await page.mouse.move(x, box.y + box.height / 2 + drag / 2 - (drag * i) / 30);
+        const { up } = await page.evaluate(() => window.reader3d.view);
+        lowest = Math.min(lowest, up[2] / Math.hypot(...up));
+      }
+      await page.mouse.up();
+      assert.ok(lowest < -0.2, `the view went over the top (lowest up.z ${lowest.toFixed(2)})`);
+      await page.waitForTimeout(1000); // the inertia spent
+      // A named view stands upright again.
+      await page.click('[data-view="iso"]');
+      await page.waitForTimeout(300);
+      assert.deepEqual((await page.evaluate(() => window.reader3d.view)).up.map((v) => Math.round(v * 1000) / 1000), [0, 0, 1]);
       assert.deepEqual(problems, []);
     } finally {
       await page.close();

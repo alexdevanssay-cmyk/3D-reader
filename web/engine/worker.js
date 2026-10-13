@@ -10,6 +10,7 @@ import { analyzeCad } from './cad.js';
 import { loadMeshFile } from './meshload.js';
 import { analyzeMeshParts } from './meshanalysis.js';
 import { wallThickness } from './thickness.js';
+import { measureHoles } from './holes.js';
 
 // Root of the site (…/web/ or …/3D-reader/), where vendor/ lives.
 const baseUrl = new URL('../', import.meta.url).href;
@@ -89,6 +90,12 @@ self.onmessage = async (event) => {
       });
       const buffers = results.flatMap((r) => (r ? [r.ray.buffer, r.sphere.buffer, r.wall.buffer] : []));
       postMessage({ type: 'result', id: msg.id, result: results }, buffers);
+      return;
+    }
+    if (msg.type === 'holes') {
+      // Holes of bodies kept by an earlier version (see client.js), measured on their meshes.
+      const results = msg.bodies.map((b) => measureHoles(b.positions, b.indices, b.surfaces, { closed: b.closed }));
+      postMessage({ type: 'result', id: msg.id, result: results });
       return;
     }
     if (msg.type !== 'analyze') return;

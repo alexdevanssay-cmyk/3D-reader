@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { buildSemantic3D } from "../../web/engine/semantic.js";
 import { buildAIContext, compactAIContext } from "../../web/engine/ai-context.js";
 import { ANALYSIS_HINTS } from "../../web/engine/analysis-hints.js";
+import { HOLES_VERSION, measureHoles } from "../../web/engine/holes.js";
+import { partBody, plate } from "./hole-parts.mjs";
 
 function body(overrides = {}) {
   return {
@@ -50,7 +52,7 @@ test("builds the versioned semantic contract without changing the raw result", (
 
   assert.equal(result.schema, "3d-semantic-json");
   assert.equal(result.schema_version, "1.0");
-  assert.equal(result.feature_schema_version, "10.0");
+  assert.equal(result.feature_schema_version, "11.0");
   assert.equal(result.model.body_count, 1);
   assert.equal(result.bodies[0].metrics.volume_mm3, 1000);
   assert.deepEqual(result.bodies[0].topology, {
@@ -378,7 +380,7 @@ const SEMANTIC_SOURCE = readFileSync(new URL("../../web/engine/semantic.js", imp
 
 test("feature schema advances with conservative blend/chamfer/pattern candidates", () => {
   const source = SEMANTIC_SOURCE;
-  assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "10.0"'));
+  assert.ok(source.includes('FEATURE_SCHEMA_VERSION = "11.0"'));
   assert.ok(source.includes('type:"fillet_feature_candidate"'));
   assert.ok(source.includes('type:"chamfer_feature_candidate"'));
   assert.ok(source.includes('type:"pattern_feature_candidate"'));
@@ -812,6 +814,34 @@ test("V6 readiness reads the closedness of the semantic body", () => {
   assert.ok(holed(false).unresolved_constraints.includes("body_not_confirmed_closed"));
 });
 
+test("V6 planning drills blind holes from their opening: one setup per side, a through hole with either", () => {
+  // Three holes of 6 along Z, measured: blind from the top, blind from the bottom, through.
+  const cylinder=(index,x)=>({index,type:"cylinder",radius_mm:3,axis:[0,0,1],center_mm:[x,0,5],orientation:"reversed",edge_signatures:[]});
+  const measured=(surfaces,axis,through)=>({surfaces,axis,diameter_mm:6,length_mm:6,through,open_ends:through ? 2 : 1,measured:true,method:"axis_rays_on_mesh",
+    ...(through ? {} : {depth_mm:6,bottom:"flat"})});
+  const result=buildSemantic3D({
+    file:"sides.step", kind:"cad", engine:"browser",
+    summary:{volume:1000,area:600,bodies:1,solids:1},
+    bodies:[body({
+      geometric_surfaces:[cylinder(0,-10),cylinder(1,0),cylinder(2,10)],
+      holes:{version:HOLES_VERSION,method:"axis_rays_on_mesh",holes:[measured([0],[0,0,-1],false),measured([1],[0,0,1],false),measured([2],[0,0,1],true)]},
+    })],
+  }).bodies[0];
+  const drillings=result.manufacturing.operations.filter(o=>o.operation.startsWith("drilling"));
+  const blind=(surface)=>drillings.find(o=>o.operation==="drilling_blind" && o.surfaces.includes(surface));
+  assert.deepEqual([blind(0).accessibility.tool_axis,blind(1).accessibility.tool_axis],[[0,0,-1],[0,0,1]]);
+  const {setups}=result.manufacturing_plan;
+  const setupOf=(operation)=>setups.find(s=>s.operation_ids.includes(operation.operation_id));
+  // Not one setup for both: each from its own side, along its own sense.
+  assert.notEqual(setupOf(blind(0)),setupOf(blind(1)));
+  assert.deepEqual([setupOf(blind(0)).tool_axis,setupOf(blind(1)).tool_axis],[[0,0,-1],[0,0,1]]);
+  assert.notEqual(setupOf(blind(0)).axis_key,setupOf(blind(1)).axis_key);
+  // The through hole joins one of them.
+  const through=drillings.find(o=>o.operation==="drilling");
+  assert.ok([setupOf(blind(0)),setupOf(blind(1))].includes(setupOf(through)));
+  assert.equal(setups.length,2);
+});
+
 /** A bore (surface 0) along Z with its counterbore (surface 1) and their planar faces. */
 function counterboredHole() {
   const e=(z,r)=>[r,0,z,r,0,z];
@@ -1108,4 +1138,191 @@ test("the costing trace of the task \"Chiffrage\" is kept whole by the compactio
   assert.ok(JSON.stringify(compact).length <= 12000, `${JSON.stringify(compact).length} characters`);
   // Less room for the geometry: more compacted, or fewer bodies in detail.
   assert.ok(compact.compaction.level > plain.compaction.level || compact.bodies.length < plain.bodies.length, `level ${compact.compaction.level}, ${compact.bodies.length} bodies`);
+});
+
+// --------------------------------------------------------------------------- holes measured on the mesh
+
+/** The semantic body of a synthetic part, its holes measured (holes.js) as the CAD engine does. */
+function measuredPart(options) {
+  const part = plate(options);
+  const semantic = buildSemantic3D({
+    file: "plate.step", kind: "cad", engine: "browser",
+    summary: { volume: 1000, area: 600, bodies: 1, solids: 1 },
+    bodies: [partBody(part, { holes: measureHoles(part.positions, part.indices, part.surfaces) })],
+  });
+  return { part, semantic, body: semantic.bodies[0] };
+}
+
+test("a hole measured through is a through hole: evidenced, drilled, no boss", () => {
+  const { body } = measuredPart({ H: 10, sections: [{ r: 5, top: 10, bottom: 0 }] });
+  const hole = body.features.find((f) => f.type === "hole_feature_candidate");
+  assert.equal(hole.subtype, "through_hole");
+  assert.equal(hole.status, "evidenced");
+  assert.equal(hole.needs_topology_confirmation, false);
+  assert.equal(hole.method, "axis_rays_on_mesh");
+  assert.equal(hole.confidence, 0.95);
+  assert.deepEqual([hole.measured, hole.through, hole.open_ends, hole.surface_index], [true, true, 2, 1]);
+  assert.equal(hole.diameter_mm, 10);
+  assert.equal(hole.length_mm, 10);
+  assert.deepEqual(hole.boundary_planes, [0, 2]);
+  assert.ok(hole.evidence.some((e) => e.source === "relation") && hole.evidence.some((e) => e.source === "mesh_measurement"));
+  const cylinder = body.features.find((f) => f.type === "cylindrical_feature_candidate");
+  assert.deepEqual([cylinder.subtype, cylinder.status, cylinder.through], ["through_hole", "evidenced", true]);
+  // Its axis is in the air: no boss.
+  assert.ok(!body.features.some((f) => f.type === "boss_feature_candidate"));
+  // One drilling for the hole and its cylinder.
+  const drilling = body.manufacturing.operations.filter((o) => o.surfaces.includes(1));
+  assert.deepEqual(drilling.map((o) => o.operation), ["drilling"]);
+  assert.deepEqual(drilling[0].feature_ids.sort(), [cylinder.feature_id, hole.feature_id].sort());
+  assert.deepEqual(body.holes, {
+    method: "axis_rays_on_mesh", status: "measured", through: 1, blind: 0, undetermined: 0,
+    note: body.holes.note,
+  });
+  assert.equal(body.foundry.evidence.feature_counts.measured_through_holes, 1);
+  assert.ok(body.foundry.evidence.confirmed.includes("holes_measured_through_or_blind"));
+});
+
+test("a hole measured blind: its depth, its bottom, its axis from the opening; drilled blind", () => {
+  const { body } = measuredPart({ H: 20, sections: [{ r: 4, top: 20, bottom: 8 }], end: "drill" });
+  const hole = body.features.find((f) => f.type === "hole_feature_candidate");
+  assert.equal(hole.subtype, "blind_hole");
+  assert.equal(hole.through, false);
+  assert.equal(hole.depth_mm, 12);
+  assert.equal(hole.bottom, "drill_point");
+  assert.ok(Math.abs(hole.drill_point_angle_deg - 118) < 1e-9);
+  assert.ok(hole.tip_depth_mm > 12);
+  assert.deepEqual(hole.axis, [0, 0, -1]);
+  assert.deepEqual(hole.hole_surfaces, [1, 2]);
+  const drilling = body.manufacturing.operations.filter((o) => o.surfaces.includes(1) && o.operation.startsWith("drilling"));
+  assert.deepEqual(drilling.map((o) => o.operation), ["drilling_blind"]);
+  // The drill point and its hole: the status of the hole.
+  const taper = body.features.find((f) => f.type === "tapered_feature_candidate");
+  assert.deepEqual([taper.measured, taper.through, taper.status], [true, false, "provisional"]);
+  assert.deepEqual([body.holes.through, body.holes.blind], [0, 1]);
+});
+
+test("a counterbored hole measured through: one through hole of its bore, the step still an interpretation", () => {
+  const { semantic, body } = measuredPart({ H: 20, sections: [{ r: 8, top: 20, bottom: 14 }, { r: 4, top: 14, bottom: 0 }] });
+  // One hole feature, on its bore (no through hole of the counterbore's diameter): its diameters given with it.
+  const holes = body.features.filter((f) => f.type === "hole_feature_candidate");
+  assert.deepEqual(holes.map((f) => [f.surface_index, f.subtype, f.diameter_mm, f.length_mm]), [[3, "through_hole", 8, 20]]);
+  assert.deepEqual([holes[0].hole_surfaces, holes[0].hole_diameters_mm], [[1, 3], [8, 16]]);
+  const cylinders = body.features.filter((f) => f.type === "cylindrical_feature_candidate");
+  assert.deepEqual(cylinders.map((f) => [f.surface_index, f.subtype]), [[3, "through_hole"]]);
+  const step = body.features.find((f) => f.type === "stepped_cylindrical_feature_candidate");
+  assert.deepEqual([step.subtype, step.through, step.status], ["possible_counterbore_or_coaxial_step", true, "provisional"]);
+  // One drilling, of the bore; the counterbore is machined by its step.
+  assert.deepEqual(body.manufacturing.operations.filter((o) => o.operation.startsWith("drilling")).map((o) => [o.operation, o.surfaces]), [["drilling", [3]]]);
+  // One hole, counted once everywhere, grouped too.
+  assert.deepEqual([body.holes.through, body.foundry.evidence.feature_counts.measured_through_holes], [1, 1]);
+  const context = buildAIContext(semantic, { task: "feature_analysis" });
+  let grouped = null;
+  for (let budget = JSON.stringify(context).length; budget > 200 && !grouped; budget -= 50) {
+    const c = compactAIContext(context, { maxChars: budget });
+    if (c.bodies[0].feature_groups) grouped = c;
+  }
+  const group = grouped.bodies[0].feature_groups.find((g) => g.type === "hole_feature_candidate");
+  assert.deepEqual([group.subtype, group.count, group.evidenced, group.diameters_mm], ["through_hole", 1, 1, [8]]);
+});
+
+test("a hole whose cylinder is given as two half faces: one hole, one drilling", () => {
+  const { body } = measuredPart({ H: 10, sections: [{ r: 5, top: 10, bottom: 0 }], split: true });
+  const holes = body.features.filter((f) => f.type === "hole_feature_candidate");
+  assert.deepEqual(holes.map((f) => [f.surface_index, f.subtype, f.diameter_mm, f.hole_surfaces]), [[1, "through_hole", 10, [1, 2]]]);
+  assert.deepEqual(body.features.filter((f) => f.type === "cylindrical_feature_candidate").map((f) => f.surface_index), [1]);
+  assert.deepEqual(body.manufacturing.operations.filter((o) => o.operation.startsWith("drilling")).map((o) => o.operation), ["drilling"]);
+  assert.deepEqual([body.holes.through, body.holes.blind, body.holes.undetermined], [1, 0, 0]);
+});
+
+test("a hole the measurement could not decide keeps its provisional subtype, with the reason", () => {
+  const part = plate({ H: 10, sections: [{ r: 5, top: 10, bottom: 0 }] });
+  const undecided = { version: HOLES_VERSION, method: "axis_rays_on_mesh", holes: [{ surfaces: [1], axis: [0, 0, 1], diameter_mm: 10, length_mm: 10, through: null, open_ends: null, measured: false, method: "axis_rays_on_mesh", reason: "inconsistent_votes" }] };
+  const [body] = buildSemantic3D({ bodies: [partBody(part, { holes: undecided })] }).bodies;
+  const hole = body.features.find((f) => f.type === "hole_feature_candidate");
+  assert.deepEqual([hole.subtype, hole.status, hole.through, hole.uncertain_reason], ["possible_through_hole_or_bore", "provisional", null, "inconsistent_votes"]);
+  // None measured: undetermined, not partly measured.
+  assert.deepEqual([body.holes.status, body.holes.through, body.holes.blind, body.holes.undetermined, body.holes.undetermined_reasons], ["undetermined", 0, 0, 1, { inconsistent_votes: 1 }]);
+  // Some measured, some not: partly measured. A face with material between its
+  // axis and its wall (a face groove round a hole) is no hole: counted apart.
+  const extra = (index, r) => ({ index, type: "cylinder", radius_mm: r, axis: [0, 0, 1], center_mm: [8, 8, 5], orientation: "reversed", edge_signatures: [] });
+  const hole2 = (surfaces, fields) => ({ surfaces, axis: [0, 0, 1], diameter_mm: 4, length_mm: 10, method: "axis_rays_on_mesh", ...fields });
+  const mixed = { ...undecided, holes: [
+    undecided.holes[0],
+    hole2([3], { through: null, open_ends: null, measured: false, reason: "material_inside" }),
+    hole2([4], { through: true, open_ends: 2, measured: true }),
+  ] };
+  const [partly] = buildSemantic3D({ bodies: [partBody({ ...part, surfaces: [...part.surfaces, extra(3, 10), extra(4, 2)] }, { holes: mixed })] }).bodies;
+  assert.deepEqual([partly.holes.status, partly.holes.through, partly.holes.undetermined, partly.holes.cylinders_not_holes], ["partly_measured", 1, 1, 1]);
+  // Kept by an earlier version, without measurements (or of another version): provisional, and said so.
+  const [old] = buildSemantic3D({ bodies: [partBody(part)] }).bodies;
+  const oldHole = old.features.find((f) => f.type === "hole_feature_candidate");
+  assert.equal(oldHole.subtype, "possible_through_hole_or_bore");
+  assert.ok(!("through" in oldHole));
+  assert.deepEqual([old.holes.status, old.holes.reason], ["not_measured", "not_measured_for_this_result"]);
+  const [other] = buildSemantic3D({ bodies: [partBody(part, { holes: { ...undecided, version: HOLES_VERSION + 1 } })] }).bodies;
+  assert.equal(other.holes.reason, "measured_by_another_version");
+  // A mesh with gaps: nothing measured on it.
+  const [gaps] = buildSemantic3D({ bodies: [partBody(part, { holes: measureHoles(part.positions, part.indices, part.surfaces, { closed: false }) })] }).bodies;
+  assert.deepEqual([gaps.holes.status, gaps.holes.reason], ["not_measured", "open_mesh"]);
+  assert.equal(gaps.features.find((f) => f.type === "hole_feature_candidate").status, "provisional");
+});
+
+test("the AI context gives the measured holes first: through or blind, depth, axis, even compacted", () => {
+  const { semantic } = measuredPart({ H: 20, sections: [{ r: 4, top: 20, bottom: 8 }], end: "flat" });
+  const context = buildAIContext(semantic, { task: "feature_analysis" });
+  assert.equal(context.bodies[0].holes.blind, 1);
+  assert.ok(context.warnings.some((w) => /measured=true/.test(w)));
+  const full = context.bodies[0].features.find((f) => f.type === "hole_feature_candidate");
+  assert.deepEqual([full.status, full.needs_topology_confirmation, full.geometry.through, full.geometry.depth_mm], ["evidenced", false, false, 12]);
+  // Compacted past the notes of every analysis: the hole keeps its status and depth, its cylinder is counted.
+  let compact = null;
+  for (let budget = JSON.stringify(context).length; budget > 1000 && !compact; budget -= 50) {
+    const c = compactAIContext(context, { maxChars: budget });
+    if (c.compaction.level >= 2) compact = c;
+  }
+  assert.ok(compact && compact.compaction.level <= 5, `level ${compact?.compaction.level}`);
+  const [b] = compact.bodies;
+  const hole = b.features.find((f) => f.type === "hole_feature_candidate");
+  assert.deepEqual([hole.subtype, hole.through, hole.depth_mm, hole.bottom, hole.axis, hole.diameter_mm], ["blind_hole", false, 12, "flat", [0, 0, -1], 8]);
+  assert.ok(!b.features.some((f) => f.type === "cylindrical_feature_candidate"));
+  assert.equal(b.repeated_features.cylindrical_feature_candidate, 1);
+  assert.deepEqual([b.holes.blind, "note" in b.holes], [1, false]);
+  assert.match(compact.holes_note, /measured on the closed mesh/);
+  // Grouped by type (from level 6), the blind holes give their depths.
+  let grouped = null;
+  for (let budget = JSON.stringify(compact).length; budget > 200 && !grouped; budget -= 20) {
+    const c = compactAIContext(context, { maxChars: budget });
+    if (c.bodies[0].feature_groups) grouped = c;
+  }
+  assert.ok(grouped, "features grouped");
+  const blind = grouped.bodies[0].feature_groups.find((g) => g.type === "hole_feature_candidate");
+  assert.deepEqual([blind.subtype, blind.evidenced, blind.diameters_mm, blind.depths_mm], ["blind_hole", 1, [8], [12]]);
+});
+
+test("compacted, a body measured and one not (a mesh with gaps) each keep their note on the holes", () => {
+  const gaps = plate({ H: 10, sections: [{ r: 5, top: 10, bottom: 0 }] });
+  const blind = plate({ H: 20, sections: [{ r: 4, top: 20, bottom: 8 }], end: "flat" });
+  const semantic = buildSemantic3D({
+    file: "two.step", kind: "cad", engine: "browser",
+    summary: { volume: 2000, area: 1200, bodies: 2, solids: 2 },
+    bodies: [
+      partBody(gaps, { holes: measureHoles(gaps.positions, gaps.indices, gaps.surfaces, { closed: false }) }),
+      partBody(blind, { holes: measureHoles(blind.positions, blind.indices, blind.surfaces) }),
+    ],
+  });
+  const compact = compactAIContext(buildAIContext(semantic, { task: "feature_analysis" }), { maxChars: 1e9 });
+  assert.equal(compact.compaction.level, 1);
+  // No note for the whole part: the measured body is not said to be unknown.
+  assert.equal(compact.holes_note, undefined);
+  const notMeasured = compact.bodies.find((b) => b.holes.status === "not_measured");
+  const measured = compact.bodies.find((b) => b.holes.status === "measured");
+  assert.match(notMeasured.holes.note, /not known/);
+  assert.match(measured.holes.note, /measured on the closed mesh/);
+  assert.equal(measured.holes.blind, 1);
+  // The same note for every body: given once.
+  const measuredBody = () => partBody(blind, { holes: measureHoles(blind.positions, blind.indices, blind.surfaces) });
+  const both = buildSemantic3D({ file: "two.step", kind: "cad", engine: "browser", bodies: [measuredBody(), measuredBody()] });
+  const once = compactAIContext(buildAIContext(both, { task: "feature_analysis" }), { maxChars: 1e9 });
+  assert.match(once.holes_note, /measured on the closed mesh/);
+  assert.ok(once.bodies.every((b) => !("note" in b.holes)));
 });

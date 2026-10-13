@@ -109,6 +109,31 @@
           <button id="section-flip" data-i18n-title="view.flip" title="Flip section side">⇄</button>
         </span>
       </div>
+      <!-- Drawing the parting line by hand: the part turned about the rotation axis by the arrows, the step, the point numbers. -->
+      <div id="draw-overlay" class="draw-overlay" hidden>
+        <div id="draw-labels" class="draw-labels" aria-hidden="true"></div>
+        <p id="draw-hint" class="draw-hint" role="status" aria-live="polite"></p>
+        <button id="turn-left" class="turn turn-left" type="button">
+          <svg viewBox="0 0 32 32" width="36" height="36" aria-hidden="true" focusable="false"><path d="M4 13A12 6 0 0 1 28 13" fill="none" stroke="currentColor" stroke-width="1.6" opacity=".4"/><path d="M27.3 15A12 6 0 0 1 9.6 18" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round"/><path d="M3.2 15.6 11.4 13.6 8 22.2Z" fill="currentColor" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+        </button>
+        <button id="turn-right" class="turn turn-right" type="button">
+          <svg viewBox="0 0 32 32" width="36" height="36" aria-hidden="true" focusable="false"><path d="M4 13A12 6 0 0 1 28 13" fill="none" stroke="currentColor" stroke-width="1.6" opacity=".4"/><path d="M4.7 15A12 6 0 0 0 22.4 18" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round"/><path d="M28.8 15.6 20.6 13.6 24 22.2Z" fill="currentColor" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+        </button>
+        <div id="turn-step" class="turn-step" role="radiogroup" aria-label="Step" data-i18n-title="view.turnStep.title" title="Fraction of a turn at each click on an arrow">
+          <span class="turn-step-label" data-i18n="view.turnStep">Step</span>
+          <button type="button" role="radio" aria-checked="true" data-step="4">1/4</button>
+          <button type="button" role="radio" aria-checked="false" data-step="8">1/8</button>
+          <button type="button" role="radio" aria-checked="false" data-step="16">1/16</button>
+          <button type="button" role="radio" aria-checked="false" data-step="32">1/32</button>
+          <span id="turn-angle" class="turn-angle"></span>
+          <button id="turn-reset" class="turn-reset" type="button" data-i18n-title="view.turnReset" title="Back to the starting orientation">↺ 0°</button>
+        </div>
+        <div id="draw-actions" class="draw-actions">
+          <button id="draw-undo" type="button"><span class="draw-icon" aria-hidden="true">↶</span><span class="draw-label" data-i18n="parting.draw.undo">Undo</span></button>
+          <button id="draw-close" type="button"><span class="draw-icon" aria-hidden="true">⊙</span><span class="draw-label" data-i18n="parting.draw.close">Close the loop</span></button>
+          <button id="draw-done" type="button"><span class="draw-icon" aria-hidden="true">✓</span><span class="draw-label" data-i18n="parting.draw.done">Done</span></button>
+        </div>
+      </div>
       <div id="drop-hint" class="drop-hint">
         <div class="drop-card">
           <h2 data-i18n="drop.title">Drop a 3D file here</h2>
@@ -255,7 +280,10 @@
       <section class="card" id="parting-card" hidden>
         <div class="card-head">
           <h3 data-i18n="parting.title">Parting line</h3>
-          <label class="check" data-i18n-title="parting.show.title" title="Show on the 3D view: the two halves of the mould, the undercuts in red, the parting line and the draw direction"><input type="checkbox" id="parting-show"> <span data-i18n="parting.show">Show</span></label>
+          <span class="card-checks">
+            <label class="check" data-i18n-title="parting.show.title" title="Show on the 3D view: the parting line in red, the undercuts in yellow, the halves of the mould as translucent blocks (the upper one blue, the lower one green) and the draw direction; the other bodies faded"><input type="checkbox" id="parting-show"> <span data-i18n="parting.show">Show</span></label>
+            <label class="check" data-i18n-title="parting.blocks.title" title="The halves of the mould as translucent blocks round the part: the upper one blue, the lower one green; they meet along the parting surface"><input type="checkbox" id="parting-blocks" checked> <span data-i18n="parting.blocks">Mould halves</span></label>
+          </span>
         </div>
         <p class="small muted" id="parting-body" hidden></p>
         <p class="small" id="parting-status" hidden></p>
@@ -286,6 +314,61 @@
               <option value="2" selected data-i18n="parting.target.lower">to the lower half</option>
             </select>
           </div>
+          <!-- The parting line drawn by hand: a plane (its normal through the centre of the part is the rotation axis), points clicked on the part. -->
+          <div class="parting-controls">
+            <button id="parting-draw" class="small toggle" type="button" data-i18n="parting.draw" data-i18n-title="parting.draw.title" title="Draw the parting line by hand">Draw by hand</button>
+          </div>
+          <p id="parting-draw-kept" class="small muted" hidden></p>
+          <div id="parting-draw-panel" class="parting-draw-panel" hidden>
+            <div class="parting-controls">
+              <label class="parting-draw-plane" data-i18n-title="parting.draw.plane.title" title="The normal of the plane chosen, through the centre of the part, becomes the rotation axis and the draw direction">
+                <span data-i18n="parting.draw.plane">Plane</span>
+                <select id="parting-draw-plane">
+                  <option value="X" data-i18n="parting.draw.plane.x">X (YZ plane)</option>
+                  <option value="Y" data-i18n="parting.draw.plane.y">Y (XZ plane)</option>
+                  <option value="Z" data-i18n="parting.draw.plane.z">Z (XY plane)</option>
+                  <option value="vector" data-i18n="parting.draw.plane.vector">Manual (normal x y z)</option>
+                  <option value="face" data-i18n="parting.draw.plane.face">Face (click a face)</option>
+                </select>
+              </label>
+              <span id="parting-draw-vector-row" class="parting-vector" hidden>
+                <input id="parting-draw-vector" type="text" placeholder="0 0 1" autocomplete="off" data-i18n-title="parting.draw.vector.title" title="Normal of the plane: three components (e.g. 0 0 1) or an axis (X, -Z…)">
+                <button id="parting-draw-vector-apply" class="small" type="button" data-i18n="parting.apply">Apply</button>
+              </span>
+            </div>
+            <p id="parting-draw-axis" class="small muted"></p>
+            <div class="parting-controls">
+              <button id="parting-draw-undo" class="small" type="button" data-i18n="parting.draw.undo" data-i18n-title="parting.draw.undo.title" title="Undo the last action (Ctrl+Z)">Undo</button>
+              <button id="parting-draw-redo" class="small" type="button" data-i18n="parting.draw.redo" data-i18n-title="parting.draw.redo.title" title="Redo (Ctrl+Y)">Redo</button>
+              <button id="parting-draw-close" class="small" type="button" data-i18n="parting.draw.close" data-i18n-title="parting.draw.close.title" title="Join the last point to the first one (Enter)">Close the loop</button>
+              <button id="parting-draw-new" class="small" type="button" data-i18n="parting.draw.new" data-i18n-title="parting.draw.new.title" title="Draw another loop, for instance in a bore through the parting plane">New loop</button>
+              <button id="parting-draw-side" class="small" type="button" data-i18n="parting.draw.side" data-i18n-title="parting.draw.side.title" title="Look at the part from the side, the rotation axis upright">Side view</button>
+              <button id="parting-draw-clear" class="small" type="button" data-i18n="parting.draw.clear" data-i18n-title="parting.draw.clear.title" title="Clear the points and go back to the proposal">Clear the drawing</button>
+              <button id="parting-draw-done" class="small" type="button" data-i18n="parting.draw.done" data-i18n-title="parting.draw.done.title" title="Leave the drawing; the drawn line stays applied (Esc)">Done</button>
+            </div>
+            <table id="parting-draw-segments" class="parting-candidates parting-segments">
+              <thead><tr><th data-i18n="parting.draw.col.segment">Segment</th><th data-i18n="parting.draw.col.type">Type</th><th class="num" data-i18n="parting.draw.col.length">Length</th><th></th></tr></thead>
+              <tbody></tbody>
+            </table>
+            <div id="parting-draw-point" class="parting-controls" hidden>
+              <span id="parting-draw-point-label"></span>
+              <button id="parting-draw-delete" class="small" type="button" data-i18n="parting.draw.delete">Delete</button>
+            </div>
+            <div id="parting-draw-halves" hidden>
+              <div class="parting-controls">
+                <span data-i18n="parting.draw.assign">Assign to a half:</span>
+                <button id="parting-draw-upper" class="small toggle" type="button" data-i18n="parting.draw.upper" data-i18n-title="parting.draw.upper.title" title="Then click a part of the part on the 3D view: it goes to the upper half">Upper part</button>
+                <button id="parting-draw-lower" class="small toggle" type="button" data-i18n="parting.draw.lower" data-i18n-title="parting.draw.lower.title" title="Then click a part of the part on the 3D view: it goes to the lower half">Lower part</button>
+                <button id="parting-draw-swap" class="small" type="button" data-i18n="parting.draw.swap">Swap the halves</button>
+              </div>
+              <p id="parting-draw-parts" class="small"></p>
+            </div>
+            <div id="parting-draw-align" class="parting-controls" hidden>
+              <label for="parting-draw-level" id="parting-draw-align-label"></label>
+              <span class="parting-draw-level"><input id="parting-draw-level" type="number" step="0.1"> mm</span>
+              <button id="parting-draw-align-apply" class="small" type="button" data-i18n="parting.draw.align">Align</button>
+            </div>
+          </div>
           <p class="small" id="parting-hint" hidden></p>
           <button id="parting-reset" class="small" type="button" data-i18n="parting.reset">Back to the proposal</button>
           <p class="parting-legend small" id="parting-legend"></p>
@@ -297,7 +380,7 @@
       <section class="card" id="feeding-card" hidden>
         <div class="card-head">
           <h3 data-i18n="feeding.title">Risers and gating</h3>
-          <label class="check" data-i18n-title="feeding.show.title" title="Show on the 3D view: a cylinder for each riser, an arrow for the ingate"><input type="checkbox" id="feeding-show"> <span data-i18n="feeding.show">Show</span></label>
+          <label class="check" data-i18n-title="feeding.show.title" title="Show on the 3D view: a cylinder for each riser, an arrow for the ingate; the other bodies faded"><input type="checkbox" id="feeding-show"> <span data-i18n="feeding.show">Show</span></label>
         </div>
         <p class="small muted" id="feeding-body" hidden></p>
         <p class="small" id="feeding-status" hidden></p>
@@ -355,6 +438,8 @@
   <script type="application/json" id="reader3d-result"></script>
   <script type="application/json" id="reader3d-semantic-result"></script>
 
+  <!-- The cards of the 3D analysis panel fold to their title, the panel's width is set by dragging. -->
+  <script type="module" src="panels.js"></script>
   <script type="module" src="app.js"></script>
 </body>
 </html>
