@@ -73,6 +73,66 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await context.close();
   });
 
+  test('the message of an action: kept while the page is drawn again by itself (a 3D result arriving), until the next action of the user', { timeout: 60_000 }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage .ccard');
+    // The messages said in the page ("kind: text"), and the page drawn again as after a 3D result (app.js "reader3d-part").
+    const said = (id = 'page-chiffrage') => page.$$eval(`#${id} .cnotice`, (els) => els.map((x) => `${['ok', 'warn', 'error'].find((k) => x.classList.contains(k))}: ${x.textContent}`));
+    const drawnAgain = () => page.evaluate(() => {
+      const before = document.querySelector('#page-chiffrage .cpage');
+      document.dispatchEvent(new CustomEvent('reader3d-part'));
+      return document.querySelector('#page-chiffrage .cpage') !== before;
+    });
+    // A file picked as the workbook: its message (the one before goes at once, at the choice).
+    const importWorkbook = async (name) => {
+      await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, name));
+      await page.waitForFunction((n) => document.querySelector('#page-chiffrage .cnotice')?.textContent.includes(n), name);
+    };
+
+    // A confirmation, then an error: each one kept while the page is drawn again, the one before replaced.
+    await importWorkbook('chiffrage.xlsm');
+    assert.deepEqual(await said(), ['ok: Classeur « chiffrage.xlsm » importé : 18 centres de profit.']);
+    for (let i = 0; i < 3; i++) assert.ok(await drawnAgain(), 'the page drawn again');
+    assert.deepEqual(await said(), ['ok: Classeur « chiffrage.xlsm » importé : 18 centres de profit.']);
+    await importWorkbook('tendances.json');
+    const error = await said();
+    assert.equal(error.length, 1);
+    assert.match(error[0], /^error: tendances\.json : ./);
+    assert.ok(await drawnAgain());
+    assert.deepEqual(await said(), error);
+
+    // The next action of the user without a message of its own: no message, not back when the page is drawn again.
+    await page.fill('#page-chiffrage [data-bind="q.client"]', 'ACME');
+    await page.dispatchEvent('#page-chiffrage [data-bind="q.client"]', 'change');
+    await page.waitForFunction(() => !document.querySelector('#page-chiffrage .cnotice'));
+    assert.ok(await drawnAgain());
+    assert.deepEqual(await said(), []);
+    // Also one that does not draw the page again: a file picker opened, then closed without a file.
+    await importWorkbook('chiffrage.xlsm');
+    const chooser = page.waitForEvent('filechooser');
+    await page.click('#page-chiffrage [data-action="import-indices"]');
+    await chooser;
+    assert.deepEqual(await said(), []);
+    assert.ok(await drawnAgain());
+    assert.deepEqual(await said(), []);
+
+    // Read, then another page opened: no longer said, there nor back here.
+    await importWorkbook('chiffrage.xlsm');
+    await page.click('.tab[data-page="parametres"]');
+    await page.waitForSelector('#page-parametres .ccard');
+    assert.deepEqual(await said('page-parametres'), []);
+    await page.click('.tab[data-page="chiffrage"]');
+    await page.waitForSelector('#page-chiffrage [data-bind="q.client"]');
+    assert.deepEqual(await said(), []);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
   test('import, best routes, choice of an island, settings kept, export', { timeout: 120_000 }, async () => {
     const context = await browser.newContext({ locale: 'fr-FR', acceptDownloads: true });
     const page = await context.newPage();

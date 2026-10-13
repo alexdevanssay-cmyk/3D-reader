@@ -27,7 +27,7 @@ let indices = store.loadIndices();
 let layers = store.loadSettingsLayers(base);
 let settings = layers.effective;
 let q = store.loadQuote(base, indices);
-let message = null; // {kind: "ok" | "error", text}
+let message = null; // {kind: "ok" | "warn" | "error", text, read}: said until the user's next action (dismissMessage)
 let thicknessBusy = false;
 let traceOpen = false; // detail of the traced values unfolded (card "Traçabilité")
 
@@ -60,7 +60,9 @@ export function mount(targets) {
       e.stopPropagation();
       zone.classList.remove("drop-target");
       const file = e.dataTransfer.files?.[0];
-      if (file) importFile({ files: [file], dataset: { file: zone.dataset.drop }, value: "" });
+      if (!file) return;
+      dismissMessage();
+      importFile({ files: [file], dataset: { file: zone.dataset.drop }, value: "" });
     });
   }
   document.addEventListener("reader3d-part", () => {
@@ -104,6 +106,9 @@ export function reload() {
 
 export function show(name) {
   page = name;
+  // A page opened: a message read before is no longer said; one given while the pages were hidden (the values
+  // applied from the IA page, an import finished meanwhile) is said now.
+  if (message?.read) message = null;
   render();
   refreshNetwork(); // the retours d'expérience of the other PCs, in the background
 }
@@ -455,6 +460,7 @@ function readValue(target) {
 function onChange(event) {
   const target = event.target;
   const bind = target.dataset.bind;
+  if (bind || target.dataset.file || target.dataset.pref) dismissMessage();
   if (!bind) {
     if (target.dataset.file) importFile(target);
     // Box "Envoyer les pièces similaires de l'historique": a choice of this browser, not of the quote.
@@ -518,6 +524,7 @@ function onChange(event) {
 async function onClick(event) {
   const button = event.target.closest("[data-action]");
   if (!button) return;
+  dismissMessage();
   const action = button.dataset.action;
   if (action === "import-workbook" || action === "import-indices" || action === "import-tendances" || action === "import-rfq" || action === "import-historique") button.parentElement.querySelector("input[data-file]")?.click();
   else if (action === "show-parametres") document.querySelector('.tab[data-page="parametres"]')?.click();
@@ -1298,13 +1305,31 @@ function render() {
     if (kept) input.replaceWith(kept);
   }
   if (focused) container.querySelector(`[data-bind="${CSS.escape(focused)}"]`)?.focus();
+  // Drawn in the page in view: read (not said again when a page is opened, show).
+  if (message && !container.hidden) message.read = true;
 }
 
+/**
+ * The message of the last action (an import, a setting, a button, the values
+ * applied from the IA page), drawn again with the page each time it is drawn
+ * (a 3D result, the shared folder read): until the user's next action
+ * (dismissMessage), another tab (setTab) or a page opened once it was read
+ * (show).
+ */
 function messageHtml() {
-  if (!message) return "";
-  const html = `<div class="cmsg ${message.kind}">${esc(message.text)}</div>`;
+  return message ? `<div class="cmsg cnotice ${message.kind}">${esc(message.text)}</div>` : "";
+}
+
+/**
+ * The user acts on a costing page (a field or a box changed, a button
+ * clicked, a file dropped): the message of the action before is no longer
+ * said, also when the page is not drawn again (a file picker opened, a
+ * dialog cancelled). Left in the page while a button is being pressed: the
+ * page is drawn again once it is released (render).
+ */
+function dismissMessage() {
   message = null;
-  return html;
+  if (!pointerDown) for (const container of Object.values(el)) container.querySelector(".cnotice")?.remove();
 }
 
 function sourcesCard() {
