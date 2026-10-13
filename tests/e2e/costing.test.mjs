@@ -129,6 +129,25 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.click('.tab[data-page="chiffrage"]');
     await page.waitForSelector('#page-chiffrage [data-bind="q.client"]');
     assert.deepEqual(await said(), []);
+
+    // A field left by pressing a button (its change comes before the click): the message of the field, a value
+    // refused, is said, not dismissed by the click of that press; the one said before the press goes.
+    await page.click('.tab[data-page="parametres"]');
+    await page.setInputFiles('#page-parametres input[data-file="tendances"]', join(dir, 'tendances.json'));
+    await page.waitForFunction(() => document.querySelector('#page-parametres .cnotice')?.textContent.includes('tendances.json'));
+    assert.match((await said('page-parametres'))[0], /^warn: Tendances « tendances\.json » importées/);
+    await page.fill('#page-parametres [data-bind="s.trs.CG3"]', '150');
+    const picker = page.waitForEvent('filechooser');
+    await page.click('#page-parametres [data-action="import-tendances"]');
+    await picker;
+    // Drawn again at the release of the button: the value not kept, the trend in the field.
+    await page.waitForFunction(() => document.querySelector('#page-parametres [data-bind="s.trs.CG3"]')?.value === '70');
+    assert.deepEqual(await said('page-parametres'), ['error: Valeur refusée (TRS entre 0 et 100 %) : non enregistrée.']);
+    // The next press, with no field left: it goes at once.
+    const again = page.waitForEvent('filechooser');
+    await page.click('#page-parametres [data-action="import-tendances"]');
+    await again;
+    assert.deepEqual(await said('page-parametres'), []);
     assert.deepEqual(errors, []);
     await context.close();
   });

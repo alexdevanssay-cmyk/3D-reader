@@ -37,7 +37,9 @@ export function mount(targets) {
     container.addEventListener("change", onChange);
     container.addEventListener("click", onClick);
     container.addEventListener("pointerdown", (e) => {
-      if (e.target.closest("button, [data-action]")) pointerDown = true;
+      if (!e.target.closest("button, [data-action]")) return;
+      pointerDown = true;
+      press = { message };
     }, true);
     // A file dropped on the row of a data file replaces that file.
     container.addEventListener("dragover", (e) => {
@@ -524,7 +526,12 @@ function onChange(event) {
 async function onClick(event) {
   const button = event.target.closest("[data-action]");
   if (!button) return;
-  dismissMessage();
+  // Only the message said before the button was pressed goes, not one given while it was held down: the field it
+  // took the focus from (its change comes before the click, a value refused). A click of the keyboard (detail 0)
+  // has no press. None left (dismissed by that change): out of the page at once too.
+  const before = press && event.detail ? press.message : message;
+  press = null;
+  if (!message || message === before) dismissMessage();
   const action = button.dataset.action;
   if (action === "import-workbook" || action === "import-indices" || action === "import-tendances" || action === "import-rfq" || action === "import-historique") button.parentElement.querySelector("input[data-file]")?.click();
   else if (action === "show-parametres") document.querySelector('.tab[data-page="parametres"]')?.click();
@@ -1281,6 +1288,7 @@ function thicknessText(t) {
 // gets it back.
 let pointerDown = false;
 let pending = false;
+let press = null; // {message}: the message said when a button was last pressed down (onClick)
 window.addEventListener("pointerup", () => {
   pointerDown = false;
   if (pending) setTimeout(render, 0);
@@ -1325,7 +1333,8 @@ function messageHtml() {
  * clicked, a file dropped): the message of the action before is no longer
  * said, also when the page is not drawn again (a file picker opened, a
  * dialog cancelled). Left in the page while a button is being pressed: the
- * page is drawn again once it is released (render).
+ * page is drawn again once it is released (render). A click dismisses only
+ * the message said before its press (onClick).
  */
 function dismissMessage() {
   message = null;
