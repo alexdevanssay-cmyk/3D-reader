@@ -342,6 +342,9 @@ const RULES = [
   { re: /^modes\.[^.]+$/, test: (v) => MODES.includes(v), message: `fonctionnement ${MODES.join(", ")}` },
   { re: /^seuilTendance$/, test: (v) => v >= 0, message: "seuil positif ou nul" },
   { re: /^tooling\.parEmpreinte$/, test: (v) => v >= 0, message: "part d'une empreinte positive ou nulle" },
+  // The orientation of the die of an island (engine/orientation.js PLANS, FEEDS).
+  { re: /^processes\.[^.]+\.orientation\.plan$/, test: (v) => v === "vertical" || v === "horizontal", message: "plan de joint vertical ou horizontal" },
+  { re: /^processes\.[^.]+\.orientation\.alimentation$/, test: (v) => v === "haut" || v === "bas", message: "alimentation par le haut ou par le bas" },
 ];
 const ruleOf = (path) => RULES.find((r) => r.re.test(path));
 

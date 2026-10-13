@@ -371,6 +371,7 @@ const LABELS = {
   "piece.epaisseurMax": "Épaisseur maxi / point chaud",
   "piece.module": "Module V/S",
   "piece.dimMax": "Plus grande dimension",
+  "piece.brutOriente": "Brut orienté (pavé minimal selon la direction de démoulage)",
   "piece.ilot": "Îlot de coulée",
   "piece.miseAuMille": "Mise au mille",
   "piece.miseAuMille.estimee": "Mise au mille estimée (non retenue)",
@@ -650,6 +651,18 @@ export function traceQuote(ctx, c) {
 }
 
 /**
+ * What the die block of a piece is sized from, in words: the part oriented in
+ * its die by the 3D page (tooling.js dieSize, block.oriented: « brut orienté
+ * du modèle 3D (direction de démoulage +Z, pavé minimal) »), else its
+ * envelope, of the 3D model or estimated.
+ *   block: estimateTooling(...).block; part: {orientedAxis, bboxSize}
+ */
+export function dieBasis(block, part) {
+  if (block?.oriented) return `brut orienté du modèle 3D (direction de démoulage ${part?.orientedAxis ?? "du plan de joint"}, pavé minimal)`;
+  return `encombrement ${part?.bboxSize?.length === 3 ? "du modèle 3D" : "estimé d'après la plus grande dimension"}`;
+}
+
+/**
  * Traces of the values of one piece (keys "piece.*", "centre.<code>.*",
  * "parametres.*"): r is the result of ui.js:computePiece, devis the traces
  * of the quote (traceQuote).
@@ -695,6 +708,11 @@ export function tracePiece(r, ctx, devis) {
   geometry("piece.epaisseurMax", "epaisseurMax", "mm", r.auto.epaisseurMax === null ? null : geo(r.auto.epaisseurMax, "mm", "app.js:partFeatures (épaisseurs : sphère inscrite maxi)"), "épaisseur maxi inconnue : 0, mise au mille par défaut de l'îlot");
   geometry("piece.module", "moduleMm", "mm", r.auto.moduleMm === null ? null : geo(r.auto.moduleMm, "mm", "volume / surface du corps", ["module global du corps, pas celui du point chaud"]), "module inconnu : 0 dans le temps de cycle");
   geometry("piece.dimMax", "dimMax", "mm", r.auto.dimMax === null ? null : geo(r.auto.dimMax, "mm", "app.js:partFeatures (boîte englobante)"), "plus grande dimension inconnue : 0, encombrement non vérifié");
+  // The part oriented in its die (the 3D page: the smallest rectangle round it seen along its draw direction, and its height along it).
+  const oriented = r.part.orientedSize?.length === 3 ? r.part.orientedSize : null;
+  if (oriented) {
+    T["piece.brutOriente"] = geo(`${oriented.map((x) => fr(x, 0)).join(" × ")} mm`, "", "app.js:partFeatures (brut orienté : pavé minimal autour de la pièce selon sa direction de démoulage, orientation.js)", [`direction de démoulage ${r.part.orientedAxis ?? "du plan de joint"}`]);
+  }
   if (!(r.part.poids > 0)) return T;
   const geomIn = { "piece.poids": T["piece.poids"], "piece.toileMini": T["piece.toileMini"], "piece.epaisseurMax": T["piece.epaisseurMax"], "piece.dimMax": T["piece.dimMax"] };
   const route = r.route;
@@ -867,14 +885,15 @@ export function tracePiece(r, ctx, devis) {
     estimate = derive(route.outillageEstime, {
       unite: "€", ref: "tooling.js:estimateTooling",
       entrees: {
-        "piece.dimMax": T["piece.dimMax"], "piece.empreintes": T["piece.empreintes"], "piece.empreintes.estimee": T["piece.empreintes.estimee"],
+        ...(t.block.oriented && T["piece.brutOriente"] ? { "piece.brutOriente": T["piece.brutOriente"] } : { "piece.dimMax": T["piece.dimMax"] }),
+        "piece.empreintes": T["piece.empreintes"], "piece.empreintes.estimee": T["piece.empreintes.estimee"],
         // From the settings, the slides are among them (parametres.outillage).
         ...(typed("outillageTiroirs") ? { "piece.outillage.tiroirs": T["piece.outillage.tiroirs"] } : {}),
         "parametres.outillage": toolingSettings,
       },
       plafond: ["moyenne", "estimation par la méthode du classeur « Outillage fonderie »"],
       hypotheses: [
-        `moule ${fr(t.block.L, 0)} × ${fr(t.block.W, 0)} × ${fr(t.block.H, 0)} mm = encombrement ${r.part.bboxSize?.length === 3 ? "du modèle 3D" : "estimé d'après la plus grande dimension"} + marges`,
+        `moule ${fr(t.block.L, 0)} × ${fr(t.block.W, 0)} × ${fr(t.block.H, 0)} mm = ${dieBasis(t.block, r.part)} + marges`,
         `${plural(t.tiroirs, "tiroir")} (${slidesHow}), complexité ${t.complexite} (${i.outillageComplexite ? "saisie" : "par défaut"})`,
         ...(t.facteurEmpreintes !== 1 ? [`${plural(t.cavities, "empreinte")}, ${t.empreintesEstimees} estimée${t.empreintesEstimees > 1 ? "s" : ""} : heures d'usinage, de scan et d'ajustage × ${fr(t.facteurEmpreintes, 2)}`] : []),
       ],
