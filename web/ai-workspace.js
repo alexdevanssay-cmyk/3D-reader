@@ -38,10 +38,26 @@
 // the local model answers if it can (box "Repli automatique sur le modèle
 // local"). What the local model answered never goes online with the
 // conversation (onlineMessages): it was given the real names and amounts.
+//
+// The model is told what changed of the part since its last answer
+// (ai-facts.js): each answer is kept with the key facts of the data it was
+// given (wall thickness, parting, slides, feeding, holes, bodies sent, the
+// island and cycle of the costing...); a question asked with the
+// conversation starts, in what the model gets only, with what changed since,
+// and that the data sent replace what it wrote before. A small grey line
+// under the question tells the person.
+//
+// An answer cut at the length allowed (the gateway's AI_MAX_TOKENS, its
+// finish_reason "length"; the window of Ollama, its done_reason) is not left
+// for the person to ask its end: its rest is asked at once (continueAnswer),
+// the same data, conversation and question with the answer so far and an
+// instruction to go on, up to 4 parts in all, shown and kept as one answer.
+// Still cut then: « Réponse encore incomplète », and a « Suite » button.
 
 import { anonymizer, buildAIContext, checkContextNumbers, compactAIContext, partNames, summaryAIContext } from "./engine/ai-context.js";
 import { PROPOSAL_FIELDS, checkProposals, readProposals, valueLabel } from "./chiffrage/ai-apply.js";
 import * as archives from "./ai-history.js";
+import { factsOf, lastFacts, updateNote, withNote } from "./ai-facts.js";
 
 const PROVIDERS = [
   ["openai", "En ligne via la passerelle (Groq…)"], // value of earlier versions, kept in this browser's storage
@@ -92,6 +108,88 @@ const COSTING_LABEL = "Raisonnement IA — rien n'est appliqué sans votre accor
 const APPLY_TEXT = "Appliquer les valeurs au chiffrage";
 // HTTP statuses of the gateway when the free quota of its provider is reached (api/ai.js): the local model may answer instead.
 const QUOTA_STATUSES = [413, 429];
+// An answer cut at the length allowed (AI_MAX_TOKENS of the gateway, the window of Ollama): its rest asked at once,
+// the answer so far sent back with this instruction, up to MAX_PARTS parts in all, joined in one answer.
+const MAX_PARTS = 4;
+const CONTINUE = "Continue exactement là où ta réponse s'est arrêtée, sans répéter ni résumer ce qui précède.";
+// The note the gateway (api/ai.js answerOf) puts at the end of a text answer cut, for the pages before: taken off.
+const CUT_NOTE = "\n\n(Réponse coupée : limite de longueur atteinte.)";
+
+const wordChar = (c) => /[\p{L}\p{N}]/u.test(c ?? "");
+
+/**
+ * A part of an answer cut at the length allowed, without the word the cut
+ * may have split ("les parois min"): back to its last space, the model
+ * writing that word again in the next part. Ended by a space or a
+ * punctuation mark: whole.
+ */
+export function cutBack(text) {
+  const s = String(text ?? "");
+  if (!wordChar(s.at(-1))) return s;
+  const i = s.search(/\s\S*$/u);
+  return i > 0 ? s.slice(0, i + 1) : s;
+}
+
+/**
+ * Two parts of an answer as one: `next` after `text` (cutBack), the words
+ * it writes again of the end of `text` once only (a model asked to go on
+ * often starts a few words back): an exact overlap, from the start of a
+ * word of `text`, to the end of a word of `next` unless long. A part that
+ * starts a new sentence after a punctuation mark is put after a space.
+ */
+export function joinParts(text, next) {
+  const a = String(text ?? "");
+  const raw = String(next ?? "");
+  const b = raw.replace(/^\s+/u, "");
+  if (!b) return a;
+  for (let k = Math.min(a.length, b.length, 4000); k >= 2; k--) {
+    const overlap = b.slice(0, k);
+    if (!a.endsWith(overlap) || !/[\p{L}\p{N}]/u.test(overlap)) continue;
+    const start = a.length - k;
+    const fromWord = start === 0 || !wordChar(a[start - 1]) || !wordChar(overlap[0]);
+    const toWord = k >= 8 || k === b.length || !wordChar(b[k]) || !wordChar(overlap[k - 1]);
+    if (fromWord && toWord) return a + b.slice(k);
+  }
+  if (!a || /\s$/u.test(a)) return a + b;
+  if (raw !== b) return a + raw; // its own space first
+  return a + (/[.!?;:,)\]»…]$/u.test(a) ? " " : "") + b;
+}
+
+/** The turns that ask the rest of an answer cut: the question as it was sent, the answer so far, the instruction to go on. */
+const continuation = (question, partial) => [{ role: "user", content: question }, { role: "assistant", content: partial }, { role: "user", content: CONTINUE }];
+
+/**
+ * The rest of an answer cut at the length allowed (`first`: {text, cut}),
+ * asked part after part (`next(text so far)` → {text, cut, ...}) until it is
+ * whole or `limit` parts in all are there (`parts`: those there already);
+ * `onPart(n, limit, text so far)` before part n is asked. A part that cannot be had
+ * (quota, network) ends it, the answer still cut, with its error; a
+ * question cancelled is cancelled. Resolves to {text, cut, parts, results
+ * (of `next`), error}.
+ */
+export async function continueAnswer(first, next, { parts = 1, limit = MAX_PARTS, onPart = () => {} } = {}) {
+  let text = first.cut ? cutBack(first.text) : first.text;
+  let cut = !!first.cut;
+  let error = null;
+  const results = [];
+  while (cut && parts < limit) {
+    parts += 1;
+    onPart(parts, limit, text);
+    let part;
+    try {
+      part = await next(text);
+    } catch (err) {
+      if (err?.name === "AbortError") throw err;
+      error = err;
+      parts -= 1;
+      break;
+    }
+    results.push(part);
+    cut = !!part.cut;
+    text = joinParts(text, cut ? cutBack(part.text) : part.text);
+  }
+  return { text, cut, parts, results, error };
+}
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -544,11 +642,14 @@ function readTokens() {
  * those of the latest 20 questions of the IA page (`question`), of the latest
  * 50 requests of any kind.
  */
-function noteQuota({ provider, quota, usage } = {}, question = false) {
-  const total = usage?.total_tokens;
-  if (typeof localStorage !== "undefined" && Number.isFinite(total) && total > 0) {
+function noteQuota({ provider, quota, usage } = {}, question = false, requests = null) {
+  // Every request (`requests`: those of an answer in several parts, the last one giving the quota); a question
+  // with the tokens of all its requests.
+  const totals = (requests ?? [{ usage }]).map((r) => r?.usage?.total_tokens).filter((t) => Number.isFinite(t) && t > 0);
+  if (typeof localStorage !== "undefined" && totals.length) {
     const kept = readTokens();
-    store.set(localStorage, KEYS.tokens, JSON.stringify({ questions: question ? [...kept.questions, total].slice(-20) : kept.questions.slice(-20), all: [...kept.all, total].slice(-50) }));
+    const total = totals.reduce((a, b) => a + b, 0);
+    store.set(localStorage, KEYS.tokens, JSON.stringify({ questions: question ? [...kept.questions, total].slice(-20) : kept.questions.slice(-20), all: [...kept.all, ...totals].slice(-50) }));
   }
   if (!Number.isFinite(quota?.requests_remaining_day)) return;
   // For every tab of this browser (the quota is the account's, whatever the tab that asked): the latest answer's.
@@ -615,6 +716,9 @@ N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux. Ne 
 Propositions : quand l'utilisateur demande de changer une saisie d'une pièce ou en donne la bonne valeur, ou quand costing_trace ou l'analyse de la pièce donnent une valeur plus juste d'une saisie, termine ta réponse par un seul bloc \`\`\`json {"propositions": [{"piece": "nom de la pièce dans costing_trace.pieces", "cle": "piece.poids", "valeur": 1.35, "unite": "kg", "source": "question", "justification": "une phrase"}]} \`\`\` ; cle : piece.poids, piece.toileMini, piece.epaisseurMax, piece.module, piece.dimMax, piece.ilot, piece.finition, piece.miseAuMille, piece.empreintes, piece.cycle, piece.mode, piece.tth, piece.tthMode, piece.noyaux, piece.tribo, piece.redressage, piece.outillage.tiroirs ou piece.outillage.complexite ; valeur dans l'unité de la saisie (kg, mm, s) ; source : question (le nombre que l'utilisateur a écrit), trace (la valeur de cette même clé pour cette pièce dans costing_trace) ou analyse_3d (la cote mesurée de la pièce : plus grande dimension, module, épaisseurs ; ou le nombre de tiroirs de l'analyse 3D, slides.count, par pièce : × empreintes pour le moule) ; un nombre absent de la source indiquée est refusé. Jamais un prix, un taux, une marge, un paramètre ni un nombre que tu calcules : seulement un nombre écrit par l'utilisateur, dans costing_trace ou dans l'analyse de la pièce. Une personne accepte chaque proposition avant qu'elle soit appliquée. Sans proposition, pas de bloc.
 Si costing_trace est null, aucun classeur de chiffrage n'est importé : dis-le et propose de l'importer dans la page Chiffrage.`;
 
+// As the gateway (api/ai.js RULES): the data of each question over the model's earlier answers (see ai-facts.js).
+const CURRENT_STATE = "À chaque question, les DONNÉES jointes décrivent l'état actuel de la pièce et du chiffrage. Elles priment sur tes réponses précédentes de la conversation : si une donnée que tu disais manquante y figure maintenant, utilise-la sans attendre qu'on te le redise.";
+
 // As the gateway's text tasks (api/ai.js TEXT_RULES): not in the task « Chiffrage », which proposes values in its own block.
 const PROPOSALS = "Paramètres de fonderie et de chiffrage (nombre de noyaux, de tiroirs, de chapes, îlot de coulée, coefficient de difficulté…) : quand on te les demande, propose-les en fondeur à partir des features et du criblage fonderie du contexte. Présente chaque valeur comme « Proposition IA — à valider », avec sa justification (identifiants des features) et ta confiance. N'invente jamais de prix, de taux horaires ni de mesures.";
 
@@ -629,6 +733,7 @@ Pour la fonderie, cite les identifiants de sources fournis et dis clairement qua
 Ce contexte est l'analyse de la pièce par 3D Reader (features détectées avec leurs identifiants, criblage fonderie, pistes de fabrication) : ne renvoie jamais vers un module ou un outil de 3D Reader que tu supposes. S'il manque du détail (champ "summary_only" ou "compaction"), dis-le et indique l'analyse à choisir dans la page IA : « Features », « Fabrication », « DFM » ou « Chiffrage ».
 Champ "selection" : seuls ces corps de la pièce sont envoyés ; réponds sur eux seulement.
 Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.
+${CURRENT_STATE}
 ${costing ? COSTING_RULES : PROPOSALS}`;
 }
 
@@ -834,6 +939,8 @@ export function mount({ page, reader }) {
   const placeholder = $("ai-input").placeholder; // the box's own, in place of the suggestion
   let shown = null; // {key, file}: the conversation on screen, the one of the tab shown and of its part
   let pending = null; // the question in progress: {key, nodes (its two messages, shown again with their conversation), dropped}
+  // The answers still cut after their parts, by id: how to ask their rest (« Suite », this visit): {key, next, derive, tabId, tabFile}.
+  const resumable = new Map();
   // The history on the right (ai-history.js): the list shown, the network folder ({handle, name, permission}),
   // what went wrong with it last, the conversations read in it, the latest reading of the lists.
   let historyTab = store.get(localStorage, KEYS.historyTab) === "reseau" ? "reseau" : "local";
@@ -1025,6 +1132,19 @@ export function mount({ page, reader }) {
         body.append(button);
       }
     }
+    if (m.incomplete) {
+      // Still cut after its parts: its rest asked on a click, while the page keeps how (this visit).
+      const note = line(body, "ai-incomplete", "Réponse encore incomplète");
+      if (resumable.has(m.id)) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "small ai-resume";
+        button.dataset.message = m.id;
+        button.textContent = "Suite";
+        button.title = "Demander la suite de la réponse";
+        note.append(" ", button);
+      }
+    }
     if (Array.isArray(m.numbers) && m.numbers.length) line(body, "ai-numbers", numbersLabel(m.numbers)).title = m.numbers.join(" ; ");
     if (Array.isArray(m.names) && m.names.length) line(body, "ai-names", namesLine(m.names));
   }
@@ -1048,10 +1168,22 @@ export function mount({ page, reader }) {
     body.append(box);
   }
 
+  /** Under a question: what the AI was told had changed of the part since its last answer (`update`: {labels, lines}, ai-facts.js updateNote). */
+  function showUpdate(body, update) {
+    body.parentElement.querySelector(".ai-update")?.remove();
+    if (!update?.labels?.length) return;
+    line(body, "ai-update", `Mise à jour envoyée à l'IA : ${update.labels.join(", ")}`).title = (update.lines ?? []).join("\n");
+  }
+
   /** A message kept in a conversation, on screen. */
   function showMessage(m) {
-    if (m.role !== "assistant") return bubble("user", m.content);
+    if (m.role !== "assistant") {
+      const body = bubble("user", m.content);
+      showUpdate(body, m.update);
+      return body;
+    }
     const body = bubble("assistant", "", !!m.costing);
+    if (m.id) body.parentElement.dataset.message = m.id;
     setAnswer(body, formatAnswer(m.content));
     if (m.notice) line(body, "ai-notice", m.notice, true);
     decorate(body, m);
@@ -1228,20 +1360,29 @@ export function mount({ page, reader }) {
 
   let timing = ""; // time spent by Ollama on the last answer, shown with it
 
-  /** Ask Ollama (`ollama`: {base, model}), the answer shown as it is written. Resolves to the whole answer. */
-  async function askOllama(question, context, history, askedTask, ollama, signal, onText, onThought) {
+  /**
+   * Ask Ollama (`ollama`: {base, model}) the conversation `history`, then
+   * `turns` (the question; to have the rest of an answer cut, the question,
+   * the answer so far and the instruction to go on), the answer shown as it
+   * is written. Resolves to {text: the whole answer, cut: at the length
+   * allowed}.
+   */
+  async function askOllama(turns, context, history, askedTask, ollama, signal, onText, onThought) {
     const { base, model } = ollama;
     const space = addressSpace(base);
     const system = `${systemPrompt(model, space === "loopback" ? "sur ce PC" : "sur un appareil du réseau local", askedTask === "costing")}\n\nCONTEXTE :\n${JSON.stringify(context)}`;
     const think = $("ai-think").checked;
     const reserve = think ? 4096 : 2048; // room for the answer, and for the reasoning written before it
-    const promptChars = () => system.length + JSON.stringify(history).length + question.length;
+    const promptChars = () => system.length + JSON.stringify(history).length + JSON.stringify(turns).length;
+    const tooLong = () => Math.ceil(promptChars() / 3) + reserve > MAX_WINDOW;
     // The oldest exchanges are left out rather than the prompt cut by Ollama.
-    while (history.length && Math.ceil(promptChars() / 3) + reserve > MAX_WINDOW) history = history.slice(2);
+    while (history.length && tooLong()) history = history.slice(2);
+    // Then of a long answer whose rest is asked, its start: the model goes on from its end.
+    while (turns.length === 3 && turns[1].content.length > 2000 && tooLong()) turns = [turns[0], { ...turns[1], content: turns[1].content.slice(Math.floor(turns[1].content.length / 2)) }, turns[2]];
     const numCtx = contextWindow(promptChars(), reserve);
     const body = {
       model,
-      messages: [{ role: "system", content: system }, ...history, { role: "user", content: question }],
+      messages: [{ role: "system", content: system }, ...history, ...turns],
       stream: true,
       think, // Qwen3 reasons before answering only when asked: much slower on a CPU
       keep_alive: "15m", // the model stays loaded between questions (loading it takes long on a CPU)
@@ -1306,7 +1447,6 @@ export function mount({ page, reader }) {
         }
       }
     }
-    if (last?.done_reason === "length") answer += "\n\n(Réponse coupée : limite de longueur atteinte.)";
     if (last) {
       // Where the time went: loading the model, reading the prompt, writing the answer.
       timing = [
@@ -1316,7 +1456,8 @@ export function mount({ page, reader }) {
       ].filter(Boolean).join(", ");
     }
     if (last?.prompt_eval_count >= 0.95 * numCtx) timing += `${timing ? ", " : ""}contexte trop long : Ollama en a peut-être ignoré le début`;
-    return answer;
+    // Cut at the length allowed (its window): its rest is asked (continueAnswer).
+    return { text: answer, cut: last?.done_reason === "length" };
   }
 
   /** A request to the gateway of this page (its address and access code): see fetchGateway. */
@@ -1340,8 +1481,15 @@ export function mount({ page, reader }) {
     return data;
   }
 
-  /** Ask the gateway the question with its context (compacted) and the conversation, within `budget`, of the model `model` (none: its own). Resolves to its answer: {output, provider, model, quota}. */
-  async function askGateway(question, context, history, askedTask, model, signal, budget) {
+  /**
+   * Ask the gateway, with its context (compacted) and the conversation
+   * `history`, within `budget`, of the model `model` (none: its own),
+   * `turns`: the question; to have the rest of an answer cut, the question,
+   * the answer so far and the instruction to go on. Resolves to its answer:
+   * {output, provider, model, quota, usage, cut (at AI_MAX_TOKENS: its rest
+   * to ask)}.
+   */
+  async function askGateway(turns, context, history, askedTask, model, signal, budget) {
     // The latest exchanges, while they take no more than half the room of the context.
     while (history.length && JSON.stringify(history).length > budget / 2) history = history.slice(2);
     const data = await gatewayFetch({
@@ -1352,13 +1500,15 @@ export function mount({ page, reader }) {
         task: askedTask,
         model: model || undefined,
         context,
-        messages: [...history, { role: "user", content: question }],
+        messages: [...history, ...turns],
       }),
       signal,
     });
     const output = data.output ?? data.text;
     if (typeof output !== "string" || !output.trim()) throw new Error("La passerelle a renvoyé une réponse vide : réessayez.");
-    return { ...data, output };
+    // Cut (a gateway before finish_reason: its note left, nothing more asked).
+    const cut = data.finish_reason === "length";
+    return { ...data, output: cut && output.endsWith(CUT_NOTE) ? output.slice(0, -CUT_NOTE.length) : output, cut };
   }
 
   async function send(question) {
@@ -1440,11 +1590,15 @@ export function mount({ page, reader }) {
     const start = performance.now();
     let written = 0;
     let fallback = null; // the local model, answering in place of the gateway
+    let partNo = 1; // the part of a long answer being asked (continueAnswer), from the second one said in the status
+    let partLimit = MAX_PARTS;
     const tick = () => {
       const s = Math.round((performance.now() - start) / 1000);
-      setStatus(local || fallback
-        ? written ? `Rédaction… ${s} s` : thought ? `Réflexion… ${s} s` : `Lecture du contexte par le modèle… ${s} s (sur un PC sans carte graphique, cela peut prendre quelques minutes)`
-        : `Analyse… ${s} s`);
+      setStatus(partNo > 1
+        ? `Réponse longue : suite ${partNo}/${partLimit}…`
+        : local || fallback
+          ? written ? `Rédaction… ${s} s` : thought ? `Réflexion… ${s} s` : `Lecture du contexte par le modèle… ${s} s (sur un PC sans carte graphique, cela peut prendre quelques minutes)`
+          : `Analyse… ${s} s`);
     };
     tick();
     const timer = setInterval(tick, 1000);
@@ -1468,17 +1622,40 @@ export function mount({ page, reader }) {
       let answer = null; // of the gateway
       let localModel = null; // of Ollama
       let output;
+      let facts = null; // the key facts of the context the model was given (ai-facts.js), kept with its answer
+      let update = null; // what it was told had changed since its last answer: {text (as sent), lines, labels}
+      // The note before the question (updateNote), for the model that answers: what changed since the facts
+      // of its last answer in the conversation it is sent (`messages`), when some of it is (`history`).
+      const noteFor = (messages, sentHistory) => {
+        update = updateNote(lastFacts(messages), facts, sentHistory.length > 0);
+        showUpdate(userBox, update);
+        return update;
+      };
+      let first; // the first part of the answer: {text, cut (at the length allowed)}
+      // Asks the rest of an answer cut, after `partial` (its words shown after it with `show` as they are written,
+      // Ollama): {text, cut, data (of the gateway)}. Kept with an answer still cut, for its « Suite ».
+      let next = null;
       const askLocal = async (ollama) => {
-        sent = compacted(await contextOf(part, read, askedTask, true), askedTask, LOCAL_CONTEXT_CHARS, true);
+        const whole = await contextOf(part, read, askedTask, true);
+        facts = factsOf(whole); // before its compaction
+        sent = compacted(whole, askedTask, LOCAL_CONTEXT_CHARS, true);
         asked = questions(question, history);
         localModel = ollama.model;
-        return askOllama(question, sent, history, askedTask, ollama, signal, onText, showThought);
+        // The local model is given the whole conversation: the facts of its last answer, of either model.
+        const turn = withNote(noteFor(conversation.messages, history), question);
+        const ask = (turns, sig, show) => askOllama(turns, sent, history, askedTask, ollama, sig, show, showThought);
+        next = async (partial, sig, show = () => {}) => {
+          const r = await ask(continuation(turn, partial), sig, (t) => show(joinParts(partial, withoutThinking(t))));
+          return { text: withoutThinking(r.text), cut: r.cut };
+        };
+        const r = await ask([{ role: "user", content: turn }], signal, onText);
+        return { text: withoutThinking(r.text), cut: r.cut };
       };
       if (local) {
         const ollama = { base: ollamaBase($("ai-url").value.trim()), model: $("ai-model").value.trim() || OLLAMA_MODEL };
         const problem = await diagnoseOllama(ollama.base, ollama.model);
         if (problem) throw new Error(problem);
-        output = await askLocal(ollama);
+        first = await askLocal(ollama);
       } else {
         // The gateway's budget; an older gateway, without its configuration: the default one.
         const info = await gatewayConfig(signal).catch((err) => {
@@ -1491,11 +1668,15 @@ export function mount({ page, reader }) {
         const model = info && wanted && !models.includes(wanted) ? null : wanted;
         if (info && wanted && !model) notice = `Modèle « ${wanted} » non proposé par la passerelle (variable AI_MODELS dans Vercel) : réponse de son modèle par défaut`;
         let whole = await contextOf(part, read, askedTask, false, budget);
+        facts = factsOf(whole); // before its compaction and the anonymizer (its internal amounts masked as sent)
         // The names of the quote of the tab, whatever the task: a question may name the customer.
         const { costingNames } = await import("./chiffrage/ui.js");
         quoteNames = costingNames({ tab: tabId });
         // Not what was answered with the internal amounts of the costing, unless they may go now, to this gateway.
-        let online = { question, history: recent(onlineMessages(conversation.messages, { amounts: $("ai-amounts").checked, gateway: $("ai-url").value.trim() })) };
+        const messages = onlineMessages(conversation.messages, { amounts: $("ai-amounts").checked, gateway: $("ai-url").value.trim() });
+        let online = { question, history: recent(messages) };
+        // What changed since the gateway's last answer it is sent (the facts of an answer of the local model never go online).
+        noteFor(messages, online.history);
         if ($("ai-anon").checked) {
           // Before the compaction: the labels count in the budget. With the names this conversation
           // replaced before: one changed since in the quote may be in its history.
@@ -1503,12 +1684,20 @@ export function mount({ page, reader }) {
           names = anonymizer(whole, unionNames(quoteNames, conversation.names), ofPart);
           whole = names.context(whole);
           online = { question: names.text(online.question), history: online.history.map((m) => ({ ...m, content: names.text(m.content) })) };
+          if (update) update = { ...update, text: names.text(update.text) }; // as the question
         }
         sent = compacted(whole, askedTask, budget, false);
         asked = questions(online.question, online.history);
+        const turn = withNote(update, online.question);
+        const ask = (turns, sig) => askGateway(turns, sent, online.history, askedTask, model, sig, budget);
         try {
-          answer = await askGateway(online.question, sent, online.history, askedTask, model, signal, budget);
-          output = answer.output;
+          answer = await ask([{ role: "user", content: turn }], signal);
+          first = { text: answer.output, cut: answer.cut };
+          // Its rest: what the model wrote sent back as it wrote it (the labels, never the real names).
+          next = async (partial, sig) => {
+            const data = await ask(continuation(turn, partial), sig);
+            return { text: data.output, cut: data.cut, data };
+          };
         } catch (err) {
           // The free quota reached: the local model, when it answers (its own address and model).
           if (err?.name === "AbortError" || !QUOTA_STATUSES.includes(err?.status) || !$("ai-fallback").checked) throw err;
@@ -1518,38 +1707,54 @@ export function mount({ page, reader }) {
           notice = fallback.notice;
           line(answerBox, "ai-notice", fallback.notice, true);
           names = null; // the real names: nothing leaves the site
-          output = await askLocal(ollama);
+          first = await askLocal(ollama);
         }
         if (notice && !fallback) line(answerBox, "ai-notice", notice, true);
       }
+      // Cut at the length allowed: its rest asked at once, the parts shown and kept as one answer.
+      const full = await continueAnswer(first, (partial) => next(partial, signal, onText), {
+        onPart: (n, limit, text) => {
+          partNo = n;
+          partLimit = limit;
+          onText(text); // the answer so far, while its rest is asked
+          tick();
+        },
+      });
+      output = full.text;
       foldThought();
       answerBox.classList.remove("ai-thinking");
       setAnswer(answerBox, formatAnswer(output) || "(réponse vide)");
       answerBox.parentElement.removeAttribute("aria-busy");
-      // Costing: every number of the answer must be in the trace the model was given.
-      let check = null;
-      if (costing) {
-        const { checkNumbers } = await import("./chiffrage/ai-trace.js");
-        check = checkNumbers(costingText(output), sent.costing_trace);
-      }
-      // Costing: the values proposed for the inputs of a piece, each number from the data sent or the questions;
-      // the piece by its rank in the trace sent (its labels online), its key and real name from the snapshot.
-      let proposals = [];
-      if (costing && unreadableProposals(output)) {
+      // What is read of the answer: again on the whole of it when its rest is asked later (« Suite »).
+      const derive = async (text) => {
+        // Costing: every number of the answer must be in the trace the model was given.
+        let check = null;
+        if (costing) {
+          const { checkNumbers } = await import("./chiffrage/ai-trace.js");
+          check = checkNumbers(costingText(text), sent.costing_trace);
+        }
+        // Costing: the values proposed for the inputs of a piece, each number from the data sent or the questions;
+        // the piece by its rank in the trace sent (its labels online), its key and real name from the snapshot.
+        let proposals = [];
+        if (costing && sent.costing_trace && read?.snapshot && tabId !== undefined) {
+          proposals = checkProposals(readProposals(proposalsOf(text), sent.costing_trace), sent, asked).map(({ index, ...p }) => {
+            const piece = read.snapshot.pieces[index];
+            return piece ? { ...p, piece: piece.nom, cle_piece: piece.cle } : p;
+          });
+        }
+        // Every task with a part: the numbers that come from none of the data sent (informative). Those of the
+        // note sent with the question come from the data (now and of the last answer): not counted.
+        const numbers = sent.no_model_loaded ? [] : checkContextNumbers(answerText(text), sent, update ? [...asked, update.text] : asked).inconnus;
+        const legend = names ? names.legend(formatAnswer(text)) : [];
+        return { check, proposals, numbers, legend, unreadable: costing && unreadableProposals(text) };
+      };
+      const { check, proposals, numbers, legend, unreadable } = await derive(output);
+      if (unreadable) {
         // Said now and kept with the answer (shown with it again).
-        const unreadable = "Propositions de l'IA illisibles (JSON non valide) : rien à appliquer.";
-        line(answerBox, "ai-notice", unreadable, true);
-        notice = [notice, unreadable].filter(Boolean).join(" ");
+        const text = "Propositions de l'IA illisibles (JSON non valide) : rien à appliquer.";
+        line(answerBox, "ai-notice", text, true);
+        notice = [notice, text].filter(Boolean).join(" ");
       }
-      if (costing && sent.costing_trace && read?.snapshot && tabId !== undefined) {
-        proposals = checkProposals(readProposals(proposalsOf(output), sent.costing_trace), sent, asked).map(({ index, ...p }) => {
-          const piece = read.snapshot.pieces[index];
-          return piece ? { ...p, piece: piece.nom, cle_piece: piece.cle } : p;
-        });
-      }
-      // Every task with a part: the numbers that come from none of the data sent (informative).
-      const numbers = sent.no_model_loaded ? [] : checkContextNumbers(answerText(output), sent, asked).inconnus;
-      const legend = names ? names.legend(formatAnswer(output)) : [];
       // An answer of the local model is marked: it never goes online with the conversation (onlineMessages);
       // one of the gateway given the internal amounts of the costing too, with the gateway: not without the box ticked.
       const source = answer ? { provider: answer.provider, model: answer.model } : { provider: "Ollama", model: localModel };
@@ -1559,8 +1764,14 @@ export function mount({ page, reader }) {
         ...(localModel ? { local: true } : {}), ...(amountsSent !== null && !localModel ? { amounts: true, gateway: amountsSent } : {}),
         ...(check ? { costing: check } : {}), ...(numbers.length ? { numbers } : {}), ...(notice ? { notice } : {}), ...(legend.length ? { names: legend } : {}),
         ...(proposals.length ? { proposals, target: { tab: tabId, file: tabFile } } : {}),
+        // What it was given, for the next question to tell it what changed since.
+        ...(facts ? { facts } : {}),
+        // In several parts; still cut after them: its « Suite » (this visit).
+        ...(full.parts > 1 ? { parts: full.parts } : {}), ...(full.cut ? { incomplete: true } : {}),
       };
       signal.throwIfAborted();
+      answerBox.parentElement.dataset.message = message.id;
+      if (full.cut) resumable.set(message.id, { key: conv.key, next, derive, tabId, tabFile });
       decorate(answerBox, message);
       toEnd();
       // Only answered questions are kept: a failed one is not sent again with the next. Not in a
@@ -1576,7 +1787,8 @@ export function mount({ page, reader }) {
         const record = archives.normalizeConversation({
           ...kept, id: kept.id ?? archives.newId(), part, file: kept.file ?? (here ? asking.file ?? here.file : null) ?? conv.file ?? part?.file ?? null,
           started: kept.started ?? askedAt, updated: new Date().toISOString(),
-          messages: [...kept.messages, { id: archives.newId(), role: "user", content: question, date: askedAt }, message], names: known,
+          // The question as the person wrote it; what the AI was told had changed beside it (its grey line).
+          messages: [...kept.messages, { id: archives.newId(), role: "user", content: question, date: askedAt, ...(update?.labels.length ? { update: { labels: update.labels, lines: update.lines } } : {}) }, message], names: known,
         });
         writeConversation(conv.key, record);
         archive(record);
@@ -1587,9 +1799,15 @@ export function mount({ page, reader }) {
         const text = [formatAnswer(output), legend.length ? namesLine(legend) : ""].filter(Boolean).join("\n\n");
         addAIAnalysis({ date: new Date().toISOString(), provider: source.provider ?? null, model: source.model ?? null, question, answer: text, verified: check.verifiee }, { tab: tabId });
       }
-      if (answer) noteQuota(answer, true);
+      // Every request of the gateway counts (the tokens of the question: those of all its parts); the quota of the last one.
+      if (answer) {
+        const requests = [answer, ...full.results.map((r) => r.data).filter(Boolean)];
+        noteQuota(requests.at(-1), true, requests);
+      }
       const label = answer ? gatewayLabel(answer) : fallback ? `repli local : Ollama · ${fallback.model}` : "";
-      setStatus(`Réponse en ${Math.round((performance.now() - start) / 1000)} s${(local || fallback) && timing ? ` (${timing})` : ""}${label ? ` · ${label}` : ""}`);
+      const parts = full.parts > 1 ? ` · ${full.parts} parties` : "";
+      const missing = full.error ? ` · suite non obtenue : ${full.error.message || full.error}` : "";
+      setStatus(`Réponse en ${Math.round((performance.now() - start) / 1000)} s${(local || fallback) && timing ? ` (${timing})` : ""}${label ? ` · ${label}` : ""}${parts}${missing}`);
       timing = "";
     } catch (err) {
       answerBox.parentElement.remove();
@@ -2153,10 +2371,79 @@ export function mount({ page, reader }) {
     updateSuggestion();
   }
 
+  /**
+   * « Suite »: the rest of an answer still cut after its parts, asked as
+   * they were (the same data, conversation and question: resumable), up to
+   * MAX_PARTS more parts, joined to it in its bubble; kept as one answer,
+   * read again (its numbers, its check, its proposals) on the whole of it.
+   */
+  async function resumeAnswer(id) {
+    const job = resumable.get(id);
+    if (!job || busy || shown?.key !== job.key) return;
+    const m = readConversation(job.key).messages.find((x) => x.id === id);
+    if (!m?.incomplete) return;
+    const box = [...$("ai-chat").querySelectorAll(".ai-assistant")].find((el) => el.dataset.message === id);
+    const body = box?.querySelector(".ai-text");
+    box?.querySelector(".ai-incomplete")?.remove();
+    const show = (text) => {
+      if (!body) return;
+      body.classList.remove("ai-md");
+      body.textContent = withoutThinking(text);
+      toEnd();
+    };
+    busy = new AbortController();
+    const { signal } = busy;
+    $("ai-cancel").hidden = false;
+    $("ai-send").disabled = true;
+    const start = performance.now();
+    const done = Number.isInteger(m.parts) && m.parts > 0 ? m.parts : MAX_PARTS;
+    try {
+      const full = await continueAnswer({ text: m.content, cut: true }, (partial) => job.next(partial, signal, show), {
+        parts: done,
+        limit: done + MAX_PARTS,
+        onPart: (n, limit, text) => {
+          show(text);
+          setStatus(`Réponse longue : suite ${n}/${limit}…`);
+        },
+      });
+      signal.throwIfAborted();
+      for (const r of full.results) if (r.data) noteQuota(r.data);
+      const { check, proposals, numbers, legend } = await job.derive(full.text);
+      const { costing: _c, numbers: _n, names: _l, proposals: _p, target: _t, incomplete: _i, ...rest } = m;
+      const answer = {
+        ...rest, content: full.text, parts: full.parts,
+        ...(check ? { costing: check } : {}), ...(numbers.length ? { numbers } : {}), ...(legend.length ? { names: legend } : {}),
+        ...(proposals.length ? { proposals, target: { tab: job.tabId, file: job.tabFile } } : {}),
+        ...(full.cut ? { incomplete: true } : {}),
+      };
+      if (!full.cut) resumable.delete(id);
+      const kept = readConversation(job.key);
+      const record = archives.normalizeConversation({ ...kept, updated: new Date().toISOString(), messages: kept.messages.map((x) => (x.id === id ? answer : x)) });
+      writeConversation(job.key, record);
+      archive(record);
+      const missing = full.error ? ` · suite non obtenue : ${full.error.message || full.error}` : "";
+      setStatus(`${full.cut ? "Réponse encore incomplète" : "Réponse complétée"} en ${Math.round((performance.now() - start) / 1000)} s · ${full.parts} parties${missing}`);
+    } catch (err) {
+      setStatus(err?.name === "AbortError" ? "Annulé" : `Suite non obtenue : ${err?.message || err}`);
+    } finally {
+      busy = null;
+      $("ai-cancel").hidden = true;
+      $("ai-send").disabled = false;
+      // The conversation drawn again, as kept (the answer as it was, if its rest could not be had).
+      if (shown?.key === job.key) {
+        shown = null;
+        showConversation();
+      }
+      updateSuggestion();
+    }
+  }
+
   $("ai-suggest-apply").addEventListener("click", () => applySuggestion());
   $("ai-chat").addEventListener("click", (event) => {
     const undo = event.target.closest(".ai-undo-apply");
     if (undo) undoApplication(undo.dataset.message);
+    const resume = event.target.closest(".ai-resume");
+    if (resume) resumeAnswer(resume.dataset.message);
   });
   // Another part, body or tab: the suggestion evaluated again.
   document.addEventListener("reader3d-part", () => updateSuggestion());

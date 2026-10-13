@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { addressSpace, answerText, costingText, defaultGateway, formatAnswer, gatewayLabel, isMarkdown, markdownToHtml, numbersLabel, proposalsOf, questionsLeft, quotaLabel, selectionOf, onlineMessages, unreadableProposals } from "../../web/ai-workspace.js";
+import { addressSpace, answerText, continueAnswer, costingText, cutBack, defaultGateway, formatAnswer, joinParts, gatewayLabel, isMarkdown, markdownToHtml, numbersLabel, proposalsOf, questionsLeft, quotaLabel, selectionOf, onlineMessages, unreadableProposals } from "../../web/ai-workspace.js";
 import { anonymizer, checkContextNumbers, partNames } from "../../web/engine/ai-context.js";
 
 test("Ollama's address declares the address space the browser checks it against", () => {
@@ -297,4 +297,60 @@ test("the proposals of the local model: its JSON block read and taken out of the
   // The gateway's JSON.
   assert.deepEqual(proposalsOf(JSON.stringify({ conclusion: "c", analyse_chiffrage: { propositions: [{ cle: "piece.cycle", valeur: 60 }] } })), [{ cle: "piece.cycle", valeur: 60 }]);
   assert.deepEqual(proposalsOf("Rien."), []);
+});
+
+test("an answer cut at the length allowed: the word the cut split taken back, the parts joined, the words written again once", () => {
+  // The word the cut may have split, written again in the next part; an answer cut after a space or a mark: whole.
+  assert.equal(cutBack("Les parois min"), "Les parois ");
+  assert.equal(cutBack("une épaisseur de 12"), "une épaisseur de ");
+  assert.equal(cutBack("Les parois minces."), "Les parois minces.");
+  assert.equal(cutBack("Conclusion :\n"), "Conclusion :\n");
+  assert.equal(cutBack("Mot"), "Mot");
+  // Its exact continuation.
+  assert.equal(joinParts("Les parois ", "minces sont à surveiller."), "Les parois minces sont à surveiller.");
+  // The model starts a few words back, or the whole answer again: those words once.
+  assert.equal(joinParts("Le carter a des parois ", "a des parois minces de 3 mm."), "Le carter a des parois minces de 3 mm.");
+  assert.equal(joinParts("Le cycle est ", "est de 45 s."), "Le cycle est de 45 s.");
+  assert.equal(joinParts("une épaisseur de ", "de 12 mm"), "une épaisseur de 12 mm");
+  assert.equal(joinParts("Les parois ", "Les parois minces."), "Les parois minces.");
+  assert.equal(joinParts("des parois min", "parois minces de 3 mm"), "des parois minces de 3 mm");
+  // Not the end of a word, nor the start of a short one: no overlap.
+  assert.equal(joinParts("Une boîte ", "te fermée"), "Une boîte te fermée");
+  assert.equal(joinParts("Le joint est plan", "planéité à vérifier"), "Le joint est planplanéité à vérifier");
+  // A new sentence after a space; the spaces and line breaks of the part kept.
+  assert.equal(joinParts("La pièce est fermée.", "Les parois sont minces."), "La pièce est fermée. Les parois sont minces.");
+  assert.equal(joinParts("Conclusion :", "\n- une boîte"), "Conclusion :\n- une boîte");
+  assert.equal(joinParts("", "Début"), "Début");
+  assert.equal(joinParts("Fin.", ""), "Fin.");
+});
+
+test("the rest of an answer cut asked part after part, up to 4 in all; a part that cannot be had leaves it cut", async () => {
+  const asked = [];
+  const seen = [];
+  const parts = [{ text: "minces de 3 mm, ", cut: true }, { text: "à surveiller.", cut: false }];
+  let r = await continueAnswer({ text: "Les parois min", cut: true }, async (partial) => {
+    asked.push(partial);
+    return parts.shift();
+  }, { onPart: (n, limit, text) => seen.push([n, limit, text]) });
+  assert.deepEqual(asked, ["Les parois ", "Les parois minces de 3 mm, "], "the answer so far, the word cut taken back");
+  assert.deepEqual(seen, [[2, 4, "Les parois "], [3, 4, "Les parois minces de 3 mm, "]]);
+  assert.deepEqual([r.text, r.cut, r.parts, r.results.length, r.error], ["Les parois minces de 3 mm, à surveiller.", false, 3, 2, null]);
+  // Whole at once: nothing asked.
+  r = await continueAnswer({ text: "Fin.", cut: false }, () => assert.fail("not asked"));
+  assert.deepEqual([r.text, r.cut, r.parts], ["Fin.", false, 1]);
+  // Still cut after 4 parts in all: left cut; asked again (« Suite »), 4 more at most.
+  let n = 0;
+  const always = async () => ({ text: `partie ${++n} `, cut: true });
+  r = await continueAnswer({ text: "Début ", cut: true }, always);
+  assert.deepEqual([r.text, r.cut, r.parts, n], ["Début partie 1 partie 2 partie 3 ", true, 4, 3]);
+  r = await continueAnswer({ text: r.text, cut: true }, always, { parts: 4, limit: 8 });
+  assert.deepEqual([r.cut, r.parts, n], [true, 8, 7]);
+  // A part that cannot be had (quota): the answer as it is, still cut, with the error; a question cancelled is.
+  r = await continueAnswer({ text: "Début ", cut: true }, async () => {
+    throw new Error("Quota de Groq atteint.");
+  });
+  assert.deepEqual([r.text, r.cut, r.parts, r.error.message], ["Début ", true, 1, "Quota de Groq atteint."]);
+  await assert.rejects(continueAnswer({ text: "Début ", cut: true }, async () => {
+    throw Object.assign(new Error("annulé"), { name: "AbortError" });
+  }), { name: "AbortError" });
 });
