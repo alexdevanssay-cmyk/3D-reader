@@ -363,6 +363,10 @@ function parseJsonc(text) {
 
 describe('Codespaces start-up (.devcontainer/devcontainer.json)', { skip: process.platform === 'win32' && 'POSIX shell' }, () => {
   const LOG = '/tmp/reader3d.log';
+  // `sleep 1` between the checks for the server: a tenth of a second, so the 90
+  // checks still give the stand-in server, started in the background, 9 s to
+  // run (an instant `sleep` made them last a few hundred ms in all).
+  const SLEEP = 'exec "$NODE" -e "setTimeout(() => {}, 100)"';
   let config;
   let dir; // one directory per run: stand-in programs, their state and the log
 
@@ -417,7 +421,7 @@ describe('Codespaces start-up (.devcontainer/devcontainer.json)', { skip: proces
   test('postAttachCommand shows why the server did not start, instead of failing silently', () => {
     const result = runPostAttach('failing', {
       curl: 'exit 7', // nothing answers on port 8000
-      sleep: 'exit 0',
+      sleep: SLEEP,
       python: [
         'echo "Traceback (most recent call last):" >&2',
         'echo "ImportError: libGL.so.1: cannot open shared object file: No such file or directory" >&2',
@@ -432,11 +436,13 @@ describe('Codespaces start-up (.devcontainer/devcontainer.json)', { skip: proces
 
   test('postAttachCommand leaves a working server running in the background', () => {
     const result = runPostAttach('working', {
-      // Port 8000 answers from the second check on (the first one is the
-      // "already running?" check, before the server is started).
-      curl: 'n=$(cat "$STUBS/curl.count" 2>/dev/null || echo 0); echo $((n + 1)) > "$STUBS/curl.count"; [ "$n" -ge 1 ]',
-      sleep: 'exit 0',
-      python: 'echo $$ > "$STUBS/python.pid"; echo "Uvicorn running"; exec "$NODE" -e "setTimeout(() => {}, 60000)"',
+      // Port 8000 answers once the stand-in server listens, as a real one does:
+      // not at the "already running?" check, before it is started, nor before
+      // the background process has run, which a busy machine can delay past
+      // the next check (then python.pid and the log were still missing).
+      curl: '[ -e "$STUBS/listening" ]',
+      sleep: SLEEP,
+      python: 'echo $$ > "$STUBS/python.pid"; echo "Uvicorn running"; : > "$STUBS/listening"; exec "$NODE" -e "setTimeout(() => {}, 60000)"',
     });
     assert.equal(result.status, 0, `exit status ${result.status}\n${result.stdout}${result.stderr}`);
     assert.match(result.stdout, /running on port 8000/);
