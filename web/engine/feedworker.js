@@ -10,8 +10,10 @@ import { FEEDING_VERSION, feedingZones, placeFeeding } from './feeding.js';
 self.onmessage = ({ data: msg }) => {
   try {
     if (msg.type === 'place') {
-      // Bodies: {positions, indices, zones ({zone, sphere, zones, body}), parting (or null)}.
-      const result = msg.bodies.map((b) => placeFeeding(b.positions, b.indices, b.zones, { parting: b.parting ?? null }));
+      // Bodies: {positions, indices, zones ({zone, sphere, zones, body}), parting (or null), up and process (the
+      // orientation of the parting for the casting process: up when cast, fed from the top or from below; else
+      // those of the parting, else up along its draw direction, fed from the top)}.
+      const result = msg.bodies.map((b) => placeFeeding(b.positions, b.indices, b.zones, { parting: b.parting ?? null, up: b.up ?? null, process: b.process ?? null }));
       postMessage({ type: 'result', id: msg.id, result });
       return;
     }

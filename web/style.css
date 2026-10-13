@@ -287,6 +287,16 @@ table.parting-candidates input { margin: 0; }
 #parting-status, #parting-body { margin: 2px 0 6px; }
 .parting-legend { margin: 8px 0 0; line-height: 1.9; }
 .parting-legend .swatch { margin-left: 4px; margin-right: 3px; }
+/* The casting process and the orientation of the part in its die (up when cast, the die blank). */
+.parting-process { margin-top: 8px; padding: 6px 0 8px; border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); }
+#parting-process-line { margin: 0; }
+.parting-select { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px 6px; min-width: 0; max-width: 100%; }
+.parting-select > span { color: var(--muted); white-space: nowrap; }
+.parting-select select { width: auto; min-width: 0; max-width: 100%; }
+#parting-up-note { margin: 6px 0 0; }
+#parting-up-note.warn { color: var(--warn); }
+#parting-orient { margin-top: 6px; }
+#feeding-mode { margin: 6px 0 0; color: var(--accent); }
 /* The parting line drawn by hand: its panel in the card (the plane, the actions, the segments, the halves). */
 .parting-controls button:disabled, .parting-vector input:disabled, table.parting-candidates.locked { opacity: 0.55; cursor: not-allowed; }
 .parting-draw-panel { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }

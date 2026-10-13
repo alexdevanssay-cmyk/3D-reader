@@ -11,7 +11,7 @@ import { centreRates, indexAverage, minimumMargin, quote, saleMetalPrice } from 
 import { DEFAULT_OPERATIONS, DEFAULT_PROCESSES, DEFAULT_TRS, bestRoutes, buildRoute, castingCycle, cavityChoices, estimateMiseAuMille, rankRoutes } from '../../web/chiffrage/routes.js';
 import { readWorkbook } from '../../web/chiffrage/xlsxread.js';
 import { filledFields, heatTreatmentOf, orderValues, programmeFor, programmeOf, readSeriesOrder } from '../../web/chiffrage/rfq.js';
-import { DEFAULT_TOOLING, cavityFactor, coefOf, estimateTooling, steelToolCost } from '../../web/chiffrage/tooling.js';
+import { DEFAULT_TOOLING, cavityFactor, coefOf, dieSize, estimateTooling, steelToolCost } from '../../web/chiffrage/tooling.js';
 import { DEFAULT_CORES, boxSize, coreBoxCost, coresPerPiece } from '../../web/chiffrage/cores.js';
 import {
   DEFAULT_DENSITIES, GENERIC_DENSITY, adoptTendance, clearSaisies, clearSetting, clearTendances, currentQuoteTab, defaultQuote, defaultSettings, exportSaisies, importTendances,
@@ -500,6 +500,19 @@ describe('in-house gravity die and heat treatments', () => {
     assert.ok(complex.total > one.total);
   });
 
+  test('the part oriented in its die (the 3D page): its sizes as they are, L from a, l from b with the cavities, h from c', () => {
+    const m = DEFAULT_TOOLING.marges;
+    // Given as the smallest rectangle round the part seen along its draw direction (a, b) and its height along it (c): not sorted.
+    const two = dieSize({ orientedSize: [150, 40, 90], bboxSize: [200, 120, 60] }, 2);
+    assert.deepEqual(two, { L: 150 + 2 * m.longueur, l: 2 * 40 + m.entreEmpreintes + 2 * m.largeur, h: 90 + 2 * m.hauteur, n: 2, oriented: true });
+    // Without it (or not three sizes): the envelope, largest first, as before.
+    for (const orientedSize of [undefined, null, [150, 40]]) {
+      assert.deepEqual(dieSize({ orientedSize, bboxSize: [60, 200, 120] }, 1), { L: 200 + 2 * m.longueur, l: 120 + 2 * m.largeur, h: 60 + 2 * m.hauteur, n: 1, oriented: false });
+    }
+    const die = estimateTooling({ ...part, orientedSize: [150, 40, 90] }, 1);
+    assert.deepEqual([die.block.L, die.block.W, die.block.H, die.block.oriented], [270, 160, 190, true]);
+  });
+
   test('more cavities than the island would use: a bigger die, more hours for its cavities; the flat price scaled', () => {
     assert.equal(cavityFactor(2, 2, 0.5), 1);
     close(cavityFactor(3, 1, 0.5), 2, 1e-12, '3 cavities, 1 estimated');
@@ -691,6 +704,26 @@ describe('settings layers: typed values, workbook, trends, defaults', () => {
     assert.equal(layers.provenance('trs.CG3').source, 'defaut');
     assert.equal(layers.provenance('marge').source, 'classeur');
     assert.equal(layers.provenance('energy.elecNouveau').source, 'classeur');
+  });
+
+  test('the orientation of the die of each island: gravity dies vertical and poured from the top, low pressure horizontal and fed from below; typed in, checked', () => {
+    storage.clear();
+    let s = loadSettings(base);
+    for (const code of ['CG1', 'CG2', 'CG3', 'CG4', 'CG5']) assert.deepEqual(s.processes[code].orientation, { plan: 'vertical', alimentation: 'haut' }, code);
+    assert.deepEqual(s.processes.BPR.orientation, { plan: 'horizontal', alimentation: 'bas' });
+    assert.equal(s.processes.SSP.orientation, undefined, 'die casting: not an in-house die');
+    assert.equal(loadSettingsLayers(base).provenance('processes.CG3.orientation.plan').source, 'defaut');
+    // Typed in Paramètres: a layer of its own; a value out of the choices refused.
+    assert.equal(setSetting('processes.CG3.orientation.plan', 'horizontal', base), null);
+    assert.equal(setSetting('processes.CG3.orientation.plan', 'oblique', base), 'plan de joint vertical ou horizontal');
+    assert.equal(setSetting('processes.BPR.orientation.alimentation', 'côté', base), 'alimentation par le haut ou par le bas');
+    s = loadSettings(base);
+    assert.deepEqual(s.processes.CG3.orientation, { plan: 'horizontal', alimentation: 'haut' });
+    assert.equal(loadSettingsLayers(base).provenance('processes.CG3.orientation.plan').source, 'saisie');
+    // A trends file: an orientation out of the choices left out.
+    const { values, report } = validateTendances({ processes: { CG2: { orientation: { plan: 'oblique', alimentation: 'bas' } } } });
+    assert.deepEqual(values.processes.CG2.orientation, { alimentation: 'bas' });
+    assert.deepEqual(report.invalid.map((x) => x.path), ['processes.CG2.orientation.plan']);
   });
 
   test('a TRS typed in, then a trends file: the typed value stays, the trend is shown beside it', () => {
@@ -1130,6 +1163,23 @@ describe('traced values of a quote (provenance.js)', () => {
     assert.deepEqual([flat.source.type, flat.source.ref], ['calcul', 'routes.js:buildRoute (forfait de l\'îlot × empreintes)']);
     assert.ok(flat.source.entrees.includes('piece.empreintes.estimee') && flat.source.entrees.includes('parametres.outillage'));
     assert.match(flat.hypotheses.join(), /prix forfaitaire de l'îlot SSP × 0,6 : 2 empreintes au lieu de 4 estimées/);
+  });
+
+  test('the die block from the part oriented in its die (the 3D page): traced as such, its sizes a geometry of the 3D model', () => {
+    const parts = [{ ...PARTS_3D[0], orientedSize: [180, 110, 70], orientedAxis: '+Z' }];
+    const c = computed({ quote: { pieces: { '0:A': { procede: 'CG3' } } }, p3d: { file: 'a.step', parts, selected: [0] } });
+    const r = c.results[0];
+    const block = r.route.tooling.block;
+    assert.deepEqual([block.L, block.W, block.H, block.oriented], [300, 230, 170, true]);
+    assert.ok(r.trace['piece.outillage.total'].hypotheses.includes('moule 300 × 230 × 170 mm = brut orienté du modèle 3D (direction de démoulage +Z, pavé minimal) + marges'));
+    const raw = r.trace['piece.brutOriente'];
+    assert.deepEqual([raw.valeur, raw.source.type, raw.source.fichier], ['180 × 110 × 70 mm', 'geometrie', 'a.step']);
+    assert.deepEqual(raw.hypotheses, ['direction de démoulage +Z']);
+    assert.ok(r.trace['piece.outillage.total'].source.entrees.includes('piece.brutOriente'));
+    // Without it: the envelope of the 3D model, as before.
+    const plain = computed({ quote: { pieces: { '0:A': { procede: 'CG3' } } }, p3d: { file: 'a.step', parts: [PARTS_3D[0]], selected: [0] } }).results[0];
+    assert.ok(plain.trace['piece.outillage.total'].hypotheses.includes('moule 320 × 240 × 160 mm = encombrement du modèle 3D + marges'));
+    assert.equal(plain.trace['piece.brutOriente'], undefined);
   });
 
   test('more cavities: the quote of each number of cavities, as "Retenir" makes it', () => {

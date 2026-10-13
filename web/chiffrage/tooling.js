@@ -11,7 +11,9 @@
 //   CAM, design       = hours by complexity × rate
 //   subcontracting    = cost / (1 − share) − cost;  margin likewise
 // The size of the die (L × l × h) is not in the 3D model: it is the size of
-// the part plus margins. The values below are neutral starting values: the
+// the part plus margins, the part oriented in its die when the 3D page gives
+// its orientation (the steel blank, « brut de coquille », of its draw
+// direction), else its envelope. The values below are neutral starting values: the
 // foundry's own (prices, rates, hours, margins calibrated on its dies) are
 // imported as a trends file (Paramètres → Importer des tendances), never
 // written in this public code.
@@ -122,24 +124,36 @@ export function steelToolCost(o, s) {
   return { total: cost + stt + marge, suivant, kg, coef, band, lines };
 }
 
-/** Size of the die of a part (mm): the part, largest first, plus the margins; the cavities side by side. */
+/**
+ * Size of the die of a part (mm) plus the margins, the cavities side by side:
+ * the part oriented in its die when the 3D page gives it (orientedSize [a, b,
+ * c]: the smallest rectangle round the part seen along its draw direction,
+ * a >= b, and its height c along that direction; engine/orientation.js), L
+ * from a, l from b, h from c as they are; else its box, largest first.
+ * {L, l, h, n, oriented}.
+ */
 export function dieSize(part, cavities, t = DEFAULT_TOOLING) {
   const n = Math.max(1, Math.round(cavities || 1));
-  let [a, b, c] = (part.bboxSize?.length === 3 ? [...part.bboxSize] : [part.dimMax || 100, (part.dimMax || 100) / 2, (part.dimMax || 100) / 4]).sort((x, y) => y - x);
+  const oriented = Array.isArray(part.orientedSize) && part.orientedSize.length === 3 && part.orientedSize.every((x) => Number.isFinite(x) && x >= 0);
+  let [a, b, c] = oriented
+    ? [...part.orientedSize]
+    : (part.bboxSize?.length === 3 ? [...part.bboxSize] : [part.dimMax || 100, (part.dimMax || 100) / 2, (part.dimMax || 100) / 4]).sort((x, y) => y - x);
   a ||= 1; b ||= 1; c ||= 1;
   const m = t.marges;
-  return { L: a + 2 * m.longueur, l: n * b + (n - 1) * m.entreEmpreintes + 2 * m.largeur, h: c + 2 * m.hauteur, n };
+  return { L: a + 2 * m.longueur, l: n * b + (n - 1) * m.entreEmpreintes + 2 * m.largeur, h: c + 2 * m.hauteur, n, oriented };
 }
 
 /**
  * Estimate of the die of a part.
  *   part: {bboxSize: [x, y, z] mm (null if unknown), dimMax mm,
- *          outillageTiroirs, outillageComplexite (else the defaults of the settings)}
+ *          orientedSize: [a, b, c] mm (the part oriented in its die, from the
+ *          3D page; dieSize), outillageTiroirs, outillageComplexite (else the
+ *          defaults of the settings)}
  *   cavities: number of cavities of the die
  *   t: the settings (DEFAULT_TOOLING)
  *   estimated: the cavities the island would use (routes.js piecesPerCycle);
  *              other cavities: the hours of the cavities × cavityFactor
- * Returns {total, suivant, lines: [{label, detail, value}], cavities, block: {L, W, H, kg}, tiroirs, complexite,
+ * Returns {total, suivant, lines: [{label, detail, value}], cavities, block: {L, W, H, kg, oriented}, tiroirs, complexite,
  *          empreintesEstimees, facteurEmpreintes}.
  */
 export function estimateTooling(part, cavities, t = DEFAULT_TOOLING, estimated = cavities) {
@@ -155,7 +169,7 @@ export function estimateTooling(part, cavities, t = DEFAULT_TOOLING, estimated =
     suivant: r.suivant,
     lines: r.lines,
     cavities: size.n,
-    block: { L: size.L, W: size.l, H: size.h, kg: r.kg },
+    block: { L: size.L, W: size.l, H: size.h, kg: r.kg, oriented: size.oriented },
     tiroirs,
     complexite,
     empreintesEstimees: n0,

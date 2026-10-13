@@ -7,7 +7,7 @@ import { centreRates, indexAverage, quote, saleMetalPrice, solveMargin as minimu
 import { bestRoutes, buildRoute, cavityChoices, rankRoutes } from "./routes.js";
 import { coreBoxCost, coresPerPiece, newCore } from "./cores.js";
 import { filledFields, orderValues, programmeFor, programmeOf, readSeriesOrder, sameProgramme } from "./rfq.js";
-import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, demandeComparee, label as traceLabel, pieceNames, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
+import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, demandeComparee, dieBasis, label as traceLabel, pieceNames, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
 import { compareCycles, countHistory, exportHistory, importHistory, mergeHistory, productionRecord } from "./history.js";
 import {
   SIMILAR, adoptEstimate, adoptedEstimate, anonymiseCycleData, cycleData, cycleNumbers, cycleQuestion, cycleText, fitCycleData, forgetAdoption, localCycleRules, readCycleAnswer, recordCycleData, undoAdoption,
@@ -97,6 +97,41 @@ const densityOf = (alloy) => settings.densities[alloy] ?? store.GENERIC_DENSITY;
  */
 function pushMaterial() {
   if (q.alliage) window.reader3d?.setMaterial?.(q.alliage, densityOf(q.alliage));
+}
+
+/**
+ * The island retained for each piece of the 3D model costed (results of
+ * compute; none given, in Paramètres: computed again with the settings of
+ * now, on a copy of the quote, nothing saved), with its orientation
+ * (Paramètres: plan de joint, alimentation) and the margins and steel density
+ * of the dies, to the 3D page (app.js setProcess): the parting of the body is
+ * proposed for that process, its die block with these margins. At each
+ * drawing of the page; the 3D page does nothing when nothing changed. An
+ * error of the 3D page is its own: logged, the page drawn all the same.
+ */
+function pushProcesses(results = null) {
+  const setProcess = window.reader3d?.setProcess;
+  if (!setProcess || !base) return;
+  if (!results) {
+    const [quoteShown, keyShown] = [q, currentKey];
+    q = structuredClone(q);
+    try {
+      results = compute({ save: false })?.results ?? [];
+    } finally {
+      [q, currentKey] = [quoteShown, keyShown];
+    }
+  }
+  const die = { marges: settings.tooling?.marges ?? null, densite: settings.tooling?.densite ?? null };
+  for (const r of results) {
+    if (r.piece.index === undefined) continue; // the piece typed in: no 3D model
+    const code = r.route?.process ?? null;
+    const p = code ? settings.processes[code] : null;
+    try {
+      setProcess(r.piece.key, { code: p ? code : null, famille: p?.famille ?? null, orientation: p?.orientation ?? null, die });
+    } catch (err) {
+      console.warn("Island retained not told to the 3D page", err);
+    }
+  }
 }
 
 /** The data files, the settings and the quote read again from this browser's storage (tests). */
@@ -1044,8 +1079,11 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
     epaisseurMax: value("epaisseurMax") ?? 0,
     moduleMm: value("moduleMm") ?? 0,
     dimMax: value("dimMax") ?? 0,
-    // For the estimate of the tooling: the envelope, volume and surface of the 3D model.
+    // For the estimate of the tooling: the envelope, volume and surface of the 3D model; the part
+    // oriented in its die (the smallest block round it along its draw direction: the 3D page's parting).
     bboxSize: piece.bboxSize ?? null,
+    orientedSize: piece.orientedSize ?? null,
+    orientedAxis: piece.orientedAxis ?? null,
     volume: piece.volume ?? null,
     area: piece.area ?? null,
     volumeAnnuel: q.volumeAnnuel || 0,
@@ -1299,6 +1337,7 @@ function thicknessText(t) {
 // gets it back.
 let pointerDown = false;
 let pending = false;
+let shownResults = null; // the pieces costed in the page drawn (renderQuote), for pushProcesses
 let press = null; // {message}: the message said when a button was last pressed down (onClick)
 window.addEventListener("pointerup", () => {
   pointerDown = false;
@@ -1318,11 +1357,14 @@ function render() {
   // drawn again (a 3D result, the shared folder read), and a file picked in an
   // input no longer in the page would be lost.
   const files = new Map([...container.querySelectorAll("input[type=file][data-file]")].map((input) => [input.dataset.file, input]));
+  shownResults = null;
   container.innerHTML = page === "parametres" ? renderSettings() : renderQuote();
   for (const input of container.querySelectorAll("input[type=file][data-file]")) {
     const kept = files.get(input.dataset.file);
     if (kept) input.replaceWith(kept);
   }
+  // The islands retained (Chiffrage), or their settings changed (Paramètres): told to the 3D page.
+  if (page === "parametres" || shownResults) pushProcesses(shownResults);
   if (focused) container.querySelector(`[data-bind="${CSS.escape(focused)}"]`)?.focus();
   // Drawn in the page in view: read (not said again when a page is opened, show).
   if (message && !container.hidden) message.read = true;
@@ -1380,6 +1422,7 @@ function renderQuote() {
       ${historyCard()}</div>`;
   }
   const c = compute();
+  shownResults = c.results;
   const lists = base.lists;
   const typologies = indices?.typologies?.length ? indices.typologies.map((t) => t.name) : lists.typologies;
   const months = indices?.months ?? [];
@@ -1599,7 +1642,7 @@ function toolingCard(r) {
           : field("Amorti par pièce", `<output>${amortised === null ? "—" : eur(amortised, 3)}</output>`, `sur ${nf(r.part.volumeTotal, 0)} pièces du programme, compris dans le prix pièce`)}
       </div>
       ${t ? slidesLine(r) : ""}
-      ${t ? `<p class="small muted">Méthode du classeur « Outillage fonderie » : moule ${nf(t.block.L, 0)} × ${nf(t.block.W, 0)} × ${nf(t.block.H, 0)} mm = encombrement de la pièce + marges, poids × coefficient, heures d'usinage, de scan et d'ajustage par tranche de poids, étude et FAO selon la complexité. Taux et tableaux dans Paramètres.</p>` : ""}
+      ${t ? `<p class="small muted">Méthode du classeur « Outillage fonderie » : moule ${nf(t.block.L, 0)} × ${nf(t.block.W, 0)} × ${nf(t.block.H, 0)} mm = ${esc(t.block.oriented ? dieBasis(t.block, r.part) : "encombrement de la pièce")} + marges, poids × coefficient, heures d'usinage, de scan et d'ajustage par tranche de poids, étude et FAO selon la complexité. Taux et tableaux dans Paramètres.</p>` : ""}
       ${route.boxes.length ? `<h4>Boîtes à noyau</h4>
       <div class="cscroll"><table class="ctable">
         <tbody>${route.boxes
@@ -2936,6 +2979,13 @@ function sinput(path, value, opts = {}) {
   return `<span class="cval">${input(`s.${path}`, value, opts)}<span class="csrc ${p.source}" title="${esc(title)}">${opts.compact ? letter : label}</span></span>${trend}`;
 }
 
+/** A choice of the settings (select "s.<path>") in a table, with the letter of where its value comes from (as sinput). */
+function sselect(path, value, options) {
+  const p = layers.provenance(path);
+  const [label, letter] = SOURCES[p.source];
+  return `<span class="cval">${select(`s.${path}`, value, options)}<span class="csrc ${p.source}" title="${esc(label)}">${letter}</span></span>`;
+}
+
 /** The number of values of the trends `t`, those completed by the defaults left out. */
 const trendCount = (t) => store.countValues(t.values) - (t.completed?.length ?? 0);
 
@@ -2980,6 +3030,19 @@ function settingsSourcesCard() {
   </section>`;
 }
 
+/**
+ * The orientation of the die of an island (settings.processes[code].orientation,
+ * engine/orientation.js): its parting plane and its feeding, for the islands
+ * whose dies are made in-house (gravity dies, low pressure dies); « — » for
+ * the others (die casting: the 3D page takes the default).
+ */
+function orientationCells(code, p) {
+  if (!/^(Coquille gravité|Basse pression)/i.test(p.famille ?? "")) return `<td class="muted">—</td><td class="muted">—</td>`;
+  const o = p.orientation ?? {};
+  return `<td>${sselect(`processes.${code}.orientation.plan`, o.plan ?? "", [["vertical", "vertical"], ["horizontal", "horizontal"]])}</td>
+      <td>${sselect(`processes.${code}.orientation.alimentation`, o.alimentation ?? "", [["haut", "par le haut"], ["bas", "par le bas"]])}</td>`;
+}
+
 function renderSettings() {
   const centres = base?.centres ?? [];
   const processes = Object.entries(settings.processes);
@@ -3005,7 +3068,8 @@ function renderSettings() {
       <td>${sinput(`processes.${code}.cycle.exposant`, p.cycle.exposant ?? 1, { width: "60px", compact: true })}</td>
       <td>${sinput(`processes.${code}.cycle.parModule2`, p.cycle.parModule2, { width: "60px", compact: true })}</td>
       <td>${pnum(code, "qualite", { width: "50px" })}</td><td>${pnum(code, "outillage", { width: "80px" })}</td>
-      <td>${checkbox(`s.processes.${code}.tth`, p.tth, "")}</td><td>${checkbox(`s.processes.${code}.noyaux`, p.noyaux, "")}</td></tr>`,
+      <td>${checkbox(`s.processes.${code}.tth`, p.tth, "")}</td><td>${checkbox(`s.processes.${code}.noyaux`, p.noyaux, "")}</td>
+      ${orientationCells(code, p)}</tr>`,
     )
     .join("");
   const opRows = Object.entries(settings.operations)
@@ -3067,9 +3131,9 @@ function renderSettings() {
   <section class="ccard">
     <h3>Îlots de coulée et méthodes</h3>
     <div class="cscroll"><table class="ctable compact">
-      <thead><tr><th>Îlot</th><th>Toile mini (mm)</th><th>Épaisseur maxi (mm)</th><th>Poids maxi (kg)</th><th>Dimension maxi (mm)</th><th>Volume mini /an</th><th>Empreintes maxi</th><th>Grappe maxi (kg)</th><th>Mise au mille par défaut</th><th>Rendement type (%)</th><th>− % par doublement épaisseur maxi / toile</th><th>− % × ln(2 kg / poids)</th><th>Cycle : base (s)</th><th>+ coef × (kg coulés)^exp.</th><th>exposant</th><th>+ s / mm² de module</th><th>Qualité /10</th><th>Outillage (€)</th><th>TTH</th><th>Noyaux</th></tr></thead>
+      <thead><tr><th>Îlot</th><th>Toile mini (mm)</th><th>Épaisseur maxi (mm)</th><th>Poids maxi (kg)</th><th>Dimension maxi (mm)</th><th>Volume mini /an</th><th>Empreintes maxi</th><th>Grappe maxi (kg)</th><th>Mise au mille par défaut</th><th>Rendement type (%)</th><th>− % par doublement épaisseur maxi / toile</th><th>− % × ln(2 kg / poids)</th><th>Cycle : base (s)</th><th>+ coef × (kg coulés)^exp.</th><th>exposant</th><th>+ s / mm² de module</th><th>Qualité /10</th><th>Outillage (€)</th><th>TTH</th><th>Noyaux</th><th title="Orientation du moule proposée sur la page Analyse 3D (coquilles et moules basse pression réalisés sur place)">Plan de joint</th><th title="Coulée par le haut (masselottes) ou alimentation par le bas (basse pression)">Alimentation</th></tr></thead>
       <tbody>${processRows}</tbody></table></div>
-    <p class="small muted">Temps de cycle estimé = base + coef × (kg coulés par cycle)^exposant + (s/mm²) × module V/S² (exposant 1 : linéaire). Mise au mille estimée = 1 / rendement, rendement = rendement type − (% par doublement) × log₂(épaisseur maxi / toile mini) − (%) × ln(2 kg / poids) pour les pièces de moins de 2 kg, borné entre 30 et 95 % (valeur par défaut tant que les épaisseurs ne sont pas calculées). Un îlot est écarté si la toile mini, le poids, la dimension, le traitement thermique ou les noyaux sont hors de ses possibilités. Valeurs de départ à ajuster aux îlots réels.</p>
+    <p class="small muted">Temps de cycle estimé = base + coef × (kg coulés par cycle)^exposant + (s/mm²) × module V/S² (exposant 1 : linéaire). Mise au mille estimée = 1 / rendement, rendement = rendement type − (% par doublement) × log₂(épaisseur maxi / toile mini) − (%) × ln(2 kg / poids) pour les pièces de moins de 2 kg, borné entre 30 et 95 % (valeur par défaut tant que les épaisseurs ne sont pas calculées). Un îlot est écarté si la toile mini, le poids, la dimension, le traitement thermique ou les noyaux sont hors de ses possibilités. Plan de joint et alimentation (îlots dont le moule est réalisé sur place) : l'orientation du moule que la page Analyse 3D propose pour une pièce dont l'îlot est retenu — coquille gravité : plan de joint vertical, coulée par le haut (masselottes au-dessus des sections massives) ; basse pression : plan de joint horizontal, chape supérieure mobile, alimentation par le bas (sections massives en bas, près de l'attaque). Valeurs de départ à ajuster aux îlots réels.</p>
   </section>
   <section class="ccard">
     <h3>Autres opérations</h3>

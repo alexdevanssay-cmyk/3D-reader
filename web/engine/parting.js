@@ -29,11 +29,22 @@
 // projected on the plane normal to d (one grid per direction): a line meets
 // only the triangles of its cell, and one walk gives both senses.
 //
+// The orientation of each direction for the casting process (orientation.js):
+// its die block (the steel blank), which ranks the directions too
+// (proposeParting), and the direction up when the metal is cast, which does
+// not: the die and its undercuts depend on the part and the draw direction,
+// not on where the metal comes in; the process decides which way is up.
+//
 // Plain JavaScript without bare imports: it runs in the parting worker
 // (partworker.js) and on the page (faces reassigned by hand).
 
+import { STEEL_TIE, normalizeDie, normalizeProcess, orientationFor, orientationKey, orientationMesh } from './orientation.js';
 import { edgeNeighbours, weld } from './thickness.js';
 
+// 3: the line on curved faces and long thin CAD triangles (silhouettes,
+// shadows); the directions ranked by their die block too, each with its
+// orientation for the process; d turned so that up is +d on a horizontal
+// parting plane.
 export const PARTING_VERSION = 3;
 
 // Half of the mould of a triangle: none (an undercut), upper (+d), lower (-d).
@@ -2093,8 +2104,8 @@ export function lineSummary(l) {
   };
 }
 
-/** The JSON of a classification of direction d. */
-function directionSummary(mesh, d, areas, height, parting, source) {
+/** The JSON of a classification of direction d (with its orientation for the process: orientation.js). */
+function directionSummary(mesh, d, areas, height, parting, source, orientation = null) {
   const total = mesh.totalArea || 1;
   return {
     axis: axisLabel(d),
@@ -2109,6 +2120,7 @@ function directionSummary(mesh, d, areas, height, parting, source) {
     projected_area_mm2: round(areas.projected, 1),
     mould_height_mm: round(height, 2),
     parting: parting ? lineSummary(parting) : null,
+    ...(orientation ? { orientation } : {}),
   };
 }
 
@@ -2116,13 +2128,21 @@ function directionSummary(mesh, d, areas, height, parting, source) {
 const LINE_RANK = { planar: 0, stepped: 1, warped: 2 };
 
 /**
- * Ranking of two directions: less undercut first; then the simpler parting
+ * Ranking of two directions: less undercut first; then less steel in the die
+ * block (within STEEL_TIE of the larger: equal); then the simpler parting
  * line (a non-planar one only when it removes undercuts: a dearer die); then
  * less zero-draft surface; then the larger projected area for the height of
- * the part (a shallower mould).
+ * the part (a shallower mould). Not the feeding of the casting process: the
+ * die and its undercuts depend on the part and the draw direction, not on
+ * where the metal comes in; the process only decides which way is up (the
+ * casting up of the direction chosen, orientation.js). So the direction, its
+ * die blank and its undercuts are the same whatever the process: the costing,
+ * which sizes the die of every island from that blank, cannot retain another
+ * island because of the orientation the island it retained causes.
  */
 function better(a, b, total) {
   if (Math.abs(a.undercut - b.undercut) > UNDERCUT_TIE * total) return a.undercut - b.undercut;
+  if (a.steel != null && b.steel != null && Math.abs(a.steel - b.steel) > STEEL_TIE * Math.max(a.steel, b.steel)) return a.steel - b.steel;
   const pa = LINE_RANK[a.kind] ?? 0, pb = LINE_RANK[b.kind] ?? 0;
   if (pa !== pb) return pa - pb;
   if (Math.abs(a.zeroDraft - b.zeroDraft) > ZERO_DRAFT_TIE * total) return a.zeroDraft - b.zeroDraft;
@@ -2708,18 +2728,41 @@ function fullDirection(mesh, d, sinDraft, getLine) {
 }
 
 /**
+ * The orientation of direction d for the process (orientation.js), and the
+ * direction to classify: on a horizontal parting plane whose up is -d, -d
+ * when `orient` (the halves swapped: the upper die on top, up = +d).
+ */
+function orientDirection(om, d, options, orient) {
+  let o = orientationFor(om, d, options);
+  if (orient && o.side === "-d") {
+    d = d.map((x) => -x + 0);
+    o = orientationFor(om, d, { ...options, up: d });
+  }
+  return { d, o };
+}
+
+/**
  * Proposed draw direction and parting line of a closed body.
  *
  * positions, indices -- its mesh (mm); not modified
  * draftDeg -- faces closer than this to the draw direction have no draft
+ * process -- {plan: "vertical" | "horizontal", alimentation: "haut" | "bas"}
+ *            (orientation.js; default: gravity, vertical plane, top feed):
+ *            the casting up of each candidate, on a horizontal plane the
+ *            sense of d; not the direction proposed (better)
+ * die -- the die block options {marges, densite, cavities} (default: those of
+ *        the costing, orientation.js DIE_DEFAULTS)
+ * thickness -- inscribed diameter per triangle (the thickness card), or null:
+ *        the feeding score (the casting up) from the volume centroid
  * Returns {proposal, side, flags, plane, segments}: the JSON proposal
  * {status, axis, direction, candidate_index, candidates [...], sampled,
- * method, ... the figures of the direction chosen}, and for that direction,
- * per triangle, its half (SIDE_*) and flags (REACH_*, ZERO_DRAFT), the
- * height of its planar line along d (null: none), and the segments of its
- * parting line.
+ * method, process, die, options_key, ... the figures of the direction chosen,
+ * its orientation}, and for that direction, per triangle, its half (SIDE_*)
+ * and flags (REACH_*, ZERO_DRAFT), the height of its planar line along d
+ * (null: none), and the segments of its parting line. On a horizontal parting
+ * plane each candidate is in the sense whose up is +d.
  */
-export function proposeParting(positions, indices, { draftDeg = DEFAULT_DRAFT_DEG, fullLimit = FULL_LIMIT, samples = SAMPLES, seed = SEED, onProgress = null } = {}) {
+export function proposeParting(positions, indices, { draftDeg = DEFAULT_DRAFT_DEG, fullLimit = FULL_LIMIT, samples = SAMPLES, seed = SEED, onProgress = null, process = null, die = null, thickness = null } = {}) {
   const mesh = prepareMesh(positions, indices);
   const sinDraft = Math.sin((draftDeg * Math.PI) / 180);
   const axes = candidateAxes(mesh);
@@ -2731,21 +2774,25 @@ export function proposeParting(positions, indices, { draftDeg = DEFAULT_DRAFT_DE
   const steps = axes.length + (sampled ? 2 : 0);
   let step = 0;
   const progress = () => onProgress?.(Math.min(1, ++step / steps));
+  const om = orientationMesh(positions, indices, mesh);
+  const options = { process: normalizeProcess(process), die: normalizeDie(die), thickness };
 
-  const evaluated = axes.map(({ direction: d, source }) => {
+  const evaluated = axes.map(({ direction, source }) => {
+    const { d, o } = orientDirection(om, direction, options, true);
     let item;
     if (!sampled) {
-      item = { ...fullDirection(mesh, d, sinDraft, getLine), d, source };
+      item = { ...fullDirection(mesh, d, sinDraft, getLine), d, source, o };
     } else {
       const grid = lineGrid(mesh, d);
       const areas = areasOf(mesh, d, classify(mesh, grid, d, list, sinDraft), list);
       areas.zeroDraft = zeroDraftArea(mesh, d, sinDraft);
-      item = { areas, height: grid.height, line: null, d, source };
+      item = { areas, height: grid.height, line: null, d, source, o };
     }
     progress();
     return item;
   });
-  const key = (e) => ({ undercut: e.areas.undercut, zeroDraft: e.areas.zeroDraft, ratio: e.height > 0 ? e.areas.projected / e.height : 0, kind: e.line?.kind ?? null });
+  // The same keys whatever the process: the sense of d (up = +d on a horizontal plane) changes none of them.
+  const key = (e) => ({ undercut: e.areas.undercut, steel: e.o.steel, zeroDraft: e.areas.zeroDraft, ratio: e.height > 0 ? e.areas.projected / e.height : 0, kind: e.line?.kind ?? null });
   if (sampled) {
     // The planarity of the lines of the best ones (as little undercut as the least): on every triangle.
     const least = Math.min(...evaluated.map((e) => e.areas.undercut));
@@ -2770,7 +2817,7 @@ export function proposeParting(positions, indices, { draftDeg = DEFAULT_DRAFT_DE
   const best = evaluated[order[0]];
   onProgress?.(1);
 
-  const candidates = evaluated.map((e) => directionSummary(mesh, e.d, e.areas, e.height, e.line, e.source));
+  const candidates = evaluated.map((e) => directionSummary(mesh, e.d, e.areas, e.height, e.line, e.source, e.o.summary));
   const chosen = candidates[order[0]];
   return {
     proposal: {
@@ -2785,6 +2832,9 @@ export function proposeParting(positions, indices, { draftDeg = DEFAULT_DRAFT_DE
       triangles: mesh.nt,
       sampled: sampled ? { triangles: mesh.nt, samples, seed, by: "area" } : null,
       method: "line_of_sight_along_draw_direction_uniform_grid",
+      process: options.process,
+      die: options.die,
+      options_key: orientationKey(options.process, options.die),
     },
     side: best.side,
     flags: best.flags,
@@ -2795,17 +2845,33 @@ export function proposeParting(positions, indices, { draftDeg = DEFAULT_DRAFT_DE
 
 /**
  * One direction d of a body, classified on every triangle (a direction
- * chosen or typed by hand): {summary (as a candidate of proposeParting),
- * side, flags, plane, segments}.
+ * chosen or typed by hand): {summary (as a candidate of proposeParting, with
+ * its orientation), side, flags, plane, segments}.
+ *
+ * process, die, thickness -- as proposeParting
+ * up -- the up direction wanted (a vector, or a side: "+u", "-v", "+d"…),
+ *       the allowed one nearest to it; else chosen by the feeding
+ * orient -- on a horizontal parting plane whose up is -d: classified along
+ *       -d (the halves swapped, up = +d), as proposeParting does; else d as
+ *       given, its summary saying that the upper half is at the bottom
+ *       (orientation.upper_half_down)
  */
-export function evaluateParting(positions, indices, direction, { draftDeg = DEFAULT_DRAFT_DEG } = {}) {
-  const d = normalize(direction);
-  if (!d) throw new Error("Invalid draw direction");
+export function evaluateParting(positions, indices, direction, { draftDeg = DEFAULT_DRAFT_DEG, process = null, die = null, thickness = null, up = null, orient = false } = {}) {
+  const given = normalize(direction);
+  if (!given) throw new Error("Invalid draw direction");
   const mesh = prepareMesh(positions, indices);
+  const options = { process: normalizeProcess(process), die: normalizeDie(die), thickness, up };
+  const { d, o } = orientDirection(orientationMesh(positions, indices, mesh), given, options, orient);
   let line = null;
   const full = fullDirection(mesh, d, Math.sin((draftDeg * Math.PI) / 180), () => (line ??= lineMesh(positions, indices, mesh.merged)));
   return {
-    summary: { ...directionSummary(mesh, d, full.areas, full.height, full.line, "manual"), draft_angle_deg: draftDeg, surface_area_mm2: round(mesh.totalArea, 1), triangles: mesh.nt },
+    summary: {
+      ...directionSummary(mesh, d, full.areas, full.height, full.line, "manual", o.summary),
+      draft_angle_deg: draftDeg,
+      surface_area_mm2: round(mesh.totalArea, 1),
+      triangles: mesh.nt,
+      options_key: orientationKey(options.process, options.die),
+    },
     side: full.side,
     flags: full.flags,
     plane: full.plane,
