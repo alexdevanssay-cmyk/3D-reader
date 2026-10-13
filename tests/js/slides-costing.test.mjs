@@ -20,7 +20,10 @@ import {
 import { buildSemantic3D } from '../../web/engine/semantic.js';
 import { buildAIContext, compactAIContext } from '../../web/engine/ai-context.js';
 import { FOUNDRY_SOURCES } from '../../web/engine/foundry-knowledge.js';
+import { evaluateParting } from '../../web/engine/parting.js';
+import { analyseSlides, effectiveSlides, prepareSlides, slideExport, undercutMask } from '../../web/engine/slides.js';
 import { costingWorkbook } from './costing-fixture.mjs';
+import { voxels } from './meshes.mjs';
 
 // The quote is kept in localStorage: an in-memory one.
 const storage = new Map();
@@ -338,6 +341,25 @@ describe('the slides in the semantic contract, the foundry screen and the AI con
     // Not computed yet: not evaluated.
     f = semanticOf(body({ parting: PARTING, slides: { status: 'computing' } })).bodies[0].foundry;
     assert.deepEqual([f.rules.slides, f.evidence.slides], ['not_evaluated', { status: 'not_evaluated' }]);
+  });
+
+  test('a slide tilted down, as the engine gives it and the page exports it: « vers le bas » in the foundry screen, in the AI context', () => {
+    // A block 60 × 40 × 40, a pocket 10 × 10 15 deep into +Y (slides.test.mjs), turned 20° down about X.
+    const mesh = voxels((x, y, z) => !(x >= 5 && x < 7 && y >= 5 && z >= 3 && z < 5), [12, 8, 8], { size: 5 });
+    const [c, sn] = [Math.cos(-20 * Math.PI / 180), Math.sin(-20 * Math.PI / 180)];
+    const P = Float64Array.from(mesh.positions);
+    for (let k = 0; k < P.length; k += 3) {
+      const [y, z] = [P[k + 1] - 20, P[k + 2] - 20];
+      [P[k + 1], P[k + 2]] = [c * y - sn * z + 20, sn * y + c * z + 20];
+    }
+    const ev = evaluateParting(P, mesh.indices, [0, 0, 1]);
+    const analysis = analyseSlides(prepareSlides(P, mesh.indices), { direction: [0, 0, 1], mask: undercutMask({ flags: ev.flags }), flags: ev.flags, side: ev.side });
+    const exported = effectiveSlides(analysis).slides.map(slideExport);
+    assert.deepEqual(exported.map((x) => [x.id, x.reference_axis, x.tilt_deg, x.tilt_up]), [['T1', '+Y', 20, false]]);
+    const semantic = semanticOf(body({ parting: PARTING, slides: slidesOf({ count: 1, cores: 0, slides: exported, cores_detail: [] }) }));
+    const risk = semantic.bodies[0].foundry.risks.find((r) => r.code === 'slides_proposed');
+    assert.equal(risk.message, '1 tiroir proposé (T1 +Y, incliné de 20° vers le bas, course 20 mm) : à valider avec l\'outillage.');
+    assert.deepEqual(buildAIContext(semantic, { task: 'general' }).bodies[0].slides.slides.map((x) => [x.tilt_deg, x.tilt_up]), [[20, false]]);
   });
 
   test('the AI context: compact, shortened when compacted; without slides, nothing of them', () => {

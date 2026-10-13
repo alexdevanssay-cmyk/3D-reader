@@ -88,7 +88,7 @@ function slidesContext(s) {
     slides: (s.slides ?? []).map((x) => ({
       id: x.id, axis: x.axis,
       ...(x.angle_deg != null ? { angle_deg: x.angle_deg } : {}),
-      ...(x.tilt_deg != null ? { tilt_deg: x.tilt_deg } : {}),
+      ...(x.tilt_deg != null ? { tilt_deg: x.tilt_deg, tilt_up: x.tilt_up ?? null } : {}),
       stroke_mm: x.stroke_mm, zones: Array.isArray(x.zones) ? x.zones.length : x.zones ?? null,
     })),
     cores_detail: (s.cores_detail ?? []).map(({ id, area_mm2, reason }) => ({ id, area_mm2, reason })),

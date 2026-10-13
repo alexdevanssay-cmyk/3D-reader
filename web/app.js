@@ -23,7 +23,8 @@ import {
 } from "./engine/feeding.js";
 import { capOrders, capQuad, planeCutsBox } from "./section.js";
 import {
-  SLIDES_VERSION, editSlides, effectiveSlides, matchSlideState, pickSlideEntry, serializeSlideState, slideStateHash, slidesSignature, undercutMask,
+  SLIDES_VERSION, editSlides, effectiveSlides, matchSlideState, pickSlideEntry, serializeSlideState, slideExport, slidesSideHash, slidesSignature, slidesViewHash,
+  undercutMask,
 } from "./engine/slides.js";
 
 // ---------------------------------------------------------------- units
@@ -5230,19 +5231,20 @@ function slideColour(n) {
 }
 
 // Per result: {byBody (body -> {sig (the definition of the analysis kept),
-// analysis, zone (per triangle: index of its zone, -1 not undercut, -2 noise,
-// -3 not analysed), error, pending (the signature being computed), percent,
+// run (its signature and halves: slidesMask), analysis, zone (per triangle:
+// index of its zone, -1 not undercut, -2 noise, -3 not analysed), error,
+// pending (the run being computed), percent,
 // state (the edits; null: the proposal), view (effectiveSlides), messages (of
 // the edits carried over)}), queued (bodies asked for by the costing or an
 // export, sent at the end of the task), selected {slide (key), zone (id)} on
-// the card's body, message}.
+// the card's body, body (the one they are of), message}.
 const slidings = new WeakMap();
 
 function slidesOf(r = state.result) {
   if (!r) return null;
   let s = slidings.get(r);
   if (!s) {
-    s = { byBody: new Map(), queued: new Set(), selected: { slide: null, zone: null }, message: null };
+    s = { byBody: new Map(), queued: new Set(), selected: { slide: null, zone: null }, body: null, message: null };
     slidings.set(r, s);
   }
   return s;
@@ -5251,7 +5253,7 @@ function slidesOf(r = state.result) {
 function slidesEntry(s, i) {
   let e = s.byBody.get(i);
   if (!e) {
-    e = { sig: null, analysis: null, zone: null, error: null, pending: null, percent: null, state: null, view: null, messages: [] };
+    e = { sig: null, run: null, analysis: null, zone: null, error: null, pending: null, percent: null, state: null, view: null, messages: [] };
     s.byBody.set(i, e);
   }
   return e;
@@ -5261,7 +5263,12 @@ function slidesEntry(s, i) {
 // (feedingParting's key): another definition, another object.
 const slideMasks = new WeakMap();
 
-/** The undercuts of the definition body i shows: {mask, sig}, or null without one. */
+/**
+ * The undercuts of the definition body i shows: {mask, sig, run (the
+ * signature and the halves: the analysis computed again for faces reassigned
+ * that are no undercut, which change the half of its slides, not the
+ * signature)}, or null without one.
+ */
 function slidesMask(i, r = state.result) {
   const field = r ? partingField(i, r) : null;
   if (!field) return null;
@@ -5270,7 +5277,8 @@ function slidesMask(i, r = state.result) {
   let m = slideMasks.get(key);
   if (!m) {
     const mask = undercutMask(field);
-    m = { mask, sig: slidesSignature({ nt: mask.length, direction: field.direction, mask }) };
+    const sig = slidesSignature({ nt: mask.length, direction: field.direction, mask });
+    m = { mask, sig, run: `${sig}|${slidesSideHash(field.side)}` };
     slideMasks.set(key, m);
   }
   return m;
@@ -5280,14 +5288,14 @@ function slidesMask(i, r = state.result) {
 function slidesReady(i, r = state.result) {
   const m = slidesMask(i, r);
   const e = m ? slidings.get(r)?.byBody.get(i) : null;
-  return e?.analysis && e.sig === m.sig ? e : null;
+  return e?.analysis && e.run === m.run ? e : null;
 }
 
 /** Their error, or null. */
 function slidesError(i, r = state.result) {
   const m = slidesMask(i, r);
   const e = m ? slidings.get(r)?.byBody.get(i) : null;
-  return e?.error && e.sig === m.sig ? e.error : null;
+  return e?.error && e.run === m.run ? e.error : null;
 }
 
 /** The slides of body i for the definition shown asked for, unless known or being computed (the model shown). */
@@ -5296,35 +5304,45 @@ function slidesRequest(i, r = state.result) {
   const m = slidesMask(i, r);
   if (!m) return;
   const e = slidesEntry(slidesOf(r), i);
-  if (e.sig === m.sig || e.pending === m.sig) return;
+  if (e.run === m.run || e.pending === m.run) return;
   const field = partingField(i, r);
-  const sig = m.sig;
+  const { sig, run } = m;
   const { positions, indices } = bodyArrays(i);
-  e.pending = sig;
+  e.pending = run;
   e.percent = null;
   const draftDeg = field.summary?.draft_angle_deg ?? partingOf(r).results[i]?.proposal?.draft_angle_deg ?? 1;
   slideClient()
     .then((client) => client.computeSlides(
-      { positions, indices, bodyKey: `${r.cacheKey ?? r.file}|${i}|${indices.length / 3}` },
+      // The body prepared kept by the worker under the content of the file, else under this result only.
+      { positions, indices, bodyKey: `${r.cacheKey ?? slidesResultId(r)}|${i}|${indices.length / 3}` },
       { direction: field.direction, mask: m.mask, flags: field.flags, side: field.side, draftDeg, sig },
       {
         owner: r,
         key: String(i),
+        first: i === partingBody(), // the card's body ahead of those the costing or an export asked for
         onProgress: ({ percent }) => {
-          if (e.pending !== sig) return;
+          if (e.pending !== run) return;
           e.percent = percent;
           if (r === state.result && i === partingBody()) renderParting();
         },
       },
     ))
-    .then((analysis) => slidesArrived(r, i, sig, analysis, null))
+    .then((analysis) => slidesArrived(r, i, run, analysis, null))
     .catch((err) => {
       if (err.cancelled) {
-        if (e.pending === sig) e.pending = null;
+        if (e.pending === run) e.pending = null;
         return;
       }
-      slidesArrived(r, i, sig, null, err.message || String(err));
+      slidesArrived(r, i, run, null, err.message || String(err));
     });
+}
+
+const slidesResults = new WeakMap(); // result -> its id for the worker's cache, without a key of its content
+let slidesResultNext = 1;
+/** An id of its own for a result without a key of its content (the server's, no crypto.subtle): never another file's body. */
+function slidesResultId(r) {
+  if (!slidesResults.has(r)) slidesResults.set(r, `result-${slidesResultNext++}`);
+  return slidesResults.get(r);
 }
 
 /**
@@ -5347,16 +5365,17 @@ function slidesQueue(i, r = state.result) {
   s.queued.add(i);
 }
 
-/** An analysis (or its error) come back: kept when its definition is still the one shown, with the edits kept for it. */
-function slidesArrived(r, i, sig, analysis, error) {
+/** An analysis (or its error) come back: kept when its definition (and halves: `run`) is still the one shown, with the edits kept for it. */
+function slidesArrived(r, i, run, analysis, error) {
   const s = slidesOf(r);
   const e = slidesEntry(s, i);
-  if (e.pending === sig) {
+  if (e.pending === run) {
     e.pending = null;
     e.percent = null;
   }
-  if (slidesMask(i, r)?.sig !== sig || (e.sig === sig && e.analysis)) return;
-  Object.assign(e, { sig, analysis, zone: analysis?.zone ?? null, error, state: null, view: null, messages: [] });
+  const m = slidesMask(i, r);
+  if (m?.run !== run || (e.run === run && e.analysis)) return;
+  Object.assign(e, { sig: m.sig, run, analysis, zone: analysis?.zone ?? null, error, state: null, view: null, messages: [] });
   if (analysis) {
     const picked = pickSlideEntry(slidesSaved()[partIdOf(r)]?.bodies?.[i], analysis);
     const kept = picked ? matchSlideState(analysis, picked.entry, { exact: picked.exact }) : { state: null, messages: [] };
@@ -5463,8 +5482,12 @@ function proposedView(analysis) {
   return v;
 }
 
-/** "<signature of the definition>#<hash of the edits>": changed by another definition and by every edit. */
-const slidesSignatureOf = (e) => `${e.sig}#${slideStateHash(e.state)}`;
+/**
+ * "<signature of the definition>#<hash of what the slides do>": changed by
+ * another definition and by every edit that changes them; an edit undone by
+ * hand, the proposal's again.
+ */
+const slidesSignatureOf = (e) => `${e.sig}#${slidesViewHash(e.view, proposedView(e.analysis))}`;
 
 function slidesWarnings(e) {
   const a = e.analysis;
@@ -5549,10 +5572,7 @@ function slidesExport(r, i) {
       cores: v.counts.cores,
       parting_zones: v.counts.parting,
       ignored: v.counts.ignored,
-      slides: v.slides.slice(0, 20).map((sl) => ({
-        id: sl.id, axis: sl.axis, direction: sl.direction, reference_axis: sl.reference_axis, angle_deg: sl.angle_deg, tilt_deg: sl.tilt_deg,
-        zones: sl.zones, area_mm2: sl.area_mm2, depth_mm: sl.depth_mm, stroke_mm: sl.stroke_mm, size_mm: sl.size_mm, half: sl.half, tags: sl.tags,
-      })),
+      slides: v.slides.slice(0, 20).map(slideExport),
       cores_detail: v.cores.slice(0, 20).map(({ id, area_mm2, centroid_mm, reason }) => ({ id, area_mm2, centroid_mm, reason })),
       parting_detail: v.parting.slice(0, 20).map(({ area_mm2, centroid_mm }) => ({ area_mm2, centroid_mm })),
       undercut_area_mm2: a.undercut_area_mm2,
@@ -5651,6 +5671,8 @@ function slidesLegend(p, i) {
 function renderSlides(p, i, field) {
   const card = $("parting-card");
   const drawing = p.mode === "draw";
+  // Pressed while the zones are edited, whatever is shown (folding the card clicks the buttons pressed).
+  const editing = () => $("slides-edit").classList.toggle("active", p.mode === "slides");
   $("slides").hidden = !field || drawing;
   if (!partingShown() || drawing) {
     card.dataset.slideArrows = "0";
@@ -5659,18 +5681,25 @@ function renderSlides(p, i, field) {
   if (!field) {
     $("parting-slides-show").disabled = true;
     card.dataset.slideStatus = card.dataset.slides = card.dataset.slideCores = "";
+    editing();
     return;
   }
   const r = state.result;
   if (!drawing) slidesRequest(i, r);
   const s = slidesOf(r);
+  // Another body: the slide selected, the zone picked and the message were the other one's.
+  if (s.body !== i) {
+    s.body = i;
+    s.selected = { slide: null, zone: null };
+    s.message = null;
+  }
   const e = slidesReady(i, r);
   const error = slidesError(i, r);
   card.dataset.slideStatus = drawing ? "drawing" : e ? "ready" : error ? "error" : "computing";
   card.dataset.slides = e ? String(e.view.counts.slides) : "";
   card.dataset.slideCores = e ? String(e.view.counts.cores) : "";
   $("parting-slides-show").disabled = !e;
-  if (drawing) return;
+  if (drawing) return editing();
   const a = e?.analysis;
   const pending = s.byBody.get(i);
   const status = error ? t("slides.error", { message: tMessage(error) })
@@ -5684,6 +5713,7 @@ function renderSlides(p, i, field) {
   $("slides-main").hidden = !main;
   if (!main) {
     if (p.mode === "slides") p.mode = null;
+    editing();
     return;
   }
 
@@ -5737,7 +5767,7 @@ function renderSlides(p, i, field) {
   ];
   setHtml($("slides-stats"), stats.map(([k, x]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(x)}</dd>`).join(""));
   $("slides-stats").hidden = !stats.length;
-  $("slides-edit").classList.toggle("active", p.mode === "slides");
+  editing();
   $("slides-reset").disabled = v.origin !== "manual";
 
   // The zone picked on the 3D view: its line, and where it goes (a slide whose direction releases it, or can take one that releases them all).
@@ -5820,7 +5850,7 @@ $("slides-retry").addEventListener("click", () => {
   const i = partingBody();
   const e = slidesOf()?.byBody.get(i);
   if (!e) return;
-  e.sig = e.error = null;
+  e.sig = e.run = e.error = null;
   renderParting();
 });
 // A row clicked: its slide selected (clicked again: no longer); its pull direction chosen in its list.
@@ -6284,8 +6314,10 @@ function setFeedingMode(mode) {
   const p = partingOf();
   if (f.mode && p?.mode === "draw") leaveDrawing();
   else if (f.mode && p?.mode) {
+    const was = p.mode;
     p.mode = null;
     renderParting();
+    if (was === "slides") applyParting(); // the zones greyed by the one picked: coloured again
   }
   // Placed on the 3D view: shown there.
   if (f.mode && !f.show) {

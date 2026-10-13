@@ -2,7 +2,9 @@
 // undercuts of the parting line shown grouped into slides in the parting
 // line card (count, table, pull directions), coloured on the 3D view with an
 // arrow each; zones edited by hand (a new slide, a merge, back to the
-// proposal) and kept after a reload; a closed cavity, a probable core; the
+// proposal) and kept after a reload; the editing of the zones ended (the
+// slides gone, a riser placed); a face reassigned (the half of the slide);
+// two bodies (each its own selection); a closed cavity, a probable core; the
 // semantic contract, the foundry screen and the AI context; the count
 // proposed to « Tiroirs du moule » on the Chiffrage page, used by a click,
 // traced, shown stale when the parting line changes, never replacing a value
@@ -69,7 +71,10 @@ function voxelsObj(bodies, [nx, ny, nz], size) {
 }
 
 /** A block 60 × 40 × 40 mm with two slots 10 wide, 10 high and 10 deep in its front face (y = 0), at x 10..20 and 40..50. */
-const twoSlots = () => voxelsObj([['a', (x, y, z) => !(((x >= 2 && x < 4) || (x >= 8 && x < 10)) && y < 2 && z >= 3 && z < 5)]], [12, 8, 8], 5);
+const slotted = (x, y, z) => !(((x >= 2 && x < 4) || (x >= 8 && x < 10)) && y < 2 && z >= 3 && z < 5);
+const twoSlots = () => voxelsObj([['a', slotted]], [12, 8, 8], 5);
+/** Two of them, the second 100 mm along +X. */
+const twoBlocks = () => voxelsObj([['a', slotted], ['b', slotted, [100, 0, 0]]], [12, 8, 8], 5);
 
 /**
  * Pixels of the 3D view by colour (parting.test.mjs), and teal (the second
@@ -310,6 +315,96 @@ describe('slides (dist/)', { skip: !existsSync(join(DIST, 'index.html')) && 'run
     await context.close();
   });
 
+  test('the zones edited: no longer once the slides are gone (the card folded leaves the view), nor once a riser is placed (the zones coloured again); a face reassigned, the half of the slide', { timeout: 2 * CAD_TIMEOUT }, async () => {
+    const { context, page, errors } = await newPage();
+    await open(page, { name: 'two_slots.obj', mimeType: 'text/plain', buffer: twoSlots() });
+    await candidate(page, 'Z');
+    await slidesReady(page, 1);
+    const active = (id) => page.evaluate((x) => document.getElementById(x).classList.contains('active'), id);
+    const exported = () => page.evaluate(() => window.reader3d.semantic.bodies[0].slides);
+    let slides = await exported();
+    assert.deepEqual(slides.slides.map((x) => x.half), ['upper']);
+
+    // A zone picked, the other one greyed; a riser to place: the editing ends, the zones in their colours again.
+    await page.click('[data-view="front"]');
+    await page.click('#slides-edit');
+    const all = await viewColours(page);
+    const at = await page.evaluate(() => window.reader3d.screenOf([45, 10, 20]));
+    await page.mouse.click(at.x, at.y);
+    await page.waitForSelector('#slides-zone:not([hidden])');
+    const picked = await viewColours(page);
+    assert.ok(picked.yellow < 0.7 * all.yellow, `the other zone greyed: ${picked.yellow} of ${all.yellow}`);
+    await page.click('#feeding-add');
+    assert.deepEqual([await active('slides-edit'), await page.isHidden('#slides-zone')], [false, true]);
+    const placing = await viewColours(page);
+    assert.ok(placing.yellow > 0.95 * all.yellow, `coloured again: ${placing.yellow} of ${all.yellow}`);
+    await page.click('#feeding-add');
+
+    // The front face (no undercut) moved to the lower half: the same undercuts, the slide now in the lower half.
+    await page.click('#parting-assign');
+    assert.equal(await page.inputValue('#parting-target'), '2');
+    const front = await page.evaluate(() => window.reader3d.screenOf([30, 0, 5]));
+    await page.mouse.click(front.x, front.y);
+    await page.waitForFunction(() => document.getElementById('parting-origin').textContent === 'manuel', null, { timeout: 30_000 });
+    await page.click('#parting-assign');
+    await page.waitForFunction(() => window.reader3d.semantic.bodies[0].slides?.slides?.[0]?.half === 'lower', null, { timeout: 60_000 });
+    const after = await exported();
+    assert.equal(after.signature, slides.signature, 'the same undercuts');
+    await page.click('#slides-table tr[data-slide] td:first-child');
+    assert.match(await page.textContent('#slides-slide'), /, chape inférieure/);
+
+    // Editing the zones, then the parting line back to its proposal (along Y, no undercut): no longer pressed; the
+    // overlay hidden, the card folded and opened again leaves it hidden.
+    await page.click('#slides-edit');
+    assert.equal(await active('slides-edit'), true);
+    await page.click('#parting-reset');
+    await page.waitForFunction(() => document.getElementById('parting-origin').textContent === 'proposé', null, { timeout: 30_000 });
+    await slidesReady(page, 0);
+    assert.equal(await active('slides-edit'), false);
+    await page.uncheck('#parting-show');
+    await page.click('#parting-card .card-toggle');
+    await page.click('#parting-card .card-toggle');
+    assert.equal(await page.isChecked('#parting-show'), false);
+    assert.equal((await slidesCard(page)).overlay, '');
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('two bodies: the slide selected and the zone picked stay with their body', { timeout: 2 * CAD_TIMEOUT }, async () => {
+    const { context, page, errors } = await newPage();
+    await open(page, { name: 'two_blocks.obj', mimeType: 'text/plain', buffer: twoBlocks() });
+    const body = async (i) => {
+      await page.click(`#bodies tr[data-index="${i}"] td.name`);
+      await page.waitForFunction((k) => document.querySelector('#bodies tr.selected')?.dataset.index === String(k), i);
+    };
+    await body(1);
+    await candidate(page, 'Z');
+    await slidesReady(page, 1);
+    await body(0);
+    await candidate(page, 'Z');
+    await slidesReady(page, 1);
+    // On the first body: T1 selected, the zones edited, zone 2 picked.
+    await page.click('#slides-table tr[data-slide] td:first-child');
+    await page.waitForSelector('#slides-slide:not([hidden])');
+    await page.click('[data-view="front"]');
+    await page.click('#slides-edit');
+    const at = await page.evaluate(() => window.reader3d.screenOf([window.reader3d.result.bodies[0].bbox.min[0] + 45, 10, 20]));
+    await page.mouse.click(at.x, at.y);
+    await page.waitForSelector('#slides-zone:not([hidden])');
+    // The other body: its own slide, nothing selected nor picked on it.
+    await body(1);
+    await slidesReady(page, 1);
+    const shown = await page.evaluate(() => ({
+      selected: document.querySelectorAll('#slides-table tr.selected').length,
+      slide: document.getElementById('slides-slide').hidden,
+      zone: document.getElementById('slides-zone').hidden,
+      hint: document.getElementById('slides-hint').textContent,
+    }));
+    assert.deepEqual(shown, { selected: 0, slide: true, zone: true, hint: 'Cliquez une zone colorée de la pièce.' });
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
   test('a closed cavity: a probable core, not a slide', { timeout: CAD_TIMEOUT }, async () => {
     const { context, page, errors } = await newPage();
     await open(page, 'cube_with_void.stl');
@@ -406,11 +501,17 @@ describe('slides (dist/)', { skip: !existsSync(join(DIST, 'index.html')) && 'run
     await page.waitForSelector('#slides-slide:not([hidden])');
     const sizes = await page.evaluate(() => {
       const scroll = document.querySelector('.slides-scroll');
-      return { page: document.documentElement.scrollWidth, inner: innerWidth, scroll: scroll.scrollWidth, client: scroll.clientWidth, open: document.getElementById('slides').open };
+      const page = () => document.documentElement.scrollWidth;
+      const before = { page: page(), scroll: scroll.scrollWidth, client: scroll.clientWidth };
+      // A row wider than the phone (a slide with all its tags): it scrolls inside the table's box, not the page.
+      document.querySelector('#slides-table tbody td').insertAdjacentHTML('beforeend', '<span class="slide-tag">aussi formable par une chape</span>'.repeat(4));
+      const wide = { page: page(), scroll: scroll.scrollWidth, client: scroll.clientWidth };
+      return { before, wide, inner: innerWidth, overflow: getComputedStyle(scroll).overflowX, open: document.getElementById('slides').open };
     });
     assert.equal(sizes.open, true);
-    assert.ok(sizes.page <= sizes.inner, JSON.stringify(sizes));
-    assert.ok(sizes.scroll >= sizes.client, JSON.stringify(sizes));
+    assert.equal(sizes.overflow, 'auto');
+    assert.ok(sizes.before.page <= sizes.inner && sizes.before.scroll <= sizes.before.client, JSON.stringify(sizes));
+    assert.ok(sizes.wide.scroll > sizes.wide.client && sizes.wide.page <= sizes.inner, JSON.stringify(sizes));
     const wide = await page.evaluate(() => [...document.querySelectorAll('#slides *')].filter((x) => x.offsetParent && !x.closest('.slides-scroll') && x.getBoundingClientRect().right > innerWidth + 0.5).map((x) => x.id || x.className || x.tagName));
     assert.deepEqual(wide, []);
     assert.deepEqual(errors, []);

@@ -259,6 +259,17 @@ export function slidesSignature({ nt, direction, mask }) {
   return `s1:${nt}:${count}:${h.hex()}`;
 }
 
+/**
+ * 8 hex digits of the halves of a definition (its `side` per triangle): the
+ * half of each zone and slide (« chape ») comes from its neighbours', so a
+ * face reassigned that is no undercut, the signature the same, changes them.
+ */
+export function slidesSideHash(side) {
+  const h = fnv32();
+  for (let f = 0; f < (side?.length ?? 0); f++) h.byte(side[f]);
+  return h.hex();
+}
+
 // ------------------------------------------------------------------ preparation
 
 function unionFind(n) {
@@ -1236,6 +1247,12 @@ export function effectiveSlides(analysis, state = null, { messages = [] } = {}) 
   return buildView(analysis, state, messages).view;
 }
 
+/** A slide of a view as the exports and the semantic contract carry it (its sense out of the plane with its tilt). */
+export const slideExport = (sl) => ({
+  id: sl.id, axis: sl.axis, direction: sl.direction, reference_axis: sl.reference_axis, angle_deg: sl.angle_deg, tilt_deg: sl.tilt_deg, tilt_up: sl.tilt_up,
+  zones: sl.zones, area_mm2: sl.area_mm2, depth_mm: sl.depth_mm, stroke_mm: sl.stroke_mm, size_mm: sl.size_mm, half: sl.half, tags: sl.tags,
+});
+
 /** The complete state of a view: every zone with its kind and slide key, every slide with its direction. */
 function materialise(analysis, state) {
   const { view, next } = buildView(analysis, state);
@@ -1418,6 +1435,26 @@ export function parseSlideState(json) {
 export function slideStateHash(state) {
   const h = fnv32();
   h.text(JSON.stringify(state == null ? null : canonicalState(state)));
+  return h.hex();
+}
+
+/**
+ * 8 hex digits of what a view does (each slide: its direction and zones; each
+ * other zone: its kind), for the signature of what the costing reads: that of
+ * the proposal (slideStateHash(null)) whenever it does what the proposal
+ * (`proposed`, effectiveSlides of the same analysis) does, whatever the edits
+ * that led there (a zone moved out and back); the same for two edits that do
+ * the same.
+ */
+export function slidesViewHash(view, proposed) {
+  const what = (v) => JSON.stringify([
+    v.slides.map((sl) => `${round6(sl.direction).join(",")}|${[...sl.zones].sort((a, b) => a - b).join(",")}`).sort(),
+    [...v.zoneKind].filter(([, k]) => k.kind !== "slide").map(([id, k]) => `${id}:${k.kind}`).sort(),
+  ]);
+  const text = what(view);
+  if (text === what(proposed)) return slideStateHash(null);
+  const h = fnv32();
+  h.text(`v|${text}`);
   return h.hex();
 }
 

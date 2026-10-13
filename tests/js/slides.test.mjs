@@ -12,7 +12,7 @@ import { SIDE_LOWER, SIDE_NONE, applyOverrides, evaluateParting, faceRegions, li
 import { drawMesh, drawnParting, layStraight, reprojectPoint } from '../../web/engine/parting-draw.js';
 import {
   SLIDE_DEFAULTS, SLIDES_VERSION, analyseSlides, dieAxes, directionParts, editSlides, effectiveSlides, matchSlideState, parseSlideState,
-  pickSlideEntry, prepareSlides, serializeSlideState, slideBasis, slideStateHash, slidesSignature, undercutMask,
+  pickSlideEntry, prepareSlides, serializeSlideState, slideBasis, slideStateHash, slidesSideHash, slidesSignature, slidesViewHash, undercutMask,
 } from '../../web/engine/slides.js';
 import { approx, approxVec } from './helpers.mjs';
 import { plate } from './hole-parts.mjs';
@@ -576,6 +576,20 @@ describe('signature of a definition', () => {
     assert.equal(other.size, 5);
   });
 
+  test('faces that are no undercut reassigned: the same signature, other halves (the half of each slide)', () => {
+    const mesh = meshB();
+    const ev = evaluateParting(mesh.positions, mesh.indices, Z);
+    const mask = undercutMask({ flags: ev.flags });
+    const side = Uint8Array.from(ev.side, (x, f) => (mask[f] ? x : SIDE_LOWER));
+    const nt = mask.length;
+    assert.equal(slidesSignature({ nt, direction: Z, mask }), slidesSignature({ nt, direction: Z, mask: undercutMask({ flags: ev.flags }) }));
+    assert.notEqual(slidesSideHash(side), slidesSideHash(ev.side));
+    assert.equal(slidesSideHash(Uint8Array.from(ev.side)), slidesSideHash(ev.side));
+    assert.match(slidesSideHash(ev.side), /^[0-9a-f]{8}$/);
+    const halves = (s) => effectiveSlides(run(mesh, Z, { ev, mask, side: s }).analysis).slides.map((sl) => sl.half);
+    assert.deepEqual([halves(ev.side), halves(side)], [['upper', 'upper'], ['lower', 'lower']]);
+  });
+
   test('the undercut mask of a field: drawn, else no reach and not reassigned', () => {
     const flags = Uint8Array.from([0, 1, 2, 3, 16, 0]);
     assert.deepEqual([...undercutMask({ flags })], [1, 0, 0, 0, 1, 1]);
@@ -608,6 +622,26 @@ describe('edits by hand', () => {
     r = editSlides(analysis, r.state, { op: 'reset' });
     assert.equal(r.state, null);
     assert.deepEqual(effectiveSlides(analysis, r.state), proposal);
+  });
+
+  test('C: what the costing reads of the edits, from what the slides do: a zone moved out and back, the proposal\'s', () => {
+    const { analysis } = run(meshC(), Z);
+    const proposal = effectiveSlides(analysis);
+    const hashOf = (state) => slidesViewHash(effectiveSlides(analysis, state), proposal);
+    assert.equal(hashOf(null), slideStateHash(null));
+    const out = editSlides(analysis, null, { op: 'move', zone: 2, to: 'new' });
+    assert.notEqual(hashOf(out.state), slideStateHash(null));
+    // Merged back: the same slide (+X, zones 1 and 2, stroke 15) as proposed, from a state that is not the proposal.
+    const back = editSlides(analysis, out.state, { op: 'merge', a: 'p1', b: 'u1' }).state;
+    assert.deepEqual(effectiveSlides(analysis, back).slides.map((s) => [s.axis, s.zones, s.stroke_mm]), [['X', [1, 2], 15]]);
+    assert.notEqual(slideStateHash(back), slideStateHash(null));
+    assert.equal(hashOf(back), slideStateHash(null));
+    // Two edits that do the same (zone 2 to a new slide, again from there): one hash; a zone made a core, another.
+    const again = editSlides(analysis, back, { op: 'move', zone: 2, to: 'new' }).state;
+    assert.notEqual(slideStateHash(again), slideStateHash(out.state));
+    assert.equal(hashOf(again), hashOf(out.state));
+    const core = editSlides(analysis, null, { op: 'kind', zone: 2, kind: 'core' }).state;
+    assert.equal(new Set([hashOf(null), hashOf(out.state), hashOf(core)]).size, 3);
   });
 
   test('B: no pull direction releases both pockets, they are not merged; a pocket not moved into the other slide', () => {
