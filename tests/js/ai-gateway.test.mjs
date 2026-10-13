@@ -89,6 +89,7 @@ test("a question goes to Groq's chat completions (key in any case); the answer, 
     provider: "Groq",
     model: "openai/gpt-oss-120b",
     quota: { requests_remaining_day: 998, requests_limit_day: 1000, tokens_remaining_minute: 5400, tokens_limit_minute: 8000, reset_requests: "2m52.8s", reset_tokens: "19.5s", tokens_limit_day: 200000 },
+    finish_reason: "stop",
   });
   assert.equal(requests.length, 1);
   const [request] = requests;
@@ -326,9 +327,15 @@ test("an empty or refused answer is an error, never an empty output", async () =
   assert.equal(r.json.error, "Groq a refusé de répondre : Je ne peux pas aider.");
   r = await call({ body: ask("?"), provider: () => completion("", { finish: "length" }) });
   assert.match(r.json.error, /limite de longueur \(1200 tokens, AI_MAX_TOKENS\) a été atteinte avant la réponse/);
-  // Cut: plain text kept with a note; JSON (costing) refused.
+  // Cut: plain text kept with a note (the pages before), and said so (the page asks its rest); JSON (costing) refused.
   r = await call({ body: ask("?"), provider: () => completion("Le volume est", { finish: "length" }) });
   assert.equal(r.json.output, "Le volume est\n\n(Réponse coupée : limite de longueur atteinte.)");
+  assert.equal(r.json.finish_reason, "length");
+  // Its rest asked: the answer so far and the instruction to go on, after the question, as the page sends them.
+  const rest = [{ role: "user", content: "?" }, { role: "assistant", content: "Le volume est" }, { role: "user", content: "Continue exactement là où ta réponse s'est arrêtée, sans répéter ni résumer ce qui précède." }];
+  r = await call({ body: ask("", { messages: rest }), provider: () => completion(" de 12 cm³.") });
+  assert.deepEqual(r.requests[0].body.messages.slice(2), rest);
+  assert.deepEqual([r.json.output, r.json.finish_reason], ["de 12 cm³.", "stop"]);
   r = await call({ body: { task: "costing", context: {}, messages: [{ role: "user", content: "?" }] }, provider: () => completion('{"conclusion":"', { finish: "length" }) });
   assert.equal(r.status, 502);
   assert.match(r.json.error, /^Réponse de Groq coupée/);

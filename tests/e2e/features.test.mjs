@@ -951,6 +951,154 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.context().close();
   });
 
+  test('IA page: an answer cut at the length allowed continued at once, its parts shown and kept as one answer; still cut after 4 parts, « Suite »; the labels only online; Ollama too', { timeout: CAD_TIMEOUT }, async (t) => {
+    // The gateway (api/ai.js) and a stand-in for Groq answering what `replies` holds, in turn: cut at the
+    // length allowed (finish_reason "length") or not; then a stand-in for Ollama, its answers in `chats`.
+    const { default: gatewayHandler } = await import('../../api/ai.js');
+    const completions = [];
+    let replies = [];
+    const groq = createServer((req, res) => {
+      let text = '';
+      req.on('data', (c) => (text += c));
+      req.on('end', () => {
+        completions.push(JSON.parse(text));
+        const { content = 'Fin.', finish = 'stop', tokens = 1000, delay = 0 } = replies.shift() ?? {};
+        setTimeout(() => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ model: 'openai/gpt-oss-120b', choices: [{ message: { role: 'assistant', content }, finish_reason: finish }], usage: { prompt_tokens: tokens - 100, completion_tokens: 100, total_tokens: tokens } }));
+        }, delay);
+      });
+    });
+    const gateway = createServer((req, res) => {
+      req.headers['x-forwarded-for'] = '198.51.100.6';
+      return gatewayHandler(req, res);
+    });
+    const chats = [];
+    let local = [];
+    const ollama = createServer((req, res) => {
+      if (req.headers.origin) res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET,POST', 'Access-Control-Allow-Headers': 'Content-Type' });
+        return res.end();
+      }
+      if (req.url === '/api/tags') {
+        res.setHeader('Content-Type', 'application/json');
+        return res.end(JSON.stringify({ models: [{ name: 'qwen3:8b' }] }));
+      }
+      let text = '';
+      req.on('data', (c) => (text += c));
+      req.on('end', () => {
+        chats.push(JSON.parse(text));
+        const { content, reason } = local.shift();
+        res.setHeader('Content-Type', 'application/x-ndjson');
+        res.write(`${JSON.stringify({ message: { role: 'assistant', content }, done: false })}\n`);
+        res.end(`${JSON.stringify({ done: true, done_reason: reason })}\n`);
+      });
+    });
+    await Promise.all([groq, gateway, ollama].map((x) => new Promise((resolve) => x.listen(0, '127.0.0.1', resolve))));
+    const saved = { ...process.env };
+    for (const k of Object.keys(process.env)) if (/^(groq_api_key|ai_|openai_|reader3d_)/i.test(k)) delete process.env[k];
+    Object.assign(process.env, { GROQ_API_KEY: 'gsk_made_up', AI_BASE_URL: `http://127.0.0.1:${groq.address().port}/openai/v1`, READER3D_ALLOWED_ORIGINS: base.replace(/\/$/, ''), READER3D_PUBLIC: '1' });
+    t.after(() => {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+      return Promise.all([groq, gateway, ollama].map((x) => new Promise((resolve) => {
+        x.closeAllConnections();
+        x.close(resolve);
+      })));
+    });
+    const { page, errors } = await newPage('fr-FR');
+    await page.goto(base);
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await settled(page);
+    await page.click('.tab[data-page="ia"]');
+    await page.selectOption('#ai-provider', 'openai');
+    await page.fill('#ai-url', `http://127.0.0.1:${gateway.address().port}/api/ai`);
+    await page.dispatchEvent('#ai-url', 'change');
+    const answered = () => page.waitForFunction(() => /^Réponse en/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+    const ask = async (question) => {
+      await page.fill('#ai-input', question);
+      await page.press('#ai-input', 'Enter');
+    };
+    const last = () => page.locator('#ai-chat .ai-msg').last();
+    const stored = () => page.evaluate(() => JSON.parse(sessionStorage.getItem('reader3d.ai.messages')).messages);
+    const online = (requests) => JSON.stringify(requests.map((c) => c.messages.slice(2)));
+    const CONTINUE = "Continue exactement là où ta réponse s'est arrêtée, sans répéter ni résumer ce qui précède.";
+
+    // Cut once: its rest asked at once (the status says so), the two parts one answer, joined where the model started again.
+    replies = [{ content: 'Corps 1 : une équerre dont les parois min', finish: 'length', tokens: 1000 }, { content: 'parois minces sont à surveiller.', tokens: 700, delay: 1500 }];
+    await ask("Décris l'Équerre en détail.");
+    await page.waitForFunction(() => document.getElementById('ai-status').textContent === 'Réponse longue : suite 2/4…', null, { timeout: 30_000 });
+    await answered();
+    assert.match(await page.textContent('#ai-status'), /^Réponse en \d+ s · Groq · openai\/gpt-oss-120b · 2 parties$/);
+    assert.equal(completions.length, 2);
+    // The second request: the same data, the question as it was sent, the answer so far (the word the cut split
+    // left to the model) as its own message, the instruction to go on.
+    assert.equal(completions[1].messages[1].content, completions[0].messages[1].content);
+    assert.deepEqual(completions[1].messages.slice(2), [
+      { role: 'user', content: "Décris l'Corps 1 en détail." },
+      { role: 'assistant', content: 'Corps 1 : une équerre dont les parois ' },
+      { role: 'user', content: CONTINUE },
+    ]);
+    // One bubble, the whole answer; its real names under it; kept whole.
+    assert.equal(await page.locator('#ai-chat .ai-assistant').count(), 1);
+    const whole = 'Corps 1 : une équerre dont les parois minces sont à surveiller.';
+    assert.equal(await last().locator('.ai-text').textContent(), whole);
+    assert.equal(await last().locator('.ai-names').textContent(), 'Noms réels : Corps 1 = Équerre');
+    assert.equal(await last().locator('.ai-incomplete').count(), 0);
+    let messages = await stored();
+    assert.deepEqual([messages.at(-1).content, messages.at(-1).parts, messages.at(-1).incomplete], [whole, 2, undefined]);
+    // Both requests counted: the question with the tokens of both.
+    const tokens = await page.evaluate(() => JSON.parse(localStorage.getItem('reader3d.ai.tokens')));
+    assert.deepEqual([tokens.questions.at(-1), tokens.all.slice(-2)], [1700, [1000, 700]]);
+
+    // Still cut after 4 parts: left so, said, and a « Suite » button that asks its rest.
+    replies = [1, 2, 3, 4].map((i) => ({ content: `${i === 1 ? 'Corps 2 : ' : ''}partie ${i},`, finish: 'length' }));
+    await ask('Et la Pin ?');
+    await answered();
+    assert.equal(completions.length, 6);
+    assert.match(await page.textContent('#ai-status'), / · 4 parties$/);
+    assert.equal(await last().locator('.ai-text').textContent(), 'Corps 2 : partie 1, partie 2, partie 3, partie 4,');
+    assert.equal(await last().locator('.ai-incomplete').textContent(), 'Réponse encore incomplète Suite');
+    messages = await stored();
+    assert.deepEqual([messages.at(-1).parts, messages.at(-1).incomplete], [4, true]);
+    replies = [{ content: 'fin de la réponse.' }];
+    await page.click('#ai-chat .ai-resume');
+    await page.waitForFunction(() => /^Réponse complétée/.test(document.getElementById('ai-status').textContent), null, { timeout: 30_000 });
+    assert.equal(completions.length, 7);
+    assert.deepEqual(completions[6].messages.slice(2).slice(-3), [
+      { role: 'user', content: 'Et la Corps 2 ?' },
+      { role: 'assistant', content: 'Corps 2 : partie 1, partie 2, partie 3, partie 4,' },
+      { role: 'user', content: CONTINUE },
+    ]);
+    assert.equal(await last().locator('.ai-text').textContent(), 'Corps 2 : partie 1, partie 2, partie 3, partie 4, fin de la réponse.');
+    assert.equal(await last().locator('.ai-incomplete').count(), 0);
+    assert.equal(await last().locator('.ai-names').textContent(), 'Noms réels : Corps 2 = Pin');
+    messages = await stored();
+    assert.deepEqual([messages.at(-1).content, messages.at(-1).parts, messages.at(-1).incomplete], ['Corps 2 : partie 1, partie 2, partie 3, partie 4, fin de la réponse.', 5, undefined]);
+    // Never a real name online, in the questions, the answers so far or the conversation.
+    for (const name of ['Équerre', 'Pin', 'named_assembly']) assert.ok(!online(completions).includes(name), name);
+
+    // The local model: its answer cut (done_reason "length") continued the same way.
+    await page.selectOption('#ai-provider', 'ollama');
+    await page.fill('#ai-url', `http://127.0.0.1:${ollama.address().port}`);
+    local = [{ content: 'Réponse locale : les parois min', reason: 'length' }, { content: 'parois minces.', reason: 'stop' }];
+    await ask('Et en local ?');
+    await answered();
+    assert.equal(chats.length, 2);
+    assert.deepEqual(chats[1].messages.slice(-3), [
+      { role: 'user', content: 'Et en local ?' },
+      { role: 'assistant', content: 'Réponse locale : les parois ' },
+      { role: 'user', content: CONTINUE },
+    ]);
+    assert.equal(await last().locator('.ai-text').textContent(), 'Réponse locale : les parois minces.');
+    assert.equal((await stored()).at(-1).content, 'Réponse locale : les parois minces.');
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  });
+
   test('IA page: one conversation per tab, names anonymised online in every task, the local model when the quota is reached and its answers kept offline, numbers checked, phone width', { timeout: CAD_TIMEOUT }, async (t) => {
     // The gateway (api/ai.js) and a stand-in for Groq, as above; a stand-in for Ollama.
     const { default: gatewayHandler } = await import('../../api/ai.js');

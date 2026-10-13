@@ -67,7 +67,9 @@ function cleanMessage(m, id, date) {
   const out = { id, role: m.role, content: m.content, date };
   if (time(m.answered)) out.answered = m.answered;
   for (const k of ["provider", "model", "gateway", "notice"]) if (typeof m[k] === "string") out[k] = m[k];
-  for (const k of ["local", "amounts"]) if (m[k] === true) out[k] = true;
+  for (const k of ["local", "amounts", "incomplete"]) if (m[k] === true) out[k] = true;
+  // An answer in several parts (cut at the length allowed, its rest asked): how many.
+  if (Number.isInteger(m.parts) && m.parts > 1) out.parts = m.parts;
   const c = m.costing;
   if (c && typeof c === "object" && Array.isArray(c.inconnus)) {
     out.costing = { verifiee: c.verifiee === true, nombres: Number.isFinite(c.nombres) ? c.nombres : 0, inconnus: c.inconnus.filter((x) => typeof x === "string") };

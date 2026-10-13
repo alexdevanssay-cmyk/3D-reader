@@ -8,7 +8,13 @@
 //
 //   GET  /api/ai  the public configuration: provider, model, context budget,
 //                 whether an access code is needed (never a secret)
-//   POST /api/ai  {task, model, context, messages} -> {output, provider, model, quota, usage}
+//   POST /api/ai  {task, model, context, messages} -> {output, provider, model, quota, usage, finish_reason}
+//
+// A text answer cut at the length allowed (AI_MAX_TOKENS) comes back with
+// finish_reason "length" (and a note at its end, for the pages before): the
+// page asks for its rest at once, the answer so far in the conversation and
+// an instruction to go on, and joins the parts. A JSON answer cut cannot be
+// continued: an error, as before.
 //
 // The context is sent once, compacted by the page to the budget given by GET
 // (the free plan of Groq allows 8,000 tokens a minute), as data between
@@ -570,12 +576,15 @@ export default async function handler(req, res) {
     const { data, headers } = await complete(config, body, task);
     const usage = usageOf(data);
     const answered = typeof data?.model === "string" && data.model ? data.model : model;
+    const finish = data?.choices?.[0]?.finish_reason;
     return reply(res, 200, {
       output: answerOf(data, !!json, config, task),
       provider: config.name,
       model: answered,
       quota: quotaOf(headers, config, answered),
       ...(usage ? { usage } : {}),
+      // Why the provider stopped, as it says: "length" for an answer cut at AI_MAX_TOKENS (the page asks its rest).
+      finish_reason: typeof finish === "string" ? finish : null,
     });
   } catch (error) {
     if (error instanceof HttpError) {
