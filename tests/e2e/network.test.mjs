@@ -416,12 +416,21 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     await page.waitForFunction(() => /1 retour d'expérience de ce poste à écrire dans le dossier réseau partagé dès que son accès est autorisé/.test(document.getElementById('cnetwork')?.textContent));
     await page.click('#cnetwork [data-action="network-grant"]');
     await page.waitForFunction(() => /— accessible/.test(document.querySelector('#cnetwork .crow')?.textContent) && /1 retour de ce poste écrit/.test(document.getElementById('cnetwork').textContent));
-    // Still said once the folder is read again (the grant reads it twice: the second one has nothing to write).
-    await page.waitForTimeout(1000);
-    assert.match(await page.textContent('#cnetwork'), /lu à .*1 retour de ce poste écrit/);
-    const files = Object.keys(await folderFiles(page, 'retours-experience'));
-    assert.equal(files.length, 1);
-    assert.match(files[0], /^REF-ATTENTE__CG3__/);
+    // Still said once the folder is read again ("Actualiser") with nothing of this PC left to write: a real time
+    // of another PC put in the folder meanwhile says when that reading is over.
+    await page.evaluate(async (text) => {
+      const folder = await (await navigator.storage.getDirectory()).getDirectoryHandle('retours-experience');
+      const writable = await (await folder.getFileHandle('AUTRE-PC__CG3__2026-06-01T10-00-00__aaaaaaaa.json', { create: true })).createWritable();
+      await writable.write(text);
+      await writable.close();
+    }, JSON.stringify({ schema: 'reader3d-historique-cycles', version: 1, pieces: [{ ref: 'AUTRE-PC', source: 'production', ilot: 'CG3', temps_cycle_s: 300, poids_kg: 2.5, date: '2026-06-01T10:00:00.000Z' }] }));
+    await page.click('#cnetwork [data-action="network-refresh"]');
+    await page.waitForFunction(() => /1 temps mesuré ajouté/.test(document.getElementById('cnetwork')?.textContent));
+    assert.match(await page.textContent('#cnetwork'), /lu à .*1 temps mesuré ajouté.* ; 1 retour de ce poste écrit/);
+    const files = Object.keys(await folderFiles(page, 'retours-experience')).sort();
+    assert.equal(files.length, 2);
+    assert.equal(files[0], 'AUTRE-PC__CG3__2026-06-01T10-00-00__aaaaaaaa.json');
+    assert.match(files[1], /^REF-ATTENTE__CG3__/);
     assert.equal(await page.evaluate(() => localStorage.getItem('reader3d.reseau.retours-a-ecrire.v1')), null);
     assert.deepEqual(errors, []);
     await context.close();
