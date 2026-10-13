@@ -326,6 +326,8 @@ web/                   the web interface (static site)
     parting.js         draw direction and parting line of cast parts
     parting-draw.js    the parting line drawn by hand (lines laid on the surface, halves by part)
     partworker.js      its worker (partclient.js: main-thread API)
+    slides.js          slides (« tiroirs »): the undercuts grouped by pull direction, probable cores
+    slideworker.js     its worker (slideclient.js: main-thread API)
     feeding.js         risers and ingate of cast parts (feeding zones, moduli)
     feedworker.js      its worker (feedclient.js: main-thread API)
   chiffrage/           costing pages: workbook reader, cost model, routes, UI

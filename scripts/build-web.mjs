@@ -81,6 +81,7 @@ const REQUIRED_DIST_FILES = [
   'engine/thickpool.js',
   'engine/partworker.js',
   'engine/feedworker.js',
+  'engine/slideworker.js',
   'engine/cache.js',
   'coi-sw.js',
   'vendor/three/three.module.js',
