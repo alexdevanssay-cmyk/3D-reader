@@ -136,6 +136,12 @@ test("a message from the folder is kept with its known fields of their types onl
   assert.deepEqual(c.messages[0], { id: "1", role: "assistant", content: "x", date: "2026-10-09T10:00:00Z", provider: "Groq", names: [["Corps 1", "Carter"]] });
   assert.deepEqual(c.messages[1].costing, { verifiee: false, nombres: 2, inconnus: ["7,5"] });
   assert.deepEqual(c.messages[1].numbers, ["9"]);
+  // An answer in several parts, still cut after them.
+  const parts = normalizeConversation({ id: "p", messages: [
+    { id: "1", role: "assistant", content: "x", date: "2026-10-09T10:00:00Z", parts: 4, incomplete: true },
+    { id: "2", role: "assistant", content: "y", date: "2026-10-09T10:00:00Z", parts: "4", incomplete: "oui" },
+  ] });
+  assert.deepEqual(parts.messages.map((m) => [m.parts, m.incomplete]), [[4, true], [undefined, undefined]]);
 });
 
 test("the network folder: a conversation written by two PCs at once keeps both their messages; another conversation's unreadable file left; its own never replaced", async () => {

@@ -8,7 +8,13 @@
 //
 //   GET  /api/ai  the public configuration: provider, model, context budget,
 //                 whether an access code is needed (never a secret)
-//   POST /api/ai  {task, model, context, messages} -> {output, provider, model, quota, usage}
+//   POST /api/ai  {task, model, context, messages} -> {output, provider, model, quota, usage, finish_reason}
+//
+// A text answer cut at the length allowed (AI_MAX_TOKENS) comes back with
+// finish_reason "length" (and a note at its end, for the pages before): the
+// page asks for its rest at once, the answer so far in the conversation and
+// an instruction to go on, and joins the parts. A JSON answer cut cannot be
+// continued: an error, as before.
 //
 // The context is sent once, compacted by the page to the budget given by GET
 // (the free plan of Groq allows 8,000 tokens a minute), as data between
@@ -115,7 +121,8 @@ La planification de fabrication est une piste, pas une gamme d'usinage exécutab
 Le criblage fonderie n'est pas une simulation de remplissage ni de solidification : n'affirme jamais une masselotte, une attaque, une porosité, un historique thermique ni une probabilité de défaut sans résultat de simulation fourni. Cite les identifiants de sources fonderie pour les recommandations tirées des connaissances, et ceux des features et relations pour les preuves géométriques.
 Ce contexte EST l'analyse de la pièce par 3D Reader : métrologie, features détectées (trous, alésages, poches, congés, chanfreins, motifs, relations coaxiales) avec leurs identifiants, criblage fonderie (contre-dépouilles, risque de noyau, épaisseurs), pistes de fabrication. Ne renvoie jamais l'utilisateur vers un module, un export ou un outil de 3D Reader que tu supposes. S'il te manque du détail (champ "summary_only" ou "compaction"), dis-le et indique l'analyse à choisir dans la page IA : « Features », « Fabrication », « DFM » ou « Chiffrage ».
 Champ "selection" : seuls ces corps de la pièce sont envoyés (le corps sélectionné dans la liste, ou les corps cochés) ; réponds sur eux seulement.
-Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.`;
+Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.
+À chaque question, les DONNÉES jointes décrivent l'état actuel de la pièce et du chiffrage. Elles priment sur tes réponses précédentes de la conversation : si une donnée que tu disais manquante y figure maintenant, utilise-la sans attendre qu'on te le redise.`;
 
 // Not for the task « Chiffrage », which explains the traced values of the quote and proposes values in its JSON (propositions).
 const TEXT_RULES = `Réponds en texte, jamais en JSON ; la mise en forme Markdown simple est permise (gras, listes, petits tableaux). Pour une conversation ou une question générale (fonderie, procédés, chiffrage, méthode), réponds directement et brièvement. Pour une question sur la pièce, organise la réponse en courtes sections, celles qui sont utiles seulement : « Conclusion », « Mesuré » (valeurs du contexte, avec leurs identifiants), « Déduit », « Recommandations », « À valider ».
@@ -569,12 +576,15 @@ export default async function handler(req, res) {
     const { data, headers } = await complete(config, body, task);
     const usage = usageOf(data);
     const answered = typeof data?.model === "string" && data.model ? data.model : model;
+    const finish = data?.choices?.[0]?.finish_reason;
     return reply(res, 200, {
       output: answerOf(data, !!json, config, task),
       provider: config.name,
       model: answered,
       quota: quotaOf(headers, config, answered),
       ...(usage ? { usage } : {}),
+      // Why the provider stopped, as it says: "length" for an answer cut at AI_MAX_TOKENS (the page asks its rest).
+      finish_reason: typeof finish === "string" ? finish : null,
     });
   } catch (error) {
     if (error instanceof HttpError) {
