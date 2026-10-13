@@ -104,6 +104,39 @@ test('a model no longer shown: its jobs dropped, the one running with its worker
   assert.equal(FakeWorker.all.at(-1), fresh);
 });
 
+test('the body looked at goes ahead of the bodies waiting, behind the job running', async () => {
+  const model = {};
+  const jobs = ['a', 'b', 'c'].map((sig, k) => computeSlides(body, input(sig), { owner: model, key: String(k + 1) }));
+  const card = computeSlides(body, input('card'), { owner: model, key: '0', first: true });
+  const worker = FakeWorker.all.at(-1);
+  for (const sig of ['a', 'card', 'b', 'c']) {
+    assert.equal(worker.posted.at(-1).sig, sig);
+    worker.reply(sig);
+  }
+  assert.deepEqual(await Promise.all([...jobs, card]), ['a', 'b', 'c', 'card']);
+});
+
+test('a model closed once its slides are known: the worker idle, keeping its body, ended; for another model, kept', async () => {
+  const closed = {}, other = {};
+  const done = computeSlides(body, input('k1'), { owner: closed, key: '0' });
+  const worker = FakeWorker.all.at(-1);
+  worker.reply('K');
+  assert.equal(await done, 'K');
+  // Idle: another model closed leaves it (and the body it keeps) alone.
+  cancelSlides(other);
+  assert.equal(worker.terminated, false);
+  cancelSlides(closed);
+  assert.equal(worker.terminated, true);
+  // The next job in a new worker; closing that model again ends nothing more.
+  const next = computeSlides(body, input('n1'), { owner: other, key: '0' });
+  const fresh = FakeWorker.all.at(-1);
+  assert.notEqual(fresh, worker);
+  fresh.reply('N');
+  assert.equal(await next, 'N');
+  cancelSlides(closed);
+  assert.equal(fresh.terminated, false);
+});
+
 test('the worker: the analysis of a definition, the body kept for the next one, an error reported', () => {
   const mesh = voxels((x, y, z) => !((x < 2 || x >= 8) && y >= 2 && y < 4 && z >= 1 && z < 3), [10, 6, 4], { size: 5 });
   const ev = evaluateParting(mesh.positions, mesh.indices, [0, 0, 1]);
