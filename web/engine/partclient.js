@@ -7,8 +7,15 @@
 // that the jobs of a model no longer shown (its tab closed, another file
 // opened in it) can be dropped: those waiting, and the one running (its
 // worker stopped, a new one for the next jobs).
+//
+// Each job carries the casting process ({plan, alimentation}) and the die
+// options ({marges, densite, cavities}; orientation.js): the proposals are
+// ranked with them, and kept with their key (orientationKey): proposals of
+// another process or other die options are not taken from the cache.
 
 import { saveResult } from './cache.js';
+import { orientationKey } from './orientation.js';
+import { PARTING_VERSION } from './parting.js';
 
 let worker = null;
 let nextId = 1;
@@ -63,21 +70,51 @@ function call(message, { onProgress, owner } = {}) {
   });
 }
 
+/** An up direction as the worker takes it: a side ("+u"…), a plain array, or null. */
+const upOf = (up) => (up == null ? null : typeof up === 'string' ? up : [...up]);
+
 /**
  * Draw direction and parting line proposed for bodies.
- * bodies -- per body {positions, indices} (copied, the caller keeps its
- *           arrays) or null to skip it (open bodies)
- * owner  -- what the job is for (a model), to drop it (cancelParting)
- * Resolves to {version, bodies: per body {proposal, side, flags, plane, segments} or null}.
+ * bodies  -- per body {positions, indices, thickness (inscribed diameter per
+ *            triangle, or none: the feeding score from the volume centroid)}
+ *            (copied, the caller keeps its arrays) or null to skip it (open bodies)
+ * owner   -- what the job is for (a model), to drop it (cancelParting)
+ * process -- {plan: "vertical" | "horizontal", alimentation: "haut" | "bas"} (default: gravity, vertical, top)
+ * die     -- {marges, densite, cavities} (default: those of the costing)
+ * Resolves to {version, options_key, bodies: per body {proposal, side, flags, plane, segments} or null}.
  */
-export function computeParting(bodies, { onProgress, owner } = {}) {
-  const list = bodies.map((b) => (b ? { positions: b.positions, indices: b.indices } : null));
-  return call({ type: 'propose', bodies: list }, { onProgress, owner });
+export function computeParting(bodies, { onProgress, owner, process = null, die = null } = {}) {
+  const list = bodies.map((b) => (b ? { positions: b.positions, indices: b.indices, thickness: b.thickness ?? null } : null));
+  return call({ type: 'propose', bodies: list, process, die }, { onProgress, owner });
 }
 
-/** One direction of a body (chosen by hand): {summary, side, flags, plane, segments}. */
-export function evaluateDirection({ positions, indices }, direction, { owner } = {}) {
-  return call({ type: 'evaluate', positions, indices, direction: [...direction] }, { owner });
+/**
+ * One direction of a body (chosen by hand): {summary (with its orientation),
+ * side, flags, plane, segments}.
+ * up     -- the up direction wanted (a vector, or "+u", "-v", "+d"…), else by the feeding
+ * orient -- a horizontal parting plane whose up is -d: classified along -d (see parting.js evaluateParting)
+ */
+export function evaluateDirection({ positions, indices, thickness = null }, direction, { owner, process = null, die = null, up = null, orient = false } = {}) {
+  return call({ type: 'evaluate', positions, indices, thickness, direction: [...direction], process, die, up: upOf(up), orient }, { owner });
+}
+
+/**
+ * The orientation alone of a direction of a body (a line drawn by hand: its
+ * plane's normal, as drawn; the feeding score again with the thickness):
+ * {orientation (orientation.js), options_key}.
+ */
+export function orientDirection({ positions, indices, thickness = null }, direction, { owner, process = null, die = null, up = null } = {}) {
+  return call({ type: 'orient', positions, indices, thickness, direction: [...direction], process, die, up: upOf(up) }, { owner });
+}
+
+/**
+ * The proposals kept with the results of a file (cache.js: {version,
+ * options_key, bodies}) when they are of this engine, for `count` bodies, for
+ * this process and these die options; else null (to compute them again).
+ */
+export function keptParting(kept, count, { process = null, die = null } = {}) {
+  if (kept?.version !== PARTING_VERSION || kept.bodies?.length !== count) return null;
+  return kept.options_key === orientationKey(process, die) ? kept.bodies : null;
 }
 
 /**

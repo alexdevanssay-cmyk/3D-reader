@@ -154,9 +154,17 @@ describe('draw direction proposed from the geometry', () => {
     const { proposal } = proposeParting(mesh.positions, mesh.indices, { fullLimit: 10, samples: 30 * nt });
     assert.ok(proposal.sampled);
     assert.deepEqual([proposal.axis, proposal.parting.kind, proposal.undercut_area_mm2], ['Z', 'planar', 0]);
-    // Its principal axis (0, -0.447, 0.894) has the least zero-draft surface, but a warped line.
-    const oblique = proposal.candidates.find((c) => c.source === 'principal_axis' && c.zero_draft_area_mm2 < proposal.zero_draft_area_mm2 && c.undercut_area_mm2 === 0);
-    assert.equal(oblique?.parting?.kind, 'warped', JSON.stringify(proposal.candidates.map((c) => c.axis)));
+    // Its principal axes, the obliques with less zero-draft surface, need more
+    // than 5 % more steel in their die block: ranked below on it, never
+    // classified on every triangle. X, as much steel and as well fed as Z, has
+    // less zero-draft surface: it would win as if its line were planar, but
+    // classified on every triangle its line is stepped.
+    for (const c of proposal.candidates.filter((c) => c.source === 'principal_axis')) {
+      assert.ok(c.orientation.steel_kg > 1.05 * proposal.orientation.steel_kg, `${c.axis}: ${c.orientation.steel_kg} kg`);
+    }
+    const lessDraft = proposal.candidates.find((c) => c.zero_draft_area_mm2 < proposal.zero_draft_area_mm2 && c.undercut_area_mm2 === 0 && c.orientation.steel_kg <= 1.05 * proposal.orientation.steel_kg);
+    assert.equal(lessDraft?.axis, 'X', JSON.stringify(proposal.candidates.map((c) => c.axis)));
+    assert.equal(lessDraft.parting?.kind, 'stepped');
   });
 
   test('a large mesh: the direction chosen shows the areas of its faces classified on every triangle', () => {
