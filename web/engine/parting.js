@@ -172,6 +172,9 @@ const PLACE_MIN = 0.5;
 const PLACE_FULL = Math.sin((15 * Math.PI) / 180);
 // Above this many triangles, the cuts of the halves on patches of them (solveCut).
 const COARSE_LIMIT = 200_000;
+// The cut of the patches made again on the triangles of the patches along its changes of label and of this many rings
+// of patches round them (refineBand: about 1.5 λ on either side).
+const BAND_RINGS = 2;
 // A triangle whose points disagree, larger than this × λ² (a long triangle of a
 // CAD face across the edge of a shadow): its majority kept by the undercuts
 // (optimiseHalves); smaller, its region regularised like any other.
@@ -1527,8 +1530,9 @@ function optimiseHalves(mesh, line, evidence, d, coarseLimit = COARSE_LIMIT) {
  * their terminal capacity: of one evidence, one facing), joined across
  * smooth edges (normals within 35°): every triangle with its patch, the cut
  * placed at their scale, half the tension's. The patches never mix kinds
- * nor cross a sharp edge. When they would not take the graph down by half
- * (triangles larger than the cells), exact on the triangles.
+ * nor cross a sharp edge. Then exact near the line (refineBand). When they
+ * would not take the graph down by half (triangles larger than the cells),
+ * exact on the triangles.
  */
 function solveCut(mesh, line, cap, tcap, free, limit = COARSE_LIMIT) {
   const { nt, normals: N, centres: C, diag } = mesh;
@@ -1630,7 +1634,65 @@ function solveCut(mesh, line, cap, tcap, free, limit = COARSE_LIMIT) {
     }
   }
   const { side } = minCut(np, pfirst, phead.subarray(0, m), pcap.subarray(0, m), psister, ptcap, { free });
-  return Uint8Array.from(patch, (p) => side[p]);
+  return refineBand(nt, head, cap, sister, tcap, free, patch, np, Uint8Array.from(patch, (p) => side[p]));
+}
+
+/**
+ * The labels of the cut of the patches (solveCut), exact where they change:
+ * the triangles of the patches along a change of label and of BAND_RINGS
+ * rings of patches round them (about 1.5 λ on either side) cut again on the
+ * triangles themselves, the others kept (each arc from the band to one of
+ * them as a terminal capacity of its triangle in the band). The cut of the
+ * patches places the line at their scale: where the evidence barely leans
+ * either way (both halves reach, the faces facing one), its line differs
+ * from the exact one and left islands of a patch or two in the other half
+ * (on a cylinder with blended bosses, 227 000 triangles: loops of a
+ * millimetre round them, 5 loops for 1 along X). The labels (`label`,
+ * changed in place).
+ */
+function refineBand(nt, head, cap, sister, tcap, free, patch, np, label) {
+  const along = new Uint8Array(np);
+  for (let a = 0; a < 3 * nt; a++) {
+    const f = (a / 3) | 0, g = head[a];
+    if (g >= 0 && label[f] !== label[g]) along[patch[f]] = along[patch[g]] = 1;
+  }
+  let band = Uint8Array.from(along);
+  for (let ring = 0; ring < BAND_RINGS; ring++) {
+    const next = Uint8Array.from(band);
+    for (let a = 0; a < 3 * nt; a++) {
+      const g = head[a];
+      if (g >= 0 && band[patch[(a / 3) | 0]]) next[patch[g]] = 1;
+    }
+    band = next;
+  }
+  const index = new Int32Array(nt).fill(-1);
+  let nb = 0;
+  for (let f = 0; f < nt; f++) if (band[patch[f]]) index[f] = nb++;
+  if (!nb) return label;
+  const bfirst = new Int32Array(nb + 1);
+  for (let k = 0; k <= nb; k++) bfirst[k] = 3 * k;
+  const bhead = new Int32Array(3 * nb).fill(-1), bsister = new Int32Array(3 * nb).fill(-1);
+  const bcap = new Float64Array(3 * nb), btcap = new Float64Array(nb);
+  for (let f = 0; f < nt; f++) {
+    const k = index[f];
+    if (k < 0) continue;
+    let t = tcap[f];
+    for (let e = 0; e < 3; e++) {
+      const a = 3 * f + e, g = head[a];
+      if (g < 0) continue;
+      if (index[g] >= 0) {
+        bhead[3 * k + e] = index[g];
+        bcap[3 * k + e] = cap[a];
+        bsister[3 * k + e] = 3 * index[g] + (sister[a] - 3 * g);
+      } else if (label[g]) t += cap[sister[a]]; // g on the source side: its arc to f cut unless f is too
+      else t -= cap[a]; // g on the sink side: the arc from f to it cut if f is on the source side
+    }
+    // (Fixed to one half, joined whole to a neighbour fixed to the other: as fixed.)
+    btcap[k] = Number.isNaN(t) ? tcap[f] : t;
+  }
+  const { side } = minCut(nb, bfirst, bhead, bcap, bsister, btcap, { free });
+  for (let f = 0; f < nt; f++) if (index[f] >= 0) label[f] = side[index[f]];
+  return label;
 }
 
 /**
@@ -3537,6 +3599,7 @@ function shadowHalves(mesh, grid, line, side, flags, d, across = null) {
   for (const f of queue) if (side[f] !== SIDE_NONE) side[f] = shadowShape(f, line.positions, I, welded, shade).half;
   return out;
 }
+
 
 // The iso-line of the halves (isoField): its Gauss-Seidel sweeps, until no value moves by more than ISO_STILL;
 // across facets no longer than ISO_MAX × the tension of the line (isoHalves).

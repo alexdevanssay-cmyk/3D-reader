@@ -8,8 +8,16 @@
 //   of the tube (exactly along d) in the shadows of the bosses;
 // - holedBlock: a block with through holes along y and z;
 // - studBlock: a block with a ledge on one side and a stud on the other, of
-//   a few tenths of a millimetre (below the tension of the line) or more.
+//   a few tenths of a millimetre (below the tension of the line) or more;
+// - groovedBlock: a block with a groove round its four sides;
+// - cylBosses: a cylinder with radial bosses blended into it, meshed by OCCT
+//   (a fixture).
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
+
 import { Body } from './curved-mesh.mjs';
+import { ROOT } from './helpers.mjs';
 
 export const TUBE = {
   r: 20,
@@ -166,6 +174,21 @@ export function groovedBlock({ L = 120, H = 40, at = 20, width = 1, depth = 1 } 
     quad([cx, cy, at], [dx, dy, at], [dx, dy, top], [cx, cy, top], normal);
   }
   return body.mesh();
+}
+
+/**
+ * A cylinder R 40, 200 long along x, with radial bosses (R 8 to 12, 15 above
+ * it) at 0, 35, 70, 110 and 150° from +y towards +z, each blended into it by
+ * a fillet R 4, a hole R 3 through two of them: a STEP body made with OCCT
+ * for these tests, meshed as the page meshes it (3546 triangles; the fixture
+ * tests/fixtures/cyl_bosses.mesh.gz: nv, nt (uint32), the positions
+ * (float32), the indices (uint32)).
+ */
+export function cylBosses() {
+  const buf = gunzipSync(readFileSync(join(ROOT, 'tests', 'fixtures', 'cyl_bosses.mesh.gz')));
+  const bytes = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  const [nv, nt] = new Uint32Array(bytes, 0, 2);
+  return { positions: new Float32Array(bytes, 8, 3 * nv), indices: new Uint32Array(bytes, 8 + 12 * nv, 3 * nt) };
 }
 
 /** A mesh with each triangle cut into 4^levels at the middles of its edges (a finely meshed body), its faces kept. */

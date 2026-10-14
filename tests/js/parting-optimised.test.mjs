@@ -11,7 +11,7 @@ import { describe, test } from 'node:test';
 
 import { REACH_DOWN, REACH_UP, SHADOW, SIDE_LOWER, SIDE_NONE, SIDE_UPPER, SILHOUETTE, evaluateParting, lineMesh, lineTension } from '../../web/engine/parting.js';
 import { analyseSlides, effectiveSlides, prepareSlides, slidesSignature, undercutMask } from '../../web/engine/slides.js';
-import { HOLED, bossedTube, groovedBlock, holedBlock, studBlock, subdivided } from './cad-parts.mjs';
+import { HOLED, bossedTube, cylBosses, groovedBlock, holedBlock, studBlock, subdivided } from './cad-parts.mjs';
 import { BRACKET, Body, zBracket } from './curved-mesh.mjs';
 import { approx } from './helpers.mjs';
 import { lineLoops, looseEnds, shapeOfLine, undercutRegions, unlinedEdges } from './line-shape.mjs';
@@ -304,5 +304,26 @@ describe('the parting halves optimised over the surface', () => {
     assert.deepEqual([r.summary.parting.kind, r.plane, r.summary.parting.loops, loops.length], ['planar', 0, 3, 3]);
     // The outline and the rims of the two holes (16-gons of radius 0.6).
     approx(r.summary.parting.length_mm, 400 + 2 * 2 * n * rad * Math.sin(Math.PI / n), 0, 0.05, 'length');
+  });
+
+  test('a cylinder with blended bosses meshed by OCCT, each triangle cut into 64 (227 000, above the coarse limit): the loops of the exact cut', () => {
+    // The cut of the patches (cells of λ / 2) placed the line at their scale
+    // where the evidence barely leans either way (both halves reach, the
+    // faces facing one): islands of a patch or two in the other half, loops
+    // of a millimetre round them (along X 5 loops for 1, along Y 4 for 2).
+    // Now cut again on the triangles in a band round its line: the exact
+    // cut's loops.
+    const part = subdivided(cylBosses(), 3);
+    assert.ok(part.indices.length / 3 > 200_000);
+    for (const d of [[1, 0, 0], [0, 1, 0]]) {
+      const label = String(d);
+      const patches = evaluateParting(part.positions, part.indices, d);
+      const exact = evaluateParting(part.positions, part.indices, d, { coarseLimit: Infinity });
+      const [lp, le] = [patches, exact].map((x) => lineLoops(x.segments));
+      assert.deepEqual([patches.summary.parting.loops, lp.length], [exact.summary.parting.loops, le.length], label);
+      assert.deepEqual(lp.filter((l) => l.length < 5).map((l) => l.length), [], `${label}: small loops`);
+      approx(patches.summary.parting.length_mm, exact.summary.parting.length_mm, 0.01, 0, `${label}: length`);
+      approx(patches.summary.undercut_area_mm2, exact.summary.undercut_area_mm2, 1e-9, 0, `${label}: undercut`);
+    }
   });
 });
