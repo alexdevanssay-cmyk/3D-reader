@@ -14,7 +14,7 @@
 // the same bits: the pieces chain end to end without a gap (feeding.js and
 // lineShape chain them by their ends).
 
-import { REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_NONE, SIDE_UPPER, lineShape } from "./parting.js";
+import { REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_NONE, SIDE_UPPER, lineShape, nearUndercuts } from "./parting.js";
 
 export const DRAW_VERSION = 1;
 
@@ -1143,7 +1143,9 @@ function chainSides(dm, f, ch, ein, eout) {
  * 'loop_not_separating' (loop) | 'too_small' (loop)}], separates (per
  * loop), seamArea, totalArea, coreExcluded, flagsKnown, pieceRegions (per
  * loop, per path: Int32Array of the regions on either side of each piece,
- * -1 unknown)}.
+ * -1 unknown), seams ([{f, parts: [{pts (xyz), region, runs (how far it
+ * runs along each edge of f)}, …]}]: the seam triangles crossed once, from
+ * edge to edge, in two parts)}.
  */
 export function splitRegions(dm, loops, { flags = null, excludeCore = false, axis = [0, 0, 1] } = {}) {
   const { nt, nvW, W, N, Q, areas } = dm;
@@ -1395,6 +1397,40 @@ export function splitRegions(dm, loops, { flags = null, excludeCore = false, axi
     return out;
   });
 
+  // The seam triangles the line crosses once, from one edge to another: their
+  // two parts, the chain and the corners on each side (wound as the triangle),
+  // each in the region of its corners (else the triangle's): the colours of
+  // the halves cut along the line, not by triangle (drawnParting pieces).
+  const seams = [];
+  for (const [f, chains] of chainsOf) {
+    const ch = chains[0];
+    if (chains.length !== 1 || ch.in < 0 || ch.out < 0 || label[f] < 0) continue;
+    const ein = ch.in - 3 * f, eout = ch.out - 3 * f;
+    if (ein === eout || sameXYZ(ch.pts[0], ch.pts.at(-1))) continue;
+    const V = cornersOf(dm, f);
+    // The corners after edge `from` round the triangle, up to corner `to`.
+    const ring = (from, to) => {
+      const out = [];
+      for (let k = (from + 1) % 3; ; k = (k + 1) % 3) {
+        out.push(k);
+        if (k === to) break;
+      }
+      return out;
+    };
+    // A part: from edge `from` along the chain to edge `to`, round the corners after it; how far it runs along each
+    // edge (from the chain's end to the first corner, from corner to corner, from the last one to the chain's start).
+    const part = (pts, from, to) => {
+      const ks = ring(to, from);
+      const r = majority(ks.map((k) => regionOf(W[3 * f + k])));
+      const runs = [0, 0, 0];
+      runs[to] += dist(pts.at(-1), V[ks[0]]);
+      for (let i = 0; i + 1 < ks.length; i++) runs[ks[i]] += dist(V[ks[i]], V[ks[i + 1]]);
+      runs[from] += dist(V[from], pts[0]);
+      return { pts: [...pts, ...ks.map((k) => V[k])], region: r >= 0 ? r : label[f], runs };
+    };
+    seams.push({ f, parts: [part(ch.pts, ein, eout), part([...ch.pts].reverse(), eout, ein)] });
+  }
+
   // Each loop must separate two regions somewhere.
   const errors = [];
   const separates = loops.map((paths, L) => {
@@ -1414,7 +1450,7 @@ export function splitRegions(dm, loops, { flags = null, excludeCore = false, axi
   else separates.forEach((s, L) => {
     if (!s && !errors.some((e) => e.loop === L)) errors.push({ code: "loop_not_separating", loop: L });
   });
-  return { label, count, regions, errors, separates, seamArea, totalArea: dm.totalArea, coreExcluded: !!core, flagsKnown: !!flags, pieceRegions, axis: a };
+  return { label, count, regions, errors, separates, seamArea, totalArea: dm.totalArea, coreExcluded: !!core, flagsKnown: !!flags, pieceRegions, seams, axis: a };
 }
 
 const flip = (s) => (s === SIDE_UPPER ? SIDE_LOWER : s === SIDE_LOWER ? SIDE_UPPER : s);
@@ -1646,7 +1682,10 @@ const message = (code, level, hint, values = {}) => ({ code, level, hint, ...val
  * Returns {ok, paths, split, regionSide, side (Uint8Array per triangle),
  * undercut (Uint8Array per triangle), segments (Float32Array, xyz of both
  * ends of each active piece, none of no length), inactive (likewise),
- * shape, figures {undercut_area_mm2, undercut_share, seam_area_mm2, parts,
+ * pieces (the seam triangles crossed once cut along the line, as
+ * partingPieces of parting.js gives a split's: each part's chape, undercut
+ * and the undercut triangle whose colour it takes), shape, figures
+ * {undercut_area_mm2, undercut_share, seam_area_mm2, parts,
  * upper_parts, lower_parts, core_excluded}, messages [{code, level ('error'
  * | 'warning'), hint, ...}]}. Not ok (side and line null) while a loop is
  * open, a segment is not laid, or the loops do not separate the surface.
@@ -1768,6 +1807,27 @@ export function drawnParting(dm, drawing, { axis = [0, 0, 1], flags = null, heig
   });
   const pieces = Float64Array.from(active);
   const shape = lineShape(pieces, a, { height, loops: activeLoops });
+  // The seam triangles crossed once, in two parts: their chapes and undercuts as a triangle's (an undercut in the
+  // colour of the undercut beside it, nearUndercuts), for the colours.
+  const parts = [];
+  for (const { f, parts: two } of split.seams) {
+    const fl = flags ? flags[f] : REACH_UP | REACH_DOWN;
+    for (const { pts, region, runs } of two) {
+      const s = region < 0 ? SIDE_NONE : regionSide[region];
+      const u = s === SIDE_NONE || (s === SIDE_UPPER && !(fl & REACH_UP)) || (s === SIDE_LOWER && !(fl & REACH_DOWN));
+      parts.push({ f, pts, half: s, undercut: u, runs, near: -1 });
+    }
+  }
+  nearUndercuts(parts, dm.N, dm.W, (f) => undercut[f] === 1);
+  const start = [0], points = [];
+  for (const { pts } of parts) {
+    for (const p of pts) points.push(p[0], p[1], p[2]);
+    start.push(points.length / 3);
+  }
+  const seamPieces = {
+    count: parts.length, tri: Int32Array.from(parts, (x) => x.f), half: Uint8Array.from(parts, (x) => x.half), undercut: Uint8Array.from(parts, (x) => (x.undercut ? 1 : 0)),
+    near: Int32Array.from(parts, (x) => x.near), start: Uint32Array.from(start), points: Float64Array.from(points),
+  };
   for (const { a: s1, b: s2 } of crossings(dm, paths)) messages.push(message("self_cross", "warning", "parting.draw.selfCross", { a: s1, b: s2 }));
   const upper = regionSide.filter((s) => s === SIDE_UPPER).length;
   if (split.count > 2) messages.push(message("regions", "warning", "parting.draw.regions", { count: split.count }));
@@ -1781,6 +1841,7 @@ export function drawnParting(dm, drawing, { axis = [0, 0, 1], flags = null, heig
     undercut,
     segments: Float32Array.from(pieces),
     inactive: Float32Array.from(inactive),
+    pieces: seamPieces,
     shape,
     figures: {
       undercut_area_mm2: round(undercutArea, 1),

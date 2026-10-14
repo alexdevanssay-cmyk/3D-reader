@@ -12,7 +12,7 @@ import {
   PARTING_VERSION, REACH_DOWN, REACH_UP, SIDE_UPPER, ZERO_DRAFT,
   applyOverrides, faceRegions, lineMesh, lineSummary, mouldBlocks, parseDirection, partingLine, sameDirection, snapDirection,
 } from "./engine/parting.js";
-import { SIDE_LOWER, SIDE_NONE, axisLabel, parseTriple } from "./engine/parting.js";
+import { LEVEL, SHADOW, SIDE_LOWER, SIDE_NONE, SILHOUETTE, axisLabel, parseTriple, pieceTriangles } from "./engine/parting.js";
 import {
   MAX_LOOPS, MAX_POINTS, alignPoints, arcDefault, arcFromCentre, arcGeometry, drawMesh, drawnParting, layArc, layStraight, parseDrawing,
   reviveDrawing, rotateAbout, segmentName, segmentPlane, serializeDrawing, surfacePoint, turnSign,
@@ -210,7 +210,7 @@ function clearModel() {
   state.selected = -1;
   // The hooks of the view for scripts and tests: nothing faded, no parting shown.
   noteFaded();
-  $("parting-card").dataset.overlay = $("parting-card").dataset.undercuts = "";
+  $("parting-card").dataset.overlay = $("parting-card").dataset.undercuts = $("parting-card").dataset.pieces = "";
 }
 
 /**
@@ -2427,6 +2427,7 @@ function removePartingOverlay(mesh) {
   group.traverse((o) => {
     if (o.userData.own) o.geometry?.dispose();
     o.material?.dispose();
+    if (o.userData.pieces) setSeeThrough(mesh, !!mesh.userData.faded && "faded"); // its depth offset back
   });
   mesh.userData.partingOverlay = null;
 }
@@ -2487,7 +2488,8 @@ function applyParting() {
   const i = partingBody();
   const field = p?.show && i >= 0 ? partingField(i) : null;
   const card = $("parting-card");
-  card.dataset.overlay = card.dataset.undercuts = card.dataset.orient = card.dataset.brut = "";
+  card.dataset.overlay = card.dataset.undercuts = card.dataset.orient = card.dataset.brut = card.dataset.pieces = "";
+  piecesShown = null;
   const tint = slidesTint(i, field); // the colours of the slides (null: the undercuts in yellow)
   if (!field) {
     if (!shown) return;
@@ -2529,6 +2531,11 @@ function applyParting() {
   noteFaded();
   const mesh = state.meshes[i];
   const group = new THREE.Group();
+  // The triangles the line crosses, their pieces on either side of it over them (null: being cut).
+  const pieces = cutPiecesOf(i, field, drawn);
+  if (pieces?.count) group.add(piecesMesh(i, pieces, (k, c) => pieceColour(field, pieces, k, c, { tint, drawn })));
+  piecesShown = pieces?.count ? { i, pieces } : null;
+  card.dataset.pieces = pieces ? String(pieces.count) : "";
   const blocks = $("parting-blocks").checked && !drawn ? partingBlocks(i, field) : null;
   if (blocks) group.add(...blockMeshes(blocks.lower, PARTING_LOWER, "lower"), ...blockMeshes(blocks.upper, PARTING_UPPER, "upper"));
   if (field.segments.length && !drawn) {
@@ -2571,8 +2578,181 @@ function partingOff() {
     mesh.userData.parting = false; // coloured by the thickness next
   });
   const card = $("parting-card");
-  card.dataset.overlay = card.dataset.undercuts = "";
+  card.dataset.overlay = card.dataset.undercuts = card.dataset.pieces = "";
+  piecesShown = null;
   renderParting();
+}
+
+// ---- the colours cut along the line
+
+// The line goes across the triangles it crosses (by the plane, along a
+// silhouette, by a chord across the edge of a shadow, drawn by hand), the
+// colours of the body by triangle: in steps along the line, a long fan
+// triangle of a CAD face all of one colour. Those triangles are drawn again
+// over the body in pieces cut where the line crosses them, each in the
+// colour of its side (engine/parting.js partingPieces, cut in the parting
+// worker: the edges of shadows cast again; a drawn line's from
+// parting-draw.js): the colours change on the red line. The body's own
+// triangles are left as they are (clicks pick them, faceIndex); its depth
+// offset a step further back while they are shown, the line a step in
+// front of them.
+const NO_PIECES = Object.freeze({ count: 0 });
+const piecesKept = new WeakMap(); // the definition (its object, as slideMasks) -> {pieces (null: being cut)}
+let piecesShown = null; // {i, pieces}: those on the 3D view (a click on them, slidesClick)
+
+/**
+ * Whether the line of a definition of body i crosses a triangle: with a
+ * plane, a face both halves can form or flagged LEVEL across it; else one
+ * flagged SILHOUETTE or SHADOW. Not moved by hand. Else the colours by
+ * triangle are those of its sides already: nothing sent to the worker.
+ */
+function mayBeCut(i, { flags, plane, fixed, direction: d }) {
+  if (!flags) return false;
+  if (plane == null) return flags.some((x, f) => x & (SILHOUETTE | SHADOW) && !fixed?.[f]);
+  const { positions: P, indices: I } = bodyArrays(i);
+  for (let f = 0; f < flags.length; f++) {
+    if (fixed?.[f] || !(flags[f] & LEVEL || (flags[f] & (REACH_UP | REACH_DOWN)) === (REACH_UP | REACH_DOWN))) continue;
+    let below = false, above = false;
+    for (let k = 0; k < 3; k++) {
+      const v = 3 * I[3 * f + k];
+      const h = P[v] * d[0] + P[v + 1] * d[1] + P[v + 2] * d[2] - plane;
+      if (h < 0) below = true;
+      else if (h > 0) above = true;
+    }
+    if (below && above) return true;
+  }
+  return false;
+}
+
+/**
+ * The pieces of the triangles the line of body i crosses: while drawing by
+ * hand, of the drawing's halves shown; a line drawn by hand, its own; else
+ * cut in the worker once per definition (null until then, the view coloured
+ * again when they come).
+ */
+function cutPiecesOf(i, field, drawn) {
+  if (drawn) return drawn.shownTint?.pieces ?? NO_PIECES;
+  if (field.drawn) return field.pieces ?? NO_PIECES;
+  const r = state.result;
+  const p = partingOf(r);
+  const key = field.manual ? p.current.get(i) : p.results[i];
+  if (!key) return null;
+  let kept = piecesKept.get(key);
+  if (!kept) {
+    kept = { pieces: mayBeCut(i, field) ? null : NO_PIECES };
+    piecesKept.set(key, kept);
+    if (!kept.pieces) {
+      const definition = { direction: field.direction, side: field.side, flags: field.flags, plane: field.plane, fixed: field.fixed ?? null, height: field.summary.mould_height_mm };
+      partClient()
+        .then((client) => client.cutPieces(bodyArrays(i), definition, { owner: r }))
+        .then((pieces) => (kept.pieces = pieces), (err) => {
+          kept.pieces = NO_PIECES; // coloured by triangle
+          if (!err.cancelled) console.warn("Parting line: the colours not cut along it", err);
+        })
+        .then(() => r === state.result && partingShown() && applyParting());
+    }
+  }
+  return kept.pieces;
+}
+
+/** The colour of piece k on the 3D view, as applyParting colours a triangle: its own side's (the tint of its half while drawing by hand). */
+function pieceColour(field, pieces, k, color, { tint, drawn }) {
+  const undercut = pieces.undercut[k] === 1;
+  color.copy(undercut ? PARTING_UNDERCUT : PARTING_FACE);
+  if (drawn) {
+    if (!undercut) color.lerp(pieces.half[k] === SIDE_UPPER ? UPPER_TINT : LOWER_TINT, 0.35);
+    return;
+  }
+  if (field.flags[pieces.tri[k]] & ZERO_DRAFT && !undercut) color.lerp(WHITE, 0.5);
+  if (undercut && tint && pieces.near[k] >= 0) tint.colourOf(pieces.near[k], color, false);
+}
+
+/**
+ * The pieces over body i: a mesh of their triangles (pieceTriangles) in
+ * their colours (colourOf(k, color)), lit as the body (its normals at their
+ * corners, interpolated over its triangles; its material, its glow when
+ * selected), cut by the section as it is. Not in state.meshes: no click
+ * meets it. The body's depth offset a step back (removePartingOverlay puts
+ * it back).
+ */
+function piecesMesh(i, pieces, colourOf) {
+  const body = state.meshes[i];
+  const geom = bodyGeometry(i);
+  const P = geom.attributes.position.array, I = geom.index.array, N = geom.attributes.normal.array;
+  const { corners, piece } = pieceTriangles(pieces);
+  const n = piece.length;
+  const position = new Float32Array(9 * n), normal = new Float32Array(9 * n), colour = new Float32Array(9 * n);
+  const colours = new Float32Array(3 * pieces.count);
+  const c = new THREE.Color();
+  for (let k = 0; k < pieces.count; k++) {
+    colourOf(k, c);
+    colours.set([c.r, c.g, c.b], 3 * k);
+  }
+  for (let t = 0; t < n; t++) {
+    const k = piece[t], f = pieces.tri[k];
+    const a = 3 * I[3 * f], b = 3 * I[3 * f + 1], o = 3 * I[3 * f + 2];
+    const u = [P[b] - P[a], P[b + 1] - P[a + 1], P[b + 2] - P[a + 2]], v = [P[o] - P[a], P[o + 1] - P[a + 1], P[o + 2] - P[a + 2]];
+    const uu = dot3(u, u), uv = dot3(u, v), vv = dot3(v, v), den = uu * vv - uv * uv;
+    for (let j = 9 * t; j < 9 * t + 9; j += 3) {
+      // Its barycentrics in triangle f: the body's normal there (unnormalised, as interpolated over f).
+      const w = [corners[j] - P[a], corners[j + 1] - P[a + 1], corners[j + 2] - P[a + 2]];
+      const wu = dot3(w, u), wv = dot3(w, v);
+      const s = den > 0 ? (vv * wu - uv * wv) / den : 1 / 3, q = den > 0 ? (uu * wv - uv * wu) / den : 1 / 3;
+      for (let x = 0; x < 3; x++) {
+        position[j + x] = corners[j + x];
+        normal[j + x] = (1 - s - q) * N[a + x] + s * N[b + x] + q * N[o + x];
+        colour[j + x] = colours[3 * k + x];
+      }
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(position, 3));
+  geometry.setAttribute("normal", new THREE.BufferAttribute(normal, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(colour, 3));
+  const m = body.material;
+  const material = new THREE.MeshStandardMaterial({
+    vertexColors: true, metalness: m.metalness, roughness: m.roughness, side: m.side, clippingPlanes: [sectionPlane], clipShadows: true,
+    polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+  });
+  m.polygonOffsetFactor = m.polygonOffsetUnits = 2;
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.onBeforeRender = () => material.emissive.copy(m.emissive); // the body's glow when selected
+  mesh.userData.own = true;
+  mesh.userData.pieces = pieces.count;
+  return mesh;
+}
+
+/** The piece shown of triangle f of body i at point p (in its plane, in the frame of the body), else -1 (none of it shown). */
+function pieceAt(i, f, p) {
+  const pieces = piecesShown?.i === i ? piecesShown.pieces : null;
+  if (!pieces?.count) return -1;
+  const { tri, start, points: X } = pieces;
+  // The first piece of f (tri ascending), then each of its pieces: p inside it (crossings, in the plane of its two largest axes).
+  let lo = 0, hi = pieces.count;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (tri[mid] < f) lo = mid + 1;
+    else hi = mid;
+  }
+  for (let k = lo; k < pieces.count && tri[k] === f; k++) {
+    const n = [0, 0, 0];
+    for (let j = start[k]; j < start[k + 1]; j++) {
+      const q = j + 1 < start[k + 1] ? j + 1 : start[k];
+      n[0] += (X[3 * j + 1] - X[3 * q + 1]) * (X[3 * j + 2] + X[3 * q + 2]);
+      n[1] += (X[3 * j + 2] - X[3 * q + 2]) * (X[3 * j] + X[3 * q]);
+      n[2] += (X[3 * j] - X[3 * q]) * (X[3 * j + 1] + X[3 * q + 1]);
+    }
+    const ax = Math.abs(n[0]) >= Math.abs(n[1]) && Math.abs(n[0]) >= Math.abs(n[2]) ? 0 : Math.abs(n[1]) >= Math.abs(n[2]) ? 1 : 2;
+    const a = (ax + 1) % 3, b = (ax + 2) % 3;
+    let inside = false;
+    for (let j = start[k]; j < start[k + 1]; j++) {
+      const q = j + 1 < start[k + 1] ? j + 1 : start[k];
+      const ya = X[3 * j + b], yb = X[3 * q + b];
+      if (ya > p[b] !== yb > p[b] && p[a] < X[3 * j + a] + ((p[b] - ya) / (yb - ya)) * (X[3 * q + a] - X[3 * j + a])) inside = !inside;
+    }
+    if (inside) return k;
+  }
+  return -1;
 }
 
 /**
@@ -2616,7 +2796,7 @@ function partingClick(hits, at = null) {
     return true;
   }
   p.message = null;
-  if (p.mode === "slides") return slidesClick(i, hit.faceIndex), true;
+  if (p.mode === "slides") return slidesClick(i, hit.faceIndex, hit.object.worldToLocal(hit.point.clone())), true;
   if (p.mode === "pick") {
     p.mode = null;
     pickPartingFace(i, hit.faceIndex);
@@ -3406,7 +3586,7 @@ function drawnDefinition(i, base, { drawing: d, result }) {
       manual: true, source: "drawn", overrides: {}, candidate: null, base, direction: base.direction,
       summary: { ...base.summary, undercut_area_mm2: result.figures.undercut_area_mm2, undercut_share: result.figures.undercut_share, parting: lineSummary(result.shape) },
       side: result.side.map((s, f) => (result.undercut[f] ? SIDE_NONE : s)),
-      flags: base.flags, plane: null, segments: result.segments, fixed: null, undercut: result.undercut,
+      flags: base.flags, plane: null, segments: result.segments, fixed: null, undercut: result.undercut, pieces: result.pieces,
       drawing: saved, drawn: info, drawSnap: drawSnapshot(d),
     },
     def: { direction: base.direction, source: "drawn", candidate: null, overrides: {}, faces: null, drawing: saved },
@@ -5668,15 +5848,16 @@ function slidesTint(i, field) {
   });
   const painted = (slidesPainted = { i, e, counts: new Map(), left: 0 });
   return {
-    colourOf(f, color) {
+    /** Triangle f in the colour of its zone (a piece of a triangle cut by the line: that of triangle f, not counted). */
+    colourOf(f, color, count = true) {
       const z = e.zone[f];
       const c = z >= 0 ? cols[z] : null;
       if (!c) {
-        painted.left++;
+        if (count) painted.left++;
         return;
       }
       color.copy(c.color);
-      painted.counts.set(c.key, (painted.counts.get(c.key) ?? 0) + 1);
+      if (count) painted.counts.set(c.key, (painted.counts.get(c.key) ?? 0) + 1);
     },
   };
 }
@@ -5853,12 +6034,14 @@ function renderSlides(p, i, field) {
 
 // ---- clicks and edits
 
-/** A click on triangle f of body i while editing the zones: its zone picked (or why not). */
-function slidesClick(i, f) {
+/** A click on triangle f of body i (at `point`, in its frame) while editing the zones: its zone picked (or why not); on a triangle the line crosses, that of the piece clicked, as coloured. */
+function slidesClick(i, f, point = null) {
   const s = slidesOf();
   const e = slidesReady(i);
   if (!e) return renderParting();
-  const z = e.zone[f];
+  const k = point ? pieceAt(i, f, point.toArray()) : -1;
+  const pieces = piecesShown?.pieces;
+  const z = k < 0 ? e.zone[f] : !pieces.undercut[k] ? -1 : pieces.near[k] >= 0 ? e.zone[pieces.near[k]] : -2;
   s.message = z === -1 ? t("slides.notZone") : z < 0 ? t("slides.tiny") : null;
   s.selected.zone = z >= 0 ? e.analysis.zones[z].id : null;
   renderParting();

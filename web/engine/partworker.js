@@ -9,7 +9,7 @@
 // when cast; it does not rank them).
 
 import { orientationKey, orientationOf } from './orientation.js';
-import { PARTING_VERSION, evaluateParting, proposeParting } from './parting.js';
+import { PARTING_VERSION, evaluateParting, lineMesh, partingPieces, proposeParting } from './parting.js';
 
 self.onmessage = ({ data: msg }) => {
   try {
@@ -45,6 +45,13 @@ self.onmessage = ({ data: msg }) => {
     if (msg.type === 'evaluate') {
       const r = evaluateParting(msg.positions, msg.indices, msg.direction, { process, die, thickness: msg.thickness ?? null, up: msg.up ?? null, orient: !!msg.orient });
       postMessage({ type: 'result', id: msg.id, result: r }, [r.side.buffer, r.flags.buffer, r.segments.buffer]);
+      return;
+    }
+    if (msg.type === 'pieces') {
+      // The triangles its parting line crosses, cut where it crosses them: the colours of the halves (the edges of shadows cast again).
+      const { side, flags, plane, fixed, height } = msg;
+      const r = partingPieces(lineMesh(msg.positions, msg.indices), side, msg.direction, { flags, plane, fixed, height });
+      postMessage({ type: 'result', id: msg.id, result: r }, [r.tri.buffer, r.half.buffer, r.undercut.buffer, r.near.buffer, r.start.buffer, r.points.buffer]);
       return;
     }
     if (msg.type === 'orient') {

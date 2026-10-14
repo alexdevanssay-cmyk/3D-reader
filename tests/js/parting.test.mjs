@@ -6,7 +6,8 @@ import { describe, test } from 'node:test';
 
 import {
   BLOCK_GRID, REACH_DOWN, REACH_UP, SIDE_LOWER, SIDE_UPPER, applyOverrides, axisLabel, canonicalAxis, evaluateParting, faceRegions,
-  lineMesh, lineShape, lineSummary, mouldBlocks, parseDirection, partingLine, proposeParting, sameDirection, sampleByArea,
+  lineMesh, lineShape, lineSummary, mouldBlocks, parseDirection, partingLine, partingPieces, pieceTriangles, proposeParting, sameDirection,
+  sampleByArea,
 } from '../../web/engine/parting.js';
 import { LEVEL, SHADOW, SIDE_NONE, SILHOUETTE, TRAPPED, ZERO_DRAFT } from '../../web/engine/parting.js';
 import { BRACKET, MUSHROOM, PEG, mushroom, peg, zBracket } from './curved-mesh.mjs';
@@ -789,6 +790,221 @@ describe('curved faces and faces along the draw direction of a CAD body (long, t
     assert.deepEqual(other.summary, base.summary);
     assert.deepEqual(other.side, base.side);
     assert.deepEqual(other.flags, base.flags);
+  });
+});
+
+/** The pieces of partingPieces: [{k, f, pts (xyz), half, undercut, near}]. */
+function piecesList(pc) {
+  return Array.from({ length: pc.count }, (_, k) => {
+    const pts = [];
+    for (let j = pc.start[k]; j < pc.start[k + 1]; j++) pts.push([pc.points[3 * j], pc.points[3 * j + 1], pc.points[3 * j + 2]]);
+    return { k, f: pc.tri[k], pts, half: pc.half[k], undercut: pc.undercut[k] === 1, near: pc.near[k] };
+  });
+}
+
+const sub3 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+/** The normal of a polygon (xyz) times twice its area. */
+const polygonNormal = (pts) => pts.slice(1, -1).reduce((s, p, k) => cross3(sub3(p, pts[0]), sub3(pts[k + 2], pts[0])).map((x, c) => x + s[c]), [0, 0, 0]);
+const polygonArea = (pts) => Math.hypot(...polygonNormal(pts)) / 2;
+/** Distance from p to the segment ab. */
+function segmentDistance(p, a, b) {
+  const ab = sub3(b, a), ap = sub3(p, a);
+  const l = dot3(ab, ab);
+  const t = l > 0 ? Math.max(0, Math.min(1, dot3(ap, ab) / l)) : 0;
+  return Math.hypot(...sub3(ap, ab.map((x) => x * t)));
+}
+
+/**
+ * The pieces of a split as its line cuts them: those of each triangle cover
+ * it (their areas its own within 1e-9), convex and wound as it is; every side
+ * of one with a piece of the other half beyond it (a point 1e-4 mm off its
+ * middle) on the line, its ends and middle within 1e-6 of the size of the
+ * part off a segment; along an edge of its triangle, the half of the
+ * triangle beyond it when that one is not cut (nor an undercut, nor without
+ * area), unless the line runs there. Returns {list, byTri, boundary (length of
+ * the sides between the halves), cut (the triangles cut)}.
+ */
+function assertPieces(part, ev, line, pc, label) {
+  const P = part.positions, I = part.indices;
+  const list = piecesList(pc);
+  const byTri = new Map();
+  for (const x of list) (byTri.get(x.f) ?? byTri.set(x.f, []).get(x.f)).push(x);
+  const corners = (f) => [0, 1, 2].map((k) => [P[3 * I[3 * f + k]], P[3 * I[3 * f + k] + 1], P[3 * I[3 * f + k] + 2]]);
+  const lo = [0, 1, 2].map((c) => Math.min(...P.filter((_, i) => i % 3 === c))), hi = [0, 1, 2].map((c) => Math.max(...P.filter((_, i) => i % 3 === c)));
+  const tol = 1e-6 * Math.hypot(...sub3(hi, lo));
+  const S = [];
+  for (let i = 0; i < ev.segments.length; i += 6) S.push([[...ev.segments.subarray(i, i + 3)], [...ev.segments.subarray(i + 3, i + 6)]]);
+  const offLine = (p) => Math.min(...S.map(([a, b]) => segmentDistance(p, a, b)));
+  let boundary = 0;
+  for (const [f, pieces] of byTri) {
+    const V = corners(f);
+    const n = cross3(sub3(V[1], V[0]), sub3(V[2], V[0]));
+    const A = Math.hypot(...n) / 2;
+    const unit = n.map((x) => x / (2 * A));
+    approx(pieces.reduce((s, x) => s + polygonArea(x.pts), 0), A, 1e-9, 1e-12, `${label}: the pieces of triangle ${f}`);
+    // A point inside a convex piece: on the left of each of its sides.
+    const inside = (pts, p) => pts.every((a, i) => dot3(cross3(sub3(pts[(i + 1) % pts.length], a), sub3(p, a)), unit) >= -1e-12);
+    for (const x of pieces) {
+      const m = polygonNormal(x.pts);
+      if (Math.hypot(...m) > 1e-9 * A) assert.ok(dot3(m, n) > 0, `${label}: piece ${x.k} wound as triangle ${f}`);
+      x.pts.forEach((p, i) => {
+        const q = x.pts[(i + 1) % x.pts.length];
+        const l = Math.hypot(...sub3(q, p));
+        if (l < 1e-9) return;
+        let edge = -1;
+        for (let e = 0; e < 3; e++) if (segmentDistance(p, V[e], V[(e + 1) % 3]) < tol && segmentDistance(q, V[e], V[(e + 1) % 3]) < tol) edge = e;
+        const mid = p.map((c, k) => (c + q[k]) / 2);
+        if (edge < 0) {
+          const out = cross3(unit, sub3(q, p)).map((c) => (-c / l) * Math.min(1e-4, l / 10));
+          const beyond = pieces.find((y) => y !== x && inside(y.pts, mid.map((c, k) => c + out[k])));
+          assert.ok(beyond, `${label}: a piece beyond the side ${p} ${q} of piece ${x.k}`);
+          if (beyond.half === x.half) return;
+          boundary += l / 2; // each side seen from both pieces
+          for (const r of [p, q, mid]) assert.ok(offLine(r) <= tol, `${label}: triangle ${f}, ${r} off the line by ${offLine(r)}`);
+        } else {
+          const g = line.neighbours[3 * f + edge];
+          if (g < 0 || byTri.has(g) || ev.side[g] === SIDE_NONE || polygonArea(corners(g)) < 1e-9) return;
+          if (ev.side[g] !== x.half) assert.ok(offLine(mid) <= tol, `${label}: piece ${x.k} of triangle ${f} beside triangle ${g} of the other half, no line there`);
+        }
+      });
+    }
+  }
+  return { list, byTri, boundary, cut: [...byTri.keys()] };
+}
+
+describe('the colours of the halves cut along the line', () => {
+  test('a plane across long triangles of faces with draft: their parts on the side their half cannot reach in the colour of the undercuts, as the figure counts them', () => {
+    // The plate drawn obliquely: the plane cuts its ±X walls (two long
+    // triangles each) and the triangles round its holes; the trapped part of
+    // each (trapAtLevel) was coloured with its triangle (a triangle all yellow
+    // or all grey by the larger part), now cut on the line: the undercut
+    // area coloured is the figure of the card.
+    const plate = castPlate();
+    const line = lineMesh(plate.positions, plate.indices);
+    const P = plate.positions, I = plate.indices;
+    for (const d of [[0.6, 0.8, 0], [Math.SQRT1_2, Math.SQRT1_2, 0]]) {
+      const ev = evaluateParting(plate.positions, plate.indices, d);
+      const pc = partingPieces(line, ev.side, d, { flags: ev.flags, plane: ev.plane, height: ev.summary.mould_height_mm });
+      const { list, byTri, boundary } = assertPieces(plate, ev, line, pc, String(d));
+      assert.ok(byTri.size >= 20 && boundary > 150, `${d}: ${byTri.size} triangles cut, ${boundary} mm between the halves`);
+      const height = (p) => dot3(p, d);
+      let coloured = 0, staircase = 0;
+      for (let f = 0; f < I.length / 3; f++) {
+        if (byTri.has(f)) continue;
+        if (!(ev.flags[f] & (REACH_UP | REACH_DOWN))) coloured += polygonArea([0, 1, 2].map((k) => [...P.subarray(3 * I[3 * f + k], 3 * I[3 * f + k] + 3)]));
+      }
+      for (const x of list) {
+        if (!x.undercut) continue;
+        coloured += polygonArea(x.pts);
+        const reach = ev.flags[x.f] & (REACH_UP | REACH_DOWN);
+        // On the side of the plane its half cannot reach (an undercut triangle: wherever).
+        if (reach === REACH_UP) x.pts.forEach((p) => assert.ok(height(p) <= ev.plane + 1e-6, `${d}: piece ${x.k} above the plane`));
+        if (reach === REACH_DOWN) x.pts.forEach((p) => assert.ok(height(p) >= ev.plane - 1e-6, `${d}: piece ${x.k} under the plane`));
+        if (reach) staircase += polygonArea(x.pts);
+      }
+      approx(coloured, ev.summary.undercut_area_mm2, 0, 0.1, `${d}: the undercuts coloured`);
+      // Trapped parts of triangles not flagged (less than half of each, grey with their triangles before).
+      assert.ok(staircase > 50, `${d}: ${staircase} mm²`);
+    }
+  });
+
+  test('a plane across a fan of long triangles of a flat face along d: its two halves, each part an undercut as its triangle', () => {
+    const plate = castPlate();
+    const line = lineMesh(plate.positions, plate.indices);
+    const ev = evaluateParting(plate.positions, plate.indices, [0, 1, 0]);
+    const pc = partingPieces(line, ev.side, [0, 1, 0], { flags: ev.flags, plane: ev.plane, height: ev.summary.mould_height_mm });
+    const { list } = assertPieces(plate, ev, line, pc, 'along Y');
+    // The top and bottom faces cut at y = 0: the upper half on the +Y side.
+    const flat = list.filter((x) => x.pts.every((p) => Math.abs(p[2]) < 1e-6 || Math.abs(p[2] - PLATE.thickness) < 1e-6));
+    assert.ok(flat.length >= 8);
+    for (const x of flat) {
+      const y = x.pts.reduce((s, p) => s + p[1], 0) / x.pts.length;
+      assert.equal(x.half, y > 0 ? SIDE_UPPER : SIDE_LOWER, `piece ${x.k} at y = ${y}`);
+      // The shadows of the boss and the bore along Y, undercuts on either side of the plane.
+      assert.equal(x.undercut, !(ev.flags[x.f] & (REACH_UP | REACH_DOWN)), `piece ${x.k}`);
+    }
+  });
+
+  test('across a curved face, the halves cut along its silhouette', () => {
+    const part = zBracket();
+    const line = lineMesh(part.positions, part.indices);
+    for (const d of [[1, 0, 0], [0, 1, 0]]) {
+      const ev = evaluateParting(part.positions, part.indices, d);
+      const pc = partingPieces(line, ev.side, d, { flags: ev.flags, plane: ev.plane, height: ev.summary.mould_height_mm });
+      const { byTri, boundary } = assertPieces(part, ev, line, pc, String(d));
+      const band = [...byTri.keys()].filter((f) => ev.flags[f] & SILHOUETTE);
+      assert.ok(band.length >= 8, `${d}: ${band.length} triangles cut by the silhouette`);
+      assert.ok(boundary > 20, `${d}: ${boundary} mm`);
+      assert.equal(pc.undercut.some((u) => u), false);
+    }
+  });
+
+  test('the edge of a shadow across a fan and across the strips of a cylinder: the undercut coloured to the chord', () => {
+    // The mushroom's cap over its base (x < 30) and the peg's underside over
+    // the ledge (x < 25 + 0.4 y): undercuts, joined to the upper half, the rest
+    // the lower half. By triangle, the colour of the undercut went past the
+    // line along the long triangles, or stopped short of it (151 mm²
+    // of the cap's underside, 260 mm² of the peg's, coloured otherwise than
+    // their side); cut on the chords, it ends on the line.
+    const front = (y) => (PEG.ledge.front[0] + PEG.ledge.front[1]) / 2 + ((PEG.ledge.front[1] - PEG.ledge.front[0]) / (2 * PEG.wall.y)) * y;
+    for (const [name, part, edge, onFace] of [
+      ['mushroom', mushroom(), () => 30, (p) => Math.abs(p[2] - MUSHROOM.stem.top) < 1e-4],
+      // (Of the peg, its underside: up to its sides, its facets reach up, grazing it.)
+      ['peg', peg(), (p) => front(p[1]), (p) => Math.abs(Math.hypot(p[1], p[2] - PEG.peg.z) - PEG.peg.r) < 0.5 && p[2] < PEG.peg.z - PEG.peg.r / 4],
+    ]) {
+      const line = lineMesh(part.positions, part.indices);
+      const ev = evaluateParting(part.positions, part.indices, [0, 0, 1]);
+      const pc = partingPieces(line, ev.side, [0, 0, 1], { flags: ev.flags, plane: ev.plane, height: ev.summary.mould_height_mm });
+      const { list, byTri } = assertPieces(part, ev, line, pc, name);
+      assert.ok([...byTri.keys()].every((f) => ev.flags[f] & SHADOW), `${name}: cut across the edges of shadows only`);
+      let pieces = 0, wrong = 0, worst = 0;
+      for (const x of list) {
+        if (!x.pts.every(onFace)) continue;
+        pieces++;
+        // The undercut on the side of the shadow; a piece of an undercut triangle out of it, or of a triangle of the lower half in it.
+        const c = x.pts.reduce((s, p) => s.map((v, k) => v + p[k] / x.pts.length), [0, 0, 0]);
+        assert.equal(x.undercut, c[0] < edge(c), `${name}: piece ${x.k} of triangle ${x.f} at x = ${c[0]}`);
+        if (x.undercut !== !(ev.flags[x.f] & (REACH_UP | REACH_DOWN))) wrong += polygonArea(x.pts);
+        // An undercut piece takes the colour of an undercut triangle beside it (its slide zone).
+        if (x.undercut) assert.ok(x.near >= 0 && !(ev.flags[x.near] & (REACH_UP | REACH_DOWN)), `${name}: piece ${x.k}, near ${x.near}`);
+        for (const p of x.pts) if (Math.abs(p[0] - edge(p)) < 0.5) worst = Math.max(worst, Math.abs(p[0] - edge(p)));
+      }
+      assert.ok(pieces >= 16, `${name}: ${pieces} pieces`);
+      assert.ok(worst < 0.2, `${name}: a corner of a piece ${worst} mm off the edge of the shadow`);
+      assert.ok(wrong > 100, `${name}: ${wrong} mm² coloured otherwise than its triangle`);
+    }
+  });
+
+  test('nothing to cut for a line along the edges; the same pieces twice; as triangles, their areas', () => {
+    const block = voxels(() => true, [4, 3, 2], { size: 5 });
+    const flat = evaluateParting(block.positions, block.indices, [0, 0, 1]);
+    const blockLine = lineMesh(block.positions, block.indices);
+    assert.equal(partingPieces(blockLine, flat.side, [0, 0, 1], { flags: flat.flags, plane: flat.plane, height: 10 }).count, 0);
+    const part = mushroom();
+    const line = lineMesh(part.positions, part.indices);
+    const ev = evaluateParting(part.positions, part.indices, [0, 0, 1]);
+    const options = { flags: ev.flags, plane: ev.plane, height: ev.summary.mould_height_mm };
+    const pc = partingPieces(line, ev.side, [0, 0, 1], options);
+    assert.deepEqual(partingPieces(lineMesh(part.positions, part.indices), ev.side, [0, 0, 1], options), pc);
+    // The line itself as partingLine gives it.
+    assert.deepEqual(partingLine(line, ev.side, [0, 0, 1], options).segments, ev.segments);
+    const { corners, piece } = pieceTriangles(pc);
+    const areas = new Float64Array(pc.count);
+    for (let t = 0; t < piece.length; t++) areas[piece[t]] += polygonArea([0, 1, 2].map((j) => [...corners.subarray(9 * t + 3 * j, 9 * t + 3 * j + 3)]));
+    piecesList(pc).forEach((x) => approx(areas[x.k], polygonArea(x.pts), 1e-9, 1e-12, `piece ${x.k}`));
+    // A polygon not convex (the part of a drawn line round a point clicked): an L of three squares.
+    const L = [[0, 0, 0], [2, 0, 0], [2, 1, 0], [1, 1, 0], [1, 2, 0], [0, 2, 0]];
+    const tris = pieceTriangles({ count: 1, start: Uint32Array.from([0, 6]), points: Float64Array.from(L.flat()) });
+    assert.equal(tris.piece.length, 4);
+    let sum = 0;
+    for (let t = 0; t < 4; t++) {
+      const n = polygonNormal([0, 1, 2].map((j) => [...tris.corners.subarray(9 * t + 3 * j, 9 * t + 3 * j + 3)]));
+      assert.ok(n[2] > 0, 'wound as the polygon');
+      sum += n[2] / 2;
+    }
+    approx(sum, 3, 1e-12, 0, 'the L');
   });
 });
 

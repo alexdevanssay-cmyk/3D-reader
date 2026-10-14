@@ -36,7 +36,7 @@ after(() => {
   else delete globalThis.Worker;
 });
 
-const { cancelParting, computeParting, evaluateDirection } = await import('../../web/engine/partclient.js');
+const { cancelParting, computeParting, cutPieces, evaluateDirection } = await import('../../web/engine/partclient.js');
 const body = { positions: new Float32Array(9), indices: Uint32Array.from([0, 1, 2]) };
 
 test('the long proposal of a closed tab does not hold up the jobs of another one', async () => {
@@ -82,4 +82,20 @@ test('a job waiting dropped: the one running goes on in its worker', async () =>
   // Nothing of an owner never given: nothing dropped.
   cancelParting(undefined);
   assert.equal(FakeWorker.all.at(-1), worker);
+});
+
+test('the triangles a definition\'s line crosses cut in the worker, in turn with the other jobs, dropped with their model', async () => {
+  const shown = {}, closed = {};
+  const worker = FakeWorker.all.at(-1);
+  const seen = worker.posted.length;
+  const definition = { direction: [0, 0, 1], side: Uint8Array.from([1]), flags: Uint8Array.from([3]), plane: 5, fixed: null, height: 20 };
+  const mine = cutPieces(body, definition, { owner: shown });
+  const dropped = cutPieces(body, { ...definition, plane: null }, { owner: closed });
+  const [job] = worker.posted.slice(seen);
+  assert.deepEqual([job.type, job.direction, job.plane, job.height, [...job.side], [...job.flags], job.fixed], ['pieces', [0, 0, 1], 5, 20, [1], [3], null]);
+  cancelParting(closed);
+  await assert.rejects(dropped, (err) => err.cancelled === true);
+  worker.reply({ count: 0 });
+  assert.deepEqual(await mine, { count: 0 });
+  assert.equal(worker.posted.length, seen + 1);
 });

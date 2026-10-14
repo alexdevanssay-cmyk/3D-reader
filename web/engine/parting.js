@@ -106,6 +106,8 @@ const SILHOUETTE_DISAGREE = 0.25;
 const HOOK_SHARE = 0.01;
 const HOOK_TURN = Math.cos((45 * Math.PI) / 180);
 const FOLD_TURN = Math.cos((10 * Math.PI) / 180);
+// The colours follow a hook taken out on the triangles whose plane it is in, within this share of its size (partingPieces).
+const HOOK_PLANE = 0.01;
 // The triangles crossed by the edges of the shadows: at most this share of them (at least SHADOW_MIN) (shadowHalves).
 const SHADOW_MAX = 0.05;
 const SHADOW_MIN = 20_000;
@@ -1447,9 +1449,12 @@ function undercutHalves(line, side, d, plane) {
  * or folded back to within 10° with their other ends closer than that (a
  * sliver a tenth of a millimetre wide between them): one piece between
  * their other ends instead (none when they are the same point), until there
- * is none. pieces: [xyz, xyz, key, key] each.
+ * is none. pieces: [xyz, xyz, key, key] each. Each taken out, in order, into
+ * `hooks` when given: {X (the point), A, B (the other ends), kx, ka, kb
+ * (their keys)}, the triangle between them now on the other side of the
+ * line (partingPieces).
  */
-function unhook(pieces) {
+function unhook(pieces, hooks = null) {
   if (pieces.length < 2) return;
   const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
   for (const [a, b] of pieces) {
@@ -1487,6 +1492,7 @@ function unhook(pieces) {
     const isHook = Math.min(la, lb) <= hook && !(la > 0 && lb > 0 && turn <= HOOK_TURN * la * lb);
     const isFold = turn > FOLD_TURN * la * lb && Math.hypot(A[0] - B[0], A[1] - B[1], A[2] - B[2]) <= hook;
     if (!isHook && !isFold) continue;
+    hooks?.push({ X, A, B, kx: key, ka, kb });
     alive[list[0]] = alive[list[1]] = 0;
     byEnd.set(key, []);
     changed = true;
@@ -1503,32 +1509,30 @@ function unhook(pieces) {
 }
 
 /**
- * Parting line of a split into halves: where the surface goes from the upper
- * half to the lower one, round the undercut regions (undercutHalves). Along
- * the edges between triangles of the two halves, and, with a planar line
- * (`plane`: its height along d), across the faces both halves can form, the
- * undercuts and the faces flagged LEVEL (`flags`), cut at that height,
- * unless reassigned by hand (`fixed`).
- *
- * side   -- half of each triangle (SIDE_*)
- * height -- of the part along d, for the planarity tolerance
- * Returns {segments (Float32Array, xyz of both ends of each piece),
- * length_mm, loops, planar, kind ("planar", "stepped", "warped", or null
- * without a line), height_range_mm, heights_mm [lowest, highest] along d,
- * level (the height most of its length is at: the median), levels (heights
- * of its level runs)}.
+ * How a split into halves is cut across its triangles, for its parting line
+ * (partingLine) and the colours of its halves (partingPieces): the same cuts
+ * for both. The undercut regions joined to a half (undercutHalves); with a
+ * planar line (`plane`), the faces both halves can form, the undercuts and
+ * the faces flagged LEVEL across the plane cut at that height; else the
+ * triangles flagged SILHOUETTE cut by the silhouette of their surface (phi =
+ * 0, positive on the upper side), those flagged SHADOW by the edges of the
+ * shadows along d (shadowLabels, shadowShape); none reassigned by hand
+ * (`fixed`). Options as partingLine. Returns {side (joined), field, shade,
+ * mesh, grid (those of the shadows, else as given), modeOf(f) (1 by the
+ * plane, 2 by its silhouette, 3 by the edges of shadows), shapeOf(f)
+ * (shadowShape), value(f, r) (of the cut at vertex r of f: the plane, the
+ * silhouette; positive upper), nearOf(f) (on the cut within this), isSplit(f),
+ * splitState (per triangle: 0 not known yet, 1 not cut, 2 cut), crossing(f,
+ * ra, rb) (where the value is 0 along edge (ra, rb), 0 to 1), along(ra, rb,
+ * t), pointOn(f, ra, rb), at(r)}.
  */
-export function partingLine(line, side, d, { flags = null, plane = null, fixed = null, height = null, mesh = null, grid = null } = {}) {
-  const { positions: P, indices: I, welded, neighbours } = line;
+function lineCuts(line, side, d, { flags = null, plane = null, fixed = null, height = null, mesh = null, grid = null } = {}) {
+  const { positions: P, indices: I, welded } = line;
   const nt = I.length / 3;
   const w = (r) => P[3 * r] * d[0] + P[3 * r + 1] * d[1] + P[3 * r + 2] * d[2];
   const tiny = 1e-9 * Math.max(1, Math.abs(plane ?? 0), height ?? 0);
   const given = side;
   side = undercutHalves(line, side, d, plane);
-  // Without a plane, the triangles flagged SILHOUETTE are cut by the
-  // silhouette of their surface (phi = 0, positive on the upper side), those
-  // flagged SHADOW by the edges of the shadows along d (shadowLabels,
-  // shadowShape), unless reassigned by hand.
   let field = null, shade = null;
   if (plane == null && flags) {
     let silhouettes = false, shadows = false;
@@ -1545,7 +1549,6 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
       shade = shadowLabels(mesh, grid, line, given, side, flags, d, field);
     }
   }
-  // How each triangle cut is cut: 1 by the plane, 2 by its silhouette, 3 by the edges of shadows.
   const modeOf = (f) => (plane != null ? 1 : flags[f] & SILHOUETTE ? 2 : 3);
   const shapes = new Map();
   const shapeOf = (f) => {
@@ -1570,7 +1573,6 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
     }
     return below && above;
   };
-  const pieces = []; // [xyz, xyz, key, key]: the ends of each piece and what they are (a vertex, a point of an edge)
   // Where along edge (ra, rb) of triangle f its value is 0: the plane, the silhouette.
   const crossing = (f, ra, rb) => {
     if (modeOf(f) === 1) {
@@ -1583,6 +1585,87 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
   const along = (ra, rb, t) => [0, 1, 2].map((c) => P[3 * ra + c] + t * (P[3 * rb + c] - P[3 * ra + c]));
   const pointOn = (f, ra, rb) => along(ra, rb, crossing(f, ra, rb));
   const at = (r) => [P[3 * r], P[3 * r + 1], P[3 * r + 2]];
+  // A typed array: every triangle of a large mesh.
+  const splitState = new Uint8Array(nt);
+  const isSplit = (f) => (splitState[f] ||= split(f) ? 2 : 1) === 2;
+  return { given, side, field, shade, mesh, grid, modeOf, shapeOf, value, nearOf, isSplit, splitState, crossing, along, pointOn, at };
+}
+
+/**
+ * Parting line of a split into halves: where the surface goes from the upper
+ * half to the lower one, round the undercut regions (undercutHalves). Along
+ * the edges between triangles of the two halves, and, with a planar line
+ * (`plane`: its height along d), across the faces both halves can form, the
+ * undercuts and the faces flagged LEVEL (`flags`), cut at that height,
+ * unless reassigned by hand (`fixed`); without a plane, across the triangles
+ * flagged SILHOUETTE and SHADOW (lineCuts).
+ *
+ * side   -- half of each triangle (SIDE_*)
+ * height -- of the part along d, for the planarity tolerance
+ * Returns {segments (Float32Array, xyz of both ends of each piece),
+ * length_mm, loops, planar, kind ("planar", "stepped", "warped", or null
+ * without a line), height_range_mm, heights_mm [lowest, highest] along d,
+ * level (the height most of its length is at: the median), levels (heights
+ * of its level runs)}.
+ */
+export function partingLine(line, side, d, options = {}) {
+  const { pieces } = lineOf(line, side, d, options);
+  const m = pieces.length;
+  // The ends measured in double precision, written to float32 for the display.
+  const ends = new Float64Array(6 * m);
+  pieces.forEach(([a, b], k) => {
+    ends.set(a, 6 * k);
+    ends.set(b, 6 * k + 3);
+  });
+  const segments = Float32Array.from(ends);
+  if (!m) return { segments, length_mm: 0, loops: 0, planar: null, kind: null, height_range_mm: null, heights_mm: null, level: null, levels: [] };
+
+  // Loops: the pieces chained by their ends.
+  const byEnd = new Map();
+  pieces.forEach(([, , ka, kb], k) => {
+    for (const key of [ka, kb]) {
+      const list = byEnd.get(key);
+      if (list) list.push(k);
+      else byEnd.set(key, [k]);
+    }
+  });
+  const used = new Uint8Array(m);
+  let loops = 0;
+  for (let k0 = 0; k0 < m; k0++) {
+    if (used[k0]) continue;
+    loops++;
+    const stack = [k0];
+    used[k0] = 1;
+    while (stack.length) {
+      const k = stack.pop();
+      for (const key of [pieces[k][2], pieces[k][3]]) {
+        for (const next of byEnd.get(key)) {
+          if (!used[next]) {
+            used[next] = 1;
+            stack.push(next);
+          }
+        }
+      }
+    }
+  }
+  const shape = lineShape(ends, d, { height: options.height ?? null, loops });
+  return { segments, length_mm: shape.length_mm, loops, planar: shape.planar, kind: shape.kind, height_range_mm: shape.height_range_mm, heights_mm: shape.heights_mm, level: shape.level, levels: shape.levels };
+}
+
+/**
+ * The pieces of the parting line of a split (partingLine): {cut (lineCuts),
+ * pieces ([xyz, xyz, key, key]: the ends of each and what they are, a
+ * vertex, a point of an edge), hooks (taken out of it, unhook)}.
+ */
+function lineOf(line, side, d, options) {
+  const { plane = null } = options;
+  const { positions: P, indices: I, welded, neighbours } = line;
+  const nt = I.length / 3;
+  const cutting = lineCuts(line, side, d, options);
+  side = cutting.side;
+  // How each triangle cut is cut: 1 by the plane, 2 by its silhouette, 3 by the edges of shadows.
+  const { modeOf, shapeOf, value, nearOf, isSplit, splitState, crossing, along, pointOn, at } = cutting;
+  const pieces = []; // [xyz, xyz, key, key]: the ends of each piece and what they are (a vertex, a point of an edge)
   const edgeKey = (wa, wb) => (wa < wb ? `e${wa},${wb}` : `e${wb},${wa}`);
   // The vertex of triangle g at welded vertex wv (the faces of a CAD body have their own: the values of g's surface).
   const corner = (g, wv) => (welded[3 * g] === wv ? I[3 * g] : welded[3 * g + 1] === wv ? I[3 * g + 1] : I[3 * g + 2]);
@@ -1631,9 +1714,6 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
       if (open != null) close(ts[k + 1]);
     }
   };
-  // Per triangle: 0 not known yet, 1 not cut, 2 cut (a typed array: every triangle of a large mesh).
-  const splitState = new Uint8Array(nt);
-  const isSplit = (f) => (splitState[f] ||= split(f) ? 2 : 1) === 2;
 
   for (let f = 0; f < nt; f++) {
     for (let e = 0; e < 3; e++) {
@@ -1692,48 +1772,352 @@ export function partingLine(line, side, d, { flags = null, plane = null, fixed =
     }
     if (ends.length === 2) pieces.push([ends[0][0], ends[1][0], ends[0][1], ends[1][1]]);
   }
-  unhook(pieces);
+  const hooks = [];
+  unhook(pieces, hooks);
+  return { cut: cutting, pieces, hooks };
+}
 
-  const m = pieces.length;
-  // The ends measured in double precision, written to float32 for the display.
-  const ends = new Float64Array(6 * m);
-  pieces.forEach(([a, b], k) => {
-    ends.set(a, 6 * k);
-    ends.set(b, 6 * k + 3);
-  });
-  const segments = Float32Array.from(ends);
-  if (!m) return { segments, length_mm: 0, loops: 0, planar: null, kind: null, height_range_mm: null, heights_mm: null, level: null, levels: [] };
-
-  // Loops: the pieces chained by their ends.
-  const byEnd = new Map();
-  pieces.forEach(([, , ka, kb], k) => {
-    for (const key of [ka, kb]) {
-      const list = byEnd.get(key);
-      if (list) list.push(k);
-      else byEnd.set(key, [k]);
+/**
+ * The triangles a split's parting line crosses, cut where it crosses them,
+ * for the colours of the halves and the undercuts to change on the line,
+ * not along the edges of the triangles: by the plane, the silhouette or the
+ * chords across the edges of shadows (lineCuts: the same cuts as
+ * partingLine); where the line takes out a hook (unhook), the triangle
+ * between the hook and the piece put instead on the other side of it, in
+ * the triangles whose plane it is in (one the line goes along the edges of
+ * cut there too). The pieces of a triangle cover it once, convex polygons in
+ * its plane wound as it is. Each piece:
+ * - half: the side of the line it is on (SIDE_UPPER, SIDE_LOWER; an undercut
+ *   region in the half it is joined to, undercutHalves);
+ * - undercut: formed by no half, as the view colours a triangle (no REACH_*,
+ *   not reassigned by hand); but, by the plane, of a face with draft only
+ *   one half can form, on the side that half cannot reach (trapAtLevel; of a
+ *   triangle flagged TRAPPED, the half of its larger part); off its
+ *   triangle's half across the edge of a shadow, by the lines of sight from
+ *   its middle (a part of a long triangle in a shadow no half reaches);
+ * - near: an undercut triangle whose colour it takes (its slide zone,
+ *   nearUndercuts): its own, else one beside it; -1 none.
+ * Nothing for a line along the edges of the triangles (count 0). Options as
+ * partingLine. Returns {count, tri (Int32Array: the triangle of each piece,
+ * ascending), half, undercut (Uint8Array), near (Int32Array), start
+ * (Uint32Array, count + 1: its first corner), points (Float64Array: xyz of
+ * the corners, in the frame of the positions)}.
+ */
+export function partingPieces(line, side, d, options = {}) {
+  const { flags = null, fixed = null } = options;
+  const { positions: P, indices: I, welded, neighbours } = line;
+  const nt = I.length / 3;
+  const { cut, hooks } = lineOf(line, side, d, options);
+  const { modeOf, shapeOf, value, nearOf, isSplit, pointOn, at } = cut;
+  const joined = cut.side;
+  // Coloured as an undercut: formed by no half, not reassigned by hand.
+  const undercutTri = (f) => !!flags && !(flags[f] & (REACH_UP | REACH_DOWN)) && !fixed?.[f];
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < P.length; i++) {
+    lo[i % 3] = Math.min(lo[i % 3], P[i]);
+    hi[i % 3] = Math.max(hi[i % 3], P[i]);
+  }
+  const diag = P.length ? Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) : 0;
+  // Parts of no area (twice their area below this), off an edge by the rounding (this far at most).
+  const small = 1e-12 * diag * diag, onEdge = 1e-9 * Math.max(1, diag, ...lo.map(Math.abs), ...hi.map(Math.abs));
+  // Twice the area of a polygon (xyz).
+  const area2 = (poly) => {
+    const s = [0, 0, 0];
+    for (let k = 1; k + 1 < poly.length; k++) {
+      const u = [0, 1, 2].map((c) => poly[k][c] - poly[0][c]), v = [0, 1, 2].map((c) => poly[k + 1][c] - poly[0][c]);
+      s[0] += u[1] * v[2] - u[2] * v[1];
+      s[1] += u[2] * v[0] - u[0] * v[2];
+      s[2] += u[0] * v[1] - u[1] * v[0];
     }
-  });
-  const used = new Uint8Array(m);
-  let loops = 0;
-  for (let k0 = 0; k0 < m; k0++) {
-    if (used[k0]) continue;
-    loops++;
-    const stack = [k0];
-    used[k0] = 1;
-    while (stack.length) {
-      const k = stack.pop();
-      for (const key of [pieces[k][2], pieces[k][3]]) {
-        for (const next of byEnd.get(key)) {
-          if (!used[next]) {
-            used[next] = 1;
-            stack.push(next);
-          }
+    return Math.hypot(s[0], s[1], s[2]);
+  };
+  const corners = (f) => [at(I[3 * f]), at(I[3 * f + 1]), at(I[3 * f + 2])];
+
+  // The pieces of each triangle cut: [{poly (xyz), half}].
+  const byTri = new Map();
+  const trapped = new Map(); // a triangle flagged TRAPPED across the plane: the half of its larger part
+  for (let f = 0; f < nt; f++) {
+    if (!isSplit(f)) continue;
+    const list = [];
+    if (modeOf(f) !== 3) {
+      // By the plane or the silhouette: the corners and the points where the value changes sign, on either side.
+      const near = nearOf(f);
+      const upper = [], lower = [];
+      for (let e = 0; e < 3; e++) {
+        const ra = I[3 * f + e], rb = I[3 * f + ((e + 1) % 3)];
+        const ha = value(f, ra), hb = value(f, rb);
+        if (Math.abs(ha) <= near) upper.push(at(ra)), lower.push(at(ra));
+        else (ha > 0 ? upper : lower).push(at(ra));
+        if (Math.abs(ha) > near && ha * hb < 0 && Math.abs(hb) > near) {
+          const p = pointOn(f, ra, rb);
+          upper.push(p);
+          lower.push(p);
         }
+      }
+      list.push({ poly: upper, half: SIDE_UPPER }, { poly: lower, half: SIDE_LOWER });
+      if (modeOf(f) === 1 && flags[f] & TRAPPED) trapped.set(f, area2(upper) >= area2(lower) ? SIDE_UPPER : SIDE_LOWER);
+    } else {
+      // Across the edges of shadows: a piece per arc cut off by a chord, and the rest (shadowShape).
+      const { events, cuts, drawn, middle } = shapeOf(f);
+      const n = events.length;
+      const corner = (k) => at(I[3 * f + k]);
+      const event = (i) => shadowPoint(P, I, f, events[i]);
+      // The corners of f between event a and the next one round its outline (all three round from the last to the first on one edge).
+      const between = (a, b) => {
+        let steps = (events[b].e - events[a].e + 3) % 3;
+        if (!steps && b <= a) steps = 3;
+        return Array.from({ length: steps }, (_, k) => corner((events[a].e + 1 + k) % 3));
+      };
+      const chordFrom = new Set(cuts.map(([i]) => i));
+      const rest = [];
+      for (let a = 0; a < n; a++) {
+        rest.push(event(a));
+        if (!chordFrom.has(a)) rest.push(...between(a, (a + 1) % n)); // else a chord to the next event
+      }
+      list.push({ poly: rest, half: middle });
+      for (const [a, b] of cuts) list.push({ poly: [event(a), ...between(a, b), event(b)], half: drawn[a] });
+    }
+    byTri.set(f, list.filter((x) => x.poly.length >= 3));
+  }
+
+  // The hooks taken out of the line: the triangle between each and its other ends on the other side (in turn, as unhook took them out).
+  if (hooks.length) {
+    let nw = 0;
+    for (let i = 0; i < welded.length; i++) if (welded[i] >= nw) nw = welded[i] + 1;
+    const start = new Int32Array(nw + 1);
+    for (let i = 0; i < welded.length; i++) start[welded[i] + 1]++;
+    for (let w = 0; w < nw; w++) start[w + 1] += start[w];
+    const around = new Int32Array(welded.length);
+    const fill = start.slice(0, nw);
+    for (let i = 0; i < welded.length; i++) around[fill[welded[i]]++] = (i / 3) | 0;
+    // The triangles round a point of the line by its key: a vertex ("v<w>"), a point of an edge ("e<a>,<b>", "e<a>,<b>:<i>": round either end).
+    const round = (key, out) => {
+      for (const w of key.slice(1).split(":")[0].split(",").map(Number)) for (let s = start[w]; s < start[w + 1]; s++) out.add(around[s]);
+      return out;
+    };
+    const flip = (h) => (h === SIDE_UPPER ? SIDE_LOWER : SIDE_UPPER);
+    for (const { X, A, B, kx, ka, kb } of hooks) {
+      const near = round(kb, round(ka, round(kx, new Set())));
+      for (const g of [...near].sort((x, y) => x - y)) {
+        // In the plane of g (2D, its corners counter-clockwise).
+        const [c0, c1, c2] = corners(g);
+        const u = [0, 1, 2].map((k) => c1[k] - c0[k]), w = [0, 1, 2].map((k) => c2[k] - c0[k]);
+        const n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+        const lu = Math.hypot(u[0], u[1], u[2]), ln = Math.hypot(n[0], n[1], n[2]);
+        if (!(lu > 0 && ln > 0)) continue;
+        const ex = u.map((x) => x / lu), nn = n.map((x) => x / ln);
+        // A hook across a crease (its triangle off the plane of g by more than 1 % of its size): left as it is.
+        const size = Math.max(Math.hypot(A[0] - X[0], A[1] - X[1], A[2] - X[2]), Math.hypot(B[0] - X[0], B[1] - X[1], B[2] - X[2]), Math.hypot(B[0] - A[0], B[1] - A[1], B[2] - A[2]));
+        const offPlane = (p) => Math.abs((p[0] - c0[0]) * nn[0] + (p[1] - c0[1]) * nn[1] + (p[2] - c0[2]) * nn[2]);
+        if (Math.max(offPlane(X), offPlane(A), offPlane(B)) > HOOK_PLANE * size + onEdge) continue;
+        const ey = [nn[1] * ex[2] - nn[2] * ex[1], nn[2] * ex[0] - nn[0] * ex[2], nn[0] * ex[1] - nn[1] * ex[0]];
+        const to2 = (p) => {
+          const r = [p[0] - c0[0], p[1] - c0[1], p[2] - c0[2]];
+          return [r[0] * ex[0] + r[1] * ex[1] + r[2] * ex[2], r[0] * ey[0] + r[1] * ey[1] + r[2] * ey[2]];
+        };
+        const to3 = ([x, y]) => [0, 1, 2].map((k) => c0[k] + x * ex[k] + y * ey[k]);
+        let t = [X, A, B].map(to2);
+        const turn = (t[1][0] - t[0][0]) * (t[2][1] - t[0][1]) - (t[1][1] - t[0][1]) * (t[2][0] - t[0][0]);
+        if (!(Math.abs(turn) > small)) continue; // no triangle between them
+        if (turn < 0) t = [t[0], t[2], t[1]];
+        // The part of a polygon (2D) on the left of p -> q (keep), or on its right.
+        const clip = (poly, p, q, keep) => {
+          const out = [];
+          const side = (r) => (keep ? 1 : -1) * ((q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]));
+          poly.forEach((r, k) => {
+            const s = poly[(k + 1) % poly.length];
+            const a = side(r), b = side(s);
+            if (a >= 0) out.push(r);
+            if (a >= 0 !== b >= 0) out.push([r[0] + (a / (a - b)) * (s[0] - r[0]), r[1] + (a / (a - b)) * (s[1] - r[1])]);
+          });
+          return out;
+        };
+        const area = (poly) => {
+          let s = 0;
+          poly.forEach((r, k) => (s += r[0] * poly[(k + 1) % poly.length][1] - poly[(k + 1) % poly.length][0] * r[1]));
+          return Math.abs(s);
+        };
+        const list = byTri.get(g) ?? [{ poly: corners(g), half: joined[g] }];
+        const out = [];
+        let touched = false;
+        for (const piece of list) {
+          let rest = piece.poly.map(to2);
+          let inside = rest;
+          for (let e = 0; e < 3; e++) inside = clip(inside, t[e], t[(e + 1) % 3], true);
+          if (!(area(inside) > small)) {
+            out.push(piece);
+            continue;
+          }
+          touched = true;
+          // Its parts out of the triangle, then the triangle's, on the other side.
+          for (let e = 0; e < 3; e++) {
+            const outside = clip(rest, t[e], t[(e + 1) % 3], false);
+            if (area(outside) > small) out.push({ poly: outside.map(to3), half: piece.half });
+            rest = clip(rest, t[e], t[(e + 1) % 3], true);
+          }
+          out.push({ poly: inside.map(to3), half: flip(piece.half) });
+        }
+        if (touched) byTri.set(g, out);
       }
     }
   }
-  const shape = lineShape(ends, d, { height, loops });
-  return { segments, length_mm: shape.length_mm, loops, planar: shape.planar, kind: shape.kind, height_range_mm: shape.height_range_mm, heights_mm: shape.heights_mm, level: shape.level, levels: shape.levels };
+
+  // The lines of sight from a point of triangle f (as shadowSight): neither half reaches it?
+  let sight = null;
+  const blocked = (f, poly) => {
+    const { mesh, grid } = cut;
+    if (!sight) sight = { sag: surfaceOf(mesh).sag, eps: mesh.diag * 1e-5, tEps: mesh.diag * 1e-7 };
+    const N = mesh.normals, c = mesh.centre, off = sight.eps + sight.sag[f];
+    const m = [0, 1, 2].map((k) => poly.reduce((sum, p) => sum + p[k], 0) / poly.length - c[k] + off * N[3 * f + k]);
+    return lineHits(mesh, grid, f, m[0], m[1], m[2], sight.tEps) === 3;
+  };
+  // Whether a piece of triangle f in half h is an undercut.
+  const undercutOf = (f, poly, h) => {
+    if (isSplit(f) && modeOf(f) === 1) {
+      const reach = flags[f] & (REACH_UP | REACH_DOWN);
+      if (trapped.has(f)) return h === trapped.get(f);
+      if (!reach) return true;
+      if (reach === (REACH_UP | REACH_DOWN) || flags[f] & ZERO_DRAFT) return false;
+      return h === (reach === REACH_UP ? SIDE_LOWER : SIDE_UPPER);
+    }
+    if (h === joined[f] || (isSplit(f) && modeOf(f) === 2) || !cut.shade) return undercutTri(f);
+    return blocked(f, poly);
+  };
+  // How far a piece runs along each edge of triangle f: its sides with both ends on that edge.
+  const alongEdges = (f, poly) => {
+    const c = corners(f);
+    const off = (p, e) => {
+      const a = c[e], b = c[(e + 1) % 3];
+      const ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+      const l = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+      const s = l > 0 ? (ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / l : 0;
+      return Math.hypot(ap[0] - s * ab[0], ap[1] - s * ab[1], ap[2] - s * ab[2]);
+    };
+    const runs = [0, 0, 0];
+    poly.forEach((p, k) => {
+      const q = poly[(k + 1) % poly.length];
+      const l = Math.hypot(q[0] - p[0], q[1] - p[1], q[2] - p[2]);
+      if (l > onEdge) for (let e = 0; e < 3; e++) if (off(p, e) <= onEdge && off(q, e) <= onEdge) runs[e] += l;
+    });
+    return runs;
+  };
+  const list = []; // {f, poly, half, undercut, runs, near}, by triangle
+  for (const f of [...byTri.keys()].sort((x, y) => x - y)) {
+    for (const { poly, half: h } of byTri.get(f)) {
+      if (!(area2(poly) > small)) continue;
+      const u = undercutOf(f, poly, h);
+      list.push({ f, poly, half: h, undercut: u, runs: u ? alongEdges(f, poly) : null, near: -1 });
+    }
+  }
+  nearUndercuts(list, neighbours, welded, undercutTri);
+  const tri = [], half = [], under = [], near = [], start = [0], points = [];
+  for (const x of list) {
+    tri.push(x.f);
+    half.push(x.half);
+    under.push(x.undercut ? 1 : 0);
+    near.push(x.near);
+    for (const p of x.poly) points.push(p[0], p[1], p[2]);
+    start.push(points.length / 3);
+  }
+  return {
+    count: tri.length,
+    tri: Int32Array.from(tri),
+    half: Uint8Array.from(half),
+    undercut: Uint8Array.from(under),
+    near: Int32Array.from(near),
+    start: Uint32Array.from(start),
+    points: Float64Array.from(points),
+  };
+}
+
+/**
+ * The undercut triangle whose colour each undercut piece takes (its slide
+ * zone), in place (`near`): its own when its triangle is one (undercutTri),
+ * else one across the edge of its triangle it runs along the most, else in
+ * turn the one of an undercut piece along that edge of a triangle cut there
+ * (a corner cut off a fan of long triangles); -1 none. Shared by
+ * partingPieces and the line drawn by hand (parting-draw.js). pieces: [{f,
+ * undercut, runs (how far it runs along each edge of f), near}], their
+ * triangles' neighbours across their edges and welded vertices (lineMesh).
+ */
+export function nearUndercuts(pieces, neighbours, welded, undercutTri) {
+  const byTri = new Map();
+  for (const x of pieces) {
+    x.near = x.undercut && undercutTri(x.f) ? x.f : -1;
+    (byTri.get(x.f) ?? byTri.set(x.f, []).get(x.f)).push(x);
+  }
+  for (let pass = 0, changed = true; changed && pass < 8; pass++) {
+    changed = false;
+    for (const x of pieces) {
+      if (!x.undercut || x.near >= 0) continue;
+      const order = [0, 1, 2].filter((e) => x.runs[e] > 0).sort((a, b) => x.runs[b] - x.runs[a] || a - b);
+      for (const e of order) {
+        const g = neighbours[3 * x.f + e];
+        if (g < 0) continue;
+        if (undercutTri(g)) x.near = g;
+        else {
+          const wa = welded[3 * x.f + e], wb = welded[3 * x.f + ((e + 1) % 3)];
+          let eg = 0;
+          while (eg < 3 && !((welded[3 * g + eg] === wa && welded[3 * g + ((eg + 1) % 3)] === wb) || (welded[3 * g + eg] === wb && welded[3 * g + ((eg + 1) % 3)] === wa))) eg++;
+          const y = eg < 3 ? byTri.get(g)?.find((y) => y.undercut && y.near >= 0 && y.runs[eg] > 0) : null;
+          if (y) x.near = y.near;
+        }
+        if (x.near >= 0) break;
+      }
+      if (x.near >= 0) changed = true;
+    }
+  }
+}
+
+/**
+ * The pieces of partingPieces (or of a drawn line, parting-draw.js) as
+ * triangles, for the view: each polygon ear-clipped in its plane (the parts
+ * of a drawn line round a clicked point are not convex), wound as it is,
+ * corners repeated in a row left out. {corners (Float64Array, xyz of the
+ * three corners of each triangle), piece (Int32Array: the piece of each)}.
+ */
+export function pieceTriangles({ count, start, points }) {
+  const corners = [], piece = [];
+  for (let k = 0; k < count; k++) {
+    const ring = [];
+    for (let j = start[k]; j < start[k + 1]; j++) {
+      const p = [points[3 * j], points[3 * j + 1], points[3 * j + 2]];
+      const q = ring.at(-1);
+      if (!q || p[0] !== q[0] || p[1] !== q[1] || p[2] !== q[2]) ring.push(p);
+    }
+    while (ring.length > 1 && ring[0].every((x, c) => x === ring.at(-1)[c])) ring.pop();
+    if (ring.length < 3) continue;
+    // Its normal (Newell), and the plane it is drawn on: the other two axes.
+    const n = [0, 0, 0];
+    ring.forEach((p, i) => {
+      const q = ring[(i + 1) % ring.length];
+      n[0] += (p[1] - q[1]) * (p[2] + q[2]);
+      n[1] += (p[2] - q[2]) * (p[0] + q[0]);
+      n[2] += (p[0] - q[0]) * (p[1] + q[1]);
+    });
+    const ax = Math.abs(n[0]) >= Math.abs(n[1]) && Math.abs(n[0]) >= Math.abs(n[2]) ? 0 : Math.abs(n[1]) >= Math.abs(n[2]) ? 1 : 2;
+    const [a, b] = n[ax] >= 0 ? [(ax + 1) % 3, (ax + 2) % 3] : [(ax + 2) % 3, (ax + 1) % 3];
+    const turn = (p, q, r) => (q[a] - p[a]) * (r[b] - p[b]) - (q[b] - p[b]) * (r[a] - p[a]);
+    const emit = (p, q, r) => {
+      corners.push(...p, ...q, ...r);
+      piece.push(k);
+    };
+    const left = ring.slice();
+    // An ear: a corner turning the polygon's way with no other corner inside its triangle; else (degenerate) a fan.
+    while (left.length > 3) {
+      let ear = -1;
+      for (let i = 0; i < left.length && ear < 0; i++) {
+        const p = left[(i + left.length - 1) % left.length], q = left[i], r = left[(i + 1) % left.length];
+        if (!(turn(p, q, r) > 0)) continue;
+        if (left.every((x) => x === p || x === q || x === r || turn(p, q, x) < 0 || turn(q, r, x) < 0 || turn(r, p, x) < 0)) ear = i;
+      }
+      if (ear < 0) break;
+      emit(left[(ear + left.length - 1) % left.length], left[ear], left[(ear + 1) % left.length]);
+      left.splice(ear, 1);
+    }
+    for (let i = 1; i + 1 < left.length; i++) emit(left[0], left[i], left[i + 1]);
+  }
+  return { corners: Float64Array.from(corners), piece: Int32Array.from(piece) };
 }
 
 /**
@@ -2395,7 +2779,9 @@ function shadowPoint(P, I, f, { e, t }) {
  * triangle as drawn: by the triangle across that edge, if at all). The half
  * of the triangle (`half`: of most of it when one corner is cut off, else
  * of its middle), and the half along each of its edges at each event
- * (runs(e): [[from, to, half] along it from its corner e]).
+ * (runs(e): [[from, to, half] along it from its corner e]); the half of its
+ * middle and the one each arc is drawn in (`middle`, `drawn`: the pieces of
+ * partingPieces).
  */
 function shadowShape(f, P, I, welded, shade) {
   const { events, arcs } = shadowOutline(f, I, welded, shade.label, shade.cross);
@@ -2448,7 +2834,7 @@ function shadowShape(f, P, I, welded, shade) {
     const whole = area([0, 1, 2].map((k) => [P[3 * I[3 * f + k]], P[3 * I[3 * f + k] + 1], P[3 * I[3 * f + k] + 2]]));
     if (whole > 0 && area(poly) > whole / 2) half = arcs[i];
   }
-  return { events, cuts, runs, half };
+  return { events, cuts, runs, half, middle, drawn };
 }
 
 /**
