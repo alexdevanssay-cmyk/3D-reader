@@ -7,15 +7,26 @@
 // along -d -> the lower half; neither -> an undercut, formed by a core or a
 // slide. Its centre, and more points spread over a large or long triangle (the
 // faces of a CAD body are fans of long triangles): each sense by the majority
-// of them. Faces at less than the draft angle from d have no draft.
+// of them, the shares of them kept as the evidence of the triangle. Faces at
+// less than the draft angle from d have no draft.
+//
+// The halves are optimised over the whole surface (optimiseHalves): two exact
+// minimum cuts of the triangles (mincut.js), the cost of each label from the
+// evidence of the triangle times its area, plus a tension λ (about 1.5 mm)
+// times the length of the line, lighter where the surface turns from one half
+// to the other: the undercuts first, then the upper and lower halves. A
+// region too small or thin for the line round it (a spike, a tooth, a small
+// loop) goes to the half round it; a slot, a hole, a boss keep their own.
 //
 // The halves, and the parting line between them:
 // - a plane leaves every triangle only one half can form on its side: a
 //   planar line; the faces both halves can form, and the undercuts, on the
 //   side of the plane, cut by it when across it;
-// - else each triangle in the half that can form it (both: the upper one): a
-//   stepped or warped line, round the undercut regions (each joins the half
-//   it shares the longer border with);
+// - else the halves of the optimum: a line across the triangles (along the
+//   silhouettes of curved faces, the edges of the shadows, an iso-line of
+//   the halves over small facets), not along their edges, round the undercut
+//   regions (each joins the half its heavier border is with); planar when
+//   all of it is within the planar tolerance of one height (then that plane);
 // - unless that splits flat faces along d (no draft) between the halves:
 //   the line would run across them along their triangles, round the shadow
 //   each detail casts along d. Then, when it traps less surface than that
@@ -38,6 +49,7 @@
 // Plain JavaScript without bare imports: it runs in the parting worker
 // (partworker.js) and on the page (faces reassigned by hand).
 
+import { minCut } from './mincut.js';
 import { STEEL_TIE, normalizeDie, normalizeProcess, orientationFor, orientationKey, orientationMesh } from './orientation.js';
 import { edgeNeighbours, weld } from './thickness.js';
 
@@ -45,7 +57,9 @@ import { edgeNeighbours, weld } from './thickness.js';
 // shadows); the directions ranked by their die block too, each with its
 // orientation for the process; d turned so that up is +d on a horizontal
 // parting plane.
-export const PARTING_VERSION = 3;
+// 4: the halves optimised over the surface (minimum cuts: no spikes, teeth,
+// small loops), the line across small facets along an iso-line.
+export const PARTING_VERSION = 4;
 
 // Half of the mould of a triangle: none (an undercut), upper (+d), lower (-d).
 export const SIDE_NONE = 0;
@@ -59,6 +73,13 @@ export const LEVEL = 8; // in the half of its side of the planar line (cut by it
 export const TRAPPED = 16; // only one half could form it, kept in the other by the planar line: an undercut (slide), its REACH_* cleared
 export const SILHOUETTE = 32; // across the silhouette of a curved face between the halves: in the half of its centre, cut by the silhouette (n·d = 0 between its corners)
 export const SHADOW = 64; // across the edge of a shadow along d inside a face between the halves (or an undercut): in the half of most of it, cut by that edge
+// Both: across the line of the optimised halves inside a smooth surface, neither a silhouette nor the edge of a
+// shadow: cut along the zero of the halves smoothed round it (isoField), in the half of its side of it.
+export const ISO_CUT = SILHOUETTE | SHADOW;
+/** How a triangle is cut by its flags (without a plane): 0, SILHOUETTE, SHADOW or ISO_CUT. */
+const cutOf = (flag) => flag & ISO_CUT;
+// The mode of lineCuts of each (none: of a shadow, as it was).
+const MODE_OF = { 0: 3, [SILHOUETTE]: 2, [SHADOW]: 3, [ISO_CUT]: 4 };
 
 export const DEFAULT_DRAFT_DEG = 1;
 // Every candidate is classified on every triangle up to this size; above,
@@ -96,8 +117,6 @@ const SAG_MAX = 5e-3;
 const GRAZE = 8;
 // n·d of a triangle off by up to 4 × this × its largest coordinate / its smallest height (float32 positions).
 const ROUNDING_NOISE = 4 * 2 ** -24;
-// A region of one half within the other up to this share of the surface: an island (smoothHalves).
-const ISLAND_SHARE = 0.002;
 // The silhouette of a curved face between the halves: n·d at its corners of either sign beyond this, at most
 // this share of the border of its band beside a triangle in the half of the other side of it.
 const SILHOUETTE_TINY = 1e-9;
@@ -108,13 +127,13 @@ const HOOK_TURN = Math.cos((45 * Math.PI) / 180);
 const FOLD_TURN = Math.cos((10 * Math.PI) / 180);
 // The colours follow a hook taken out on the triangles whose plane it is in, within this share of its size (partingPieces).
 const HOOK_PLANE = 0.01;
+// A small loop of the line taken out: at most this many pieces (dropSmallLoops).
+const SMALL_LOOP_PIECES = 64;
 // The triangles crossed by the edges of the shadows: at most this share of them (at least SHADOW_MIN) (shadowHalves).
 const SHADOW_MAX = 0.05;
 const SHADOW_MIN = 20_000;
 // Their points of an edge look from inside the triangle by 2 % of its height there, this share of the diagonal at most.
 const SHADOW_INSET = 1e-3;
-// A triangle with two edges on the border of an undercut, its third shorter than this share of them: a finger (undercutHalves).
-const FINGER = 0.25;
 // Points of a triangle its lines of sight start from: its centre, and on a
 // triangle larger or longer than the spacing, one per spacing of its longest
 // edge or per spacing² of its area (the more), SAMPLE_MAX at most. The
@@ -137,6 +156,26 @@ export const SAMPLE_POINTS = { R2A, R2B, INSET: SAMPLE_INSET };
 // UNDERCUT_TIE of the surface): a line across it along its triangles.
 const FLAT_FACET = Math.cos((0.5 * Math.PI) / 180);
 const MIXED_SHARE = 0.05;
+// The tension of the parting line (optimiseHalves, mm): 1.5 mm, at most 1 %
+// of the diagonal of a small part.
+const TENSION_MM = 1.5;
+const TENSION_SHARE = 0.01;
+// The weight of the line along an edge (placeWeights): half its length on the
+// outline along d, all of it across faces with 15° of draft or more, or
+// across a flat face (its triangles within 0.5°, FLAT_FACET: no outline there).
+const PLACE_MIN = 0.5;
+const PLACE_FULL = Math.sin((15 * Math.PI) / 180);
+// Above this many triangles, the cuts of the halves on patches of them (solveCut).
+const COARSE_LIMIT = 200_000;
+// A triangle whose points disagree, larger than this × λ² (a long triangle of a
+// CAD face across the edge of a shadow): its majority kept by the undercuts
+// (optimiseHalves); smaller, its region regularised like any other.
+const STRADDLE_AREA = 4;
+// A triangle in the half it does not face (facingDown: a face both halves can
+// form, upper when exactly along d) costs this share of its area more: a face
+// along d changes half only to save more line than that (a small region of
+// it), not to take the line diagonally across it or one step lower.
+const FACING = 0.1;
 
 // ------------------------------------------------------------------ mesh
 
@@ -701,7 +740,7 @@ function surfaceOf(mesh) {
  * Whether triangle f (both halves can form it) faces -d: by the silhouette
  * of its face, n·d of the normals at its corners (vertexNormals of `line`),
  * their mean beyond their rounding, as the triangles cut by a silhouette
- * (smoothHalves) when the faces have vertices of their own; else by the
+ * (silhouetteHalves) when the faces have vertices of their own; else by the
  * normal of its smooth surface (surfaceOf).
  */
 function facingDown(mesh, line, f, d) {
@@ -726,9 +765,14 @@ const before = (P, u, v) => P[u] < P[v] || (P[u] === P[v] && (P[u + 1] < P[v + 1
  * null) for direction d: each sense reached from at least half of the points
  * of the triangle (its centre first, then a low-discrepancy sequence over it,
  * as many as sampleCount gives). A triangle drawn several times in `list`:
- * classified once.
+ * classified once. `evidence` (every triangle, list null; newEvidence): per
+ * triangle the shares of its points whose line of sight is free upwards,
+ * downwards, and free neither way (share, 3 per triangle; a sliver: free
+ * both ways), how many points (count) and which were blocked upwards and
+ * downwards (up, down: bit j for point j): what the halves are optimised on
+ * (optimiseHalves).
  */
-function classify(mesh, grid, d, list, sinDraft) {
+function classify(mesh, grid, d, list, sinDraft, evidence = null) {
   const { positions: P, indices: I, normals, centres, nt, diag } = mesh;
   const n = list ? list.length : nt;
   const flags = new Uint8Array(n);
@@ -753,6 +797,10 @@ function classify(mesh, grid, d, list, sinDraft) {
     if (mesh.areas[f] < mesh.sliver || !(nx || ny || nz)) {
       flags[s] = flag | REACH_UP | REACH_DOWN;
       known?.set(f, flags[s]);
+      if (evidence) {
+        evidence.share[3 * f] = evidence.share[3 * f + 1] = 1;
+        evidence.count[f] = 1;
+      }
       continue;
     }
     const cx = centres[3 * f], cy = centres[3 * f + 1], cz = centres[3 * f + 2];
@@ -763,34 +811,58 @@ function classify(mesh, grid, d, list, sinDraft) {
     if (before(P, b, a)) [a, b] = [b, a];
     if (before(P, c, b)) [b, c] = [c, b];
     if (before(P, b, a)) [a, b] = [b, a];
-    let up = 0, down = 0;
+    let up = 0, down = 0, none = 0, upMask = 0, downMask = 0;
     for (let j = 0; j < k; j++) {
-      // Its first SAMPLE_FIRST points (spread over it) agree both ways: the rest would not change the majority.
+      // Its first SAMPLE_FIRST points (spread over it) agree both ways: the rest would not change the majority (nor the shares).
       if (j === SAMPLE_FIRST && up % SAMPLE_FIRST === 0 && down % SAMPLE_FIRST === 0) {
         k = SAMPLE_FIRST;
         break;
       }
       let x = cx, y = cy, z = cz;
       if (j) {
-        let p = (0.5 + j * R2A) % 1, q = (0.5 + j * R2B) % 1;
-        if (p + q > 1) {
-          p = 1 - p;
-          q = 1 - q;
-        }
+        const [p, q] = samplePoint(j);
         x += SAMPLE_INSET * (P[a] + p * (P[b] - P[a]) + q * (P[c] - P[a]) - cx);
         y += SAMPLE_INSET * (P[a + 1] + p * (P[b + 1] - P[a + 1]) + q * (P[c + 1] - P[a + 1]) - cy);
         z += SAMPLE_INSET * (P[a + 2] + p * (P[b + 2] - P[a + 2]) + q * (P[c + 2] - P[a + 2]) - cz);
       }
       const hits = lineHits(mesh, grid, f, x + off * nx, y + off * ny, z + off * nz, tEps);
       if (!(hits & 1)) up++;
+      else upMask |= 1 << j;
       if (!(hits & 2)) down++;
+      else downMask |= 1 << j;
+      if (hits === 3) none++;
     }
     if (2 * up >= k) flag |= REACH_UP;
     if (2 * down >= k) flag |= REACH_DOWN;
     flags[s] = flag;
     known?.set(f, flag);
+    if (evidence) {
+      evidence.share[3 * f] = up / k;
+      evidence.share[3 * f + 1] = down / k;
+      evidence.share[3 * f + 2] = none / k;
+      evidence.count[f] = k;
+      evidence.up[f] = upMask;
+      evidence.down[f] = downMask;
+    }
   }
   return flags;
+}
+
+/** The evidence of the lines of sight of nt triangles, for classify to fill. */
+const newEvidence = (nt) => ({ share: new Float32Array(3 * nt), count: new Uint8Array(nt), up: new Uint32Array(nt), down: new Uint32Array(nt) });
+
+/**
+ * Point j of the sequence of the points of a triangle (j >= 1; point 0 is its
+ * centre): (p, q), the point a + p (b - a) + q (c - a) of its corners a, b, c
+ * by position, before it is pulled SAMPLE_INSET towards the centre.
+ */
+function samplePoint(j) {
+  let p = (0.5 + j * R2A) % 1, q = (0.5 + j * R2B) % 1;
+  if (p + q > 1) {
+    p = 1 - p;
+    q = 1 - q;
+  }
+  return [p, q];
 }
 
 /** True for a triangle both halves can form (a face without draft, on the outside). */
@@ -880,7 +952,8 @@ function planeHeight(mesh, flags, d, tol, line = null) {
 /**
  * Half of each triangle from its flags: the side it leaves by; none for an
  * undercut. With a planar line (height `plane`), a face both halves can form,
- * or flagged LEVEL: the side of its centre; else a face both can form, by the
+ * or flagged LEVEL: the side of its centre (in the plane: as without a
+ * plane, a face at the level of the line); else a face both can form, by the
  * sense it faces (facingDown: the silhouette of its face with the line mesh
  * `line`, else the normal of its smooth surface), square to d within the
  * rounding of its positions: upper (an exact plane along d cut into long
@@ -889,13 +962,16 @@ function planeHeight(mesh, flags, d, tol, line = null) {
 export function sidesOf(mesh, flags, d, plane = null, line = null) {
   const { normals, centres, nt, centre } = mesh;
   const level = plane == null ? null : plane - dot(centre, d);
+  const tiny = 1e-9 * Math.max(1, mesh.diag);
   const side = new Uint8Array(nt);
   for (let f = 0; f < nt; f++) {
     if (!(normals[3 * f] || normals[3 * f + 1] || normals[3 * f + 2])) continue; // degenerate: no side
     const reach = flags[f] & (REACH_UP | REACH_DOWN);
     if (!reach) continue;
-    if (level != null && (flags[f] & LEVEL || reach === (REACH_UP | REACH_DOWN))) {
-      side[f] = centres[3 * f] * d[0] + centres[3 * f + 1] * d[1] + centres[3 * f + 2] * d[2] - level < 0 ? SIDE_LOWER : SIDE_UPPER;
+    // (A face in the plane, its centre on it: by its reach, as without a plane.)
+    const h = level == null ? 0 : centres[3 * f] * d[0] + centres[3 * f + 1] * d[1] + centres[3 * f + 2] * d[2] - level;
+    if (level != null && (flags[f] & LEVEL || reach === (REACH_UP | REACH_DOWN)) && Math.abs(h) > tiny) {
+      side[f] = h < 0 ? SIDE_LOWER : SIDE_UPPER;
     } else if (reach === REACH_UP) side[f] = SIDE_UPPER;
     else if (reach === REACH_DOWN) side[f] = SIDE_LOWER;
     else side[f] = facingDown(mesh, line, f, d) ? SIDE_LOWER : SIDE_UPPER;
@@ -1227,6 +1303,361 @@ function zeroDraftArea(mesh, d, sinDraft) {
   return sum;
 }
 
+// ------------------------------------------------------------------ optimised halves
+
+/**
+ * The surface as a graph, for the minimum cuts of the halves (minCut),
+ * computed once (kept on `line`): a node per triangle, an arc per edge to
+ * the triangle across it (welded vertices; none for a free or non-manifold
+ * edge, nor a triangle next to itself). {first (Int32Array, nt + 1: arcs
+ * 3 f .. 3 f + 2 of triangle f), head (Int32Array, 3 nt: the triangle
+ * across edge e of f at 3 f + e, -1 none), sister (the arc back), length
+ * (Float64Array: of the edge)}.
+ */
+function surfaceGraph(line) {
+  if (line.graph) return line.graph;
+  const { positions: P, indices: I, welded, neighbours } = line;
+  const nt = I.length / 3;
+  const first = new Int32Array(nt + 1);
+  for (let f = 0; f <= nt; f++) first[f] = 3 * f;
+  const head = new Int32Array(3 * nt).fill(-1);
+  const sister = new Int32Array(3 * nt).fill(-1);
+  const length = new Float64Array(3 * nt);
+  for (let f = 0; f < nt; f++) {
+    for (let e = 0; e < 3; e++) {
+      const a = 3 * f + e;
+      const g = neighbours[a];
+      if (g < 0 || g === f) continue;
+      // The edge of g with the same two vertices.
+      const wa = welded[a], wb = welded[3 * f + ((e + 1) % 3)];
+      let back = -1;
+      for (let c = 0; c < 3 && back < 0; c++) {
+        const ua = welded[3 * g + c], ub = welded[3 * g + ((c + 1) % 3)];
+        if ((ua === wa && ub === wb) || (ua === wb && ub === wa)) back = 3 * g + c;
+      }
+      if (back < 0 || neighbours[back] !== f) continue;
+      head[a] = g;
+      sister[a] = back;
+      const ra = 3 * I[a], rb = 3 * I[3 * f + ((e + 1) % 3)];
+      length[a] = Math.hypot(P[rb] - P[ra], P[rb + 1] - P[ra + 1], P[rb + 2] - P[ra + 2]);
+    }
+  }
+  return (line.graph = { first, head, sister, length });
+}
+
+/**
+ * Per arc of the surface graph (surfaceGraph), the weight of the parting
+ * line along its edge for direction d: its length, times how poor a place
+ * it is for the line, from PLACE_MIN where the surface turns from one half
+ * to the other (the faces on either side of the edge facing opposite senses
+ * along d, or one along d: the outline of the part along d, a silhouette)
+ * up to 1 across a face with PLACE_FULL of draft or more (both faces
+ * facing one sense: a line across a face with draft, a step on it), and
+ * across a flat face (two triangles within 0.5°, FLAT_FACET). By the
+ * normals of the faces from `line` alone (the same weights on the page:
+ * partingLine), whatever their orientation; those of the last direction
+ * kept on `line`.
+ */
+function placeWeights(line, d) {
+  const kept = line.place;
+  if (kept && kept.d[0] === d[0] && kept.d[1] === d[1] && kept.d[2] === d[2]) return kept.w;
+  const { positions: P, indices: I } = line;
+  const nt = I.length / 3;
+  const { head, length } = surfaceGraph(line);
+  // n·d of each triangle (its unit normal, any orientation: only the signs relative to each other matter).
+  const nd = new Float64Array(nt);
+  const n = new Float64Array(3 * nt);
+  for (let f = 0; f < nt; f++) {
+    const a = 3 * I[3 * f], b = 3 * I[3 * f + 1], c = 3 * I[3 * f + 2];
+    const ux = P[b] - P[a], uy = P[b + 1] - P[a + 1], uz = P[b + 2] - P[a + 2];
+    const vx = P[c] - P[a], vy = P[c + 1] - P[a + 1], vz = P[c + 2] - P[a + 2];
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const len = Math.hypot(nx, ny, nz);
+    if (len > 0) {
+      n[3 * f] = nx / len;
+      n[3 * f + 1] = ny / len;
+      n[3 * f + 2] = nz / len;
+    }
+    nd[f] = len > 0 ? (nx * d[0] + ny * d[1] + nz * d[2]) / len : 0;
+  }
+  // Two triangles of one flat face (either orientation): the surface does not turn there, whatever n·d (a face along d
+  // has no outline inside it: the line across it, a corner of it cut off, is a line across a face).
+  const flat = (f, g) => Math.abs(n[3 * f] * n[3 * g] + n[3 * f + 1] * n[3 * g + 1] + n[3 * f + 2] * n[3 * g + 2]) >= FLAT_FACET;
+  const w = new Float64Array(3 * nt);
+  for (let a = 0; a < 3 * nt; a++) {
+    const f = (a / 3) | 0, g = head[a];
+    if (g >= 0) w[a] = length[a] * (flat(f, g) ? 1 : placeOf(nd[f], nd[g]));
+  }
+  line.place = { d: [d[0], d[1], d[2]], w };
+  return w;
+}
+
+/** The tension of the parting line (mm): λ of optimiseHalves, for a part of this diagonal. */
+export const lineTension = (diag) => Math.min(TENSION_MM, TENSION_SHARE * diag);
+
+/** The weight of the line per mm between two faces of n·d p and q (placeWeights). */
+const placeOf = (p, q) => PLACE_MIN + (1 - PLACE_MIN) * Math.min(1, (p * q <= 0 ? 0 : Math.min(Math.abs(p), Math.abs(q))) / PLACE_FULL);
+
+/**
+ * Whether the points of triangle f disagree (evidence of classify): some of
+ * them blocked in a sense where others are not. Such a triangle straddles
+ * the edge of a shadow (a long triangle of a CAD face across it): its
+ * majority is all a whole-triangle label can say of it, the line goes
+ * across it (shadowHalves).
+ */
+function straddles(evidence, f) {
+  const k = evidence.count[f];
+  if (k < 2) return false;
+  const all = k >= 32 ? 0xffffffff : 2 ** k - 1;
+  const up = evidence.up[f], down = evidence.down[f];
+  return (up !== 0 && up !== all) || (down !== 0 && down !== all);
+}
+
+/**
+ * The halves of direction d optimised over the whole surface, from the
+ * evidence of the lines of sight of each triangle (classify, newEvidence),
+ * with `line` (lineMesh). Two minimum cuts (minCut) over the triangles,
+ * each exact:
+ * 1. the undercuts: of the labels undercut / formed by a half, the least
+ *    Σ area × (1 - none) over the triangles called undercuts + Σ area × none
+ *    over the others + λ × the length of the edges between them, `none` the
+ *    share of the points of a triangle blocked both ways: a triangle whose
+ *    points all agree is called as they are, unless its region is too thin
+ *    or small for its border (a single long triangle, a spike, a sliver
+ *    round a singular point: what its neighbours are; a slot or a hole
+ *    across d keeps its own); a triangle whose points disagree (it straddles
+ *    the edge of a shadow) larger than STRADDLE_AREA × λ² (below, the comb
+ *    of a blend's facets along a shadow: as any other) keeps its majority (an
+ *    undercut when most of its points are blocked both ways; its points in
+ *    the reach of one half or the other, a triangle across the edge between
+ *    the shadows of the two senses: formed, cut by the line), the line or
+ *    the border of the undercut across it, and its edges weigh nothing (its
+ *    border is across it, not along them: a sliver in the shadow beside it
+ *    is not moved out of it by them);
+ * 2. the halves: of the labels upper / lower, the least Σ area × (1 - up)
+ *    over the upper half + Σ area × (1 - down) over the lower one, FACING ×
+ *    area more in the half it does not face (facingDown: a face both halves
+ *    can form in the one it faces, upper when exactly along d, unless moving
+ *    a small part of it saves more line), an undercut nothing either way
+ *    (its region joined whole to a half by its border), + λ × the weight of
+ *    the edges between them (placeWeights: their length, half of it on the
+ *    outline along d): each triangle in the half that can form it, the faces
+ *    both can form in the one they face; a region of one half within the
+ *    other too small for the line round it (a small loop, a tooth of long
+ *    triangles) in the other. Ties: the upper half, the triangles formed by
+ *    a half.
+ * λ, the tension of the line (lineTension): TENSION_MM, less on a small part
+ * (TENSION_SHARE of its diagonal): about the smallest detail a die is given
+ * a parting or a slide of its own for (a fillet, a lettering 1 mm high), and
+ * ten times the deflection of the mesh of a CAD face (its facets, the noise
+ * of the lines of sight along them, well below it). A region of contrary
+ * evidence changes label when that costs less than the line round it: an
+ * undercut region when twice its area is under λ × its border (a strip
+ * narrower than λ, a disc under 4 λ across); a region of one half in the
+ * other when its area (1 + FACING) is under λ × the weight of its border (on
+ * a face with draft, a strip narrower than about 2 λ). The details of a
+ * casting (a boss, a rib, a hole, a slot of a few millimetres) keep their
+ * own.
+ * Returns {under (Uint8Array: 1 an undercut), upper (Uint8Array: 1 in the
+ * upper half, an undercut joined to it)}.
+ */
+function optimiseHalves(mesh, line, evidence, d) {
+  const { nt, areas, diag } = mesh;
+  const { first, head, sister, length } = surfaceGraph(line);
+  const { share } = evidence;
+  const lambda = lineTension(diag);
+  const cap = new Float64Array(3 * nt);
+  const tcap = new Float64Array(nt);
+  // 1. The undercuts (the source side), the rest formed by a half (ties). A large triangle across the edge of a shadow
+  // as most of it is, not pulling its neighbours (its border is across it, not along its edges). (No point blocked
+  // both ways: no undercut, no cut.)
+  let under = new Uint8Array(nt);
+  let blocked = false;
+  for (let f = 0; f < nt && !blocked; f++) blocked = share[3 * f + 2] > 0;
+  if (blocked) {
+    const across = Uint8Array.from(areas, (a, f) => (a >= STRADDLE_AREA * lambda * lambda && straddles(evidence, f) ? 1 : 0));
+    for (let a = 0; a < 3 * nt; a++) if (head[a] >= 0 && !across[(a / 3) | 0] && !across[head[a]]) cap[a] = lambda * length[a];
+    for (let f = 0; f < nt; f++) {
+      if (!across[f]) tcap[f] = areas[f] * (2 * share[3 * f + 2] - 1);
+      else tcap[f] = 2 * share[3 * f + 2] > 1 ? Infinity : -Infinity;
+    }
+    under = solveCut(mesh, line, cap, tcap, 0);
+  }
+  // 2. The upper half (the source side, and ties); two undercuts: one region, joined whole.
+  const w = placeWeights(line, d);
+  for (let f = 0; f < nt; f++) {
+    for (let a = 3 * f; a < 3 * f + 3; a++) if (head[a] >= 0) cap[a] = under[f] && under[head[a]] ? Infinity : lambda * w[a];
+    if (under[f]) {
+      tcap[f] = 0;
+      continue;
+    }
+    // (A triangle only one half reaches, all its points, faces that half: no need to ask.)
+    const up = share[3 * f], down = share[3 * f + 1];
+    const facing = up === 1 && down === 0 ? FACING : up === 0 && down === 1 ? -FACING : facingDown(mesh, line, f, d) ? -FACING : FACING;
+    tcap[f] = areas[f] * (up - down + facing);
+  }
+  const upper = solveCut(mesh, line, cap, tcap, 1);
+  return { under, upper };
+}
+
+/**
+ * The minimum cut of the triangles of `mesh` (minCut over surfaceGraph of
+ * `line`, capacities cap per arc, tcap per triangle, ties to `free`): the
+ * labels per triangle. Exact up to COARSE_LIMIT triangles; above (a mesh of
+ * millions of small triangles: the trees of the maximum flow re-rooted at
+ * each of its many tiny paths), solved on patches of them: the triangles
+ * joined across their edges from a first one in their order, of the same
+ * kind (the sign of their terminal capacity: of one evidence, one facing),
+ * on one smooth surface (normals within 35° of the first one's), their
+ * centres within λ / 2 (lineTension) of its: every triangle with its patch.
+ * The patches never mix kinds nor cross a sharp edge, the cut is placed at
+ * their scale, half the tension's.
+ */
+function solveCut(mesh, line, cap, tcap, free) {
+  const { nt, normals: N, centres: C, diag } = mesh;
+  const { first, head, sister } = surfaceGraph(line);
+  if (nt <= COARSE_LIMIT) return minCut(nt, first, head, cap, sister, tcap, { free }).side;
+  const kind = (x) => (x === Infinity ? 2 : x === -Infinity ? -2 : x > 0 ? 1 : x < 0 ? -1 : 0);
+  const radius = lineTension(diag) / 2;
+  const patch = new Int32Array(nt).fill(-1);
+  const queue = new Int32Array(nt);
+  let np = 0;
+  for (let s = 0; s < nt; s++) {
+    if (patch[s] >= 0) continue;
+    const id = np++;
+    patch[s] = id;
+    const k = kind(tcap[s]);
+    let qh = 0, qt = 0;
+    queue[qt++] = s;
+    while (qh < qt) {
+      const f = queue[qh++];
+      for (let a = 3 * f; a < 3 * f + 3; a++) {
+        const g = head[a];
+        if (g < 0 || patch[g] >= 0 || kind(tcap[g]) !== k) continue;
+        if (N[3 * s] * N[3 * g] + N[3 * s + 1] * N[3 * g + 1] + N[3 * s + 2] * N[3 * g + 2] <= SMOOTH_FACETS) continue;
+        if ((C[3 * g] - C[3 * s]) ** 2 + (C[3 * g + 1] - C[3 * s + 1]) ** 2 + (C[3 * g + 2] - C[3 * s + 2]) ** 2 > radius * radius) continue;
+        patch[g] = id;
+        queue[qt++] = g;
+      }
+    }
+  }
+  // The patches' terminal capacities, and their arcs: the edges between two of them, their capacities summed.
+  const ptcap = new Float64Array(np);
+  for (let f = 0; f < nt; f++) ptcap[patch[f]] += tcap[f];
+  const start = new Int32Array(np + 1);
+  for (let a = 0; a < 3 * nt; a++) {
+    const g = head[a];
+    if (g >= 0 && patch[g] !== patch[(a / 3) | 0]) start[patch[(a / 3) | 0] + 1]++;
+  }
+  for (let p = 0; p < np; p++) start[p + 1] += start[p];
+  const to = new Int32Array(start[np]), w = new Float64Array(start[np]);
+  const fill = start.slice(0, np);
+  for (let a = 0; a < 3 * nt; a++) {
+    const g = head[a], p = patch[(a / 3) | 0];
+    if (g < 0 || patch[g] === p) continue;
+    to[fill[p]] = patch[g];
+    w[fill[p]++] = cap[a];
+  }
+  // Each pair once per patch (the edges both ways: the same sums), its sister by the pair.
+  const pfirst = new Int32Array(np + 1), seenAt = new Int32Array(np).fill(-1);
+  const phead = [], pcap = [];
+  for (let p = 0; p < np; p++) {
+    pfirst[p] = phead.length;
+    for (let x = start[p]; x < start[p + 1]; x++) {
+      const q = to[x];
+      if (seenAt[q] >= pfirst[p]) pcap[seenAt[q]] += w[x];
+      else {
+        seenAt[q] = phead.length;
+        phead.push(q);
+        pcap.push(w[x]);
+      }
+    }
+  }
+  pfirst[np] = phead.length;
+  const index = new Map();
+  for (let p = 0; p < np; p++) for (let x = pfirst[p]; x < pfirst[p + 1]; x++) index.set(p * np + phead[x], x);
+  const psister = new Int32Array(phead.length);
+  for (let p = 0; p < np; p++) for (let x = pfirst[p]; x < pfirst[p + 1]; x++) psister[x] = index.get(phead[x] * np + p);
+  const { side } = minCut(np, pfirst, Int32Array.from(phead), Float64Array.from(pcap), psister, ptcap, { free });
+  return Uint8Array.from(patch, (p) => side[p]);
+}
+
+/**
+ * The flags of the optimised halves (optimiseHalves), in place: an undercut
+ * without REACH_*; a triangle formed by a half with its REACH_* (by most of
+ * its points: one the optimum moved to the half round it keeps them, a small
+ * face in a shadow is still on the wrong side of a plane), and, without any
+ * (no half reaches most of it, but its region is too small or thin to be an
+ * undercut), that of its half.
+ */
+function optimisedFlags(flags, { under, upper }) {
+  for (let f = 0; f < flags.length; f++) {
+    const reach = flags[f] & (REACH_UP | REACH_DOWN);
+    if (under[f]) flags[f] &= ~(REACH_UP | REACH_DOWN);
+    else if (!reach) flags[f] |= upper[f] ? REACH_UP : REACH_DOWN;
+  }
+  return flags;
+}
+
+/** The halves of the optimum (optimiseHalves): SIDE_NONE for an undercut. */
+function optimisedSides({ under, upper }) {
+  const side = new Uint8Array(under.length);
+  for (let f = 0; f < side.length; f++) side[f] = under[f] ? SIDE_NONE : upper[f] ? SIDE_UPPER : SIDE_LOWER;
+  return side;
+}
+
+/**
+ * The half each undercut triangle (SIDE_NONE in `side`) is joined to, for
+ * the line round its region: of the labels upper / lower of the undercuts,
+ * the other triangles as `side` has them, the least weight of the line
+ * (placeWeights; as the second cut of optimiseHalves joins them: an
+ * undercut costing nothing either way, a region of them joined whole: the
+ * minimum cut of the undercuts alone, each region in the half its heavier
+ * border is with). The line goes round each region at its lightest border.
+ * The edge between two triangles flagged SHADOW in `flags` weighs nothing:
+ * the line goes across them, not along it (long triangles in turn undercuts
+ * and of a half across the edge of a shadow, one region of each on either
+ * side of it). Ties: the upper half. A new array, or `side` itself without
+ * undercuts.
+ */
+function joinUndercuts(line, side, d, flags = null) {
+  const nt = side.length;
+  let firstUndercut = -1;
+  for (let f = 0; f < nt && firstUndercut < 0; f++) if (side[f] === SIDE_NONE) firstUndercut = f;
+  if (firstUndercut < 0) return side;
+  const { head } = surfaceGraph(line);
+  const w = placeWeights(line, d);
+  const out = Uint8Array.from(side);
+  // Each region whole (the minimum cut with infinite arcs inside it): the half its lighter border is not with.
+  const region = new Int32Array(nt).fill(-1);
+  const queue = [];
+  for (let f0 = firstUndercut; f0 < nt; f0++) {
+    if (side[f0] !== SIDE_NONE || region[f0] >= 0) continue;
+    region[f0] = f0;
+    queue.length = 0;
+    queue.push(f0);
+    let balance = 0; // the weight of its border with the upper half less that with the lower one
+    for (let q = 0; q < queue.length; q++) {
+      const f = queue[q];
+      for (let a = 3 * f; a < 3 * f + 3; a++) {
+        const g = head[a];
+        if (g < 0) continue;
+        if (side[g] === SIDE_NONE) {
+          if (region[g] < 0) {
+            region[g] = f0;
+            queue.push(g);
+          }
+        } else if (flags && cutOf(flags[f]) === SHADOW && cutOf(flags[g]) === SHADOW) continue;
+        else if (side[g] === SIDE_UPPER) balance += w[a];
+        else if (side[g] === SIDE_LOWER) balance -= w[a];
+      }
+    }
+    const half = balance >= 0 ? SIDE_UPPER : SIDE_LOWER;
+    for (const f of queue) out[f] = half;
+  }
+  return out;
+}
+
 // ------------------------------------------------------------------ parting line
 
 /**
@@ -1237,6 +1668,21 @@ function zeroDraftArea(mesh, d, sinDraft) {
 export function lineMesh(positions, indices, merged = weld(positions, indices)) {
   const { welded, nv } = merged;
   return { positions, indices, welded, neighbours: merged.neighbours ?? edgeNeighbours(nv, welded) };
+}
+
+/** The triangles round each welded vertex of `line` (lineMesh), {start, around} in compressed rows, computed once. */
+function weldedTriangles(line) {
+  if (line.weldedRows) return line.weldedRows;
+  const { welded } = line;
+  let nw = 0;
+  for (let i = 0; i < welded.length; i++) if (welded[i] >= nw) nw = welded[i] + 1;
+  const start = new Int32Array(nw + 1);
+  for (let i = 0; i < welded.length; i++) start[welded[i] + 1]++;
+  for (let w = 0; w < nw; w++) start[w + 1] += start[w];
+  const around = new Int32Array(welded.length);
+  const fill = start.slice(0, nw);
+  for (let i = 0; i < welded.length; i++) around[fill[welded[i]]++] = (i / 3) | 0;
+  return (line.weldedRows = { start, around });
 }
 
 /**
@@ -1348,95 +1794,22 @@ function silhouetteField(line, d) {
  * The halves of the undercut triangles (SIDE_NONE: a core or a slide), for
  * the line only: it goes round an undercut region, it does not stop at it.
  * With a planar line (`plane`), the side of the plane of their centres (cut
- * by it when across it, see partingLine); else each region of them (joined
- * by their edges) in the half it shares the longer border with (the line
- * follows its shorter one). A long triangle of a half with two edges on
- * undercuts, its third shorter than FINGER of them (a finger of a comb: long
- * triangles in turn on either side of the edge of a shadow across them, see
- * shadowHalves), joins them in one region and counts for the length of its
- * third edge, shared between the two: the line will cut across it, not go
- * along its long edges. Ties: by the length of the edges, then the upper
- * one. A new array, or `side` itself without undercuts.
+ * by it when across it, see partingLine); else the half each is joined to
+ * by the lightest line round them (joinUndercuts: the joins of the optimum
+ * of the halves; `flags` with SHADOW, see there). A new array, or `side`
+ * itself without undercuts.
  */
-function undercutHalves(line, side, d, plane) {
-  const { positions: P, indices: I, neighbours } = line;
+function undercutHalves(line, side, d, plane, flags = null) {
+  const { positions: P, indices: I } = line;
   const nt = I.length / 3;
   let first = -1;
   for (let f = 0; f < nt && first < 0; f++) if (side[f] === SIDE_NONE) first = f;
   if (first < 0) return side;
+  if (plane == null) return joinUndercuts(line, side, d, flags);
   const out = Uint8Array.from(side);
   const w = (r) => P[3 * r] * d[0] + P[3 * r + 1] * d[1] + P[3 * r + 2] * d[2];
-  if (plane != null) {
-    for (let f = first; f < nt; f++) {
-      if (side[f] === SIDE_NONE) out[f] = (w(I[3 * f]) + w(I[3 * f + 1]) + w(I[3 * f + 2])) / 3 < plane ? SIDE_LOWER : SIDE_UPPER;
-    }
-    return out;
-  }
-  const length = (f, e) => {
-    const ra = 3 * I[3 * f + e], rb = 3 * I[3 * f + ((e + 1) % 3)];
-    return Math.hypot(P[rb] - P[ra], P[rb + 1] - P[ra + 1], P[rb + 2] - P[ra + 2]);
-  };
-  // A finger g of a half into the undercuts: two edges on them, its third shorter than FINGER of them: half of
-  // that third edge; else none.
-  const finger = (g) => {
-    let k = 0, rest = 0, shortest = Infinity;
-    for (let e = 0; e < 3; e++) {
-      const h = neighbours[3 * g + e];
-      const l = length(g, e);
-      if (h >= 0 && side[h] === SIDE_NONE) {
-        k++;
-        shortest = Math.min(shortest, l);
-      } else rest += l;
-    }
-    return k === 2 && rest < FINGER * shortest ? rest / 2 : Infinity;
-  };
-  // The regions: undercut triangles joined by their edges, or by a finger between them (a comb of long triangles).
-  const root = new Int32Array(nt).fill(-1);
-  const find = (f) => {
-    while (root[f] !== f) f = root[f] = root[root[f]];
-    return f;
-  };
-  const join = (f, g) => {
-    const a = find(f), b = find(g);
-    if (a !== b) root[Math.max(a, b)] = Math.min(a, b);
-  };
-  for (let f = first; f < nt; f++) if (side[f] === SIDE_NONE) root[f] = f;
   for (let f = first; f < nt; f++) {
-    if (side[f] !== SIDE_NONE) continue;
-    for (let e = 0; e < 3; e++) {
-      const g = neighbours[3 * f + e];
-      if (g < 0) continue;
-      if (side[g] === SIDE_NONE) join(f, g);
-      else if (finger(g) < Infinity) {
-        for (let c = 0; c < 3; c++) {
-          const h = neighbours[3 * g + c];
-          if (h >= 0 && side[h] === SIDE_NONE) join(f, h);
-        }
-      }
-    }
-  }
-  // Per region and half (upper 0, lower 1): the border with fingers across (comb), and along their edges (edges).
-  const slot = new Map();
-  for (let f = first; f < nt; f++) if (side[f] === SIDE_NONE && find(f) === f) slot.set(f, slot.size);
-  const comb = new Float64Array(2 * slot.size), edges = new Float64Array(2 * slot.size);
-  for (let f = first; f < nt; f++) {
-    if (side[f] !== SIDE_NONE) continue;
-    const r = slot.get(find(f));
-    for (let e = 0; e < 3; e++) {
-      const g = neighbours[3 * f + e];
-      if (g < 0 || side[g] === SIDE_NONE) continue;
-      const k = 2 * r + (side[g] === SIDE_UPPER ? 0 : 1);
-      const len = length(f, e);
-      edges[k] += len;
-      comb[k] += Math.min(len, finger(g));
-    }
-  }
-  const tie = (a, b) => Math.abs(a - b) <= 1e-9 * (a + b);
-  for (let f = first; f < nt; f++) {
-    if (side[f] !== SIDE_NONE) continue;
-    const r = slot.get(find(f));
-    const [u, l] = tie(comb[2 * r], comb[2 * r + 1]) ? [edges[2 * r], edges[2 * r + 1]] : [comb[2 * r], comb[2 * r + 1]];
-    out[f] = l > u ? SIDE_LOWER : SIDE_UPPER;
+    if (side[f] === SIDE_NONE) out[f] = (w(I[3 * f]) + w(I[3 * f + 1]) + w(I[3 * f + 2])) / 3 < plane ? SIDE_LOWER : SIDE_UPPER;
   }
   return out;
 }
@@ -1532,14 +1905,16 @@ function lineCuts(line, side, d, { flags = null, plane = null, fixed = null, hei
   const w = (r) => P[3 * r] * d[0] + P[3 * r + 1] * d[1] + P[3 * r + 2] * d[2];
   const tiny = 1e-9 * Math.max(1, Math.abs(plane ?? 0), height ?? 0);
   const given = side;
-  side = undercutHalves(line, side, d, plane);
-  let field = null, shade = null;
+  side = undercutHalves(line, side, d, plane, flags);
+  let field = null, shade = null, iso = null;
   if (plane == null && flags) {
-    let silhouettes = false, shadows = false;
-    for (let f = 0; f < nt && !(silhouettes && shadows); f++) {
+    let silhouettes = false, shadows = false, isos = false;
+    for (let f = 0; f < nt && !(silhouettes && shadows && isos); f++) {
       if (fixed?.[f]) continue;
-      if (flags[f] & SILHOUETTE) silhouettes = true;
-      else if (flags[f] & SHADOW) shadows = true;
+      const cut = cutOf(flags[f]);
+      if (cut === ISO_CUT) isos = true;
+      else if (cut === SILHOUETTE) silhouettes = true;
+      else if (cut === SHADOW) shadows = true;
     }
     if (silhouettes) field = silhouetteField(line, d);
     if (shadows) {
@@ -1548,8 +1923,10 @@ function lineCuts(line, side, d, { flags = null, plane = null, fixed = null, hei
       field ??= silhouetteField(line, d);
       shade = shadowLabels(mesh, grid, line, given, side, flags, d, field);
     }
+    if (isos) iso = isoField(line, side, flags, fixed);
   }
-  const modeOf = (f) => (plane != null ? 1 : flags[f] & SILHOUETTE ? 2 : 3);
+  // 1 by the plane, 2 by its silhouette, 3 by the edges of shadows, 4 by the iso-line of the halves.
+  const modeOf = (f) => (plane != null ? 1 : MODE_OF[cutOf(flags[f])]);
   const shapes = new Map();
   const shapeOf = (f) => {
     let s = shapes.get(f);
@@ -1557,12 +1934,15 @@ function lineCuts(line, side, d, { flags = null, plane = null, fixed = null, hei
     return s;
   };
   // The value of the cut at vertex r of triangle f cut by the plane or a silhouette (positive: upper), on it within nearOf(f).
-  const value = (f, r) => (modeOf(f) === 1 ? w(r) - plane : field.phi[r]);
+  const value = (f, r) => {
+    const mode = modeOf(f);
+    return mode === 1 ? w(r) - plane : mode === 4 ? iso[r] : field.phi[r];
+  };
   const nearOf = (f) => (plane != null ? tiny : SILHOUETTE_TINY);
   // A face both halves can form, an undercut or a face flagged LEVEL, across the plane: its side changes at the plane.
   const split = (f) => {
     if (fixed?.[f] || !flags) return false;
-    if (plane != null ? !(flags[f] & LEVEL || isFree(flags[f])) : !((field && flags[f] & SILHOUETTE) || (shade && flags[f] & SHADOW))) return false;
+    if (plane != null ? !(flags[f] & LEVEL || isFree(flags[f])) : !((field && cutOf(flags[f]) === SILHOUETTE) || (shade && cutOf(flags[f]) === SHADOW) || (iso && cutOf(flags[f]) === ISO_CUT))) return false;
     if (modeOf(f) === 3) return shapeOf(f).cuts.length > 0;
     const near = nearOf(f);
     let below = false, above = false;
@@ -1579,7 +1959,7 @@ function lineCuts(line, side, d, { flags = null, plane = null, fixed = null, hei
       const ha = w(ra), hb = w(rb);
       return (plane - ha) / (hb - ha);
     }
-    const va = field.phi[ra], vb = field.phi[rb];
+    const va = value(f, ra), vb = value(f, rb);
     return va / (va - vb);
   };
   const along = (ra, rb, t) => [0, 1, 2].map((c) => P[3 * ra + c] + t * (P[3 * rb + c] - P[3 * ra + c]));
@@ -1666,7 +2046,10 @@ function lineOf(line, side, d, options) {
   // How each triangle cut is cut: 1 by the plane, 2 by its silhouette, 3 by the edges of shadows.
   const { modeOf, shapeOf, value, nearOf, isSplit, splitState, crossing, along, pointOn, at } = cutting;
   const pieces = []; // [xyz, xyz, key, key]: the ends of each piece and what they are (a vertex, a point of an edge)
-  const edgeKey = (wa, wb) => (wa < wb ? `e${wa},${wb}` : `e${wb},${wa}`);
+  // A point at t along edge (wa, wb) (welded) where a cut crosses it: by where it is along the edge (two cuts of
+  // their own, the silhouettes of two faces or a silhouette and an iso-line, cross it at points of their own, joined
+  // along it; the same point for the triangles on either side of a cut, the line goes on).
+  const edgeKey = (wa, wb, t) => (wa < wb ? `e${wa},${wb}@${Math.round(t * 1e9)}` : `e${wb},${wa}@${Math.round((1 - t) * 1e9)}`);
   // The vertex of triangle g at welded vertex wv (the faces of a CAD body have their own: the values of g's surface).
   const corner = (g, wv) => (welded[3 * g] === wv ? I[3 * g] : welded[3 * g + 1] === wv ? I[3 * g + 1] : I[3 * g + 2]);
   // The halves along edge (wa, wb) of triangle x cut, from wa to wb: [{from, to, upper, keyFrom, keyTo}].
@@ -1676,7 +2059,7 @@ function lineOf(line, side, d, options) {
       const ha = value(x, ra), hb = value(x, rb);
       if (!(ha * hb < 0)) return [{ from: 0, to: 1, upper: ha + hb > 0, keyFrom: `v${wa}`, keyTo: `v${wb}` }];
       const t = crossing(x, ra, rb);
-      return [{ from: 0, to: t, upper: ha > 0, keyFrom: `v${wa}`, keyTo: edgeKey(wa, wb) }, { from: t, to: 1, upper: hb > 0, keyFrom: edgeKey(wa, wb), keyTo: `v${wb}` }];
+      return [{ from: 0, to: t, upper: ha > 0, keyFrom: `v${wa}`, keyTo: edgeKey(wa, wb, t) }, { from: t, to: 1, upper: hb > 0, keyFrom: edgeKey(wa, wb, t), keyTo: `v${wb}` }];
     }
     const s = shapeOf(x);
     let e = 0;
@@ -1731,7 +2114,7 @@ function lineOf(line, side, d, options) {
       if (xf && xg) {
         // The same rule on both sides; but two faces cut by rules or values of their own (silhouettes of two faces, a silhouette and a shadow): the parts of the edge where they differ.
         const ga = corner(g, wa), gb = corner(g, wb);
-        if (plane == null && (ga !== ra || gb !== rb || modeOf(f) === 3 || modeOf(g) === 3)) edgeParts(f, g, null, wa, wb);
+        if (plane == null && (ga !== ra || gb !== rb || modeOf(f) === 3 || modeOf(g) === 3 || modeOf(f) !== modeOf(g))) edgeParts(f, g, null, wa, wb);
         continue;
       }
       // One side cut (upper above the plane, on the upper side of the silhouette or the shadow), the other of one half: the part of the edge where they differ.
@@ -1748,8 +2131,9 @@ function lineOf(line, side, d, options) {
       const inB = keepAbove ? hb > 0 : hb < 0;
       if (inA && inB) pieces.push([at(ra), at(rb), `v${wa}`, `v${wb}`]);
       else if (inA !== inB && Math.abs(hb - ha) > nearOf(x)) {
-        const cut = pointOn(x, ra, rb);
-        pieces.push(inA ? [at(ra), cut, `v${wa}`, edgeKey(wa, wb)] : [cut, at(rb), edgeKey(wa, wb), `v${wb}`]);
+        const t = crossing(x, ra, rb);
+        const cut = along(ra, rb, t);
+        pieces.push(inA ? [at(ra), cut, `v${wa}`, edgeKey(wa, wb, t)] : [cut, at(rb), edgeKey(wa, wb, t), `v${wb}`]);
       }
     }
   }
@@ -1768,13 +2152,93 @@ function lineOf(line, side, d, options) {
       const ra = I[3 * f + e], rb = I[3 * f + ((e + 1) % 3)];
       const ha = value(f, ra), hb = value(f, rb);
       if (Math.abs(ha) <= near) ends.push([at(ra), `v${welded[3 * f + e]}`]);
-      else if (ha * hb < 0 && Math.abs(hb) > near) ends.push([pointOn(f, ra, rb), edgeKey(welded[3 * f + e], welded[3 * f + ((e + 1) % 3)])]);
+      else if (ha * hb < 0 && Math.abs(hb) > near) {
+        const t = crossing(f, ra, rb);
+        ends.push([along(ra, rb, t), edgeKey(welded[3 * f + e], welded[3 * f + ((e + 1) % 3)], t)]);
+      }
     }
     if (ends.length === 2) pieces.push([ends[0][0], ends[1][0], ends[0][1], ends[1][1]]);
   }
   const hooks = [];
   unhook(pieces, hooks);
+  dropSmallLoops(line, pieces, hooks);
   return { cut: cutting, pieces, hooks };
+}
+
+/**
+ * The small closed loops of a line taken out, in place: a loop of at most
+ * SMALL_LOOP_PIECES pieces (chained by their keys, each point on two of
+ * them) enclosing less than λ² (lineTension of the part: a sliver between
+ * two cuts that meet, the silhouettes of two faces, a silhouette and the edge
+ * of a shadow; a region of a few square millimetres a cut cuts off), each
+ * into `hooks` as the fan of triangles from its first point (partingPieces:
+ * its inside on the other side of the line, as the line round it). A real
+ * small hole, a slot, is larger.
+ */
+function dropSmallLoops(line, pieces, hooks) {
+  if (pieces.length < 3) return;
+  const size = line.diag ??= (() => {
+    const P = line.positions;
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < P.length; i++) {
+      lo[i % 3] = Math.min(lo[i % 3], P[i]);
+      hi[i % 3] = Math.max(hi[i % 3], P[i]);
+    }
+    return Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+  })();
+  const lambda = lineTension(size);
+  const byEnd = new Map();
+  pieces.forEach(([, , ka, kb], k) => {
+    for (const key of [ka, kb]) (byEnd.get(key) ?? byEnd.set(key, []).get(key)).push(k);
+  });
+  const seen = new Uint8Array(pieces.length);
+  const drop = new Uint8Array(pieces.length);
+  for (let k0 = 0; k0 < pieces.length; k0++) {
+    if (seen[k0]) continue;
+    // The loop from piece k0: each of its points on two pieces exactly, back to its start.
+    const loop = [k0];
+    const points = [pieces[k0][0]], keys = [pieces[k0][2]];
+    seen[k0] = 1;
+    let key = pieces[k0][3], at = pieces[k0][1], closed = false, simple = true;
+    while (loop.length <= SMALL_LOOP_PIECES) {
+      const list = byEnd.get(key);
+      if (list.length !== 2) {
+        simple = false;
+        break;
+      }
+      const next = list[0] === loop.at(-1) ? list[1] : list[0];
+      if (next === k0) {
+        closed = true;
+        break;
+      }
+      if (seen[next]) {
+        simple = false;
+        break;
+      }
+      seen[next] = 1;
+      loop.push(next);
+      points.push(at);
+      keys.push(key);
+      const forward = pieces[next][2] === key;
+      at = forward ? pieces[next][1] : pieces[next][0];
+      key = forward ? pieces[next][3] : pieces[next][2];
+    }
+    if (!closed || !simple || loop.length < 3) continue;
+    // Its area (Newell): under λ².
+    const n = [0, 0, 0];
+    points.forEach((p, i) => {
+      const q = points[(i + 1) % points.length];
+      n[0] += (p[1] - q[1]) * (p[2] + q[2]);
+      n[1] += (p[2] - q[2]) * (p[0] + q[0]);
+      n[2] += (p[0] - q[0]) * (p[1] + q[1]);
+    });
+    if (!(Math.hypot(n[0], n[1], n[2]) / 2 < lambda * lambda)) continue;
+    for (const k of loop) drop[k] = 1;
+    for (let i = 1; i + 1 < points.length; i++) hooks.push({ X: points[0], A: points[i], B: points[i + 1], kx: keys[0], ka: keys[i], kb: keys[i + 1] });
+  }
+  let m = 0;
+  for (let k = 0; k < pieces.length; k++) if (!drop[k]) pieces[m++] = pieces[k];
+  pieces.length = m;
 }
 
 /**
@@ -1890,9 +2354,9 @@ export function partingPieces(line, side, d, options = {}) {
     const around = new Int32Array(welded.length);
     const fill = start.slice(0, nw);
     for (let i = 0; i < welded.length; i++) around[fill[welded[i]]++] = (i / 3) | 0;
-    // The triangles round a point of the line by its key: a vertex ("v<w>"), a point of an edge ("e<a>,<b>", "e<a>,<b>:<i>": round either end).
+    // The triangles round a point of the line by its key: a vertex ("v<w>"), a point of an edge ("e<a>,<b>@<t>", "e<a>,<b>:<i>": round either end).
     const round = (key, out) => {
-      for (const w of key.slice(1).split(":")[0].split(",").map(Number)) for (let s = start[w]; s < start[w + 1]; s++) out.add(around[s]);
+      for (const w of key.slice(1).split(/[:@]/)[0].split(",").map(Number)) for (let s = start[w]; s < start[w + 1]; s++) out.add(around[s]);
       return out;
     };
     const flip = (h) => (h === SIDE_UPPER ? SIDE_LOWER : SIDE_UPPER);
@@ -1980,7 +2444,8 @@ export function partingPieces(line, side, d, options = {}) {
       if (reach === (REACH_UP | REACH_DOWN) || flags[f] & ZERO_DRAFT) return false;
       return h === (reach === REACH_UP ? SIDE_LOWER : SIDE_UPPER);
     }
-    if (h === joined[f] || (isSplit(f) && modeOf(f) === 2) || !cut.shade) return undercutTri(f);
+    // Across the edge of a shadow: each piece by its lines of sight (a sliver in the shadow the undercuts left to a half, still in it).
+    if ((isSplit(f) && modeOf(f) !== 3) || !cut.shade || (h === joined[f] && !isSplit(f))) return undercutTri(f);
     return blocked(f, poly);
   };
   // How far a piece runs along each edge of triangle f: its sides with both ends on that edge.
@@ -2613,9 +3078,12 @@ function shadowSight(mesh, grid, line, given, joined, d, field) {
     }
     return joined[f];
   };
-  const sideAt = (f, [x, y, z]) => {
+  const hitsAt = (f, [x, y, z]) => {
     const off = eps + sag[f];
-    const hits = lineHits(mesh, grid, f, x + off * N[3 * f], y + off * N[3 * f + 1], z + off * N[3 * f + 2], tEps);
+    return lineHits(mesh, grid, f, x + off * N[3 * f], y + off * N[3 * f + 1], z + off * N[3 * f + 2], tEps);
+  };
+  const sideAt = (f, [x, y, z]) => {
+    const hits = hitsAt(f, [x, y, z]);
     const up = !(hits & 1), down = !(hits & 2);
     if (up && down) return below(f, x, y, z) ? SIDE_LOWER : SIDE_UPPER;
     return up ? SIDE_UPPER : down ? SIDE_LOWER : none(f);
@@ -2655,7 +3123,12 @@ function shadowSight(mesh, grid, line, given, joined, d, field) {
     if (!onSilhouette(v)) return sideAt(f, p);
     return below(f, p[0], p[1], p[2]) ? SIDE_LOWER : SIDE_UPPER;
   };
-  return { sideAt, point, vertexSide, onSilhouette };
+  // A corner both halves reach (off any silhouette): its half is a default, not the edge of a shadow.
+  const vertexFree = (f, k) => {
+    const v = I[3 * f + k];
+    return !onSilhouette(v) && hitsAt(f, point(f, 3 * v, 3 * v, 0)) === 0;
+  };
+  return { sideAt, point, vertexSide, vertexFree, onSilhouette };
 }
 
 /**
@@ -2683,14 +3156,14 @@ function shadowLabels(mesh, grid, line, given, joined, flags, d, field) {
   const cross = new Map();
   const middle = new Uint8Array(nt);
   for (let f = 0; f < nt; f++) {
-    if (!(flags[f] & SHADOW)) continue;
+    if (cutOf(flags[f]) !== SHADOW) continue;
     for (let k = 0; k < 3; k++) {
       const v = welded[3 * f + k];
       if (!label[v]) label[v] = vertexSide(f, k);
     }
   }
   for (let f = 0; f < nt; f++) {
-    if (!(flags[f] & SHADOW)) continue;
+    if (cutOf(flags[f]) !== SHADOW) continue;
     for (let e = 0; e < 3; e++) {
       let k0 = e, k1 = (e + 1) % 3;
       if (welded[3 * f + k1] < welded[3 * f + k0]) [k0, k1] = [k1, k0];
@@ -2720,7 +3193,7 @@ function shadowLabels(mesh, grid, line, given, joined, flags, d, field) {
     }
   }
   for (let f = 0; f < nt; f++) {
-    if (!(flags[f] & SHADOW)) continue;
+    if (cutOf(flags[f]) !== SHADOW) continue;
     const { events, arcs } = shadowOutline(f, I, welded, label, cross);
     const c = [0, 1, 2].map((k) => (P[3 * I[3 * f] + k] + P[3 * I[3 * f + 1] + k] + P[3 * I[3 * f + 2] + k]) / 3);
     if (events.length === 4) {
@@ -2839,7 +3312,7 @@ function shadowShape(f, P, I, welded, shade) {
 
 /**
  * The edges of the shadows across the faces, for a line that is not planar
- * (after smoothHalves): where the halves (the undercut regions joined to
+ * (after silhouetteHalves): where the halves (the undercut regions joined to
  * one, see undercutHalves) meet inside a smooth surface (across an edge of
  * a face, not along one), their triangles there are flagged SHADOW, and with
  * them every triangle of that surface at a vertex of one of them whose half
@@ -2850,11 +3323,20 @@ function shadowShape(f, P, I, welded, shade) {
  * them not an undercut in the half of most of it by that line. The flags (a
  * new array, or `flags` itself), `side` changed in place.
  */
-function shadowHalves(mesh, grid, line, side, flags, d) {
+function shadowHalves(mesh, grid, line, side, flags, d, across = null) {
   const { indices: I, neighbours, welded } = line;
   const { normals: N, nt } = mesh;
-  const joined = undercutHalves(line, side, d, null);
-  const has = (g, v) => I[3 * g] === v || I[3 * g + 1] === v || I[3 * g + 2] === v;
+  // The triangles across the edge of a shadow by their points (`across`, not cut by a silhouette): flagged first, the
+  // undercuts joined with them (not along the edges between them, joinUndercuts).
+  let out = flags;
+  if (across) {
+    for (let f = 0; f < nt; f++) {
+      if (!across[f] || flags[f] & SILHOUETTE) continue;
+      if (out === flags) out = Uint8Array.from(flags);
+      out[f] |= SHADOW;
+    }
+  }
+  const joined = undercutHalves(line, side, d, null, out);
   const smoothWith = (f, g) => N[3 * f] * N[3 * g] + N[3 * f + 1] * N[3 * g + 1] + N[3 * f + 2] * N[3 * g + 2] > SMOOTH_FACETS;
   const band = new Uint8Array(nt);
   const queue = [];
@@ -2885,6 +3367,7 @@ function shadowHalves(mesh, grid, line, side, flags, d) {
     const v = (phi[a] + phi[b] + phi[c]) / 3, tol = SILHOUETTE_TINY + Math.max(noise[a], noise[b], noise[c]);
     return joined[h] === SIDE_UPPER ? v > tol : v < -tol;
   };
+  const has = (g, v) => I[3 * g] === v || I[3 * g + 1] === v || I[3 * g + 2] === v;
   for (let f = 0; f < nt; f++) {
     for (let e = 0; e < 3; e++) {
       const g = neighbours[3 * f + e];
@@ -2896,104 +3379,205 @@ function shadowHalves(mesh, grid, line, side, flags, d) {
       enter(g);
     }
   }
-  if (!queue.length) return flags;
+  if (!queue.length) {
+    // Those next to a silhouette's cut (not entered): as given.
+    if (out === flags) return flags;
+    for (let f = 0; f < nt; f++) if (out[f] & SHADOW && !band[f]) out[f] &= ~SHADOW;
+    return out;
+  }
   // The band grown across the triangles the edges of the shadows cross.
-  const { vertexSide } = shadowSight(mesh, grid, line, side, joined, d, field);
-  const seen = new Map(); // welded vertex -> its half
+  const { vertexSide, vertexFree } = shadowSight(mesh, grid, line, side, joined, d, field);
+  const seen = new Map(); // welded vertex -> its half (0: both halves reach it)
   const most = Math.max(SHADOW_MIN, SHADOW_MAX * nt);
   for (let q = 0; q < queue.length; q++) {
     const f = queue[q];
     for (let k = 0; k < 3; k++) {
       const v = I[3 * f + k], wv = welded[3 * f + k];
       let half = seen.get(wv);
-      if (half === undefined) seen.set(wv, (half = vertexSide(f, k)));
+      // A corner both halves reach: no shadow to follow from it (its half would be a default, the sense its face
+      // faces, where the optimum may have put the face in the other half: the band would flood it, cut into a comb).
+      if (half === undefined) seen.set(wv, (half = vertexFree(f, k) ? 0 : vertexSide(f, k)));
+      if (!half) continue;
       for (let s = start[v]; s < start[v + 1] && queue.length < most; s++) {
         const g = around[s];
         if (!band[g] && joined[g] !== half && smoothWith(f, g)) enter(g);
       }
     }
   }
-  const out = Uint8Array.from(flags);
+  if (out === flags) out = Uint8Array.from(flags);
+  // Flagged: the band (those of `across` it left out, by a silhouette, not).
+  for (let f = 0; f < nt; f++) if (out[f] & SHADOW && !band[f]) out[f] &= ~SHADOW;
   for (const f of queue) out[f] |= SHADOW;
-  const shade = shadowLabels(mesh, grid, line, side, joined, out, d, field);
+  // The joins with the band flagged (as partingLine has them).
+  const final = undercutHalves(line, side, d, null, out);
+  const shade = shadowLabels(mesh, grid, line, side, final, out, d, field);
   for (const f of queue) if (side[f] !== SIDE_NONE) side[f] = shadowShape(f, line.positions, I, welded, shade).half;
   return out;
 }
 
+// The iso-line of the halves (isoField): its Gauss-Seidel sweeps, until no value moves by more than ISO_STILL;
+// across facets no longer than ISO_MAX × the tension of the line (isoHalves).
+const ISO_SWEEPS = 400;
+const ISO_STILL = 1e-12;
+const ISO_MAX = 4;
+
 /**
- * The halves of a line that is not planar, cleaned of what the triangles of
- * a CAD mesh (long, thin, grazing) make of a smooth surface, `side` changed
- * in place; the flags with SILHOUETTE (a new array, or `flags` itself):
- * - a tooth: a triangle of one half between two or three of the other on its
- *   smooth surface (a spike of the line round one long triangle, the teeth
- *   of a comb across a band of them) goes to that half when it can form it;
- * - an island: a region of one half within the other, smaller than
- *   ISLAND_SHARE of the surface (a small loop round a few triangles), goes to
- *   that half when it can form every triangle of it;
- * - a silhouette: across a band of triangles of a curved face that turns from
- *   facing +d to facing -d (phi of silhouetteField changes sign between
- *   their corners) between the halves, the upper one on its side of the
- *   silhouette and the lower one on the other, the line follows the
- *   silhouette across them (flagged SILHOUETTE, each in the half of its
- *   centre), not their edges (a staircase, or a zigzag along staggered rows).
+ * The halves smoothed round their line where it is cut along their iso-line
+ * (the triangles flagged ISO_CUT, not reassigned by hand), per vertex (by
+ * index, the value of its welded vertex): +1 in the upper half, -1 in the
+ * lower one (`joined`: the undercuts joined to a half), harmonic over the
+ * band (each vertex of it with all its triangles in it the mean of the
+ * vertices it shares an edge with), from the vertices on its border, each
+ * the mean of the halves of its triangles out of it. Its zero runs through
+ * the band where the halves meet, smoothed: across the triangles, not along
+ * the staircase of their edges. It depends only on the halves round the
+ * band: the same once those of the band are set from it. NaN off the band.
  */
-function smoothHalves(mesh, grid, line, side, flags, d) {
-  const { nt, areas, sliver, totalArea, normals: N } = mesh;
+function isoField(line, joined, flags, fixed = null) {
+  const { indices: I, welded } = line;
+  const nt = I.length / 3;
+  const { start, around } = weldedTriangles(line);
+  const nw = start.length - 1;
+  const band = (f) => cutOf(flags[f]) === ISO_CUT && !fixed?.[f];
+  const value = new Float64Array(nw).fill(NaN);
+  const free = new Uint8Array(nw);
+  const sign = (f) => (joined[f] === SIDE_UPPER ? 1 : joined[f] === SIDE_LOWER ? -1 : 0);
+  const touched = [];
+  for (let f = 0; f < nt; f++) {
+    if (!band(f)) continue;
+    for (let k = 0; k < 3; k++) {
+      const v = welded[3 * f + k];
+      if (!Number.isNaN(value[v]) || free[v]) continue;
+      let out = 0, sum = 0;
+      for (let s = start[v]; s < start[v + 1]; s++) {
+        const g = around[s];
+        if (band(g)) continue;
+        out++;
+        sum += sign(g);
+      }
+      if (out) value[v] = sum / out;
+      else {
+        free[v] = 1;
+        value[v] = 0;
+        touched.push(v);
+      }
+    }
+  }
+  touched.sort((a, b) => a - b);
+  for (let sweep = 0; sweep < ISO_SWEEPS; sweep++) {
+    let moved = 0;
+    for (const v of touched) {
+      let sum = 0, n = 0;
+      for (let s = start[v]; s < start[v + 1]; s++) {
+        const g = around[s];
+        for (let k = 0; k < 3; k++) {
+          const u = welded[3 * g + k];
+          if (u === v) continue;
+          sum += value[u];
+          n++;
+        }
+      }
+      const next = n ? sum / n : 0;
+      moved = Math.max(moved, Math.abs(next - value[v]));
+      value[v] = next;
+    }
+    if (moved <= ISO_STILL) break;
+  }
+  // Per vertex by index.
+  const out = new Float64Array(line.positions.length / 3).fill(NaN);
+  for (let i = 0; i < I.length; i++) out[I[i]] = value[welded[i]];
+  return out;
+}
+
+/**
+ * The line of the halves of a line that is not planar across the smooth
+ * surfaces where it is neither on a silhouette nor on the edge of a shadow
+ * (after silhouetteHalves, shadowHalves): the optimum along the edges of
+ * small facets (a blend, a finely meshed face: a staircase, teeth round
+ * them) smoothed. Where the halves (the undercuts joined to one) meet across
+ * an edge inside a face (its two facets with its vertices: not the border
+ * of two faces, a clean line already) less than 35° apart, neither cut,
+ * both formable by either half (where the evidence leaves the optimum free
+ * to place it), both no longer than ISO_MAX × λ (lineTension; longer ones,
+ * the strips of a cylinder, the fans of a flat face, are cut by their
+ * silhouettes and shadows), the facets of that face round its ends that are
+ * as small, as free and not cut, flagged ISO_CUT: the line across them
+ * along the zero of the halves smoothed
+ * (isoField), each not cut in the half of the sign there (`side` changed in
+ * place, but the undercuts), until the joins of the undercuts no longer
+ * change (as partingLine has them). The flags (a new array, or `flags`
+ * itself).
+ */
+function isoHalves(mesh, line, side, flags, d) {
+  const { indices: I, neighbours, welded } = line;
+  const { normals: N, nt, areas, sliver, reach, diag } = mesh;
+  const most = ISO_MAX * lineTension(diag);
+  // Both halves can form it (a face only one can form keeps its half: the line along its border is the evidence's,
+  // the edge of a shadow along the edges of the facets); not an undercut (the line goes round its region, along its
+  // border).
+  const small = (f) => reach[f] <= most && areas[f] >= sliver && !cutOf(flags[f]) && side[f] !== SIDE_NONE && isFree(flags[f]);
+  const smoothWith = (f, g) => N[3 * f] * N[3 * g] + N[3 * f + 1] * N[3 * g + 1] + N[3 * f + 2] * N[3 * g + 2] > SMOOTH_FACETS;
+  const has = (g, v) => I[3 * g] === v || I[3 * g + 1] === v || I[3 * g + 2] === v;
+  // Inside a face (the triangles round a vertex by its index: of its face; a border of faces, a fillet's with a face,
+  // is a clean line already).
+  const { start, around } = surfaceOf(mesh).vertexTriangles();
+  let joined = undercutHalves(line, side, d, null, flags);
+  const ends = new Set();
+  for (let f = 0; f < nt; f++) {
+    if (!small(f)) continue;
+    for (let e = 0; e < 3; e++) {
+      const g = neighbours[3 * f + e];
+      if (g <= f || !small(g) || joined[f] === joined[g] || joined[f] === SIDE_NONE || joined[g] === SIDE_NONE || !smoothWith(f, g)) continue;
+      if (!has(g, I[3 * f + e]) || !has(g, I[3 * f + ((e + 1) % 3)])) continue;
+      ends.add(I[3 * f + e]);
+      ends.add(I[3 * f + ((e + 1) % 3)]);
+    }
+  }
+  if (!ends.size) return flags;
+  const out = Uint8Array.from(flags);
+  const band = [];
+  for (const v of [...ends].sort((a, b) => a - b)) {
+    for (let s = start[v]; s < start[v + 1]; s++) {
+      const g = around[s];
+      if (!small(g) || cutOf(out[g])) continue;
+      out[g] |= ISO_CUT;
+      band.push(g);
+    }
+  }
+  for (let pass = 0; pass < 4; pass++) {
+    const iso = isoField(line, joined, out);
+    for (const f of band) {
+      if (side[f] === SIDE_NONE) continue;
+      const m = iso[I[3 * f]] + iso[I[3 * f + 1]] + iso[I[3 * f + 2]];
+      if (m > 0) side[f] = SIDE_UPPER;
+      else if (m < 0) side[f] = SIDE_LOWER;
+    }
+    const again = undercutHalves(line, side, d, null, out);
+    let same = true;
+    for (let f = 0; f < nt && same; f++) same = again[f] === joined[f];
+    if (same) break;
+    joined = again;
+  }
+  return out;
+}
+
+/**
+ * The silhouettes of the halves of a line that is not planar (the optimum
+ * of optimiseHalves), `side` changed in place; the flags with SILHOUETTE (a
+ * new array, or `flags` itself): across a band of triangles of a curved face
+ * that turns from facing +d to facing -d (phi of silhouetteField changes
+ * sign between their corners) between the halves, the upper one on its side
+ * of the silhouette and the lower one on the other, the line follows the
+ * silhouette across them (flagged SILHOUETTE, each in the half of its
+ * centre), not their edges (a staircase, or a zigzag along staggered rows).
+ */
+function silhouetteHalves(mesh, grid, line, side, flags, d) {
+  const { nt, areas, sliver } = mesh;
   const { indices: I, neighbours } = line;
   const reachOf = (half) => (half === SIDE_UPPER ? REACH_UP : REACH_DOWN);
   const can = (f, half) => areas[f] < sliver || (flags[f] & reachOf(half)) !== 0;
-  const has = (g, v) => I[3 * g] === v || I[3 * g + 1] === v || I[3 * g + 2] === v;
-  // Across edge e of f, a facet of its smooth surface (its vertices, normals within 35°).
-  const smoothAcross = (f, e, g) =>
-    g >= 0 && has(g, I[3 * f + e]) && has(g, I[3 * f + ((e + 1) % 3)]) && N[3 * f] * N[3 * g] + N[3 * f + 1] * N[3 * g + 1] + N[3 * f + 2] * N[3 * g + 2] > SMOOTH_FACETS;
-  // Teeth, a few passes (each in place: a comb of alternate triangles ends in one half).
-  for (let pass = 0; pass < 4; pass++) {
-    let changed = 0;
-    for (let f = 0; f < nt; f++) {
-      const s = side[f];
-      if (s !== SIDE_UPPER && s !== SIDE_LOWER) continue;
-      const o = s === SIDE_UPPER ? SIDE_LOWER : SIDE_UPPER;
-      let others = 0;
-      for (let e = 0; e < 3; e++) {
-        const g = neighbours[3 * f + e];
-        if (smoothAcross(f, e, g) && side[g] === o) others++;
-      }
-      if (others >= 2 && can(f, o)) {
-        side[f] = o;
-        changed++;
-      }
-    }
-    if (!changed) break;
-  }
-  // Islands.
   const comp = new Int32Array(nt).fill(-1);
   const queue = new Int32Array(nt);
-  for (let f0 = 0; f0 < nt; f0++) {
-    const s = side[f0];
-    if (comp[f0] >= 0 || (s !== SIDE_UPPER && s !== SIDE_LOWER)) continue;
-    let head = 0, tail = 0, area = 0, around = 0; // around: the half all round it (-1: several, or an undercut)
-    comp[f0] = f0;
-    queue[tail++] = f0;
-    while (head < tail) {
-      const f = queue[head++];
-      area += areas[f];
-      for (let e = 0; e < 3; e++) {
-        const g = neighbours[3 * f + e];
-        if (g < 0) continue;
-        if (side[g] === s) {
-          if (comp[g] < 0) {
-            comp[g] = f0;
-            queue[tail++] = g;
-          }
-        } else if (around === 0) around = side[g] === SIDE_NONE ? -1 : side[g];
-        else if (around !== side[g]) around = -1;
-      }
-    }
-    if (around <= 0 || area > ISLAND_SHARE * totalArea) continue;
-    let ok = true;
-    for (let k = 0; k < tail && ok; k++) ok = can(queue[k], around);
-    if (ok) for (let k = 0; k < tail; k++) side[queue[k]] = around;
-  }
   // Silhouettes.
   const field = silhouetteField(line, d);
   if (!field) return flags;
@@ -3013,14 +3597,13 @@ function smoothHalves(mesh, grid, line, side, flags, d) {
     any = true;
   }
   if (!any) return flags;
-  const effective = undercutHalves(line, side, d, null);
+  const effective = undercutHalves(line, side, d, null, flags);
   const P = line.positions;
   const edgeLength = (f, e) => {
     const ra = 3 * I[3 * f + e], rb = 3 * I[3 * f + ((e + 1) % 3)];
     return Math.hypot(P[rb] - P[ra], P[rb + 1] - P[ra + 1], P[rb + 2] - P[ra + 2]);
   };
   let out = flags;
-  comp.fill(-1);
   for (let f0 = 0; f0 < nt; f0++) {
     if (!band[f0] || comp[f0] >= 0) continue;
     let head = 0, tail = 0, agree = 0, disagree = 0, upper = false, lower = false;
@@ -3065,25 +3648,53 @@ function smoothHalves(mesh, grid, line, side, flags, d) {
 
 /**
  * A direction classified on every triangle: {areas, side, flags, plane, line,
- * height}. A plane that leaves every triangle one half only can form on its
- * side: a planar line. Else each triangle in its half (smoothHalves): a
- * stepped or warped line, unless that splits flat faces along d between the
- * halves (round the shadows of the details on them) over more area than a
- * planar line at the best level traps (bestLevel, trapAtLevel): then that
- * planar line.
+ * height}. The halves optimised over the surface (optimiseHalves), the flags
+ * those of the optimum (optimisedFlags). A plane that leaves every triangle
+ * one half only can form on its side: a planar line. Else the halves of the
+ * optimum, the line across the triangles along the silhouettes, the edges of
+ * the shadows and the iso-line of the small facets (silhouetteHalves,
+ * shadowHalves, isoHalves). That line all within the planar tolerance of one
+ * height: the plane at that height (trapAtLevel), unless it traps more than
+ * that tolerance along the line. Else a stepped or warped line, unless the
+ * shadows of the details on flat faces along d split them between the halves
+ * (as classified) over more area than a planar line at the best level traps
+ * (bestLevel, trapAtLevel): then that planar line.
  */
 function fullDirection(mesh, d, sinDraft, getLine) {
   const grid = lineGrid(mesh, d);
-  let flags = classify(mesh, grid, d, null, sinDraft);
+  const evidence = newEvidence(mesh.nt);
+  let flags = classify(mesh, grid, d, null, sinDraft, evidence);
+  const classified = Uint8Array.from(flags);
+  const optimum = optimiseHalves(mesh, getLine(), evidence, d);
+  optimisedFlags(flags, optimum);
+  // The triangles across the edge of a shadow by their points (straddles): the line goes across them.
+  const straddling = Uint8Array.from(optimum.under, (_, f) => (straddles(evidence, f) ? 1 : 0));
   let plane = planeHeight(mesh, flags, d, planarTolerance(grid.height), getLine());
+  if (plane == null) {
+    // A plane by the triangles as classified, that the optimum's moves broke (a small face only one half reaches
+    // moved to the half round it, across that plane): that plane, with those flags, but the optimum's undercuts
+    // (a spike formed by the half of its side of the plane, a sliver between undercuts one of them).
+    const classifiedPlane = planeHeight(mesh, classified, d, planarTolerance(grid.height), getLine());
+    if (classifiedPlane != null) {
+      plane = classifiedPlane;
+      const level = plane - dot(mesh.centre, d), C = mesh.centres;
+      flags = Uint8Array.from(classified, (flag, f) => {
+        if (optimum.under[f]) return flag & ~(REACH_UP | REACH_DOWN);
+        if (flag & (REACH_UP | REACH_DOWN)) return flag;
+        return flag | (C[3 * f] * d[0] + C[3 * f + 1] * d[1] + C[3 * f + 2] * d[2] < level ? REACH_DOWN : REACH_UP);
+      });
+    }
+  }
   const split = (plane) => {
-    const side = sidesOf(mesh, flags, d, plane, getLine());
     const line = getLine();
-    inheritSlivers(mesh, side, line.neighbours);
-    // The halves of the triangles as classified (what a planar line is weighed against), then cleaned and cut.
-    const raw = plane == null ? Uint8Array.from(side) : side;
-    const cut = plane == null ? shadowHalves(mesh, grid, line, side, smoothHalves(mesh, grid, line, side, flags, d), d) : flags;
-    return { side, raw, flags: cut, line: partingLine(line, side, d, { flags: cut, plane, height: grid.height, mesh, grid }) };
+    let side;
+    if (plane != null) {
+      side = sidesOf(mesh, flags, d, plane, line);
+      inheritSlivers(mesh, side, line.neighbours);
+    } else side = optimisedSides(optimum);
+    // The halves of the optimum cut along silhouettes, shadows and iso-lines.
+    const cut = plane == null ? isoHalves(mesh, line, side, shadowHalves(mesh, grid, line, side, silhouetteHalves(mesh, grid, line, side, flags, d), d, straddling), d) : flags;
+    return { side, flags: cut, line: partingLine(line, side, d, { flags: cut, plane, height: grid.height, mesh, grid }) };
   };
   let halves;
   let trapped = null;
@@ -3092,7 +3703,30 @@ function fullDirection(mesh, d, sinDraft, getLine) {
     halves = split(plane);
   } else {
     halves = split(null);
-    const across = halves.line.planar ? 0 : splitFlatArea(mesh, getLine().neighbours, flags, halves.raw);
+    const tol = planarTolerance(grid.height);
+    const [lo, hi] = halves.line.heights_mm ?? [0, 0];
+    if (halves.line.planar && hi - halves.line.level <= tol && halves.line.level - lo <= tol) {
+      // The optimum's line all within the planar tolerance of one height: cut by that plane (straight across
+      // the faces, not along their edges), unless it traps more than the band of that tolerance along the line.
+      // (A detour round a detail, in the 5 % of its length a planar line may have off its height, stays: the
+      // plane would trap that detail.)
+      const level = halves.line.level - dot(mesh.centre, d);
+      const trap = trapAtLevel(mesh, flags, d, level);
+      if (trap.trapped <= tol * halves.line.length_mm) {
+        flags = trap.flags;
+        trapped = trap.trapped;
+        plane = halves.line.level;
+        halves = split(plane);
+      }
+    }
+    // What a planar line is weighed against: the flat area the shadows split, in the halves of the triangles
+    // as classified (the free area the optimum adds to a shadow, for a shorter line, is its choice, not forced).
+    let across = 0;
+    if (plane == null && !halves.line.planar) {
+      const forced = sidesOf(mesh, classified, d, null, getLine());
+      inheritSlivers(mesh, forced, getLine().neighbours);
+      across = splitFlatArea(mesh, getLine().neighbours, classified, forced);
+    }
     if (across > 0) {
       const level = bestLevel(mesh, flags, d);
       const trap = trapAtLevel(mesh, flags, d, level);

@@ -264,7 +264,10 @@ describe('undercuts grouped into slides', () => {
     const faces = run(castPlate(), X, { name: 'plate X' });
     const welded = run(castPlate({ welded: true }), X, { name: 'plate X welded' });
     for (const { analysis, view } of [faces, welded]) {
-      approx(analysis.undercut_area_mm2, 2432.1, 0, 0.1, 'undercut');
+      // (2432.1 before the halves were optimised: the sides of the raised
+      // letters, 1 mm high, in the shadows of others, strips narrower than the
+      // tension of the line, are now formed with the half round them.)
+      approx(analysis.undercut_area_mm2, 2423.07, 0, 0.1, 'undercut');
       // Stroke: the boss bore 8 and the plate 15, + 5.
       assert.deepEqual(view.slides.map((s) => [s.axis, s.zones.length, s.stroke_mm]), [['Z', 5, 28]]);
       assert.equal(view.ignored.zones.length, 1);
@@ -295,9 +298,12 @@ describe('undercuts grouped into slides', () => {
     const { ev, analysis, view } = run(castPlate(), d, { name: 'plate oblique' });
     assert.deepEqual(view.slides.map((s) => [s.axis, s.stroke_mm]), [['Z', 28]]);
     assert.deepEqual(view.parting.map((p) => p.area_mm2), [144]);
-    approx(analysis.undercut_area_mm2, 2536.3, 0, 0.5, 'undercut');
+    // (2536.3 and 2757.3 before the halves were optimised: the sides of the
+    // raised letters, 1 mm high, in the shadows of others, formed with the half
+    // round them, as along X.)
+    approx(analysis.undercut_area_mm2, 2501.38, 0, 0.5, 'undercut');
     // Below the card's figure, which counts the trapped parts of the faces the plane cuts.
-    approx(ev.summary.undercut_area_mm2, 2757.3, 0, 0.5, 'undercut of the parting');
+    approx(ev.summary.undercut_area_mm2, 2722.4, 0, 0.5, 'undercut of the parting');
   });
 
   test('the same result twice, whatever the order of the triangles and their corners', () => {
