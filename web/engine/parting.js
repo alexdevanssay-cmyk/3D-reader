@@ -1434,7 +1434,9 @@ function straddles(evidence, f) {
  *    the border of the undercut across it, and its edges weigh nothing (its
  *    border is across it, not along them: a sliver in the shadow beside it
  *    is not moved out of it by them);
- * 2. the halves: of the labels upper / lower, the least Σ area × (1 - up)
+ * 2. the halves: of the labels upper / lower (a large triangle across the
+ *    edge of a shadow, most of its points in one half's reach only: in that
+ *    one, as the first cut keeps its majority), the least Σ area × (1 - up)
  *    over the upper half + Σ area × (1 - down) over the lower one, FACING ×
  *    area more in the half it does not face (facingDown: a face both halves
  *    can form in the one it faces, upper when exactly along d, unless moving
@@ -1474,8 +1476,8 @@ function optimiseHalves(mesh, line, evidence, d) {
   let under = new Uint8Array(nt);
   let blocked = false;
   for (let f = 0; f < nt && !blocked; f++) blocked = share[3 * f + 2] > 0;
+  const across = Uint8Array.from(areas, (a, f) => (a >= STRADDLE_AREA * lambda * lambda && straddles(evidence, f) ? 1 : 0));
   if (blocked) {
-    const across = Uint8Array.from(areas, (a, f) => (a >= STRADDLE_AREA * lambda * lambda && straddles(evidence, f) ? 1 : 0));
     for (let a = 0; a < 3 * nt; a++) if (head[a] >= 0 && !across[(a / 3) | 0] && !across[head[a]]) cap[a] = lambda * length[a];
     for (let f = 0; f < nt; f++) {
       if (!across[f]) tcap[f] = areas[f] * (2 * share[3 * f + 2] - 1);
@@ -1493,6 +1495,12 @@ function optimiseHalves(mesh, line, evidence, d) {
     }
     // (A triangle only one half reaches, all its points, faces that half: no need to ask.)
     const up = share[3 * f], down = share[3 * f + 1];
+    // A large triangle across the edge of a shadow, most of it in one half's reach only: in that half (the line
+    // across it, shadowHalves), never moved whole into the other one by its neighbours, as the first cut keeps it.
+    if (across[f] && 2 * up >= 1 !== 2 * down >= 1) {
+      tcap[f] = 2 * up >= 1 ? Infinity : -Infinity;
+      continue;
+    }
     const facing = up === 1 && down === 0 ? FACING : up === 0 && down === 1 ? -FACING : facingDown(mesh, line, f, d) ? -FACING : FACING;
     tcap[f] = areas[f] * (up - down + facing);
   }

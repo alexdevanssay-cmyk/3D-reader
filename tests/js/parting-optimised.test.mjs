@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
-import { evaluateParting, lineMesh, lineTension } from '../../web/engine/parting.js';
+import { REACH_DOWN, REACH_UP, SHADOW, SIDE_LOWER, SIDE_NONE, SIDE_UPPER, SILHOUETTE, evaluateParting, lineMesh, lineTension } from '../../web/engine/parting.js';
 import { HOLED, bossedTube, holedBlock, studBlock, subdivided } from './cad-parts.mjs';
 import { Body, zBracket } from './curved-mesh.mjs';
 import { approx } from './helpers.mjs';
@@ -154,6 +154,28 @@ describe('the parting halves optimised over the surface', () => {
     const results = [exact, { positions: nudged, indices: exact.indices }].map((part, k) => cleanSplit(part, [0, 0, 1], k ? 'nudged' : 'exact'));
     for (const { r } of results) assert.deepEqual([r.summary.parting.kind, r.plane, r.summary.parting.loops], ['planar', 0, 1]);
     approx(results[1].r.summary.parting.length_mm, results[0].r.summary.parting.length_mm, 0, 1e-3, 'length');
+  });
+
+  test('a large triangle across the edge of a shadow, most of it in one half\'s reach: never left whole in the other half', () => {
+    // The second cut moved such a long triangle whole into the half round it
+    // (the shadows cut it no more, it was no longer between the halves): a
+    // face in a half its flags exclude, uncut. Now in the half of its
+    // majority, as the first cut keeps it.
+    const cases = [[bossedTube(), [0.6, 0.8, 0]], [holedBlock(), [0.6, 0, 0.8]], [holedBlock(), [0, 0.6, 0.8]]];
+    for (const [part, d] of cases) {
+      const r = evaluateParting(part.positions, part.indices, d);
+      assert.equal(r.plane, null);
+      const lambda = lineTension(diagonal(part));
+      const P = part.positions, I = part.indices;
+      r.flags.forEach((flag, f) => {
+        const reach = flag & (REACH_UP | REACH_DOWN);
+        if ((reach !== REACH_UP && reach !== REACH_DOWN) || flag & (SILHOUETTE | SHADOW) || r.side[f] === SIDE_NONE) return;
+        const [a, b, c] = [0, 1, 2].map((k) => 3 * I[3 * f + k]);
+        const u = [0, 1, 2].map((k) => P[b + k] - P[a + k]), v = [0, 1, 2].map((k) => P[c + k] - P[a + k]);
+        const area = Math.hypot(u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]) / 2;
+        if (area >= 4 * lambda * lambda) assert.equal(r.side[f], reach === REACH_UP ? SIDE_UPPER : SIDE_LOWER, `${d}: triangle ${f}, ${area} mm²`);
+      });
+    }
   });
 
   test('pin holes along d (Ø 1.2 mm): a loop round each, the halves of their walls and the line agreeing', () => {
