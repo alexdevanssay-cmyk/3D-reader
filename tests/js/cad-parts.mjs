@@ -138,6 +138,36 @@ export function studBlock({ stud = [0.3, 2, 0.3], at = 12, ledge = [0.2, 0.3, 0.
   return body.mesh();
 }
 
+/**
+ * A block L × L × H (x, y, z) with a groove `width` high and `depth` deep
+ * round its four sides, its floor at z = `at` (each face flat, its own
+ * vertices): along Z the groove is an undercut (a slide), whatever its size.
+ */
+export function groovedBlock({ L = 120, H = 40, at = 20, width = 1, depth = 1 } = {}) {
+  const body = new Body();
+  const quad = (p, q, r, s, normal) => body.addFace([p, q, r, s], [[0, 1, 2], [0, 2, 3]], () => normal);
+  const square = (a, b) => [[a, a], [b, a], [b, b], [a, b]];
+  const top = at + width;
+  body.flat([0, 0, 0], [1, 0, 0], [0, 1, 0], square(0, L), [], [0, 0, -1]);
+  body.flat([0, 0, H], [1, 0, 0], [0, 1, 0], square(0, L), [], [0, 0, 1]);
+  // The groove's floor and ceiling: rings round the inner square of its back.
+  const inner = square(depth, L - depth).reverse();
+  body.flat([0, 0, at], [1, 0, 0], [0, 1, 0], square(0, L), [inner], [0, 0, 1]);
+  body.flat([0, 0, top], [1, 0, 0], [0, 1, 0], square(0, L), [inner], [0, 0, -1]);
+  // The four sides: below the groove, above it, and its back.
+  const corners = [[0, 0], [L, 0], [L, L], [0, L]];
+  const back = [[depth, depth], [L - depth, depth], [L - depth, L - depth], [depth, L - depth]];
+  for (let i = 0; i < 4; i++) {
+    const [ax, ay] = corners[i], [bx, by] = corners[(i + 1) % 4];
+    const normal = [by - ay, ax - bx, 0].map((x) => Math.sign(x));
+    quad([ax, ay, 0], [bx, by, 0], [bx, by, at], [ax, ay, at], normal);
+    quad([ax, ay, top], [bx, by, top], [bx, by, H], [ax, ay, H], normal);
+    const [cx, cy] = back[i], [dx, dy] = back[(i + 1) % 4];
+    quad([cx, cy, at], [dx, dy, at], [dx, dy, top], [cx, cy, top], normal);
+  }
+  return body.mesh();
+}
+
 /** A mesh with each triangle cut into 4^levels at the middles of its edges (a finely meshed body), its faces kept. */
 export function subdivided({ positions, indices, face }, levels) {
   const P = Array.from(positions);

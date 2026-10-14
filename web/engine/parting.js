@@ -160,6 +160,11 @@ const MIXED_SHARE = 0.05;
 // of the diagonal of a small part.
 const TENSION_MM = 1.5;
 const TENSION_SHARE = 0.01;
+// A region of triangles blocked both ways by their points is noise of the lines of sight, formed by the half round
+// it, when its area is under this share of the line's tension times its border (noiseUndercuts): narrower than
+// 0.2 mm, a lone triangle under about 0.6 mm (a point or two of a small facet at the edge of a shadow). Every other is
+// reported as an undercut, its area and its slides, whatever the line does round it (a groove, a window in a wall).
+const UNDERCUT_NOISE = 1 / 16;
 // The weight of the line along an edge (placeWeights): half its length on the
 // outline along d, all of it across faces with 15° of draft or more, or
 // across a flat face (its triangles within 0.5°, FLAT_FACET: no outline there).
@@ -1418,7 +1423,9 @@ function straddles(evidence, f) {
  * evidence of the lines of sight of each triangle (classify, newEvidence),
  * with `line` (lineMesh). Two minimum cuts (minCut) over the triangles,
  * each exact:
- * 1. the undercuts: of the labels undercut / formed by a half, the least
+ * 1. the undercuts of the line (its shape only: the undercuts reported are
+ *    those of the lines of sight, optimisedFlags): of the labels undercut /
+ *    formed by a half, the least
  *    Σ area × (1 - none) over the triangles called undercuts + Σ area × none
  *    over the others + λ × the length of the edges between them, `none` the
  *    share of the points of a triangle blocked both ways: a triangle whose
@@ -1454,12 +1461,13 @@ function straddles(evidence, f) {
  * ten times the deflection of the mesh of a CAD face (its facets, the noise
  * of the lines of sight along them, well below it). A region of contrary
  * evidence changes label when that costs less than the line round it: an
- * undercut region when twice its area is under λ × its border (a strip
- * narrower than λ, a disc under 4 λ across); a region of one half in the
- * other when its area (1 + FACING) is under λ × the weight of its border (on
- * a face with draft, a strip narrower than about 2 λ). The details of a
- * casting (a boss, a rib, a hole, a slot of a few millimetres) keep their
- * own.
+ * undercut region (for the line) when its area is under λ × its border (a
+ * strip narrower than 2 λ, a disc under 4 λ across: the line goes round it
+ * as round the half it joins, the undercut still reported); a region of one
+ * half in the other when its area (1 + FACING) is under λ × the weight of its
+ * border (on a face with draft, a strip narrower than about 2 λ). The
+ * details of a casting (a boss, a rib, a hole, a slot of a few millimetres)
+ * keep their own.
  * Returns {under (Uint8Array: 1 an undercut), upper (Uint8Array: 1 in the
  * upper half, an undercut joined to it)}.
  */
@@ -1591,20 +1599,58 @@ function solveCut(mesh, line, cap, tcap, free) {
 }
 
 /**
- * The flags of the optimised halves (optimiseHalves), in place: an undercut
- * without REACH_*; a triangle formed by a half with its REACH_* (by most of
- * its points: one the optimum moved to the half round it keeps them, a small
- * face in a shadow is still on the wrong side of a plane), and, without any
- * (no half reaches most of it, but its region is too small or thin to be an
- * undercut), that of its half.
+ * The flags of the optimised halves (optimiseHalves), in place: those of the
+ * lines of sight (classify: the undercuts reported, their area, their
+ * slides, as every triangle's REACH_* by most of its points, whatever half
+ * the line puts it in), but a triangle blocked both ways in a region of
+ * noise (noise, of noiseUndercuts): the REACH_* of the half the optimum puts
+ * it in. The line's own undercuts (`under`, regularised at its tension) are
+ * for its shape only: a triangle it absorbs into a half or adds to an
+ * undercut region keeps its flags.
  */
-function optimisedFlags(flags, { under, upper }) {
+function optimisedFlags(flags, { upper }, noise) {
   for (let f = 0; f < flags.length; f++) {
-    const reach = flags[f] & (REACH_UP | REACH_DOWN);
-    if (under[f]) flags[f] &= ~(REACH_UP | REACH_DOWN);
-    else if (!reach) flags[f] |= upper[f] ? REACH_UP : REACH_DOWN;
+    if (noise[f] && !(flags[f] & (REACH_UP | REACH_DOWN))) flags[f] |= upper[f] ? REACH_UP : REACH_DOWN;
   }
   return flags;
+}
+
+/**
+ * The triangles blocked both ways by their points (no REACH_* in `flags`, as
+ * classified) whose region (joined by their edges) is noise of the lines of
+ * sight: its area under UNDERCUT_NOISE × λ (lineTension) × its border, 1
+ * each. A real undercut, a groove 1 mm wide or a window through a wall, is
+ * far above it.
+ */
+function noiseUndercuts(mesh, line, flags) {
+  const { nt, areas, diag } = mesh;
+  const { head, length } = surfaceGraph(line);
+  const tension = UNDERCUT_NOISE * lineTension(diag);
+  const blocked = (f) => !(flags[f] & (REACH_UP | REACH_DOWN));
+  const out = new Uint8Array(nt), seen = new Uint8Array(nt);
+  const queue = [];
+  for (let f0 = 0; f0 < nt; f0++) {
+    if (seen[f0] || !blocked(f0)) continue;
+    seen[f0] = 1;
+    queue.length = 0;
+    queue.push(f0);
+    let area = 0, border = 0;
+    for (let q = 0; q < queue.length; q++) {
+      const f = queue[q];
+      area += areas[f];
+      for (let a = 3 * f; a < 3 * f + 3; a++) {
+        const g = head[a];
+        if (g < 0) continue;
+        if (!blocked(g)) border += length[a];
+        else if (!seen[g]) {
+          seen[g] = 1;
+          queue.push(g);
+        }
+      }
+    }
+    if (area < tension * border) for (const f of queue) out[f] = 1;
+  }
+  return out;
 }
 
 /** The halves of the optimum (optimiseHalves): SIDE_NONE for an undercut. */
@@ -3702,21 +3748,20 @@ function fullDirection(mesh, d, sinDraft, getLine) {
   let flags = classify(mesh, grid, d, null, sinDraft, evidence);
   const classified = Uint8Array.from(flags);
   const optimum = optimiseHalves(mesh, getLine(), evidence, d);
-  optimisedFlags(flags, optimum);
+  const noise = noiseUndercuts(mesh, getLine(), classified);
+  optimisedFlags(flags, optimum, noise);
   // The triangles across the edge of a shadow by their points (straddles): the line goes across them.
   const straddling = Uint8Array.from(optimum.under, (_, f) => (straddles(evidence, f) ? 1 : 0));
   let plane = planeHeight(mesh, flags, d, planarTolerance(grid.height), getLine());
   if (plane == null) {
-    // A plane by the triangles as classified, that the optimum's moves broke (a small face only one half reaches
-    // moved to the half round it, across that plane): that plane, with those flags, but the optimum's undercuts
-    // (a spike formed by the half of its side of the plane, a sliver between undercuts one of them).
+    // A plane by the triangles as classified, that the halves the optimum gave the noise broke (a speck formed by
+    // the half round it, across that plane): that plane, the noise formed by the half of its side of it.
     const classifiedPlane = planeHeight(mesh, classified, d, planarTolerance(grid.height), getLine());
     if (classifiedPlane != null) {
       plane = classifiedPlane;
       const level = plane - dot(mesh.centre, d), C = mesh.centres;
       flags = Uint8Array.from(classified, (flag, f) => {
-        if (optimum.under[f]) return flag & ~(REACH_UP | REACH_DOWN);
-        if (flag & (REACH_UP | REACH_DOWN)) return flag;
+        if (!noise[f] || flag & (REACH_UP | REACH_DOWN)) return flag;
         return flag | (C[3 * f] * d[0] + C[3 * f + 1] * d[1] + C[3 * f + 2] * d[2] < level ? REACH_DOWN : REACH_UP);
       });
     }

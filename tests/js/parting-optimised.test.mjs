@@ -1,17 +1,20 @@
 // The parting halves optimised over the surface (web/engine/parting.js,
 // optimiseHalves: minimum cuts) on synthetic parts meshed as CAD bodies are,
-// coarse and fine: no undercut spikes, no small or isolated loops, no
-// teeth, planar where a plane fits, the real holes, slots and studs kept.
+// coarse and fine: no small or isolated loops, no teeth, the line where the
+// halves change, planar where a plane fits; every real undercut reported
+// (its area, its slides), the real holes, slots and studs kept.
 //
 //   node --test tests/js/parting-optimised.test.mjs
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import { REACH_DOWN, REACH_UP, SHADOW, SIDE_LOWER, SIDE_NONE, SIDE_UPPER, SILHOUETTE, evaluateParting, lineMesh, lineTension } from '../../web/engine/parting.js';
-import { HOLED, bossedTube, holedBlock, studBlock, subdivided } from './cad-parts.mjs';
-import { Body, zBracket } from './curved-mesh.mjs';
+import { analyseSlides, effectiveSlides, prepareSlides, slidesSignature, undercutMask } from '../../web/engine/slides.js';
+import { HOLED, bossedTube, groovedBlock, holedBlock, studBlock, subdivided } from './cad-parts.mjs';
+import { BRACKET, Body, zBracket } from './curved-mesh.mjs';
 import { approx } from './helpers.mjs';
 import { lineLoops, looseEnds, shapeOfLine, undercutRegions, unlinedEdges } from './line-shape.mjs';
+import { voxels } from './meshes.mjs';
 
 /** The diagonal of the box of a mesh. */
 function diagonal({ positions: P }) {
@@ -41,25 +44,44 @@ function cleanSplit(part, d, label) {
   return { r, loops, regions };
 }
 
+/** The slides of a split along d (slides.js, as the page groups them): {analysis, view}. */
+function slidesOf(part, d, r) {
+  const mask = undercutMask({ flags: r.flags });
+  const sig = slidesSignature({ nt: mask.length, direction: d, mask });
+  const analysis = analyseSlides(prepareSlides(part.positions, part.indices), { direction: d, mask, flags: r.flags, side: r.side, sig });
+  return { analysis, view: effectiveSlides(analysis) };
+}
+
 describe('the parting halves optimised over the surface', () => {
   test('the tension of the line: 1.5 mm, 1 % of the diagonal of a small part', () => {
     assert.equal(lineTension(300), 1.5);
     approx(lineTension(80), 0.8, 1e-12);
   });
 
-  test('a finely meshed body (each triangle cut into 16): no undercut spikes, the line of the coarse body', () => {
-    // The Z bracket along Z, its faces cut into small triangles: on the boss
-    // (0.5° of draft, its rows staggered), small triangles some of whose
-    // points' lines met the rows above them were undercuts of a triangle or
-    // two each (415 mm² in 179 regions, yellow specks all over it); now in
-    // the half round them, the line the coarse body's: round the bottom face,
-    // up the web, round the underside of the upper flange.
+  test('a finely meshed body (each triangle cut into 16): the line of the coarse body; the overhangs of its faceted boss still reported', () => {
+    // The Z bracket along Z, its faces cut into small triangles. On the boss
+    // (0.5° of draft, its rows staggered), small facets under the rows above
+    // them (which stand out by the sagitta of the facets, 0.2 mm) are blocked
+    // both ways: reported as undercuts (7 mm² each, the slides judge them),
+    // joined to the half round them: the line is the coarse body's, round the
+    // bottom face, up the web, round the underside of the upper flange.
+    const { x, y, r: rb, height } = BRACKET.boss;
+    const t = (20 * Math.PI) / 180;
+    const cx = Math.cos(t) * x - Math.sin(t) * y, cy = Math.sin(t) * x + Math.cos(t) * y;
     for (const [label, part] of [['coarse', zBracket()], ['fine', subdivided(zBracket(), 2)]]) {
       const { r, loops, regions } = cleanSplit(part, [0, 0, 1], label);
       const { parting } = r.summary;
-      assert.deepEqual([parting.kind, parting.loops, parting.levels_mm, r.summary.undercut_area_mm2], ['stepped', 1, [0, 22], 0], label);
+      assert.deepEqual([parting.kind, parting.loops, parting.levels_mm, loops.length], ['stepped', 1, [0, 22], 1], label);
       approx(parting.length_mm, 2 * 46 + 40 + 2 * 22 + 2 * 34 + 40, 0, 1e-6, `${label}: length`);
-      assert.deepEqual([loops.length, regions.length], [1, 0], label);
+      // The undercuts all on the boss.
+      const P = part.positions, I = part.indices;
+      r.flags.forEach((flag, f) => {
+        if (flag & (REACH_UP | REACH_DOWN)) return;
+        const c = [0, 1, 2].map((k) => (P[3 * I[3 * f] + k] + P[3 * I[3 * f + 1] + k] + P[3 * I[3 * f + 2] + k]) / 3);
+        assert.ok(Math.hypot(c[0] - cx, c[1] - cy) <= rb + 0.01 && c[2] >= 30 && c[2] <= 30 + height, `${label}: an undercut at ${c}`);
+      });
+      if (label === 'coarse') assert.equal(regions.length, 0);
+      else approx(r.summary.undercut_area_mm2, 415, 0.02, 0, 'the overhangs of the fine boss');
     }
   });
 
@@ -131,6 +153,36 @@ describe('the parting halves optimised over the surface', () => {
     assert.deepEqual([r.plane, r.summary.parting.loops, loops.length, r.summary.undercut_area_mm2], [null, 1, 1, 0]);
     // Round the bottom (140 mm), up both sides of the strip to the stud and round its underside: + 2 × 12 + 1 + 1.
     approx(r.summary.parting.length_mm, 140 + 2 * 12 + 2 * 1 + 1, 0, 0.05, 'length');
+  });
+
+  test('real undercuts narrower than twice the tension of the line: reported, their area and their slides', () => {
+    // The line's undercuts are regularised at its tension (1.5 mm): a region
+    // narrower than 3 mm goes to a half for the line's shape. Those of the
+    // lines of sight are reported all the same (the costing needs every
+    // undercut, every slide): a groove 1 × 1 mm (or 2 × 0.5) round a block,
+    // a window 10 × 10 mm through a wall 2.5 mm thick. They were reported
+    // formed, no slide.
+    for (const [width, depth] of [[1, 1], [2, 0.5]]) {
+      const L = 120, part = groovedBlock({ L, width, depth });
+      const label = `groove ${width} × ${depth}`;
+      const { r } = cleanSplit(part, [0, 0, 1], label);
+      // Its floor and ceiling (rings round the back), its back.
+      const area = 2 * (L * L - (L - 2 * depth) ** 2) + 4 * (L - 2 * depth) * width;
+      approx(r.summary.undercut_area_mm2, area, 0, 0.1, `${label}: undercut`);
+      assert.deepEqual([r.summary.parting.kind, r.summary.parting.loops], ['planar', 1], label);
+      const { analysis, view } = slidesOf(part, [0, 0, 1], r);
+      approx(analysis.zones.reduce((sum, z) => sum + z.area_mm2, 0), area, 0, 0.1, `${label}: zones`);
+      assert.equal(view.slides.length, 2, `${label}: slides`);
+    }
+    // A cup 100 × 100 × 50 mm (open below), its walls 2.5 mm thick, a window 10 × 10 mm through one.
+    const cup = voxels((x, y, z) => {
+      if (x >= 1 && x < 39 && y >= 1 && y < 39 && z < 19) return false;
+      return !(x === 39 && y >= 18 && y < 22 && z >= 6 && z < 10);
+    }, [40, 40, 20], { size: 2.5, perFace: true });
+    const { r } = cleanSplit(cup, [0, 0, 1], 'window');
+    approx(r.summary.undercut_area_mm2, 4 * 10 * 2.5, 0, 0.1, 'window: undercut');
+    const { view } = slidesOf(cup, [0, 0, 1], r);
+    assert.deepEqual(view.slides.map((sl) => [sl.axis, sl.zones.length]), [['X', 1]]);
   });
 
   test('a planar line across faces whose shared vertices differ by a hair (welded): one loop, not broken where it crosses their edges', () => {

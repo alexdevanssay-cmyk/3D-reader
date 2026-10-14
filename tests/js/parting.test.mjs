@@ -289,10 +289,8 @@ describe('flat faces along the draw direction (a CAD body: flat faces cut into l
         assert.ok(flags[f] & LEVEL);
       });
       // Trapped (undercuts): faces with draft that only the other half could
-      // form; the faces of the pillars that face the line (2 × 8 × 12 mm²).
-      // (Half of a side of the L in the shadow of a pillar, 1 mm², was too: a
-      // strip 1 mm high between undercuts, narrower than the tension of the
-      // line, it is now part of their undercut, still in the undercut figure.)
+      // form; the faces of the pillars that face the line (2 × 8 × 12 mm²),
+      // half of a side of the L in the shadow of a pillar.
       let trapped = 0;
       tris.forEach(({ c, n, area }, f) => {
         if (!(flags[f] & TRAPPED)) return;
@@ -302,7 +300,7 @@ describe('flat faces along the draw direction (a CAD body: flat faces cut into l
         assert.ok(n[1] * c[1] < 0, `trapped on its own side: ${c}`);
         assert.ok(Math.abs(c[1]) >= 16, c.join());
       });
-      approx(trapped, 2 * 8 * PLATE.pillarHeight, 1e-6, 0, `${label}: trapped`);
+      approx(trapped, 2 * 8 * PLATE.pillarHeight + 1, 1e-6, 0, `${label}: trapped`);
       approx(summary.trapped_area_mm2, trapped, 0, 0.05, `${label}: trapped in the summary`);
       // Part of the undercut figure, with the bore and holes across Y and the shadows between details.
       assert.ok(summary.undercut_area_mm2 > trapped);
