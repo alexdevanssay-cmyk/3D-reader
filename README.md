@@ -39,9 +39,13 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   a core or slide), and the parting line, planar or stepped/warped with
   its height range. Shown on the 3D view: the parting line as a thick red line drawn over
   everything, the undercuts in yellow, the other faces in light grey (lighter without
-  draft), and the two halves of the mould ("chapes") as translucent blocks round the part,
-  the upper one blue and the lower one green, a margin of the larger of 5 mm and 15 % of
-  the part round it (*Mould halves* hides them). The blocks meet flat at the level of a
+  draft), the triangles the line crosses (a plane, a silhouette or the edge of a shadow
+  across a long CAD triangle) in pieces cut on the line, so that the colours change on it,
+  not in steps along the triangles (the figures of the card stay by triangle, as for every
+  candidate and the slides; the parts of faces a planar line traps were counted to the
+  plane already), and the two halves of the mould ("chapes") as translucent blocks round
+  the part, the upper one blue and the lower one green, a margin of the larger of 5 mm and
+  15 % of the part round it (*Mould halves* hides them). The blocks meet flat at the level of a
   planar line; for a stepped or warped line, on a surface interpolated from the points of
   the line (a height field of at most 48 × 48 cells, inverse distance weighting), so the
   interface follows the line near it and goes from one level to the other between its
@@ -101,9 +105,9 @@ hand" of `web/app.js`:
   formed by neither half (a core) is left out when it would join them. Undercuts: the
   faces a half cannot form, or of no half. The drawn line is applied as any definition by
   hand (red line, yellow undercuts, blocks, risers placed again) and kept per part in the
-  browser, as is a drawing not finished (a draft). Halves are per triangle: on a coarse
-  mesh their boundary zigzags by a triangle along the line (the line itself is exact; the
-  area of the triangles it crosses is exported as `seam_area_mm2`).
+  browser, as is a drawing not finished (a draft). Halves are per triangle (the line
+  itself is exact; the area of the triangles it crosses is exported as `seam_area_mm2`);
+  on the 3D view the triangles it crosses once are coloured in two parts, cut on the line.
 - **Mould orientation by casting process**, in the parting line card: the process of the
   part comes from the costing (the island retained for its piece: « Coquille gravité »
   CG1…CG5 a vertical parting plane, poured from the top; « Basse pression » BPR a

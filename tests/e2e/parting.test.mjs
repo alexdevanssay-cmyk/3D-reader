@@ -17,6 +17,7 @@ import { after, before, describe, test } from 'node:test';
 import { chromium } from 'playwright';
 
 import { createStaticServer } from '../../scripts/serve.mjs';
+import { MUSHROOM, mushroom } from '../js/curved-mesh.mjs';
 import { ROOT, fixturePath } from '../js/helpers.mjs';
 
 const DIST = join(ROOT, 'dist');
@@ -153,6 +154,38 @@ const partingStats = (page) => page.evaluate(() => Object.fromEntries([...docume
 
 /** Two boxes (DOMRects) overlapping. */
 const overlap = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+
+/** An OBJ of a mesh {positions, indices} as it is (each face with its own vertices), its points moved by `move`. */
+function meshObj({ positions: P, indices: I }, move = (p) => p) {
+  const lines = [];
+  for (let i = 0; i < P.length; i += 3) lines.push(`v ${move([P[i], P[i + 1], P[i + 2]]).join(' ')}`);
+  for (let i = 0; i < I.length; i += 3) lines.push(`f ${I[i] + 1} ${I[i + 1] + 1} ${I[i + 2] + 1}`);
+  return Buffer.from(`${lines.join('\n')}\n`);
+}
+
+/** The colours ([r, g, b]) of the 3D view at points of the model, the view drawn. */
+async function coloursAt(page, points) {
+  await page.waitForTimeout(300);
+  const box = await page.locator('#viewport canvas').boundingBox();
+  const at = await page.evaluate((ps) => ps.map((p) => window.reader3d.screenOf(p)), points);
+  const png = await page.locator('#viewport canvas').screenshot();
+  return page.evaluate(async ([b64, xy]) => {
+    const img = new Image();
+    img.src = `data:image/png;base64,${b64}`;
+    await img.decode();
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const g = canvas.getContext('2d');
+    g.drawImage(img, 0, 0);
+    return xy.map(([x, y]) => [...g.getImageData(Math.round(x), Math.round(y), 1, 1).data.slice(0, 3)]);
+  }, [png.toString('base64'), at.map((a) => [a.x - box.x, a.y - box.y])]);
+}
+
+// The colours of the parting display: the grey of the faces, the yellow of the undercuts (and of slide T1), the teal of slide T2.
+const isGrey = ([r, g, b]) => r > 80 && Math.max(r, g, b) - Math.min(r, g, b) < 30;
+const isYellow = ([r, g, b]) => r > 150 && g > 120 && b < 80;
+const isTeal = ([r, g, b]) => b > r + 60 && g > r + 60;
 
 describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) && 'run `npm run build` first' }, () => {
   let server;
@@ -442,6 +475,146 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     await page.selectOption('#language', 'en');
     assert.equal(await page.textContent('label:has(#parting-blocks)'), ' Mould halves');
     assert.match(await page.textContent('#parting-legend'), /^parting line undercut faces of the part \(lighter: no draft\) upper half lower half/);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('the colours cut along the line across long triangles: each side of it in its own; a click picks the triangle clicked; the section', { timeout: 2 * CAD_TIMEOUT }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 } });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    // The mushroom of the unit tests (tests/js/curved-mesh.mjs: each face its
+    // own vertices, its flat faces fans of long triangles) turned over about X:
+    // along -Z, the underside of its cap (up, z = -25) is an undercut over the
+    // base (x < 30), the lower half beyond it; the edge of the base's shadow,
+    // x = 30, crosses the fan of the underside.
+    const part = mushroom();
+    const turn = ([x, y, z]) => [x, -y, -z];
+    await page.setInputFiles('#file-input', { name: 'mushroom.obj', mimeType: 'text/plain', buffer: meshObj(part, turn) });
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
+    await page.fill('#parting-vector', '0 0 -1');
+    await page.click('#parting-apply');
+    await page.waitForFunction(() => document.getElementById('parting-axis').textContent === '-Z', null, { timeout: 60_000 });
+    // Pairs of points 1.5 mm on either side of the line, on the underside: both of a pair in one long triangle crossing it
+    // for most (by triangle, of one colour).
+    const ys = [-15, -12, -9, -3, 0, 3, 6, 9, 15];
+    const pairs = ys.map((y) => [[28.5, y, MUSHROOM.stem.top], [31.5, y, MUSHROOM.stem.top]]);
+    const P = part.positions, I = part.indices;
+    const triangleAt = ([x, y, z]) => {
+      for (let f = 0; f < I.length / 3; f++) {
+        const c = [0, 1, 2].map((k) => [P[3 * I[3 * f + k]], P[3 * I[3 * f + k] + 1], P[3 * I[3 * f + k] + 2]]);
+        if (!c.every((p) => Math.abs(p[2] - z) < 1e-4)) continue;
+        const s = (a, b) => (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]);
+        const d = [s(c[0], c[1]), s(c[1], c[2]), s(c[2], c[0])];
+        if (d.every((v) => v >= 0) || d.every((v) => v <= 0)) return f;
+      }
+      return -1;
+    };
+    assert.ok(pairs.filter(([a, b]) => triangleAt(a) === triangleAt(b) && triangleAt(a) >= 0).length >= 6, 'pairs across one triangle');
+    const inside = pairs.map(([a]) => turn(a)), outside = pairs.map(([, b]) => turn(b));
+    const card = () => page.evaluate(() => ({ ...document.getElementById('parting-card').dataset, caps: document.getElementById('viewport').dataset.caps }));
+
+    // Shown without the blocks nor the slides, the section keeping the cap (z < -15), seen from the top.
+    await page.check('#parting-show');
+    await page.uncheck('#parting-blocks');
+    await page.uncheck('#parting-slides-show');
+    await page.click('#toggle-section');
+    await page.$eval('#section-pos', (el) => {
+      el.value = '375';
+      el.dispatchEvent(new Event('input'));
+    });
+    await page.click('[data-view="top"]');
+    await page.waitForFunction(() => Number(document.getElementById('parting-card').dataset.pieces) > 0, null, { timeout: 60_000 });
+    let shown = await card();
+    assert.equal(shown.caps, 'body', 'the section closed');
+    let inner = await coloursAt(page, inside), outer = await coloursAt(page, outside);
+    ys.forEach((y, k) => {
+      assert.ok(isYellow(inner[k]), `y = ${y}: over the base, the undercut: ${inner[k]}`);
+      assert.ok(isGrey(outer[k]), `y = ${y}: beyond it, the lower half: ${outer[k]}`);
+    });
+    // The slides: over the base their colours, never the grey of the faces; beyond it grey.
+    await page.check('#parting-slides-show');
+    await page.waitForFunction(() => document.getElementById('parting-card').dataset.slideStatus === 'ready' && document.getElementById('parting-card').dataset.slideColours !== '', null, { timeout: 60_000 });
+    inner = await coloursAt(page, inside);
+    outer = await coloursAt(page, outside);
+    ys.forEach((y, k) => {
+      assert.ok(isYellow(inner[k]) || isTeal(inner[k]), `y = ${y}: a slide's colour: ${inner[k]}`);
+      assert.ok(isGrey(outer[k]), `y = ${y}: ${outer[k]}`);
+    });
+
+    // Its zones edited: a click on the colour of a slide in a long triangle picks its zone; on the grey beyond the line in the same triangle, none.
+    await page.click('#slides-edit');
+    const click = async (p) => {
+      const at = await page.evaluate((q) => window.reader3d.screenOf(q), p);
+      await page.mouse.click(at.x, at.y);
+    };
+    await click(inside[4]);
+    await page.waitForSelector('#slides-zone:not([hidden])');
+    assert.match(await page.textContent('#slides-zone'), /^Zone \d+ : /);
+    await click(outside[4]);
+    await page.waitForFunction(() => document.getElementById('slides-hint').textContent.startsWith('Pas une zone'));
+    await page.keyboard.press('Escape');
+
+    // The faces reassigned by a click: the underside beyond the line moved to the upper half, cut no more (no pieces left), grey.
+    await page.click('#parting-assign');
+    await page.selectOption('#parting-target', '1');
+    await click(outside[4]);
+    await page.waitForFunction(() => document.getElementById('parting-origin').textContent === 'manuel', null, { timeout: 30_000 });
+    assert.equal(await page.evaluate(() => window.reader3d.semantic.bodies[0].parting.reassigned_faces), 1);
+    await page.waitForFunction(() => document.getElementById('parting-card').dataset.pieces === '0', null, { timeout: 60_000 });
+    inner = await coloursAt(page, inside);
+    ys.forEach((y, k) => assert.ok(isGrey(inner[k]), `y = ${y}: ${inner[k]}`));
+    await page.click('#parting-assign');
+
+    // A face picked: the underside (its normal up), clicked over the base.
+    await page.click('#parting-pick');
+    await click(inside[4]);
+    await page.waitForFunction(() => document.getElementById('parting-axis').textContent === 'Z', null, { timeout: 60_000 });
+    shown = await card();
+    assert.equal(shown.caps, 'body');
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('dessin manuel : les teintes des chapes changent sur la ligne tracée, à travers les grands triangles', { timeout: 2 * CAD_TIMEOUT }, async () => {
+    const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto(`${base}?lang=fr`);
+    // A block 60 × 40 × 20 mm, each face two triangles with vertices of its own (a CAD body); a loop drawn round its
+    // sides at z = 8 crosses them all.
+    const corner = (i) => [i & 1 ? 60 : 0, i & 2 ? 40 : 0, i & 4 ? 20 : 0];
+    const quads = [[0, 4, 6, 2], [1, 3, 7, 5], [0, 1, 5, 4], [2, 6, 7, 3], [0, 2, 3, 1], [4, 5, 7, 6]];
+    const box = { positions: Float32Array.from(quads.flatMap((q) => q.flatMap(corner))), indices: Uint32Array.from(quads.flatMap((_, k) => [0, 1, 2, 0, 2, 3].map((j) => 4 * k + j))) };
+    await page.setInputFiles('#file-input', { name: 'block.obj', mimeType: 'text/plain', buffer: meshObj(box) });
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
+    await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
+    await page.click('#parting-draw');
+    const points = [[[10, 0, 8], [0, -1, 0]], [[50, 0, 8], [0, -1, 0]], [[60, 30, 8], [1, 0, 0]], [[30, 40, 8], [0, 1, 0]], [[0, 20, 8], [-1, 0, 0]]];
+    for (const [p, n] of points) {
+      await faceToward(page, p, n);
+      await clickModel(page, p);
+    }
+    await faceToward(page, ...points[0]);
+    await clickModel(page, points[0][0], [4, 0]);
+    await page.waitForFunction(() => document.getElementById('parting-origin').textContent === 'dessin manuel', null, { timeout: 30_000 });
+    assert.equal(await page.evaluate(() => document.getElementById('parting-card').dataset.draw), 'halves');
+    // Each side's two triangles in two parts.
+    assert.equal(await page.evaluate(() => document.getElementById('parting-card').dataset.pieces), '16');
+    // Seen from the front: 1 mm above the line the tint of the upper chape (blue: 84,94,122), under it that of the lower
+    // one (green: 84,102,96). By triangle, a blend of both from the top of the face to its bottom (84,98,108 above,
+    // 84,99,106 under it).
+    await faceToward(page, [30, 0, 10], [0, -1, 0]);
+    const xs = [8, 20, 30, 40];
+    const above = await coloursAt(page, xs.map((x) => [x, 0, 9])), below = await coloursAt(page, xs.map((x) => [x, 0, 7]));
+    xs.forEach((x, k) => {
+      assert.ok(above[k][2] >= above[k][1] + 15, `x = ${x}: the upper chape above the line: ${above[k]}`);
+      assert.ok(below[k][1] >= below[k][2] + 3, `x = ${x}: the lower chape under it: ${below[k]}`);
+    });
     assert.deepEqual(errors, []);
     await context.close();
   });
