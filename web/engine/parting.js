@@ -1471,7 +1471,7 @@ function straddles(evidence, f) {
  * Returns {under (Uint8Array: 1 an undercut), upper (Uint8Array: 1 in the
  * upper half, an undercut joined to it)}.
  */
-function optimiseHalves(mesh, line, evidence, d) {
+function optimiseHalves(mesh, line, evidence, d, coarseLimit = COARSE_LIMIT) {
   const { nt, areas, diag } = mesh;
   const { first, head, sister, length } = surfaceGraph(line);
   const { share } = evidence;
@@ -1491,7 +1491,7 @@ function optimiseHalves(mesh, line, evidence, d) {
       if (!across[f]) tcap[f] = areas[f] * (2 * share[3 * f + 2] - 1);
       else tcap[f] = 2 * share[3 * f + 2] > 1 ? Infinity : -Infinity;
     }
-    under = solveCut(mesh, line, cap, tcap, 0);
+    under = solveCut(mesh, line, cap, tcap, 0, coarseLimit);
   }
   // 2. The upper half (the source side, and ties); two undercuts: one region, joined whole.
   const w = placeWeights(line, d);
@@ -1512,29 +1512,45 @@ function optimiseHalves(mesh, line, evidence, d) {
     const facing = up === 1 && down === 0 ? FACING : up === 0 && down === 1 ? -FACING : facingDown(mesh, line, f, d) ? -FACING : FACING;
     tcap[f] = areas[f] * (up - down + facing);
   }
-  const upper = solveCut(mesh, line, cap, tcap, 1);
+  const upper = solveCut(mesh, line, cap, tcap, 1, coarseLimit);
   return { under, upper };
 }
 
 /**
  * The minimum cut of the triangles of `mesh` (minCut over surfaceGraph of
  * `line`, capacities cap per arc, tcap per triangle, ties to `free`): the
- * labels per triangle. Exact up to COARSE_LIMIT triangles; above (a mesh of
- * millions of small triangles: the trees of the maximum flow re-rooted at
- * each of its many tiny paths), solved on patches of them: the triangles
- * joined across their edges from a first one in their order, of the same
- * kind (the sign of their terminal capacity: of one evidence, one facing),
- * on one smooth surface (normals within 35° of the first one's), their
- * centres within λ / 2 (lineTension) of its: every triangle with its patch.
- * The patches never mix kinds nor cross a sharp edge, the cut is placed at
- * their scale, half the tension's.
+ * labels per triangle. Exact up to `limit` triangles (COARSE_LIMIT); above (a
+ * mesh of millions of small triangles: the trees of the maximum flow
+ * re-rooted at each of its many tiny paths), solved on patches of them,
+ * whatever the order of the triangles: the triangles of one cell of a grid
+ * of λ / 2 (lineTension) over their centres, of the same kind (the sign of
+ * their terminal capacity: of one evidence, one facing), joined across
+ * smooth edges (normals within 35°): every triangle with its patch, the cut
+ * placed at their scale, half the tension's. The patches never mix kinds
+ * nor cross a sharp edge. When they would not take the graph down by half
+ * (triangles larger than the cells), exact on the triangles.
  */
-function solveCut(mesh, line, cap, tcap, free) {
+function solveCut(mesh, line, cap, tcap, free, limit = COARSE_LIMIT) {
   const { nt, normals: N, centres: C, diag } = mesh;
   const { first, head, sister } = surfaceGraph(line);
-  if (nt <= COARSE_LIMIT) return minCut(nt, first, head, cap, sister, tcap, { free }).side;
+  if (nt <= limit) return minCut(nt, first, head, cap, sister, tcap, { free }).side;
   const kind = (x) => (x === Infinity ? 2 : x === -Infinity ? -2 : x > 0 ? 1 : x < 0 ? -1 : 0);
-  const radius = lineTension(diag) / 2;
+  // The cell of each triangle (its centre in a grid of λ / 2 from the least corner of the centres).
+  const size = lineTension(diag) / 2;
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let f = 0; f < nt; f++) {
+    for (let k = 0; k < 3; k++) {
+      lo[k] = Math.min(lo[k], C[3 * f + k]);
+      hi[k] = Math.max(hi[k], C[3 * f + k]);
+    }
+  }
+  const nx = Math.floor((hi[0] - lo[0]) / size) + 1, ny = Math.floor((hi[1] - lo[1]) / size) + 1;
+  const cell = new Float64Array(nt);
+  for (let f = 0; f < nt; f++) {
+    const [i, j, k] = [0, 1, 2].map((c) => Math.floor((C[3 * f + c] - lo[c]) / size));
+    cell[f] = i + nx * (j + ny * k);
+  }
+  // The patches: connected components (the same whatever the order) of one cell, one kind, across smooth edges.
   const patch = new Int32Array(nt).fill(-1);
   const queue = new Int32Array(nt);
   let np = 0;
@@ -1549,15 +1565,16 @@ function solveCut(mesh, line, cap, tcap, free) {
       const f = queue[qh++];
       for (let a = 3 * f; a < 3 * f + 3; a++) {
         const g = head[a];
-        if (g < 0 || patch[g] >= 0 || kind(tcap[g]) !== k) continue;
-        if (N[3 * s] * N[3 * g] + N[3 * s + 1] * N[3 * g + 1] + N[3 * s + 2] * N[3 * g + 2] <= SMOOTH_FACETS) continue;
-        if ((C[3 * g] - C[3 * s]) ** 2 + (C[3 * g + 1] - C[3 * s + 1]) ** 2 + (C[3 * g + 2] - C[3 * s + 2]) ** 2 > radius * radius) continue;
+        if (g < 0 || patch[g] >= 0 || cell[g] !== cell[f] || kind(tcap[g]) !== k) continue;
+        if (N[3 * f] * N[3 * g] + N[3 * f + 1] * N[3 * g + 1] + N[3 * f + 2] * N[3 * g + 2] <= SMOOTH_FACETS) continue;
         patch[g] = id;
         queue[qt++] = g;
       }
     }
   }
-  // The patches' terminal capacities, and their arcs: the edges between two of them, their capacities summed.
+  if (2 * np > nt) return minCut(nt, first, head, cap, sister, tcap, { free }).side;
+  // The patches' terminal capacities, and their arcs: the edges between two of them, rows sorted by the patch at
+  // their other end and merged (their capacities summed), the sister of each found in its row by bisection.
   const ptcap = new Float64Array(np);
   for (let f = 0; f < nt; f++) ptcap[patch[f]] += tcap[f];
   const start = new Int32Array(np + 1);
@@ -1574,27 +1591,45 @@ function solveCut(mesh, line, cap, tcap, free) {
     to[fill[p]] = patch[g];
     w[fill[p]++] = cap[a];
   }
-  // Each pair once per patch (the edges both ways: the same sums), its sister by the pair.
-  const pfirst = new Int32Array(np + 1), seenAt = new Int32Array(np).fill(-1);
-  const phead = [], pcap = [];
+  const pfirst = new Int32Array(np + 1);
+  const phead = new Int32Array(start[np]), pcap = new Float64Array(start[np]);
+  let m = 0;
   for (let p = 0; p < np; p++) {
-    pfirst[p] = phead.length;
+    pfirst[p] = m;
+    // Insertion sort of the row by its other end (a few arcs each).
+    for (let x = start[p] + 1; x < start[p + 1]; x++) {
+      const q = to[x], c = w[x];
+      let y = x - 1;
+      for (; y >= start[p] && to[y] > q; y--) {
+        to[y + 1] = to[y];
+        w[y + 1] = w[y];
+      }
+      to[y + 1] = q;
+      w[y + 1] = c;
+    }
     for (let x = start[p]; x < start[p + 1]; x++) {
-      const q = to[x];
-      if (seenAt[q] >= pfirst[p]) pcap[seenAt[q]] += w[x];
+      if (m > pfirst[p] && phead[m - 1] === to[x]) pcap[m - 1] += w[x];
       else {
-        seenAt[q] = phead.length;
-        phead.push(q);
-        pcap.push(w[x]);
+        phead[m] = to[x];
+        pcap[m++] = w[x];
       }
     }
   }
-  pfirst[np] = phead.length;
-  const index = new Map();
-  for (let p = 0; p < np; p++) for (let x = pfirst[p]; x < pfirst[p + 1]; x++) index.set(p * np + phead[x], x);
-  const psister = new Int32Array(phead.length);
-  for (let p = 0; p < np; p++) for (let x = pfirst[p]; x < pfirst[p + 1]; x++) psister[x] = index.get(phead[x] * np + p);
-  const { side } = minCut(np, pfirst, Int32Array.from(phead), Float64Array.from(pcap), psister, ptcap, { free });
+  pfirst[np] = m;
+  const psister = new Int32Array(m);
+  for (let p = 0; p < np; p++) {
+    for (let x = pfirst[p]; x < pfirst[p + 1]; x++) {
+      const q = phead[x];
+      let a = pfirst[q], b = pfirst[q + 1] - 1;
+      while (a < b) {
+        const mid = (a + b) >> 1;
+        if (phead[mid] < p) a = mid + 1;
+        else b = mid;
+      }
+      psister[x] = a;
+    }
+  }
+  const { side } = minCut(np, pfirst, phead.subarray(0, m), pcap.subarray(0, m), psister, ptcap, { free });
   return Uint8Array.from(patch, (p) => side[p]);
 }
 
@@ -1690,7 +1725,7 @@ function joinUndercuts(line, side, d, flags = null) {
     region[f0] = f0;
     queue.length = 0;
     queue.push(f0);
-    let balance = 0; // the weight of its border with the upper half less that with the lower one
+    let balance = 0, border = 0; // the weight of its border with the upper half less that with the lower one; in all
     for (let q = 0; q < queue.length; q++) {
       const f = queue[q];
       for (let a = 3 * f; a < 3 * f + 3; a++) {
@@ -1702,11 +1737,17 @@ function joinUndercuts(line, side, d, flags = null) {
             queue.push(g);
           }
         } else if (flags && cutOf(flags[f]) === SHADOW && cutOf(flags[g]) === SHADOW) continue;
-        else if (side[g] === SIDE_UPPER) balance += w[a];
-        else if (side[g] === SIDE_LOWER) balance -= w[a];
+        else if (side[g] === SIDE_UPPER) {
+          balance += w[a];
+          border += w[a];
+        } else if (side[g] === SIDE_LOWER) {
+          balance -= w[a];
+          border += w[a];
+        }
       }
     }
-    const half = balance >= 0 ? SIDE_UPPER : SIDE_LOWER;
+    // Ties within a part in 1e9 of its border (the rounding of the sums, in the order of the triangles): upper.
+    const half = balance >= -1e-9 * border ? SIDE_UPPER : SIDE_LOWER;
     for (const f of queue) out[f] = half;
   }
   return out;
@@ -3742,12 +3783,12 @@ function silhouetteHalves(mesh, grid, line, side, flags, d) {
  * (as classified) over more area than a planar line at the best level traps
  * (bestLevel, trapAtLevel): then that planar line.
  */
-function fullDirection(mesh, d, sinDraft, getLine) {
+function fullDirection(mesh, d, sinDraft, getLine, coarseLimit = COARSE_LIMIT) {
   const grid = lineGrid(mesh, d);
   const evidence = newEvidence(mesh.nt);
   let flags = classify(mesh, grid, d, null, sinDraft, evidence);
   const classified = Uint8Array.from(flags);
-  const optimum = optimiseHalves(mesh, getLine(), evidence, d);
+  const optimum = optimiseHalves(mesh, getLine(), evidence, d, coarseLimit);
   const noise = noiseUndercuts(mesh, getLine(), classified);
   optimisedFlags(flags, optimum, noise);
   // The triangles across the edge of a shadow by their points (straddles): the line goes across them.
@@ -3956,15 +3997,17 @@ export function proposeParting(positions, indices, { draftDeg = DEFAULT_DRAFT_DE
  *       -d (the halves swapped, up = +d), as proposeParting does; else d as
  *       given, its summary saying that the upper half is at the bottom
  *       (orientation.upper_half_down)
+ * coarseLimit -- above this many triangles, the halves optimised on patches
+ *       of them (COARSE_LIMIT; lower in the tests of the patches)
  */
-export function evaluateParting(positions, indices, direction, { draftDeg = DEFAULT_DRAFT_DEG, process = null, die = null, thickness = null, up = null, orient = false } = {}) {
+export function evaluateParting(positions, indices, direction, { draftDeg = DEFAULT_DRAFT_DEG, process = null, die = null, thickness = null, up = null, orient = false, coarseLimit = COARSE_LIMIT } = {}) {
   const given = normalize(direction);
   if (!given) throw new Error("Invalid draw direction");
   const mesh = prepareMesh(positions, indices);
   const options = { process: normalizeProcess(process), die: normalizeDie(die), thickness, up };
   const { d, o } = orientDirection(orientationMesh(positions, indices, mesh), given, options, orient);
   let line = null;
-  const full = fullDirection(mesh, d, Math.sin((draftDeg * Math.PI) / 180), () => (line ??= lineMesh(positions, indices, mesh.merged)));
+  const full = fullDirection(mesh, d, Math.sin((draftDeg * Math.PI) / 180), () => (line ??= lineMesh(positions, indices, mesh.merged)), coarseLimit);
   return {
     summary: {
       ...directionSummary(mesh, d, full.areas, full.height, full.line, "manual", o.summary),

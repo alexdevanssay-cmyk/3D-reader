@@ -2,7 +2,8 @@
 // optimiseHalves: minimum cuts) on synthetic parts meshed as CAD bodies are,
 // coarse and fine: no small or isolated loops, no teeth, the line where the
 // halves change, planar where a plane fits; every real undercut reported
-// (its area, its slides), the real holes, slots and studs kept.
+// (its area, its slides), the real holes, slots and studs kept; the same
+// halves whatever the order of the triangles.
 //
 //   node --test tests/js/parting-optimised.test.mjs
 import assert from 'node:assert/strict';
@@ -50,6 +51,30 @@ function slidesOf(part, d, r) {
   const sig = slidesSignature({ nt: mask.length, direction: d, mask });
   const analysis = analyseSlides(prepareSlides(part.positions, part.indices), { direction: d, mask, flags: r.flags, side: r.side, sig });
   return { analysis, view: effectiveSlides(analysis) };
+}
+
+/** The same mesh, its triangles in another order and each turned (its corners from another one): {mesh, order}. */
+function shuffled({ positions, indices }, seed = 7) {
+  const nt = indices.length / 3;
+  let a = seed >>> 0;
+  const next = () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const order = Array.from({ length: nt }, (_, i) => i);
+  for (let i = nt - 1; i > 0; i--) {
+    const j = Math.floor(next() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  const out = new Uint32Array(3 * nt);
+  order.forEach((f, k) => {
+    const [p, q, r] = [indices[3 * f], indices[3 * f + 1], indices[3 * f + 2]];
+    out.set(k % 2 ? [q, r, p] : [p, q, r], 3 * k);
+  });
+  return { mesh: { positions, indices: out }, order };
 }
 
 describe('the parting halves optimised over the surface', () => {
@@ -183,6 +208,33 @@ describe('the parting halves optimised over the surface', () => {
     approx(r.summary.undercut_area_mm2, 4 * 10 * 2.5, 0, 0.1, 'window: undercut');
     const { view } = slidesOf(cup, [0, 0, 1], r);
     assert.deepEqual(view.slides.map((sl) => [sl.axis, sl.zones.length]), [['X', 1]]);
+  });
+
+  test('above the coarse limit, on patches of triangles: exact where patches cannot take the graph down by half', () => {
+    // The tube's triangles are larger than the cells of the patches (λ / 2):
+    // each its own patch, the cut made on the triangles, the same halves.
+    const part = bossedTube();
+    for (const d of [[1, 0, 0], [0, 0, 1], [0, 0.6, 0.8]]) {
+      const exact = evaluateParting(part.positions, part.indices, d);
+      const coarse = evaluateParting(part.positions, part.indices, d, { coarseLimit: 100 });
+      assert.deepEqual([coarse.side, coarse.flags, coarse.summary], [exact.side, exact.flags, exact.summary], String(d));
+    }
+  });
+
+  test('a finely meshed body above the coarse limit (264 000 triangles): the same halves whatever the order of its triangles', () => {
+    // The patches were grown from the triangles in their order: shuffled, the
+    // line had a loop more along Z and 28 mm less obliquely. Now the patches
+    // of the cells of a grid of λ / 2 (connected parts of each), the cut of
+    // their graph unique: the same undercut and loops, the line within 1 %.
+    const part = subdivided(bossedTube(), 4);
+    const { mesh } = shuffled(part);
+    for (const d of [[0, 0, 1], [0, 0.6, 0.8]]) {
+      const a = evaluateParting(part.positions, part.indices, d), b = evaluateParting(mesh.positions, mesh.indices, d);
+      const label = String(d);
+      approx(b.summary.undercut_area_mm2, a.summary.undercut_area_mm2, 1e-6, 0, `${label}: undercut`);
+      assert.deepEqual([b.summary.parting.kind, b.summary.parting.loops], [a.summary.parting.kind, a.summary.parting.loops], label);
+      approx(b.summary.parting.length_mm, a.summary.parting.length_mm, 0.01, 0, `${label}: length`);
+    }
   });
 
   test('a planar line across faces whose shared vertices differ by a hair (welded): one loop, not broken where it crosses their edges', () => {
