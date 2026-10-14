@@ -3,8 +3,10 @@
 // would choose: chosen in Paramètres; a part analysed written in its
 // subfolder "analyses-3d", with its wall thickness, and opened from there
 // without being analysed once this browser's own results are gone (another
-// PC); a real cycle time saved in the costing written in "retours-experience",
-// and the files of other PCs merged into the history (the newer record only);
+// PC), then kept in this browser with its thickness, or not at all when the
+// page is closed first; a real cycle time saved in the costing written in
+// "retours-experience", and the files of other PCs merged into the history
+// (the newer record only);
 // the conversations of a folder chosen in the IA page before, moved into
 // "historique-ia". With a made-up workbook (tests/js/costing-fixture.mjs).
 //
@@ -79,6 +81,17 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
           return real.apply(this, args);
         };
       }
+      // The page closed before the results it read from the folder are kept in this browser (the flag
+      // "test.unkept"): the transaction that keeps their thickness aborted, as an unload aborts one not committed.
+      const put = IDBObjectStore.prototype.put;
+      IDBObjectStore.prototype.put = function (value, key) {
+        const request = put.call(this, value, key);
+        if (localStorage.getItem('test.unkept') && this.transaction.db.name === 'reader3d-cache' && String(key).endsWith('#thickness')) {
+          localStorage.removeItem('test.unkept');
+          this.transaction.abort();
+        }
+        return request;
+      };
       window.__posted = [];
       const post = Worker.prototype.postMessage;
       Worker.prototype.postMessage = function (message, ...rest) {
@@ -116,6 +129,38 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     }
     return done === count;
   }, [sub, suffix, n]);
+
+  /**
+   * Wait until the results of the part `sha` (the SHA-256 of its file), with their thickness, are kept in
+   * this browser: written in the background once shown, and a reload drops a write not committed. A read
+   * waits for the writes begun before it.
+   */
+  const keptHere = (page, sha) => until(page, async (hash) => {
+    const db = await new Promise((resolve, reject) => {
+      const req = indexedDB.open('reader3d-cache');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    const keys = await new Promise((resolve, reject) => {
+      const req = db.transaction('data', 'readonly').objectStore('data').getAllKeys();
+      req.onsuccess = () => resolve(req.result.map(String));
+      req.onerror = () => reject(req.error);
+    }).finally(() => db.close());
+    return keys.some((k) => k.split('|')[1] === hash && !k.includes('#') && keys.includes(`${k}#thickness`));
+  }, sha);
+
+  /** The page reloaded and box.stl opened again: read from the shared folder, nothing analysed, with its volume and its thickness. */
+  async function openedFromFolder(page, { volume, min }) {
+    await page.reload();
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
+    assert.match(await page.textContent('#method'), /Analyse lue dans le dossier réseau partagé \(« Actualiser » la recalcule\)/);
+    assert.equal(await page.textContent('#total-volume'), volume);
+    assert.equal(await page.isVisible('#thick-body'), true);
+    assert.equal(await page.textContent('#thick-min'), min);
+    const posted = await page.evaluate(() => window.__posted);
+    assert.deepEqual(posted.filter((type) => ['analyze', 'mesh', 'prepare', 'range'].includes(type)), [], `nothing analysed: ${posted}`);
+  }
 
   /** Choose the shared folder in Paramètres: accessible. */
   async function chooseFolder(page) {
@@ -162,18 +207,10 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
 
     // Another PC: this browser's results gone, the shared folder still chosen. Opened from the folder, nothing analysed, thickness included.
     await page.evaluate(async () => (await import(new URL('engine/client.js', location.href).href)).clearCache());
-    await page.reload();
-    await page.setInputFiles('#file-input', fixturePath('box.stl'));
-    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
-    assert.match(await page.textContent('#method'), /Analyse lue dans le dossier réseau partagé \(« Actualiser » la recalcule\)/);
-    assert.equal(await page.textContent('#total-volume'), volume);
-    assert.equal(await page.isVisible('#thick-body'), true);
-    assert.equal(await page.textContent('#thick-min'), min);
-    const posted = await page.evaluate(() => window.__posted);
-    assert.deepEqual(posted.filter((type) => ['analyze', 'mesh', 'prepare', 'range'].includes(type)), [], `nothing analysed: ${posted}`);
+    await openedFromFolder(page, { volume, min });
 
     // Kept in this browser now: opened again, from it.
-    await page.waitForTimeout(500);
+    await keptHere(page, key);
     await page.reload();
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
@@ -202,6 +239,32 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
       const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle('analyses-3d');
       return (await (await dir.getFileHandle(name)).getFile().then((f) => f.size, () => 0)) > 100;
     }, names[0]);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('a part read from the folder, the page closed before it is kept in this browser: opened again, its thickness still there', { timeout: TIMEOUT }, async () => {
+    const { context, page, errors } = await newPage();
+    await page.goto(`${base}?lang=fr`);
+    await chooseFolder(page);
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
+    const volume = await page.textContent('#total-volume');
+    await page.evaluate(() => window.reader3d.computeThickness());
+    const min = await page.textContent('#thick-min');
+    await filesWritten(page, 'analyses-3d', '.r3d.gz', 2);
+
+    // Another PC, the page closed before what it read from the folder is kept in this browser (test.unkept).
+    await page.evaluate(async () => {
+      await (await import(new URL('engine/client.js', location.href).href)).clearCache();
+      localStorage.setItem('test.unkept', '1');
+    });
+    await openedFromFolder(page, { volume, min });
+    await page.waitForFunction(() => !localStorage.getItem('test.unkept'));
+    // Opened again: kept in this browser all together or not at all, never the analysis without its thickness (it
+    // would open from here, « Résultats mémorisés », without it). Read from the folder again, thickness included.
+    await openedFromFolder(page, { volume, min });
     assert.deepEqual(errors, []);
     await context.close();
   });
