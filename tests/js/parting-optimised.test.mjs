@@ -9,7 +9,7 @@ import { describe, test } from 'node:test';
 
 import { evaluateParting, lineMesh, lineTension } from '../../web/engine/parting.js';
 import { HOLED, bossedTube, holedBlock, studBlock, subdivided } from './cad-parts.mjs';
-import { zBracket } from './curved-mesh.mjs';
+import { Body, zBracket } from './curved-mesh.mjs';
 import { approx } from './helpers.mjs';
 import { lineLoops, looseEnds, shapeOfLine, undercutRegions } from './line-shape.mjs';
 
@@ -131,5 +131,28 @@ describe('the parting halves optimised over the surface', () => {
     assert.deepEqual([r.plane, r.summary.parting.loops, loops.length, r.summary.undercut_area_mm2], [null, 1, 1, 0]);
     // Round the bottom (140 mm), up both sides of the strip to the stud and round its underside: + 2 × 12 + 1 + 1.
     approx(r.summary.parting.length_mm, 140 + 2 * 12 + 2 * 1 + 1, 0, 0.05, 'length');
+  });
+
+  test('a planar line across faces whose shared vertices differ by a hair (welded): one loop, not broken where it crosses their edges', () => {
+    // A cylinder along x in strips offset half a step (no vertex on the line
+    // at z = 0), its caps with their own copies of the rim vertices, one
+    // float32 step higher: the plane crossed each rim edge at two points a
+    // hair apart (one per face), the line in 4 loops.
+    const n = 24, r = 10, L = 50;
+    const ring = (x) => Array.from({ length: n }, (_, i) => {
+      const a = (2 * Math.PI * (i + 0.5)) / n;
+      return [x, r * Math.cos(a), r * Math.sin(a)];
+    });
+    const body = new Body();
+    body.band(ring(0), ring(L), (q) => [0, q[1], q[2]]);
+    const disc = ring(0).map(([, y, z]) => [y, z]);
+    body.flat([0, 0, 0], [0, 1, 0], [0, 0, 1], disc, [], [-1, 0, 0]);
+    body.flat([L, 0, 0], [0, 1, 0], [0, 0, 1], disc, [], [1, 0, 0]);
+    const exact = body.mesh();
+    const nudged = Float32Array.from(exact.positions);
+    for (let v = 2 * n; v < nudged.length / 3; v++) nudged[3 * v + 2] = Math.fround(nudged[3 * v + 2] + Math.abs(nudged[3 * v + 2]) * 2 ** -23);
+    const results = [exact, { positions: nudged, indices: exact.indices }].map((part, k) => cleanSplit(part, [0, 0, 1], k ? 'nudged' : 'exact'));
+    for (const { r } of results) assert.deepEqual([r.summary.parting.kind, r.plane, r.summary.parting.loops], ['planar', 0, 1]);
+    approx(results[1].r.summary.parting.length_mm, results[0].r.summary.parting.length_mm, 0, 1e-3, 'length');
   });
 });

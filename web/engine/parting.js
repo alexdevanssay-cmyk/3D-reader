@@ -2048,8 +2048,13 @@ function lineOf(line, side, d, options) {
   const pieces = []; // [xyz, xyz, key, key]: the ends of each piece and what they are (a vertex, a point of an edge)
   // A point at t along edge (wa, wb) (welded) where a cut crosses it: by where it is along the edge (two cuts of
   // their own, the silhouettes of two faces or a silhouette and an iso-line, cross it at points of their own, joined
-  // along it; the same point for the triangles on either side of a cut, the line goes on).
-  const edgeKey = (wa, wb, t) => (wa < wb ? `e${wa},${wb}@${Math.round(t * 1e9)}` : `e${wb},${wa}@${Math.round((1 - t) * 1e9)}`);
+  // along it; the same point for the triangles on either side of a cut, the line goes on). A plane crosses an edge
+  // once: by the edge alone (its vertices' copies of two faces, welded but not bit for bit the same, would put the
+  // crossing at two points a hair apart, the line broken there).
+  const edgeKey = (wa, wb, t) => {
+    if (plane != null) return wa < wb ? `e${wa},${wb}` : `e${wb},${wa}`;
+    return wa < wb ? `e${wa},${wb}@${Math.round(t * 1e9)}` : `e${wb},${wa}@${Math.round((1 - t) * 1e9)}`;
+  };
   // The vertex of triangle g at welded vertex wv (the faces of a CAD body have their own: the values of g's surface).
   const corner = (g, wv) => (welded[3 * g] === wv ? I[3 * g] : welded[3 * g + 1] === wv ? I[3 * g + 1] : I[3 * g + 2]);
   // The halves along edge (wa, wb) of triangle x cut, from wa to wb: [{from, to, upper, keyFrom, keyTo}].
