@@ -109,6 +109,17 @@ export function orientDirection({ positions, indices, thickness = null }, direct
 }
 
 /**
+ * The triangles of a body its parting line crosses, cut where it crosses
+ * them, for the colours of its halves (parting.js partingPieces): the
+ * definition {direction, side, flags, plane, fixed (the triangles of the
+ * faces moved by hand, or null), height (of the mould, for the tolerance of
+ * the plane)}. Resolves to {count, tri, half, undercut, near, start, points}.
+ */
+export function cutPieces({ positions, indices }, { direction, side, flags, plane = null, fixed = null, height = null }, { owner } = {}) {
+  return call({ type: 'pieces', positions, indices, direction: [...direction], side, flags, plane, fixed, height }, { owner });
+}
+
+/**
  * The proposals kept with the results of a file (cache.js: {version,
  * options_key, bodies}) when they are of this engine, for `count` bodies, for
  * this process and these die options; else null (to compute them again).

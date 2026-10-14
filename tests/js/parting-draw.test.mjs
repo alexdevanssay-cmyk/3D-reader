@@ -556,6 +556,52 @@ describe('the drawn parting line', () => {
     assert.deepEqual(result.messages, []);
   });
 
+  test('the seam triangles cut along the line: their two parts in the chapes of their sides, for the colours', () => {
+    // The halves of a drawn line were coloured by triangle (a seam triangle in the chape of its larger part):
+    // each triangle the loop crosses is now in two parts, the chain between them.
+    const { flags } = evaluateParting(mesh.positions, mesh.indices, Z);
+    const result = drawnParting(box.dm, drawing, { axis: Z, flags, height: 20 });
+    const pc = result.pieces;
+    const seams = new Set(pc.tri);
+    // The row of triangles of the sides between z = 10 and 15: 2 × 2 × (12 + 8) of them.
+    assert.equal(seams.size, 80);
+    assert.equal(pc.count, 160);
+    const P = mesh.positions, I = mesh.indices;
+    const area = (pts) => {
+      const s = [0, 0, 0];
+      for (let k = 1; k + 1 < pts.length; k++) {
+        const u = pts[k].map((x, c) => x - pts[0][c]), v = pts[k + 1].map((x, c) => x - pts[0][c]);
+        s[0] += u[1] * v[2] - u[2] * v[1];
+        s[1] += u[2] * v[0] - u[0] * v[2];
+        s[2] += u[0] * v[1] - u[1] * v[0];
+      }
+      return Math.hypot(...s) / 2;
+    };
+    const sums = new Map();
+    for (let k = 0; k < pc.count; k++) {
+      const pts = [];
+      for (let j = pc.start[k]; j < pc.start[k + 1]; j++) pts.push([pc.points[3 * j], pc.points[3 * j + 1], pc.points[3 * j + 2]]);
+      sums.set(pc.tri[k], (sums.get(pc.tri[k]) ?? 0) + area(pts));
+      // Above the line the upper chape, under it the lower one; its side on the line at z = 10.3.
+      const z = pts.reduce((s, p) => s + p[2], 0) / pts.length;
+      assert.equal(pc.half[k], z > 10.3 ? SIDE_UPPER : SIDE_LOWER, `part ${k}`);
+      assert.ok(pts.filter((p) => Math.abs(p[2] - 10.3) < 1e-9).length >= 2, `part ${k}: its side on the line`);
+      assert.deepEqual([pc.undercut[k], pc.near[k]], [0, -1]);
+    }
+    for (const [f, sum] of sums) approx(sum, area([0, 1, 2].map((k) => [...P.subarray(3 * I[3 * f + k], 3 * I[3 * f + k] + 3)])), 1e-9, 0, `triangle ${f}`);
+    // A loop on the top face, its inside given to the lower chape (which cannot form it): the parts inside it
+    // undercuts, in the colour of an undercut triangle beside them; those outside not.
+    const top = [[12, 12, 20], [48, 13, 20], [47, 28, 20], [13, 27, 20]].map(box.at);
+    const inside = drawnParting(box.dm, { loops: [{ points: top, segs: [], closed: true }], seeds: [{ t: box.at([30, 20, 20]).t, side: SIDE_LOWER }] }, { axis: Z, flags, height: 20 });
+    assert.equal(inside.ok, true, JSON.stringify(inside.messages));
+    const q = inside.pieces;
+    assert.ok(q.count >= 20, String(q.count));
+    for (let k = 0; k < q.count; k++) {
+      assert.equal(q.undercut[k], q.half[k] === SIDE_LOWER ? 1 : 0, `part ${k}`);
+      if (q.undercut[k]) assert.equal(inside.undercut[q.near[k]], 1, `part ${k}`);
+    }
+  });
+
   test('an arc not given its radius or side yet: the default one, 60° bulging up in the vertical plane of its segment', () => {
     const segs = [{ kind: 'arc' }, ...drawing.loops[0].segs.slice(1)];
     const result = drawnParting(box.dm, { ...drawing, loops: [{ ...drawing.loops[0], segs }] }, { axis: Z, height: 20, bodyCentre: [30, 20, 10] });
