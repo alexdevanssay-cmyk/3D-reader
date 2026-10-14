@@ -26,6 +26,13 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
 - **Envelope**: axis-aligned bounding box (L × W × H and its volume), the minimum
   oriented bounding box, and the **fill ratio** (material volume ÷ envelope volume).
 - Surface area, centre of mass, and **mass** from a material density (preset list or custom).
+- **Several bodies** in a file: only the largest one (the largest volume; the largest envelope
+  when none has a volume) is checked and shown at first, the others unchecked and hidden, as a
+  note of the *Bodies* card says. Checking them (or *all*) includes them in the volume, the
+  exports, the costing, the wall thickness, the semantic contract and the IA page, as for
+  any body checked; each tab keeps its own choice. The link modes for scripts (`report=1`,
+  `export=…`) keep every body; `?bodies=all` checks every body at first, `?bodies=largest`
+  the largest one alone in those modes too.
 - **Wall thickness** for casting design ("épaisseur de toile"), button *Thickness*: colour
   scale of the thickness (switchable), histogram of the surface per thickness over a
   graduated scale, and a cursor that highlights the zones of one thickness (± a tolerance).
@@ -207,7 +214,8 @@ hand" of `web/app.js`:
   of the CAD engine, of the page and of the device) that warns before a file that could
   make the browser stop the page; the CAD engine gives its memory back after a large file.
 - **AI assistants and scripts** can use the online reader by link
-  (`?url=<model URL>&report=1`), through `window.reader3d.analyze()` in the page, or
+  (`?url=<model URL>&report=1`, every body of the file), through `window.reader3d.analyze()`
+  in the page (the bodies checked: add `?bodies=all` to the page's address for every body), or
   with the Python package: see [web/ai.html](web/ai.html) (published at `/ai.html`).
 - Units: everything is reported in mm / mm² / mm³ (switchable to cm³, dm³, m³, in³).
   CAD files are converted from their own unit automatically. Mesh files have no unit,

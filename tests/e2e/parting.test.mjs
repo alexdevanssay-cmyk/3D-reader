@@ -357,7 +357,8 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}?lang=fr`);
+    // Every body checked (a file of several bodies shows its largest one alone by default): all of them shown.
+    await page.goto(`${base}?lang=fr&bodies=all`);
     await page.setInputFiles('#file-input', { name: 'blocks.obj', mimeType: 'text/plain', buffer: blocksObj() });
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
@@ -624,7 +625,8 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}?lang=fr`);
+    // Every body checked (a file of several bodies shows its largest one alone by default): all of them shown.
+    await page.goto(`${base}?lang=fr&bodies=all`);
     // Two blocks 60 × 20 × 20 mm: A at y -40..-20, in front of B at y 20..40 seen from the front.
     const box = () => true;
     const obj = voxelsObj([['a', box, [-30, -40, 0]], ['b', box, [-30, 20, 0]]], [12, 4, 4], 5);
@@ -1126,7 +1128,8 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}?lang=fr`);
+    // Every body checked (a file of several bodies shows its largest one alone by default): all of them shown.
+    await page.goto(`${base}?lang=fr&bodies=all`);
     await page.setInputFiles('#file-input', { name: 'blocks.obj', mimeType: 'text/plain', buffer: blocksObj() });
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });

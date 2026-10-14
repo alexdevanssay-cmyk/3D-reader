@@ -5,7 +5,7 @@ import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
 import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
 import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.js";
 import { engravingMask, thicknessHistogram, thicknessStats } from "./engine/thickness.js";
-import { summarize } from "./engine/summary.js";
+import { largestBody, summarize } from "./engine/summary.js";
 import { buildSemantic3D, SEMANTIC_VERSION } from "./engine/semantic.js";
 import { buildAIContext, AI_CONTEXT_VERSION } from "./engine/ai-context.js";
 import {
@@ -117,6 +117,7 @@ const state = {
   edges: [], // wireframe overlays
   selected: -1,
   included: new Set(), // bodies checked in the list: the volume, the exports and the costing are theirs
+  largestOnly: false, // the largest body alone checked when shown first (defaultBodies), the selection not changed since
   bounds: new THREE.Box3(),
 };
 
@@ -301,12 +302,31 @@ function buildModel(result) {
   // The wireframe is only built when shown (on a large model it takes longer than the rest of the view).
   if ($("toggle-wire").classList.contains("active")) showWireframe(true);
 
-  state.included = new Set(result.bodies.map((_, i) => i));
+  // Shown for the first time in this tab: the largest body alone when there are several, the others
+  // unchecked and hidden as if unchecked in the list (setIncluded); a note says so (renderBodies).
+  const shown = defaultBodies(result);
+  state.included = new Set(shown);
+  state.meshes.forEach((m, i) => (m.visible = state.included.has(i)));
+  state.largestOnly = shown.length < result.bodies.length;
   state.subsetSummary = null;
   const s = result.summary.bbox;
   state.bounds.set(new THREE.Vector3(...s.min), new THREE.Vector3(...s.max));
   placeHelpers();
   setView("iso");
+}
+
+/**
+ * The bodies checked when a result is first shown in a tab: with several, the
+ * largest one alone (engine/summary.js largestBody). Every body for the link
+ * modes that publish the results for a script (report=1, export=…), or with
+ * bodies=all; bodies=largest keeps the largest one alone in those too.
+ */
+function defaultBodies(result) {
+  const all = result.bodies.map((_, i) => i);
+  const asked = params.get("bodies");
+  const publishing = Boolean(params.get("report") || params.get("export"));
+  if (all.length < 2 || asked === "all" || (publishing && asked !== "largest")) return all;
+  return [largestBody(result.bodies)];
 }
 
 /** The envelope and the axes of the model shown (none without a model), and the section plane. */
@@ -722,7 +742,10 @@ function currentSummary(indices = includedIndices()) {
 
 /** Check exactly these bodies (from the list, or from the costing page). */
 function setIncluded(indices) {
-  state.included = new Set(indices);
+  const next = new Set(indices);
+  // The selection changed (by the list, the costing page or a script): the note of the largest body alone, gone.
+  if (next.size !== state.included.size || [...next].some((i) => !state.included.has(i))) state.largestOnly = false;
+  state.included = next;
   state.meshes.forEach((m, i) => (m.visible = state.included.has(i)));
   renderPanel();
   renderParting();
@@ -757,6 +780,10 @@ function renderBodies() {
   const r = state.result;
   const tbody = $("bodies");
   tbody.innerHTML = "";
+  // Several bodies, the largest one alone checked by default: said until the selection is changed.
+  const note = $("bodies-note");
+  note.hidden = !(state.largestOnly && state.included.size < r.bodies.length);
+  note.textContent = note.hidden ? "" : t("bodies.largestOnly", { n: r.bodies.length });
   const total = currentSummary()?.volume || 0;
   r.bodies.forEach((b, i) => {
     const tr = document.createElement("tr");
@@ -7589,6 +7616,7 @@ function stashTab(tab) {
         edges: state.edges,
         selected: state.selected,
         included: state.included,
+        largestOnly: state.largestOnly,
         subsetSummary: state.subsetSummary,
         bounds: state.bounds.clone(),
         camera: { position: camera.position.clone(), up: camera.up.clone(), near: camera.near, far: camera.far, target: controls.target.clone() },
@@ -7623,6 +7651,7 @@ function showTab(tab) {
     state.edges = view.edges;
     state.selected = view.selected;
     state.included = view.included;
+    state.largestOnly = view.largestOnly;
     state.subsetSummary = view.subsetSummary;
     if (view.meshes.length) modelGroup.add(...view.meshes);
     state.bounds.copy(view.bounds);
@@ -7952,6 +7981,9 @@ setInterval(() => document.visibilityState === "visible" && !$("memory-card").hi
 //   &lang=fr|en  &unit=mm|cm|m|in|ft  &quality=coarse|normal|fine
 //   &export=json|xlsx|csv         download the results once analysed
 //   &report=1                     show the results as plain text in the page
+//   &bodies=all|largest           bodies checked when a file has several: all of them, or the
+//                                 largest one alone (by default: the largest one alone, but all
+//                                 of them with report or export, which publish the results)
 // The results are also in <script id="reader3d-result" type="application/json">,
 // <body data-status="analysing|done|error"> and window.reader3d.
 const params = new URLSearchParams(location.search);
