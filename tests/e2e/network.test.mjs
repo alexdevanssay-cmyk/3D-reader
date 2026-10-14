@@ -66,15 +66,19 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
         localStorage.removeItem('test.prompt');
         return 'granted';
       };
-      // A network slow to answer (the flag "test.slow": ms): each folder or file looked for waits that long (window.__slow counts them).
+      // A network slow to answer (the flag "test.slow": ms): each folder or file looked for waits that long; a file
+      // opened while the flag "test.hold" is set waits until it is removed, the network answering when the test says
+      // so (window.__slow counts them).
       window.__slow = { waiting: 0, done: 0 };
       for (const method of ['getDirectoryHandle', 'getFileHandle']) {
         const real = FileSystemDirectoryHandle.prototype[method];
         FileSystemDirectoryHandle.prototype[method] = async function (...args) {
           const ms = Number(localStorage.getItem('test.slow'));
-          if (ms) {
+          const held = method === 'getFileHandle' && !!localStorage.getItem('test.hold');
+          if (ms || held) {
             window.__slow.waiting++;
-            await new Promise((resolve) => setTimeout(resolve, ms));
+            if (ms) await new Promise((resolve) => setTimeout(resolve, ms));
+            while (held && localStorage.getItem('test.hold')) await new Promise((resolve) => setTimeout(resolve, 20));
             window.__slow.waiting--;
             window.__slow.done++;
           }
@@ -375,10 +379,11 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
       return { state: el.querySelector('.crow strong').textContent, buttons: [...el.querySelectorAll('button')].map((b) => b.textContent), text: el.textContent };
     });
 
-    // Read again, its file opened slowly: meanwhile a history imported, and "Actualiser" clicked again.
-    await page.evaluate(() => localStorage.setItem('test.slow', '3000'));
+    // Read again, its file opened slowly: meanwhile a history imported, and "Actualiser" clicked again. The file
+    // held until then (test.hold): on a loaded machine the import takes longer than any delay the network would take.
+    await page.evaluate(() => localStorage.setItem('test.hold', '1'));
     await page.click('#cnetwork [data-action="network-refresh"]');
-    await page.waitForFunction(() => window.__slow.done >= 1 && window.__slow.waiting > 0); // the folder found, its file being opened
+    await page.waitForFunction(() => window.__slow.waiting > 0); // the folder found, its file being opened
     await page.setInputFiles('#page-parametres input[data-file="historique"]', join(dir, 'historique.json'));
     await page.waitForFunction(() => /Historique « historique\.json » importé/.test(document.querySelector('#page-parametres .cmsg')?.textContent));
     assert.ok(await page.evaluate(() => {
@@ -386,7 +391,7 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
       document.querySelector('#cnetwork [data-action="network-refresh"]').click();
       return true;
     }), '"Actualiser" clicked while the folder is read');
-    await page.evaluate(() => localStorage.removeItem('test.slow'));
+    await page.evaluate(() => localStorage.removeItem('test.hold'));
     // The reading over, the folder checked and read again: the row with its buttons, what the reading brought.
     await page.waitForFunction(() => /— accessible/.test(document.querySelector('#cnetwork .crow')?.textContent) && /lu à/.test(document.getElementById('cnetwork').textContent), null, { timeout: 20_000 });
     const after = await row();
@@ -397,15 +402,18 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     const kept = await page.evaluate(() => JSON.parse(localStorage.getItem('reader3d.chiffrage.historique.v1')).pieces);
     assert.deepEqual(kept.map((r) => [r.ref, r.source]).sort(), [['AUTRE-PC', 'production'], ['DEVIS-PC', 'devis']]);
 
-    // "Ne plus utiliser" while the folder is read: no reading said for a folder no longer used.
+    // "Ne plus utiliser" while the folder is read: no reading said for a folder no longer used. The reading
+    // asked again above may not be over yet (the row says "accessible" once the folder is checked, before
+    // its files are read): "Actualiser" then draws the row "vérification…", without its buttons, until that
+    // reading is over and the folder checked again. Clicked once the row has its buttons and the folder is
+    // read, by the page itself when it sees both (a click from here may come once the folder answered).
     await page.evaluate(() => localStorage.setItem('test.slow', '3000'));
     await page.click('#cnetwork [data-action="network-refresh"]');
-    await page.waitForFunction(() => window.__slow.waiting > 0);
-    assert.ok(await page.evaluate(() => {
-      if (!window.__slow.waiting) return false;
-      setTimeout(() => document.querySelector('#cnetwork [data-action="network-forget"]').click()); // its confirm() accepted out of this evaluate
+    await page.waitForFunction(() => {
+      if (!window.__slow.waiting || !document.querySelector('#cnetwork [data-action="network-forget"]')) return false;
+      setTimeout(() => document.querySelector('#cnetwork [data-action="network-forget"]').click()); // its confirm() accepted out of this wait
       return true;
-    }), '"Ne plus utiliser" clicked while the folder is read');
+    }, null, { timeout: 20_000 });
     await page.evaluate(() => localStorage.removeItem('test.slow'));
     await page.waitForFunction(() => /Dossier réseau partagé :\s*aucun/.test(document.querySelector('#cnetwork .crow')?.textContent), null, { timeout: 20_000 });
     await page.waitForFunction(() => window.__slow.waiting === 0);
@@ -423,17 +431,23 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     await chooseFolder(page);
     await page.waitForFunction(() => /lu à/.test(document.getElementById('cnetwork')?.textContent));
     await page.click('.tab[data-page="viewer"]');
-    await page.evaluate(() => localStorage.setItem('test.slow', '1500'));
+    await page.evaluate(() => localStorage.setItem('test.hold', '1'));
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
-    await page.waitForFunction(() => window.__slow.waiting > 0);
-    await page.click('#cancel');
+    // Cancel clicked while the file of the part is looked for in the folder: by the page itself as soon as it
+    // looks for it (a click from here may come once the folder answered), then the folder answers.
+    await page.waitForFunction(() => {
+      const cancel = document.getElementById('cancel');
+      if (!window.__slow.waiting || !cancel.checkVisibility()) return false;
+      cancel.click();
+      localStorage.removeItem('test.hold');
+      return true;
+    });
     // The lookup over (the folder found, no file of this part in it): no analysis started for a file cancelled.
-    await page.waitForFunction(() => window.__slow.done >= 2 && window.__slow.waiting === 0, null, { timeout: 20_000 });
+    await page.waitForFunction(() => window.__slow.done >= 1 && window.__slow.waiting === 0, null, { timeout: 20_000 });
     await page.waitForTimeout(1000);
     assert.deepEqual((await page.evaluate(() => window.__posted)).filter((type) => type === 'analyze'), []);
     assert.notEqual(await page.evaluate(() => document.body.dataset.status), 'analysing');
-    // Opened again, the network back: analysed.
-    await page.evaluate(() => localStorage.removeItem('test.slow'));
+    // Opened again, the network answering: analysed.
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
     assert.deepEqual((await page.evaluate(() => window.__posted)).filter((type) => type === 'analyze'), ['analyze']);
