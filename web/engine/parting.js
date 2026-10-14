@@ -2045,7 +2045,13 @@ function lineOf(line, side, d, options) {
   side = cutting.side;
   // How each triangle cut is cut: 1 by the plane, 2 by its silhouette, 3 by the edges of shadows.
   const { modeOf, shapeOf, value, nearOf, isSplit, splitState, crossing, along, pointOn, at } = cutting;
-  const pieces = []; // [xyz, xyz, key, key]: the ends of each piece and what they are (a vertex, a point of an edge)
+  // [xyz, xyz, key, key, whole?]: the ends of each piece and what they are (a vertex, a point of an edge); along the
+  // edge of a triangle not cut, a point inside it (its centroid), or true when both triangles of the edge are whole.
+  const pieces = [];
+  const centroid = (w) => {
+    const [a, b, c] = [at(I[3 * w]), at(I[3 * w + 1]), at(I[3 * w + 2])];
+    return [(a[0] + b[0] + c[0]) / 3, (a[1] + b[1] + c[1]) / 3, (a[2] + b[2] + c[2]) / 3];
+  };
   // A point at t along edge (wa, wb) (welded) where a cut crosses it: by where it is along the edge (two cuts of
   // their own, the silhouettes of two faces or a silhouette and an iso-line, cross it at points of their own, joined
   // along it; the same point for the triangles on either side of a cut, the line goes on). A plane crosses an edge
@@ -2113,7 +2119,7 @@ function lineOf(line, side, d, options) {
       // The edge as a vertex pair of the triangle cut (of f when neither is).
       const ra = xf || !xg ? I[3 * f + e] : corner(g, wa), rb = xf || !xg ? I[3 * f + ((e + 1) % 3)] : corner(g, wb);
       if (!xf && !xg) {
-        if (sf !== SIDE_NONE && sg !== SIDE_NONE && sf !== sg) pieces.push([at(ra), at(rb), `v${wa}`, `v${wb}`]);
+        if (sf !== SIDE_NONE && sg !== SIDE_NONE && sf !== sg) pieces.push([at(ra), at(rb), `v${wa}`, `v${wb}`, true]);
         continue;
       }
       if (xf && xg) {
@@ -2134,7 +2140,7 @@ function lineOf(line, side, d, options) {
       const ha = value(x, ra), hb = value(x, rb);
       const inA = keepAbove ? ha > 0 : ha < 0;
       const inB = keepAbove ? hb > 0 : hb < 0;
-      if (inA && inB) pieces.push([at(ra), at(rb), `v${wa}`, `v${wb}`]);
+      if (inA && inB) pieces.push([at(ra), at(rb), `v${wa}`, `v${wb}`, centroid(xf ? g : f)]);
       else if (inA !== inB && Math.abs(hb - ha) > nearOf(x)) {
         const t = crossing(x, ra, rb);
         const cut = along(ra, rb, t);
@@ -2173,12 +2179,16 @@ function lineOf(line, side, d, options) {
 /**
  * The small closed loops of a line taken out, in place: a loop of at most
  * SMALL_LOOP_PIECES pieces (chained by their keys, each point on two of
- * them) enclosing less than λ² (lineTension of the part: a sliver between
- * two cuts that meet, the silhouettes of two faces, a silhouette and the edge
- * of a shadow; a region of a few square millimetres a cut cuts off), each
- * into `hooks` as the fan of triangles from its first point (partingPieces:
- * its inside on the other side of the line, as the line round it). A real
- * small hole, a slot, is larger.
+ * them) enclosing less than λ² (lineTension of the part), every piece of it
+ * across a triangle (a point of an edge at one end at least): a sliver
+ * between two cuts that meet, the silhouettes of two faces, a silhouette and
+ * the edge of a shadow, inside the triangles they cut; each into `hooks` as
+ * the fan of triangles from its first point (partingPieces: its inside, the
+ * parts of those triangles, on the other side of the line, as the line round
+ * it). A loop round a whole triangle stays (the rim of a pin hole, a small
+ * face of its own): the hooks move the parts of the triangles cut, not it,
+ * its half the colours show. So does one with a piece along an edge between
+ * two whole triangles of different halves (one of them inside).
  */
 function dropSmallLoops(line, pieces, hooks) {
   if (pieces.length < 3) return;
@@ -2229,6 +2239,8 @@ function dropSmallLoops(line, pieces, hooks) {
       key = forward ? pieces[next][3] : pieces[next][2];
     }
     if (!closed || !simple || loop.length < 3) continue;
+    // Along an edge between two whole triangles: one of them inside.
+    if (loop.some((k) => pieces[k][4] === true)) continue;
     // Its area (Newell): under λ².
     const n = [0, 0, 0];
     points.forEach((p, i) => {
@@ -2238,6 +2250,17 @@ function dropSmallLoops(line, pieces, hooks) {
       n[2] += (p[0] - q[0]) * (p[1] + q[1]);
     });
     if (!(Math.hypot(n[0], n[1], n[2]) / 2 < lambda * lambda)) continue;
+    // Along the edge of a whole triangle: that triangle inside (on the left of the piece seen from n, the loop
+    // turning round n) or not sure which side.
+    const wholeInside = loop.some((k, i) => {
+      const c = pieces[k][4];
+      if (!c) return false;
+      const p = points[i], q = points[(i + 1) % points.length];
+      const e = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+      const left = [n[1] * e[2] - n[2] * e[1], n[2] * e[0] - n[0] * e[2], n[0] * e[1] - n[1] * e[0]];
+      return (c[0] - p[0]) * left[0] + (c[1] - p[1]) * left[1] + (c[2] - p[2]) * left[2] >= 0;
+    });
+    if (wholeInside) continue;
     for (const k of loop) drop[k] = 1;
     for (let i = 1; i + 1 < points.length; i++) hooks.push({ X: points[0], A: points[i], B: points[i + 1], kx: keys[0], ka: keys[i], kb: keys[i + 1] });
   }

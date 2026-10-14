@@ -11,7 +11,7 @@ import { evaluateParting, lineMesh, lineTension } from '../../web/engine/parting
 import { HOLED, bossedTube, holedBlock, studBlock, subdivided } from './cad-parts.mjs';
 import { Body, zBracket } from './curved-mesh.mjs';
 import { approx } from './helpers.mjs';
-import { lineLoops, looseEnds, shapeOfLine, undercutRegions } from './line-shape.mjs';
+import { lineLoops, looseEnds, shapeOfLine, undercutRegions, unlinedEdges } from './line-shape.mjs';
 
 /** The diagonal of the box of a mesh. */
 function diagonal({ positions: P }) {
@@ -25,19 +25,19 @@ function diagonal({ positions: P }) {
 
 /**
  * The split of `part` along d, checked clean: no loose end, no tooth, no
- * comb, no run turning back; every loop of the line enclosing λ² at least
- * (no sliver loop round a few triangles); every undercut region λ² at least
- * (no spike). Returns {r (evaluateParting), loops, regions}.
+ * comb, no run turning back; the line along every edge between two whole
+ * triangles of different halves (unlinedEdges: the colours never change
+ * where no line is drawn). Returns {r (evaluateParting), loops, regions
+ * (the areas of the undercut regions, largest first)}.
  */
 function cleanSplit(part, d, label) {
   const r = evaluateParting(part.positions, part.indices, d);
-  const lambda = lineTension(diagonal(part));
   assert.equal(looseEnds(r.segments), 0, `${label}: loose ends`);
   assert.deepEqual(shapeOfLine(r.segments), { reversals: 0, teeth: 0, combs: 0 }, `${label}: shape`);
+  const neighbours = lineMesh(part.positions, part.indices).neighbours;
+  assert.deepEqual(unlinedEdges(part, neighbours, r, d), [], `${label}: halves changing with no line`);
   const loops = lineLoops(r.segments);
-  for (const l of loops) assert.ok(!(l.area < lambda * lambda), `${label}: a loop of ${l.length} mm round ${l.area} mm²`);
-  const regions = undercutRegions(part, lineMesh(part.positions, part.indices).neighbours, r.flags);
-  for (const a of regions) assert.ok(a >= lambda * lambda, `${label}: an undercut region of ${a} mm²`);
+  const regions = undercutRegions(part, neighbours, r.flags);
   return { r, loops, regions };
 }
 
@@ -154,5 +154,29 @@ describe('the parting halves optimised over the surface', () => {
     const results = [exact, { positions: nudged, indices: exact.indices }].map((part, k) => cleanSplit(part, [0, 0, 1], k ? 'nudged' : 'exact'));
     for (const { r } of results) assert.deepEqual([r.summary.parting.kind, r.plane, r.summary.parting.loops], ['planar', 0, 1]);
     approx(results[1].r.summary.parting.length_mm, results[0].r.summary.parting.length_mm, 0, 1e-3, 'length');
+  });
+
+  test('pin holes along d (Ø 1.2 mm): a loop round each, the halves of their walls and the line agreeing', () => {
+    // Loops enclosing less than λ² were taken out of the line whatever was
+    // inside: the walls of the holes, whole triangles in the upper half, kept
+    // their colour with no line round them (1 loop, 400 mm, for 3, 407.5).
+    // Now only the slivers between two cuts inside the triangles they cut.
+    const rad = 0.6, n = 16, H = 5, holes = [[30, 30], [70, 70]];
+    const body = new Body();
+    const circle = (cx, cy) => Array.from({ length: n }, (_, i) => [cx + rad * Math.cos((2 * Math.PI * i) / n), cy + rad * Math.sin((2 * Math.PI * i) / n)]);
+    const rect = [[0, 0], [100, 0], [100, 100], [0, 100]], side = [[0, 0], [100, 0], [100, H], [0, H]];
+    const rims = holes.map(([x, y]) => circle(x, y));
+    body.flat([0, 0, 0], [1, 0, 0], [0, 1, 0], rect, rims.map((c) => [...c].reverse()), [0, 0, -1]);
+    body.flat([0, 0, H], [1, 0, 0], [0, 1, 0], rect, rims.map((c) => [...c].reverse()), [0, 0, 1]);
+    body.flat([0, 0, 0], [1, 0, 0], [0, 0, 1], side, [], [0, -1, 0]);
+    body.flat([0, 100, 0], [1, 0, 0], [0, 0, 1], side, [], [0, 1, 0]);
+    body.flat([0, 0, 0], [0, 1, 0], [0, 0, 1], side, [], [-1, 0, 0]);
+    body.flat([100, 0, 0], [0, 1, 0], [0, 0, 1], side, [], [1, 0, 0]);
+    holes.forEach(([x, y], k) => body.band(rims[k].map(([u, v]) => [u, v, 0]), rims[k].map(([u, v]) => [u, v, H]), (c) => [x - c[0], y - c[1], 0]));
+    const part = body.mesh();
+    const { r, loops } = cleanSplit(part, [0, 0, 1], 'pin holes');
+    assert.deepEqual([r.summary.parting.kind, r.plane, r.summary.parting.loops, loops.length], ['planar', 0, 3, 3]);
+    // The outline and the rims of the two holes (16-gons of radius 0.6).
+    approx(r.summary.parting.length_mm, 400 + 2 * 2 * n * rad * Math.sin(Math.PI / n), 0, 0.05, 'length');
   });
 });

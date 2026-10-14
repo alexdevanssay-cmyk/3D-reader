@@ -2,7 +2,7 @@
 // each), shared by the parting tests: loose ends, runs turning back (teeth,
 // combs), its loops (length, enclosed area); and the undercut regions of a
 // split (their areas).
-import { REACH_DOWN, REACH_UP } from '../../web/engine/parting.js';
+import { REACH_DOWN, REACH_UP, SHADOW, SIDE_NONE, SILHOUETTE } from '../../web/engine/parting.js';
 
 /** The ends of the pieces of a line met by an odd number of pieces (within 1e-4 mm): 0 when it is in closed loops. */
 export function looseEnds(segments) {
@@ -169,4 +169,40 @@ export function undercutRegions({ positions: P, indices: I }, neighbours, flags)
     out.push(sum);
   }
   return out.sort((a, b) => b - a);
+}
+
+/**
+ * The edges between two triangles of different halves (`side`, neither an
+ * undercut) that no piece of the line runs along, neither triangle cut by
+ * it (by the plane `plane` along d, across it; else flagged SILHOUETTE or
+ * SHADOW): the colours of the halves changing with no line there. [] when
+ * the line and the halves agree.
+ */
+export function unlinedEdges({ positions: P, indices: I }, neighbours, { side, flags, segments, plane = null }, d) {
+  const key = (a, b) => {
+    const k = (i) => `${Math.round(P[3 * i] * 1e4)},${Math.round(P[3 * i + 1] * 1e4)},${Math.round(P[3 * i + 2] * 1e4)}`;
+    const [x, y] = [k(a), k(b)];
+    return x < y ? `${x} ${y}` : `${y} ${x}`;
+  };
+  const lined = new Set();
+  const at = (j) => `${Math.round(segments[j] * 1e4)},${Math.round(segments[j + 1] * 1e4)},${Math.round(segments[j + 2] * 1e4)}`;
+  for (let j = 0; j < segments.length; j += 6) {
+    const [x, y] = [at(j), at(j + 3)];
+    lined.add(x < y ? `${x} ${y}` : `${y} ${x}`);
+  }
+  const height = (i) => P[3 * i] * d[0] + P[3 * i + 1] * d[1] + P[3 * i + 2] * d[2] - plane;
+  const cut = (f) => {
+    if (plane == null) return (flags[f] & (SILHOUETTE | SHADOW)) !== 0;
+    const h = [0, 1, 2].map((k) => height(I[3 * f + k]));
+    return h.some((x) => x < -1e-6) && h.some((x) => x > 1e-6);
+  };
+  const out = [];
+  for (let f = 0; f < I.length / 3; f++) {
+    for (let e = 0; e < 3; e++) {
+      const g = neighbours[3 * f + e];
+      if (g <= f || side[f] === SIDE_NONE || side[g] === SIDE_NONE || side[f] === side[g] || cut(f) || cut(g)) continue;
+      if (!lined.has(key(I[3 * f + e], I[3 * f + ((e + 1) % 3)]))) out.push([f, g]);
+    }
+  }
+  return out;
 }
