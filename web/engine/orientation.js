@@ -658,6 +658,28 @@ export function orientationFor(om, direction, { process = null, die = null, thic
 }
 
 /**
+ * The die blank of an orientation (orientationFor's summary) as a box, one
+ * cavity: {centre (raw_centre_mm), u, v, d (block_axes), size [L, l, h] (mm:
+ * raw_mm plus twice the margins along u, v, d)}. The « Brut » box of the 3D
+ * view; the halves of the mould are cut out of it (parting.js mouldBlocks
+ * box). Null when the summary lacks any of them.
+ */
+export function blankBox(s) {
+  const axes = s?.block_axes;
+  const vector = (x, n = 3) => Array.isArray(x) && x.length === n && x.every(Number.isFinite);
+  if (!axes || !vector(axes.u) || !vector(axes.v) || !vector(axes.d) || !vector(s.raw_mm) || !vector(s.raw_centre_mm)) return null;
+  const { marges: m } = normalizeDie({ marges: s.margins_mm });
+  const [a, b, c] = s.raw_mm;
+  return {
+    centre: [...s.raw_centre_mm],
+    u: [...axes.u],
+    v: [...axes.v],
+    d: [...axes.d],
+    size: [a + 2 * m.longueur, b + 2 * m.largeur, c + 2 * m.hauteur],
+  };
+}
+
+/**
  * The orientation of draw direction d of a body (a line drawn by hand: its
  * plane's normal, its sense as drawn; the score again with the thickness):
  * orientationFor(...).summary on a mesh of its own.

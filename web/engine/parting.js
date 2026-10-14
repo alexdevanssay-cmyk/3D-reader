@@ -2274,6 +2274,12 @@ const BLOCK_MARGIN_SHARE = 0.15; // of its largest size
 // at most this many cells a side, from at most this many points of the line.
 export const BLOCK_GRID = 48;
 export const BLOCK_POINTS = 2048;
+// A box given for the blocks: its axes square within this (cosine), the body
+// inside it within BOX_SLACK_MM plus this share of its size (the summary of
+// an orientation rounds its sizes to 0.01 mm, its axes to 1e-6).
+const BOX_SQUARE = 1e-5;
+const BOX_SLACK_MM = 0.02;
+const BOX_SLACK_SHARE = 1e-5;
 
 /**
  * At most `max` points spread evenly along segments (xyz of both ends of
@@ -2319,39 +2325,46 @@ function pointsAlong(segments, max) {
  * cells a side, interpolated from points spread along the line (inverse
  * distance weighting, at most 2048 points; the height of a node follows the
  * points nearest to it), within the extent of the body along d. Without a
- * line nor a level: under the body.
+ * line nor a level: under the body. With a `box` (the die blank of the
+ * orientation of d, orientation.js blankBox): the blocks are that box cut in
+ * two by the same interface, in its frame (u, v its axes) in place of the
+ * extent of the body plus the margin; ignored when its axes are not square
+ * to d and to each other, or when the body is not inside it.
  *
  * positions -- of the body (xyz, mm); only its extent is used
  * direction -- the draw direction (the upper half leaves along it)
  * segments -- of its parting line (xyz of both ends of each piece), or null
  * level -- height along d of a planar line (in the frame of the positions), or null
+ * box -- {centre [x, y, z], u, v (unit; d as either sense of direction, or
+ *   left out), size [U, V, W] (mm, along u, v, d)}, or null
  * Returns {lower, upper: {positions (Float32Array), indices (Uint32Array),
  * edges (Float32Array, xyz of both ends of each: the outlines of its two
  * faces, its vertical corners)}, frame: {d, u, v}, cells: [nu, nv], heights (Float64Array, along d, of the
  * (nu + 1) × (nv + 1) nodes of the interface, node (i, j) at i × (nv + 1) +
- * j), extent: {u, v, w: [min, max] of the body}, margin}; null for a body
- * without vertices or a direction of no length.
+ * j), extent: {u, v, w: [min, max] of the body}, margin (with a box: the
+ * largest of its margins round the body), box (the box used, or null)}; null
+ * for a body without vertices or a direction of no length.
  */
-export function mouldBlocks(positions, direction, { segments = null, level = null, grid = BLOCK_GRID, points = BLOCK_POINTS } = {}) {
+export function mouldBlocks(positions, direction, { segments = null, level = null, grid = BLOCK_GRID, points = BLOCK_POINTS, box = null } = {}) {
   const d = normalize(direction);
   const nv = Math.floor(positions.length / 3);
   if (!d || !nv) return null;
-  const [u, v] = basis(d);
-  let umin = Infinity, umax = -Infinity, vmin = Infinity, vmax = -Infinity, wmin = Infinity, wmax = -Infinity;
-  for (let i = 0; i < nv; i++) {
-    const x = positions[3 * i], y = positions[3 * i + 1], z = positions[3 * i + 2];
-    const a = x * u[0] + y * u[1] + z * u[2], b = x * v[0] + y * v[1] + z * v[2], w = x * d[0] + y * d[1] + z * d[2];
-    if (a < umin) umin = a;
-    if (a > umax) umax = a;
-    if (b < vmin) vmin = b;
-    if (b > vmax) vmax = b;
-    if (w < wmin) wmin = w;
-    if (w > wmax) wmax = w;
+  // In the frame of the box given when it holds the body, else of two axes square to d.
+  const frame = box ? boxFrame(box, d) : null;
+  let [u, v] = frame ? [frame.u, frame.v] : basis(d);
+  let extent = extentAlong(positions, nv, u, v, d);
+  let sides = frame ? boxSides(frame, extent, d) : null;
+  if (frame && !sides) {
+    [u, v] = basis(d);
+    extent = extentAlong(positions, nv, u, v, d);
   }
-  const margin = Math.max(BLOCK_MARGIN_MM, BLOCK_MARGIN_SHARE * Math.max(umax - umin, vmax - vmin, wmax - wmin));
-  const u0 = umin - margin, v0 = vmin - margin;
-  const W = umax - umin + 2 * margin, H = vmax - vmin + 2 * margin;
-  const bottom = wmin - margin, top = wmax + margin;
+  const [umin, umax, vmin, vmax, wmin, wmax] = extent;
+  if (!sides) {
+    // The extent of the body and a margin round it.
+    const m = Math.max(BLOCK_MARGIN_MM, BLOCK_MARGIN_SHARE * Math.max(umax - umin, vmax - vmin, wmax - wmin));
+    sides = { margin: m, u0: umin - m, v0: vmin - m, W: umax - umin + 2 * m, H: vmax - vmin + 2 * m, bottom: wmin - m, top: wmax + m };
+  }
+  const { margin, u0, v0, W, H, bottom, top } = sides;
   const clamp = (h) => (h > wmax ? wmax : h >= wmin ? h : wmin); // NaN: under the body
 
   // The interface: flat (one cell), or heights from the points of the line.
@@ -2466,7 +2479,59 @@ export function mouldBlocks(positions, direction, { segments = null, level = nul
     heights,
     extent: { u: [umin, umax], v: [vmin, vmax], w: [wmin, wmax] },
     margin,
+    box: sides.box ?? null,
   };
+}
+
+/** [umin, umax, vmin, vmax, wmin, wmax]: the extent of the first nv points along u, v, d. */
+function extentAlong(positions, nv, u, v, d) {
+  let umin = Infinity, umax = -Infinity, vmin = Infinity, vmax = -Infinity, wmin = Infinity, wmax = -Infinity;
+  for (let i = 0; i < nv; i++) {
+    const x = positions[3 * i], y = positions[3 * i + 1], z = positions[3 * i + 2];
+    const a = x * u[0] + y * u[1] + z * u[2], b = x * v[0] + y * v[1] + z * v[2], w = x * d[0] + y * d[1] + z * d[2];
+    if (a < umin) umin = a;
+    if (a > umax) umax = a;
+    if (b < vmin) vmin = b;
+    if (b > vmax) vmax = b;
+    if (w < wmin) wmin = w;
+    if (w > wmax) wmax = w;
+  }
+  return [umin, umax, vmin, vmax, wmin, wmax];
+}
+
+/**
+ * The frame of a box given for the blocks of direction d (unit): {u, v (unit,
+ * (u, v, d) right-handed: v turned round otherwise, the box being symmetric),
+ * centre, size, box (as given, copied)}; null when its axes are not square to
+ * d and to each other (BOX_SQUARE), its d not along d, or its centre or sizes
+ * not finite (sizes negative).
+ */
+function boxFrame(box, d) {
+  const u = normalize(box.u ?? []), v0 = normalize(box.v ?? []);
+  const { centre, size } = box;
+  const finite = (x) => Array.isArray(x) && x.length === 3 && x.every(Number.isFinite);
+  if (!u || !v0 || !finite(centre) || !finite(size) || size.some((x) => x < 0)) return null;
+  if (Math.abs(dot(u, d)) > BOX_SQUARE || Math.abs(dot(v0, d)) > BOX_SQUARE || Math.abs(dot(u, v0)) > BOX_SQUARE) return null;
+  if (box.d != null && !(Math.abs(dot(normalize(box.d) ?? [0, 0, 0], d)) >= 1 - BOX_SQUARE)) return null;
+  const w = [u[1] * v0[2] - u[2] * v0[1], u[2] * v0[0] - u[0] * v0[2], u[0] * v0[1] - u[1] * v0[0]];
+  const v = dot(w, d) < 0 ? v0.map((x) => -x + 0) : v0;
+  return { u, v, centre, size, box: { centre: [...centre], u: [...box.u], v: [...box.v], ...(box.d ? { d: [...box.d] } : {}), size: [...size] } };
+}
+
+/**
+ * The sides of the box of `frame` round a body of extent [umin, umax, vmin,
+ * vmax, wmin, wmax] (along u, v, d): {u0, v0, W, H (its footprint), bottom,
+ * top (along d), margin (its largest margin round the body), box}; null when
+ * the body is not inside it (within BOX_SLACK_*).
+ */
+function boxSides({ u, v, centre, size, box }, [umin, umax, vmin, vmax, wmin, wmax], d) {
+  const cu = dot(centre, u), cv = dot(centre, v), cw = dot(centre, d);
+  const u0 = cu - size[0] / 2, v0 = cv - size[1] / 2, bottom = cw - size[2] / 2;
+  const top = cw + size[2] / 2;
+  const slack = BOX_SLACK_MM + BOX_SLACK_SHARE * Math.max(...size);
+  const margins = [umin - u0, u0 + size[0] - umax, vmin - v0, v0 + size[1] - vmax, wmin - bottom, top - wmax];
+  if (!margins.every((m) => m >= -slack)) return null;
+  return { u0, v0, W: size[0], H: size[1], bottom, top, margin: Math.max(0, ...margins), box };
 }
 
 // ------------------------------------------------------------------ directions
