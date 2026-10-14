@@ -24,6 +24,18 @@ import { ROOT, approx, fixturePath } from '../js/helpers.mjs';
 
 const DIST = join(ROOT, 'dist');
 const CAD_TIMEOUT = 180_000;
+
+/**
+ * The card's body cast in a gravity die with a horizontal parting plane (the
+ * process of the parting card; by default a vertical one, up across the draw
+ * direction): up when cast along the draw direction, the risers on top along
+ * it, as this test reads them. Kept for the part; once the risers are placed
+ * for it.
+ */
+async function horizontalPlane(page, body = 0) {
+  await page.selectOption('#parting-process-select', 'horizontal-haut');
+  await page.waitForFunction((i) => window.reader3d.semantic?.bodies?.[i]?.feeding?.process?.plan === 'horizontal', body, { timeout: 120_000 });
+}
 const FOV = 40; // the camera of app.js
 
 /** The pixels of the 3D view (CSS px from its top left) where points (mm) are seen, from reader3d.view. */
@@ -123,6 +135,7 @@ describe('section view: closed cuts (dist/)', { skip: !existsSync(join(DIST, 'in
     await page.setInputFiles('#file-input', fixturePath('holed_block.step'));
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     await page.waitForFunction(() => document.getElementById('feeding-card').dataset.status === 'proposed', null, { timeout: 120_000 });
+    await horizontalPlane(page);
     const caps = () => capsShown(page);
     const bbox = await page.evaluate(() => window.reader3d.result.summary.bbox);
     const setSection = async (axis, at) => {

@@ -8,7 +8,13 @@
 //
 //   GET  /api/ai  the public configuration: provider, model, context budget,
 //                 whether an access code is needed (never a secret)
-//   POST /api/ai  {task, model, context, messages} -> {output, provider, model, quota, usage}
+//   POST /api/ai  {task, model, context, messages} -> {output, provider, model, quota, usage, finish_reason}
+//
+// A text answer cut at the length allowed (AI_MAX_TOKENS) comes back with
+// finish_reason "length" (and a note at its end, for the pages before): the
+// page asks for its rest at once, the answer so far in the conversation and
+// an instruction to go on, and joins the parts. A JSON answer cut cannot be
+// continued: an error, as before.
 //
 // The context is sent once, compacted by the page to the budget given by GET
 // (the free plan of Groq allows 8,000 tokens a minute), as data between
@@ -115,14 +121,15 @@ La planification de fabrication est une piste, pas une gamme d'usinage exécutab
 Le criblage fonderie n'est pas une simulation de remplissage ni de solidification : n'affirme jamais une masselotte, une attaque, une porosité, un historique thermique ni une probabilité de défaut sans résultat de simulation fourni. Cite les identifiants de sources fonderie pour les recommandations tirées des connaissances, et ceux des features et relations pour les preuves géométriques.
 Ce contexte EST l'analyse de la pièce par 3D Reader : métrologie, features détectées (trous, alésages, poches, congés, chanfreins, motifs, relations coaxiales) avec leurs identifiants, criblage fonderie (contre-dépouilles, risque de noyau, épaisseurs), pistes de fabrication. Ne renvoie jamais l'utilisateur vers un module, un export ou un outil de 3D Reader que tu supposes. S'il te manque du détail (champ "summary_only" ou "compaction"), dis-le et indique l'analyse à choisir dans la page IA : « Features », « Fabrication », « DFM » ou « Chiffrage ».
 Champ "selection" : seuls ces corps de la pièce sont envoyés (le corps sélectionné dans la liste, ou les corps cochés) ; réponds sur eux seulement.
-Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.`;
+Si aucun modèle 3D n'est chargé (champ "no_model_loaded"), ne prétends pas connaître une pièce et propose d'ouvrir le modèle si la question en dépend.
+À chaque question, les DONNÉES jointes décrivent l'état actuel de la pièce et du chiffrage. Elles priment sur tes réponses précédentes de la conversation : si une donnée que tu disais manquante y figure maintenant, utilise-la sans attendre qu'on te le redise.`;
 
 // Not for the task « Chiffrage », which explains the traced values of the quote and proposes values in its JSON (propositions).
 const TEXT_RULES = `Réponds en texte, jamais en JSON ; la mise en forme Markdown simple est permise (gras, listes, petits tableaux). Pour une conversation ou une question générale (fonderie, procédés, chiffrage, méthode), réponds directement et brièvement. Pour une question sur la pièce, organise la réponse en courtes sections, celles qui sont utiles seulement : « Conclusion », « Mesuré » (valeurs du contexte, avec leurs identifiants), « Déduit », « Recommandations », « À valider ».
 Paramètres de fonderie et de chiffrage (nombre de noyaux, de tiroirs, de chapes, îlot de coulée, coefficient de difficulté…) : quand on te les demande, propose-les en fondeur à partir des features et du criblage fonderie du contexte. Présente chaque valeur comme « Proposition IA — à valider », avec sa justification (identifiants des features) et ta confiance. N'invente jamais de prix, de taux horaires ni de mesures.`;
 
 // The values of a piece the model may propose (web/chiffrage/ai-apply.js PROPOSAL_FIELDS: the same keys), shared with the local model.
-export const PROPOSAL_RULES = `Propositions (analyse_chiffrage.propositions) : quand l'utilisateur demande de changer une saisie d'une pièce ou en donne la bonne valeur, ou quand costing_trace ou l'analyse de la pièce donnent une valeur plus juste d'une saisie, propose-la : piece (son nom dans costing_trace.pieces), cle (une seule de : piece.poids en kg, piece.toileMini, piece.epaisseurMax, piece.module et piece.dimMax en mm, piece.ilot (code de l'îlot), piece.finition (code de la finition), piece.miseAuMille, piece.empreintes, piece.cycle en s, piece.mode (1*8, 2*8, 3*8 ou Réel), piece.tth (code du traitement ou none), piece.tthMode (scie ou masselotte), piece.noyaux, piece.tribo, piece.redressage (true ou false), piece.outillage.tiroirs, piece.outillage.complexite (Simple, Moyen ou Compliqué(e))), valeur (un nombre dans l'unité de la saisie : kg, mm ou s ; un code ou true / false), unite, source (question : le nombre que l'utilisateur a écrit ; trace : la valeur de cette même clé pour cette pièce dans costing_trace, ou une de ses autres sources ; analyse_3d : la cote mesurée de la pièce, pour la plus grande dimension, le module ou les épaisseurs) et justification (une phrase). Une proposition dont le nombre ne se trouve pas dans la source indiquée, pour cette clé, est refusée. Jamais un prix, un taux, une marge, un paramètre, une valeur du devis entier ni une valeur masquée ; jamais un nombre que tu calcules ou estimes toi-même : seulement un nombre écrit par l'utilisateur, dans costing_trace ou dans l'analyse de la pièce. Une personne accepte chaque proposition avant qu'elle soit appliquée aux saisies de la pièce. Aucune proposition : une liste vide.`;
+export const PROPOSAL_RULES = `Propositions (analyse_chiffrage.propositions) : quand l'utilisateur demande de changer une saisie d'une pièce ou en donne la bonne valeur, ou quand costing_trace ou l'analyse de la pièce donnent une valeur plus juste d'une saisie, propose-la : piece (son nom dans costing_trace.pieces), cle (une seule de : piece.poids en kg, piece.toileMini, piece.epaisseurMax, piece.module et piece.dimMax en mm, piece.ilot (code de l'îlot), piece.finition (code de la finition), piece.miseAuMille, piece.empreintes, piece.cycle en s, piece.mode (1*8, 2*8, 3*8 ou Réel), piece.tth (code du traitement ou none), piece.tthMode (scie ou masselotte), piece.noyaux, piece.tribo, piece.redressage (true ou false), piece.outillage.tiroirs, piece.outillage.complexite (Simple, Moyen ou Compliqué(e))), valeur (un nombre dans l'unité de la saisie : kg, mm ou s ; un code ou true / false), unite, source (question : le nombre que l'utilisateur a écrit ; trace : la valeur de cette même clé pour cette pièce dans costing_trace, ou une de ses autres sources ; analyse_3d : la cote mesurée de la pièce, pour la plus grande dimension, le module ou les épaisseurs, ou le nombre de tiroirs de l'analyse 3D, slides.count, par pièce : × empreintes pour le moule) et justification (une phrase). Une proposition dont le nombre ne se trouve pas dans la source indiquée, pour cette clé, est refusée. Jamais un prix, un taux, une marge, un paramètre, une valeur du devis entier ni une valeur masquée ; jamais un nombre que tu calcules ou estimes toi-même : seulement un nombre écrit par l'utilisateur, dans costing_trace ou dans l'analyse de la pièce. Une personne accepte chaque proposition avant qu'elle soit appliquée aux saisies de la pièce. Aucune proposition : une liste vide.`;
 
 const COSTING_RULES = `Tâche « Chiffrage » : costing_trace contient les valeurs tracées du devis en cours ; tu ne les modifies pas toi-même. Réponds par un objet JSON (schéma engineering_analysis), toutes ses chaînes en français. Explique ces valeurs dans analyse_chiffrage : explications, ecarts_signales (écarts, alertes et valeurs à valider, chacun avec sa clé de la trace dans cle), questions à l'utilisateur, hypotheses ; cite la clé de chaque valeur dont tu parles (par exemple piece.prix.vente).
 N'invente jamais de prix, de taux, de temps de cycle ni de nombre de noyaux. Dans les explications, ne cite que des nombres présents dans costing_trace, tels quels ou arrondis : une réponse qui contient un autre nombre est marquée « non vérifiée ». Les valeurs masquées (« masqué ») sont confidentielles : ne les devine jamais.
@@ -569,12 +576,15 @@ export default async function handler(req, res) {
     const { data, headers } = await complete(config, body, task);
     const usage = usageOf(data);
     const answered = typeof data?.model === "string" && data.model ? data.model : model;
+    const finish = data?.choices?.[0]?.finish_reason;
     return reply(res, 200, {
       output: answerOf(data, !!json, config, task),
       provider: config.name,
       model: answered,
       quota: quotaOf(headers, config, answered),
       ...(usage ? { usage } : {}),
+      // Why the provider stopped, as it says: "length" for an answer cut at AI_MAX_TOKENS (the page asks its rest).
+      finish_reason: typeof finish === "string" ? finish : null,
     });
   } catch (error) {
     if (error instanceof HttpError) {

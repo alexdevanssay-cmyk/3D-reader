@@ -12,16 +12,22 @@ import {
   PARTING_VERSION, REACH_DOWN, REACH_UP, SIDE_UPPER, ZERO_DRAFT,
   applyOverrides, faceRegions, lineMesh, lineSummary, mouldBlocks, parseDirection, partingLine, sameDirection, snapDirection,
 } from "./engine/parting.js";
-import { SIDE_LOWER, SIDE_NONE, axisLabel, parseTriple } from "./engine/parting.js";
+import { LEVEL, SHADOW, SIDE_LOWER, SIDE_NONE, SILHOUETTE, axisLabel, parseTriple, pieceTriangles } from "./engine/parting.js";
 import {
   MAX_LOOPS, MAX_POINTS, alignPoints, arcDefault, arcFromCentre, arcGeometry, drawMesh, drawnParting, layArc, layStraight, parseDrawing,
   reviveDrawing, rotateAbout, segmentName, segmentPlane, serializeDrawing, surfacePoint, turnSign,
 } from "./engine/parting-draw.js";
 import {
-  FEEDING_VERSION, METHOD as FEEDING_METHOD, feedingContext, feedingYield, feeds, gateFromPoint, hotSpotsWithoutRiser,
+  FEEDING_VERSION, METHOD as FEEDING_METHOD, feedingContext, feedingOptionsKey, feedingYield, feeds, gateFromPoint, hotSpotsWithoutRiser,
   resizeRiser, riserFromPoint,
 } from "./engine/feeding.js";
 import { capOrders, capQuad, planeCutsBox } from "./section.js";
+import { DEFAULT_PROCESS, FEEDS, PLANS, normalizeDie, orientationKey, processForIsland } from "./engine/orientation.js";
+import { keptParting } from "./engine/partclient.js";
+import {
+  SLIDES_VERSION, editSlides, effectiveSlides, matchSlideState, pickSlideEntry, serializeSlideState, slideExport, slidesSideHash, slidesSignature, slidesViewHash,
+  undercutMask,
+} from "./engine/slides.js";
 
 // ---------------------------------------------------------------- units
 
@@ -204,7 +210,7 @@ function clearModel() {
   state.selected = -1;
   // The hooks of the view for scripts and tests: nothing faded, no parting shown.
   noteFaded();
-  $("parting-card").dataset.overlay = $("parting-card").dataset.undercuts = "";
+  $("parting-card").dataset.overlay = $("parting-card").dataset.undercuts = $("parting-card").dataset.pieces = "";
 }
 
 /**
@@ -863,7 +869,7 @@ function exportableResult(r, indices = includedIndices()) {
     summary: { ...(currentSummary(indices) ?? r.summary), mass: mass((currentSummary(indices) ?? r.summary).volume) },
     bodies: indices.map((i) => {
       const { mesh, ...b } = r.bodies[i];
-      return { ...b, mass: mass(b.volume), ...thicknessExport(r, [i]), ...partingExport(r, i), ...feedingExport(r, i) };
+      return { ...b, mass: mass(b.volume), ...thicknessExport(r, [i]), ...partingExport(r, i), ...slidesExport(r, i), ...feedingExport(r, i) };
     }),
     ...thicknessExport(r, indices),
     elapsed_s: r.elapsed_s,
@@ -2210,8 +2216,8 @@ function savePartingDef(partId, body, def, { draft = false } = {}) {
 /** A new model is shown: its parting, kept from an earlier opening, else computed in the background. */
 function partingNewModel(data) {
   const p = partingOf(data);
-  const kept = data.cachedParting;
-  if (!p.results && kept?.version === PARTING_VERSION && kept.bodies?.length === data.bodies.length) p.results = kept.bodies;
+  // Kept for the process of each body and the die options of now (casting process and orientation).
+  if (!p.results) p.results = keptPartings(data);
   if (p.results) restoreParting();
   else computePartings(data);
   renderParting();
@@ -2229,8 +2235,7 @@ function computePartings(r) {
   p.error = null;
   p.percent = 0;
   p.pending = partClient()
-    .then((client) => client.computeParting(bodies, {
-      owner: r,
+    .then((client) => proposeOriented(client, r, bodies, {
       onProgress: ({ percent }) => {
         p.percent = percent;
         if (r === state.result) renderParting();
@@ -2274,13 +2279,14 @@ async function partingDirection(i, d) {
   const p = partingOf(r);
   const res = p.results[i];
   if (sameDirection(d, res.proposal.direction)) return proposalBase(res);
-  const key = `${i}|${d.map((x) => x.toFixed(9)).join(",")}`;
+  const options = partingOptions(i, r);
+  const key = `${i}|${d.map((x) => x.toFixed(9)).join(",")}|${options.key}`;
   if (p.evaluated.has(key)) return p.evaluated.get(key);
   p.busy++;
   renderParting();
   try {
     const client = await partClient();
-    const ev = await client.evaluateDirection(bodyArrays(i), d, { owner: r });
+    const ev = await client.evaluateDirection(bodyArrays(i), d, { owner: r, process: options.process, die: options.die });
     const base = { direction: ev.summary.direction, summary: ev.summary, side: ev.side, flags: ev.flags, plane: ev.plane, segments: ev.segments };
     p.evaluated.set(key, base);
     return base;
@@ -2293,6 +2299,7 @@ async function partingDirection(i, d) {
 /** A result no longer in any tab (closed, another file opened in it): its parting jobs dropped, they would hold up the other tabs'. */
 function partingAbandon(r) {
   if (r) partClient.module?.then((client) => client.cancelParting(r));
+  if (r) slideClient.module?.then((client) => client.cancelSlides(r));
 }
 
 /**
@@ -2393,7 +2400,7 @@ function partingExport(r, i) {
   const res = p?.results?.[i];
   if (!res) return {};
   const cur = p.current.get(i);
-  if (!cur) return { parting: res.proposal };
+  if (!cur) return { parting: { ...res.proposal, ...orientationExport(r, i) } };
   const { candidates, ranking, sampled, method, version, draft_angle_deg, surface_area_mm2, triangles } = res.proposal;
   return {
     parting: {
@@ -2406,6 +2413,7 @@ function partingExport(r, i) {
       ...(cur.drawn ? { undercut_basis: "drawn_halves", drawn: cur.drawn } : {}),
       proposed: { axis: res.proposal.axis, direction: res.proposal.direction },
       candidates, ranking, sampled, method, version, draft_angle_deg, surface_area_mm2, triangles,
+      ...orientationExport(r, i),
     },
   };
 }
@@ -2419,6 +2427,7 @@ function removePartingOverlay(mesh) {
   group.traverse((o) => {
     if (o.userData.own) o.geometry?.dispose();
     o.material?.dispose();
+    if (o.userData.pieces) setSeeThrough(mesh, !!mesh.userData.faded && "faded"); // its depth offset back
   });
   mesh.userData.partingOverlay = null;
 }
@@ -2479,7 +2488,9 @@ function applyParting() {
   const i = partingBody();
   const field = p?.show && i >= 0 ? partingField(i) : null;
   const card = $("parting-card");
-  card.dataset.overlay = card.dataset.undercuts = "";
+  card.dataset.overlay = card.dataset.undercuts = card.dataset.orient = card.dataset.brut = card.dataset.pieces = "";
+  piecesShown = null;
+  const tint = slidesTint(i, field); // the colours of the slides (null: the undercuts in yellow)
   if (!field) {
     if (!shown) return;
     state.meshes.forEach((mesh) => (mesh.userData.parting = false));
@@ -2504,6 +2515,7 @@ function applyParting() {
       let undercut = field.undercut ? field.undercut[f] === 1 : !(field.flags[f] & (REACH_UP | REACH_DOWN)) && !field.fixed?.[f];
       color.copy(undercut ? PARTING_UNDERCUT : PARTING_FACE);
       if (field.flags[f] & ZERO_DRAFT && !undercut) color.lerp(WHITE, 0.5);
+      if (undercut && tint && !drawn) tint.colourOf(f, color);
       if (drawn) undercut = drawFaceColour(drawn, f, color);
       if (undercut) undercuts++;
       for (let k = 0; k < 3; k++) {
@@ -2519,6 +2531,11 @@ function applyParting() {
   noteFaded();
   const mesh = state.meshes[i];
   const group = new THREE.Group();
+  // The triangles the line crosses, their pieces on either side of it over them (null: being cut).
+  const pieces = cutPiecesOf(i, field, drawn);
+  if (pieces?.count) group.add(piecesMesh(i, pieces, (k, c) => pieceColour(field, pieces, k, c, { tint, drawn })));
+  piecesShown = pieces?.count ? { i, pieces } : null;
+  card.dataset.pieces = pieces ? String(pieces.count) : "";
   const blocks = $("parting-blocks").checked && !drawn ? partingBlocks(i, field) : null;
   if (blocks) group.add(...blockMeshes(blocks.lower, PARTING_LOWER, "lower"), ...blockMeshes(blocks.upper, PARTING_UPPER, "upper"));
   if (field.segments.length && !drawn) {
@@ -2540,6 +2557,8 @@ function applyParting() {
   const length = 0.35 * reach;
   // (While drawing: the rotation axis of the drawing instead.)
   if (!drawn) group.add(new THREE.ArrowHelper(d, centre.clone().addScaledVector(d, along / 2 + (blocks?.margin ?? 0) + 0.05 * reach), length, PARTING_ARROW, 0.3 * length, 0.15 * length));
+  if (!drawn) addSlideArrows(group, i, field); // an arrow per slide, along its pull direction
+  addOrientationOverlay(group, i, { drawn, blocks }); // the arrow « haut », the die blank
   mesh.add(group);
   mesh.userData.partingOverlay = group;
   // What the view shows, for scripts and tests: "line", "lower", "upper"; the triangles in yellow.
@@ -2559,8 +2578,181 @@ function partingOff() {
     mesh.userData.parting = false; // coloured by the thickness next
   });
   const card = $("parting-card");
-  card.dataset.overlay = card.dataset.undercuts = "";
+  card.dataset.overlay = card.dataset.undercuts = card.dataset.pieces = "";
+  piecesShown = null;
   renderParting();
+}
+
+// ---- the colours cut along the line
+
+// The line goes across the triangles it crosses (by the plane, along a
+// silhouette, by a chord across the edge of a shadow, drawn by hand), the
+// colours of the body by triangle: in steps along the line, a long fan
+// triangle of a CAD face all of one colour. Those triangles are drawn again
+// over the body in pieces cut where the line crosses them, each in the
+// colour of its side (engine/parting.js partingPieces, cut in the parting
+// worker: the edges of shadows cast again; a drawn line's from
+// parting-draw.js): the colours change on the red line. The body's own
+// triangles are left as they are (clicks pick them, faceIndex); its depth
+// offset a step further back while they are shown, the line a step in
+// front of them.
+const NO_PIECES = Object.freeze({ count: 0 });
+const piecesKept = new WeakMap(); // the definition (its object, as slideMasks) -> {pieces (null: being cut)}
+let piecesShown = null; // {i, pieces}: those on the 3D view (a click on them, slidesClick)
+
+/**
+ * Whether the line of a definition of body i crosses a triangle: with a
+ * plane, a face both halves can form or flagged LEVEL across it; else one
+ * flagged SILHOUETTE or SHADOW. Not moved by hand. Else the colours by
+ * triangle are those of its sides already: nothing sent to the worker.
+ */
+function mayBeCut(i, { flags, plane, fixed, direction: d }) {
+  if (!flags) return false;
+  if (plane == null) return flags.some((x, f) => x & (SILHOUETTE | SHADOW) && !fixed?.[f]);
+  const { positions: P, indices: I } = bodyArrays(i);
+  for (let f = 0; f < flags.length; f++) {
+    if (fixed?.[f] || !(flags[f] & LEVEL || (flags[f] & (REACH_UP | REACH_DOWN)) === (REACH_UP | REACH_DOWN))) continue;
+    let below = false, above = false;
+    for (let k = 0; k < 3; k++) {
+      const v = 3 * I[3 * f + k];
+      const h = P[v] * d[0] + P[v + 1] * d[1] + P[v + 2] * d[2] - plane;
+      if (h < 0) below = true;
+      else if (h > 0) above = true;
+    }
+    if (below && above) return true;
+  }
+  return false;
+}
+
+/**
+ * The pieces of the triangles the line of body i crosses: while drawing by
+ * hand, of the drawing's halves shown; a line drawn by hand, its own; else
+ * cut in the worker once per definition (null until then, the view coloured
+ * again when they come).
+ */
+function cutPiecesOf(i, field, drawn) {
+  if (drawn) return drawn.shownTint?.pieces ?? NO_PIECES;
+  if (field.drawn) return field.pieces ?? NO_PIECES;
+  const r = state.result;
+  const p = partingOf(r);
+  const key = field.manual ? p.current.get(i) : p.results[i];
+  if (!key) return null;
+  let kept = piecesKept.get(key);
+  if (!kept) {
+    kept = { pieces: mayBeCut(i, field) ? null : NO_PIECES };
+    piecesKept.set(key, kept);
+    if (!kept.pieces) {
+      const definition = { direction: field.direction, side: field.side, flags: field.flags, plane: field.plane, fixed: field.fixed ?? null, height: field.summary.mould_height_mm };
+      partClient()
+        .then((client) => client.cutPieces(bodyArrays(i), definition, { owner: r }))
+        .then((pieces) => (kept.pieces = pieces), (err) => {
+          kept.pieces = NO_PIECES; // coloured by triangle
+          if (!err.cancelled) console.warn("Parting line: the colours not cut along it", err);
+        })
+        .then(() => r === state.result && partingShown() && applyParting());
+    }
+  }
+  return kept.pieces;
+}
+
+/** The colour of piece k on the 3D view, as applyParting colours a triangle: its own side's (the tint of its half while drawing by hand). */
+function pieceColour(field, pieces, k, color, { tint, drawn }) {
+  const undercut = pieces.undercut[k] === 1;
+  color.copy(undercut ? PARTING_UNDERCUT : PARTING_FACE);
+  if (drawn) {
+    if (!undercut) color.lerp(pieces.half[k] === SIDE_UPPER ? UPPER_TINT : LOWER_TINT, 0.35);
+    return;
+  }
+  if (field.flags[pieces.tri[k]] & ZERO_DRAFT && !undercut) color.lerp(WHITE, 0.5);
+  if (undercut && tint && pieces.near[k] >= 0) tint.colourOf(pieces.near[k], color, false);
+}
+
+/**
+ * The pieces over body i: a mesh of their triangles (pieceTriangles) in
+ * their colours (colourOf(k, color)), lit as the body (its normals at their
+ * corners, interpolated over its triangles; its material, its glow when
+ * selected), cut by the section as it is. Not in state.meshes: no click
+ * meets it. The body's depth offset a step back (removePartingOverlay puts
+ * it back).
+ */
+function piecesMesh(i, pieces, colourOf) {
+  const body = state.meshes[i];
+  const geom = bodyGeometry(i);
+  const P = geom.attributes.position.array, I = geom.index.array, N = geom.attributes.normal.array;
+  const { corners, piece } = pieceTriangles(pieces);
+  const n = piece.length;
+  const position = new Float32Array(9 * n), normal = new Float32Array(9 * n), colour = new Float32Array(9 * n);
+  const colours = new Float32Array(3 * pieces.count);
+  const c = new THREE.Color();
+  for (let k = 0; k < pieces.count; k++) {
+    colourOf(k, c);
+    colours.set([c.r, c.g, c.b], 3 * k);
+  }
+  for (let t = 0; t < n; t++) {
+    const k = piece[t], f = pieces.tri[k];
+    const a = 3 * I[3 * f], b = 3 * I[3 * f + 1], o = 3 * I[3 * f + 2];
+    const u = [P[b] - P[a], P[b + 1] - P[a + 1], P[b + 2] - P[a + 2]], v = [P[o] - P[a], P[o + 1] - P[a + 1], P[o + 2] - P[a + 2]];
+    const uu = dot3(u, u), uv = dot3(u, v), vv = dot3(v, v), den = uu * vv - uv * uv;
+    for (let j = 9 * t; j < 9 * t + 9; j += 3) {
+      // Its barycentrics in triangle f: the body's normal there (unnormalised, as interpolated over f).
+      const w = [corners[j] - P[a], corners[j + 1] - P[a + 1], corners[j + 2] - P[a + 2]];
+      const wu = dot3(w, u), wv = dot3(w, v);
+      const s = den > 0 ? (vv * wu - uv * wv) / den : 1 / 3, q = den > 0 ? (uu * wv - uv * wu) / den : 1 / 3;
+      for (let x = 0; x < 3; x++) {
+        position[j + x] = corners[j + x];
+        normal[j + x] = (1 - s - q) * N[a + x] + s * N[b + x] + q * N[o + x];
+        colour[j + x] = colours[3 * k + x];
+      }
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(position, 3));
+  geometry.setAttribute("normal", new THREE.BufferAttribute(normal, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(colour, 3));
+  const m = body.material;
+  const material = new THREE.MeshStandardMaterial({
+    vertexColors: true, metalness: m.metalness, roughness: m.roughness, side: m.side, clippingPlanes: [sectionPlane], clipShadows: true,
+    polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+  });
+  m.polygonOffsetFactor = m.polygonOffsetUnits = 2;
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.onBeforeRender = () => material.emissive.copy(m.emissive); // the body's glow when selected
+  mesh.userData.own = true;
+  mesh.userData.pieces = pieces.count;
+  return mesh;
+}
+
+/** The piece shown of triangle f of body i at point p (in its plane, in the frame of the body), else -1 (none of it shown). */
+function pieceAt(i, f, p) {
+  const pieces = piecesShown?.i === i ? piecesShown.pieces : null;
+  if (!pieces?.count) return -1;
+  const { tri, start, points: X } = pieces;
+  // The first piece of f (tri ascending), then each of its pieces: p inside it (crossings, in the plane of its two largest axes).
+  let lo = 0, hi = pieces.count;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (tri[mid] < f) lo = mid + 1;
+    else hi = mid;
+  }
+  for (let k = lo; k < pieces.count && tri[k] === f; k++) {
+    const n = [0, 0, 0];
+    for (let j = start[k]; j < start[k + 1]; j++) {
+      const q = j + 1 < start[k + 1] ? j + 1 : start[k];
+      n[0] += (X[3 * j + 1] - X[3 * q + 1]) * (X[3 * j + 2] + X[3 * q + 2]);
+      n[1] += (X[3 * j + 2] - X[3 * q + 2]) * (X[3 * j] + X[3 * q]);
+      n[2] += (X[3 * j] - X[3 * q]) * (X[3 * j + 1] + X[3 * q + 1]);
+    }
+    const ax = Math.abs(n[0]) >= Math.abs(n[1]) && Math.abs(n[0]) >= Math.abs(n[2]) ? 0 : Math.abs(n[1]) >= Math.abs(n[2]) ? 1 : 2;
+    const a = (ax + 1) % 3, b = (ax + 2) % 3;
+    let inside = false;
+    for (let j = start[k]; j < start[k + 1]; j++) {
+      const q = j + 1 < start[k + 1] ? j + 1 : start[k];
+      const ya = X[3 * j + b], yb = X[3 * q + b];
+      if (ya > p[b] !== yb > p[b] && p[a] < X[3 * j + a] + ((p[b] - ya) / (yb - ya)) * (X[3 * q + a] - X[3 * j + a])) inside = !inside;
+    }
+    if (inside) return k;
+  }
+  return -1;
 }
 
 /**
@@ -2604,6 +2796,7 @@ function partingClick(hits, at = null) {
     return true;
   }
   p.message = null;
+  if (p.mode === "slides") return slidesClick(i, hit.faceIndex, hit.object.worldToLocal(hit.point.clone())), true;
   if (p.mode === "pick") {
     p.mode = null;
     pickPartingFace(i, hit.faceIndex);
@@ -2711,6 +2904,10 @@ function renderParting() {
   syncDrawView(partingOf(r), partingBody()); // drawing by hand: left when its body is no longer the card's (or no model); the view's controls
   if (!r) return;
   const p = partingOf(r);
+  // Every body proposed for other options than its own now (its process, the
+  // die margins) proposed again: whichever body the card shows, an open one or
+  // none too (before the card stops there, below).
+  reproposeStale(r);
   const i = partingBody();
   const field = i >= 0 ? partingField(i) : null;
   const named = r.bodies.length > 1 && i >= 0;
@@ -2722,6 +2919,7 @@ function renderParting() {
   else if (p.pending) status = t("parting.computing", { percent: p.percent != null ? `${p.percent} %` : "" });
   else if (p.error) status = t("parting.error", { message: tMessage(p.error) });
   else if (p.busy) status = t("parting.busy");
+  else if (r.bodies[i].closed && orientOf(r).proposing.has(i)) status = t("parting.reproposing");
   $("parting-status").hidden = !status;
   $("parting-status").textContent = status;
   $("parting-retry").hidden = !(p.error && !p.pending);
@@ -2729,6 +2927,7 @@ function renderParting() {
   $("parting-show").disabled = !field;
   $("parting-blocks").disabled = !field;
   $("parting-main").hidden = !field;
+  renderSlides(p, i, field); // the slides of the definition shown
   if (!field) return;
   if (p.mode) renderer.domElement.style.cursor = "crosshair";
 
@@ -2764,7 +2963,7 @@ function renderParting() {
       const proposed = k === res.proposal.candidate_index;
       return `<tr class="${proposed ? "proposed" : ""}" data-candidate="${k}" title="${escapeHtml(t("parting.candidate.title"))}">` +
         `<td><input type="radio" name="parting-candidate" value="${k}"${on ? " checked" : ""}></td>` +
-        `<td>${escapeHtml(c.axis)}${proposed ? " ★" : ""}</td><td class="num">${fmtShare(c.undercut_share)}</td><td class="num">${fmtShare(c.zero_draft_share)}</td><td>${escapeHtml(short(c))}</td></tr>`;
+        `<td>${escapeHtml(c.axis)}${proposed ? " ★" : ""}</td><td class="num">${fmtShare(c.undercut_share)}</td><td class="num">${fmtShare(c.zero_draft_share)}</td><td>${escapeHtml(short(c))}</td><td class="num">${brutKg(c)}</td></tr>`;
     })
     .join(""));
 
@@ -2774,8 +2973,9 @@ function renderParting() {
   $("parting-hint").hidden = !hint;
   $("parting-hint").textContent = hint;
   $("parting-reset").disabled = !field.manual;
-  $("parting-legend").innerHTML = t(p.mode === "draw" ? "parting.draw.legend" : "parting.legend");
+  $("parting-legend").innerHTML = t(p.mode === "draw" ? "parting.draw.legend" : "parting.legend") + slidesLegend(p, i) + (p.mode === "draw" ? "" : orientLegend());
   renderDrawPanel(p, i, field, hint); // the drawing by hand: its panel, its controls on the view, the other ways locked
+  renderOrientation(p, i, field); // the process, the casting up, the die blank
 }
 
 $("parting-show").addEventListener("change", (e) => {
@@ -2842,18 +3042,18 @@ function setPartingMode(mode) {
     f.mode = null;
     renderFeeding();
   }
-  if ((p.mode === "assign" || p.mode === "draw") && !p.show) {
+  if ((p.mode === "assign" || p.mode === "draw" || p.mode === "slides") && !p.show) {
     p.show = true;
     if (thick.colors || thick.highlight) {
       thick.colors = thick.highlight = false;
       renderThickness();
     }
-    if (p.mode === "assign") applyParting();
+    if (p.mode === "assign" || p.mode === "slides") applyParting();
   }
   // Drawing by hand: entered (its plane, its view, its colours), or left (the definition shown as usual).
   if (p.mode === "draw") return enterDrawing();
   renderParting();
-  if (was === "draw") applyParting();
+  if (was === "draw" || was === "slides") applyParting();
 }
 $("parting-pick").addEventListener("click", () => setPartingMode("pick"));
 $("parting-assign").addEventListener("click", () => setPartingMode("assign"));
@@ -3386,7 +3586,7 @@ function drawnDefinition(i, base, { drawing: d, result }) {
       manual: true, source: "drawn", overrides: {}, candidate: null, base, direction: base.direction,
       summary: { ...base.summary, undercut_area_mm2: result.figures.undercut_area_mm2, undercut_share: result.figures.undercut_share, parting: lineSummary(result.shape) },
       side: result.side.map((s, f) => (result.undercut[f] ? SIDE_NONE : s)),
-      flags: base.flags, plane: null, segments: result.segments, fixed: null, undercut: result.undercut,
+      flags: base.flags, plane: null, segments: result.segments, fixed: null, undercut: result.undercut, pieces: result.pieces,
       drawing: saved, drawn: info, drawSnap: drawSnapshot(d),
     },
     def: { direction: base.direction, source: "drawn", candidate: null, overrides: {}, faces: null, drawing: saved },
@@ -3722,6 +3922,21 @@ function addPoint(i, d, hit, at) {
     if (path.status !== "ok") p.message = segmentError(d, d.current, K, path);
     else if (path.method === "edges") p.message = t("parting.draw.edges.msg", { seg: segName(d, d.current, K) });
   }
+  changed(i, d);
+}
+
+/** The last point placed clicked again: taken off with its segment (one step to undo), the placing going on from the point before; a loop emptied stays open. */
+function removeLastPoint(i, d) {
+  const loop = openLoop(d);
+  if (!loop?.points.length) return;
+  pushHistory(d);
+  loop.points.pop();
+  loop.segs.pop();
+  loop.paths.pop();
+  d.inputs.delete(`${d.current}:${loop.segs.length}`);
+  d.selected = null;
+  d.result = null;
+  d.closeHover = false;
   changed(i, d);
 }
 
@@ -4113,9 +4328,9 @@ function markerAt(i, d, at, hits) {
 
 /**
  * A click on the 3D view while drawing (handled here: true). Choosing the
- * axis by a face; placing an arc's centre; placing points (point 1 closes
- * the loop, a point clicked is selected, else a point is added); the halves
- * (a part given to the chape chosen).
+ * axis by a face; placing an arc's centre; placing points (the last point
+ * placed taken off, point 1 closes the loop, a point clicked is selected,
+ * else a point is added); the halves (a part given to the chape chosen).
  */
 function drawClick({ p, i, d }, hits, at) {
   p.message = null;
@@ -4144,11 +4359,17 @@ function drawClick({ p, i, d }, hits, at) {
     setSegmentCentre(i, d, loop, seg, hit.point.toArray());
     return true;
   }
-  if (d.stage === "points" && nearFirst(i, openLoop(d), hits, at)) {
+  const marker = markerAt(i, d, at, hits);
+  // The last point of the loop being placed clicked (pressed, not dragged): taken off. With one point, it is point 1 too.
+  const open = openLoop(d);
+  if (open && marker?.loop === d.current && marker.k === open.points.length - 1 && !drawUi.drag?.moved) {
+    removeLastPoint(i, d);
+    return true;
+  }
+  if (d.stage === "points" && nearFirst(i, open, hits, at)) {
     closeLoop(i, d);
     return true;
   }
-  const marker = markerAt(i, d, at, hits);
   if (marker) {
     d.selected = marker;
     changed(i, d);
@@ -5202,6 +5423,735 @@ $("turn-step").addEventListener("keydown", (e) => {
   e.preventDefault();
 });
 
+// ---------------------------------------------------------------- slides
+
+// Slides (« tiroirs ») of the parting definition shown (engine/slides.js):
+// its undercut triangles grouped into zones, each released by the lateral
+// directions that pull a slide out of it (« direction de sortie »), and the
+// zones grouped into slides; the probable cores, the zones to rework at the
+// parting line and the markings apart. Computed in a worker of its own
+// (engine/slideclient.js) for the card's body whenever its definition changes
+// (proposed, a candidate, a face picked, a direction typed, faces reassigned,
+// drawn by hand), and for the other bodies when the costing or an export asks
+// for them; never kept with the results of the file (recomputed in seconds).
+// Each slide in a colour of its own on the 3D view (the first one in the
+// yellow of the undercuts) with an arrow along its pull direction. Zones
+// moved, made cores or ignored, slides merged or turned by hand: kept per part
+// and definition in this browser (carried over to another definition of the
+// same draw direction). The count is proposed to the costing (« Tiroirs du
+// moule »), used there only by a click.
+const SLIDES_KEY = "reader3d.slides.v1";
+const SLIDES_PARTS = 200; // parts whose edits are kept, the latest
+const SLIDES_ENTRIES = 4; // definitions kept per body, the latest
+const SLIDES_OPEN_KEY = "reader3d.slides.open";
+// T1 in the yellow of the undercuts (a part with one slide looks as before), then colours away from the red
+// line, the blue and green halves, the orange risers and the purple ingate.
+const SLIDE_PALETTE = [0xffcf00, 0x00a6b8, 0xe8609e, 0x8e5bd6, 0x9e9d24, 0x455a64].map((c) => new THREE.Color(c));
+const SLIDE_CORE = new THREE.Color(0x6d4c41);
+const SLIDE_PARTING = new THREE.Color(0xff8a65);
+const SLIDE_IGNORED = PARTING_UNDERCUT.clone().lerp(PARTING_FACE, 0.65);
+const SLIDE_DIMMED = 0.6; // a slide selected (a zone picked): the other zones this far toward the grey of the faces
+
+const slideClient = () => (slideClient.module ??= import("./engine/slideclient.js"));
+
+/** The colour of slide Tn: the palette, then the bodies' colours lightened. */
+function slideColour(n) {
+  return n >= 1 && n <= SLIDE_PALETTE.length ? SLIDE_PALETTE[n - 1] : new THREE.Color(PALETTE[1 + ((n - 7) % 5 + 5) % 5]).lerp(WHITE, 0.4);
+}
+
+// Per result: {byBody (body -> {sig (the definition of the analysis kept),
+// run (its signature and halves: slidesMask), analysis, zone (per triangle:
+// index of its zone, -1 not undercut, -2 noise, -3 not analysed), error,
+// pending (the run being computed), percent,
+// state (the edits; null: the proposal), view (effectiveSlides), messages (of
+// the edits carried over)}), queued (bodies asked for by the costing or an
+// export, sent at the end of the task), selected {slide (key), zone (id)} on
+// the card's body, body (the one they are of), message}.
+const slidings = new WeakMap();
+
+function slidesOf(r = state.result) {
+  if (!r) return null;
+  let s = slidings.get(r);
+  if (!s) {
+    s = { byBody: new Map(), queued: new Set(), selected: { slide: null, zone: null }, body: null, message: null };
+    slidings.set(r, s);
+  }
+  return s;
+}
+
+function slidesEntry(s, i) {
+  let e = s.byBody.get(i);
+  if (!e) {
+    e = { sig: null, run: null, analysis: null, zone: null, error: null, pending: null, percent: null, state: null, view: null, messages: [] };
+    s.byBody.set(i, e);
+  }
+  return e;
+}
+
+// The undercut mask and signature of a definition, by the object that holds it
+// (feedingParting's key): another definition, another object.
+const slideMasks = new WeakMap();
+
+/**
+ * The undercuts of the definition body i shows: {mask, sig, run (the
+ * signature and the halves: the analysis computed again for faces reassigned
+ * that are no undercut, which change the half of its slides, not the
+ * signature)}, or null without one.
+ */
+function slidesMask(i, r = state.result) {
+  const field = r ? partingField(i, r) : null;
+  if (!field) return null;
+  const p = partingOf(r);
+  const key = field.manual ? p.current.get(i) : p.results[i];
+  let m = slideMasks.get(key);
+  if (!m) {
+    const mask = undercutMask(field);
+    const sig = slidesSignature({ nt: mask.length, direction: field.direction, mask });
+    m = { mask, sig, run: `${sig}|${slidesSideHash(field.side)}` };
+    slideMasks.set(key, m);
+  }
+  return m;
+}
+
+/** The slides of the definition body i shows (its entry, with its analysis and view), or null while they are not known. */
+function slidesReady(i, r = state.result) {
+  const m = slidesMask(i, r);
+  const e = m ? slidings.get(r)?.byBody.get(i) : null;
+  return e?.analysis && e.run === m.run ? e : null;
+}
+
+/** Their error, or null. */
+function slidesError(i, r = state.result) {
+  const m = slidesMask(i, r);
+  const e = m ? slidings.get(r)?.byBody.get(i) : null;
+  return e?.error && e.run === m.run ? e.error : null;
+}
+
+/** The slides of body i for the definition shown asked for, unless known or being computed (the model shown). */
+function slidesRequest(i, r = state.result) {
+  if (r !== state.result) return;
+  const m = slidesMask(i, r);
+  if (!m) return;
+  const e = slidesEntry(slidesOf(r), i);
+  if (e.run === m.run || e.pending === m.run) return;
+  const field = partingField(i, r);
+  const { sig, run } = m;
+  const { positions, indices } = bodyArrays(i);
+  e.pending = run;
+  e.percent = null;
+  const draftDeg = field.summary?.draft_angle_deg ?? partingOf(r).results[i]?.proposal?.draft_angle_deg ?? 1;
+  slideClient()
+    .then((client) => client.computeSlides(
+      // The body prepared kept by the worker under the content of the file, else under this result only.
+      { positions, indices, bodyKey: `${r.cacheKey ?? slidesResultId(r)}|${i}|${indices.length / 3}` },
+      { direction: field.direction, mask: m.mask, flags: field.flags, side: field.side, draftDeg, sig },
+      {
+        owner: r,
+        key: String(i),
+        first: i === partingBody(), // the card's body ahead of those the costing or an export asked for
+        onProgress: ({ percent }) => {
+          if (e.pending !== run) return;
+          e.percent = percent;
+          if (r === state.result && i === partingBody()) renderParting();
+        },
+      },
+    ))
+    .then((analysis) => slidesArrived(r, i, run, analysis, null))
+    .catch((err) => {
+      if (err.cancelled) {
+        if (e.pending === run) e.pending = null;
+        return;
+      }
+      slidesArrived(r, i, run, null, err.message || String(err));
+    });
+}
+
+const slidesResults = new WeakMap(); // result -> its id for the worker's cache, without a key of its content
+let slidesResultNext = 1;
+/** An id of its own for a result without a key of its content (the server's, no crypto.subtle): never another file's body. */
+function slidesResultId(r) {
+  if (!slidesResults.has(r)) slidesResults.set(r, `result-${slidesResultNext++}`);
+  return slidesResults.get(r);
+}
+
+/**
+ * The slides of body i asked for by the costing or an export: sent at the end
+ * of this task, the card's body first (one job at a time in the worker).
+ */
+function slidesQueue(i, r = state.result) {
+  const s = slidesOf(r);
+  if (!s) return;
+  if (!s.queued.size) {
+    queueMicrotask(() => {
+      const bodies = [...s.queued];
+      s.queued.clear();
+      if (r !== state.result) return;
+      const card = partingBody();
+      if (card >= 0 && partingOf(r)?.mode !== "draw") slidesRequest(card, r);
+      for (const j of bodies) slidesRequest(j, r);
+    });
+  }
+  s.queued.add(i);
+}
+
+/** An analysis (or its error) come back: kept when its definition (and halves: `run`) is still the one shown, with the edits kept for it. */
+function slidesArrived(r, i, run, analysis, error) {
+  const s = slidesOf(r);
+  const e = slidesEntry(s, i);
+  if (e.pending === run) {
+    e.pending = null;
+    e.percent = null;
+  }
+  const m = slidesMask(i, r);
+  if (m?.run !== run || (e.run === run && e.analysis)) return;
+  Object.assign(e, { sig: m.sig, run, analysis, zone: analysis?.zone ?? null, error, state: null, view: null, messages: [] });
+  if (analysis) {
+    const picked = pickSlideEntry(slidesSaved()[partIdOf(r)]?.bodies?.[i], analysis);
+    const kept = picked ? matchSlideState(analysis, picked.entry, { exact: picked.exact }) : { state: null, messages: [] };
+    e.state = kept.state;
+    e.messages = kept.messages;
+    e.view = effectiveSlides(analysis, e.state, { messages: kept.messages });
+  }
+  if (r !== state.result) return;
+  if (i === partingBody()) {
+    s.selected = { slide: null, zone: null };
+    s.message = null;
+    renderParting();
+    if (partingShown()) applyParting();
+  }
+  updatePublished(r);
+}
+
+// ---- edits kept in this browser: {part id: {savedAt, bodies: {index: [{sig, version, direction, savedAt, state}]}}}
+// (the latest definitions of each body first; a null state: the proposal chosen)
+
+let slidesMemory = null; // the edits of this visit, when this browser's storage refuses them
+
+function slidesSaved() {
+  if (slidesMemory) return structuredClone(slidesMemory);
+  try {
+    const saved = JSON.parse(localStorage.getItem(SLIDES_KEY));
+    return saved && typeof saved === "object" ? saved : {};
+  } catch {
+    return {};
+  }
+}
+
+/** The edits of body i (its entry e) kept for its definition: the latest first, a few per body, the latest parts. */
+function saveSlideEntry(r, i, e) {
+  const partId = partIdOf(r);
+  if (!partId || !e.analysis) return;
+  const all = slidesSaved();
+  const part = all[partId] && typeof all[partId] === "object" ? all[partId] : {};
+  const bodies = part.bodies && typeof part.bodies === "object" ? part.bodies : {};
+  const now = Date.now();
+  const kept = Array.isArray(bodies[i]) ? bodies[i].filter((x) => x?.sig !== e.sig) : [];
+  bodies[i] = [{ sig: e.sig, version: SLIDES_VERSION, direction: e.analysis.direction, savedAt: now, state: serializeSlideState(e.state) }, ...kept].slice(0, SLIDES_ENTRIES);
+  all[partId] = { savedAt: now, bodies };
+  const ids = Object.keys(all).sort((a, b) => (all[b]?.savedAt ?? 0) - (all[a]?.savedAt ?? 0));
+  for (const id of ids.slice(SLIDES_PARTS)) delete all[id];
+  try {
+    localStorage.setItem(SLIDES_KEY, JSON.stringify(all));
+    slidesMemory = null;
+  } catch {
+    slidesMemory = all; // kept for this visit only
+  }
+}
+
+// ---- names
+
+/** The name of a direction (its parts, directionParts): « +Y », « +Y +30° », « +Y, incliné de 20° vers le haut ». */
+function slideName({ reference_axis, angle_deg, tilt_deg, tilt_up }) {
+  const minus = (x) => String(x ?? "").replace(/^-/, "−");
+  let name = minus(reference_axis);
+  if (angle_deg != null) name = t("slides.dir.angle", { axis: name, angle: `${angle_deg > 0 ? "+" : "−"}${fmtNum(Math.abs(angle_deg), 1)}` });
+  if (tilt_deg != null) name = t("slides.dir.tilted", { axis: name, tilt: fmtNum(tilt_deg, 1), sense: t(tilt_up ? "slides.up" : "slides.down") });
+  return name;
+}
+
+/** The size of a slide's face (width × height): to the millimetre, to the tenth under 10 mm. */
+const slideSize = (size) => `${size.map((x) => fmtNum(x, x < 10 ? 1 : 0)).join(" × ")} mm`;
+
+/** The share of zone `id` that direction k of the pool frees. */
+const slideShare = (a, id, k) => (k == null ? 0 : a.zones[id - 1]?.releases.find((x) => x.dir === k)?.share ?? 0);
+
+/** The directions of the pool that release every one of these zones. */
+const slidesCommon = (a, ids) => a.directions.map((_, k) => k).filter((k) => ids.every((id) => slideShare(a, id, k) >= a.thresholds.releaseShare));
+
+/** The tags of a slide: [text, warn]. */
+function slideTags(sl) {
+  const tags = [];
+  if (sl.tags.inclined) tags.push([t("slides.tag.inclined"), false]);
+  if (sl.tags.small) tags.push([t("slides.tag.small"), true]);
+  if (sl.tags.long_stroke) tags.push([t("slides.tag.long"), true]);
+  if (sl.tags.also_by_half) tags.push([t("slides.tag.half"), false]);
+  if (sl.tags.partial != null) tags.push([t("slides.tag.partial", { share: fmtShare(sl.tags.partial) }), true]);
+  if (sl.tags.forced != null) tags.push([t("slides.tag.forced", { share: fmtShare(sl.tags.forced) }), true]);
+  return tags;
+}
+
+/** Why a zone is a probable core. */
+function coreReason(a, core) {
+  if (core.reason === "enclosed") return t("slides.core.enclosed");
+  if (core.reason === "no_direction") return t("slides.core.no_direction");
+  if (core.reason === "partial") {
+    const best = a.zones[core.zone - 1]?.releases[0]?.share;
+    return t("slides.core.partial", { share: best != null ? fmtShare(best) : `< ${fmtShare(0.5)}` });
+  }
+  return t("slides.core.manual");
+}
+
+// ---- for the costing and the exports
+
+const proposedViews = new WeakMap();
+/** The view of the proposal of an analysis, once. */
+function proposedView(analysis) {
+  let v = proposedViews.get(analysis);
+  if (!v) proposedViews.set(analysis, (v = effectiveSlides(analysis)));
+  return v;
+}
+
+/**
+ * "<signature of the definition>#<hash of what the slides do>": changed by
+ * another definition and by every edit that changes them; an edit undone by
+ * hand, the proposal's again.
+ */
+const slidesSignatureOf = (e) => `${e.sig}#${slidesViewHash(e.view, proposedView(e.analysis))}`;
+
+function slidesWarnings(e) {
+  const a = e.analysis;
+  return [...(e.view.counts.slides > a.thresholds.manySlides ? ["many_slides"] : []), ...a.warnings, ...(a.status === "capped" ? ["capped"] : [])];
+}
+
+/** How many zones and slides of a view differ from the proposal. */
+function slidesEdited(view, proposed) {
+  const slideKey = (sl) => `${sl.direction.join(",")}|${sl.zones.join(",")}`;
+  const kinds = (v) => {
+    const keys = new Map(v.slides.map((sl) => [sl.key, slideKey(sl)]));
+    return new Map([...v.zoneKind].map(([id, k]) => [id, k.kind === "slide" ? keys.get(k.key) : k.kind]));
+  };
+  const now = kinds(view), before = kinds(proposed);
+  const had = new Set(proposed.slides.map(slideKey)), has = new Set(view.slides.map(slideKey));
+  return {
+    zones: [...now].filter(([id, k]) => before.get(id) !== k).length,
+    slides: Math.max(view.slides.filter((sl) => !had.has(slideKey(sl))).length, proposed.slides.filter((sl) => !has.has(slideKey(sl))).length),
+  };
+}
+
+/** The definition the slides are for, in short: {axis, status, source}. */
+const slidesParting = (field) => ({ axis: field.summary?.axis ?? null, status: field.manual ? "manual" : "proposed", source: field.manual ? field.source ?? null : null });
+
+/**
+ * The slides of body i of the model shown for the costing (partFeatures):
+ * {status ("ready" | "computing" | "error" | "idle": a body not checked |
+ * "none": no parting line), count, cores, parting_zones, ignored, warnings,
+ * signature (another definition or an edit, another one), edited, parting,
+ * slides [{id, axis, reference_axis, angle_deg, tilt_deg, tilt_up,
+ * stroke_mm}], message}. Asks for them when they are not known.
+ */
+function slidesBrief(i) {
+  const r = state.result;
+  const field = r ? partingField(i, r) : null;
+  if (!field) return { status: r?.bodies[i]?.closed && partingOf(r)?.pending ? "computing" : "none" };
+  const e = slidesReady(i, r);
+  if (e) {
+    const v = e.view;
+    return {
+      status: "ready",
+      count: v.counts.slides,
+      cores: v.counts.cores,
+      parting_zones: v.counts.parting,
+      ignored: v.counts.ignored,
+      warnings: slidesWarnings(e),
+      signature: slidesSignatureOf(e),
+      edited: v.origin === "manual",
+      parting: slidesParting(field),
+      slides: v.slides.map(({ id, axis, reference_axis, angle_deg, tilt_deg, tilt_up, stroke_mm }) => ({ id, axis, reference_axis, angle_deg, tilt_deg, tilt_up, stroke_mm })),
+    };
+  }
+  const error = slidesError(i, r);
+  if (error) return { status: "error", message: error, parting: slidesParting(field) };
+  if (!includedIndices().includes(i) && i !== partingBody()) return { status: "idle" };
+  slidesQueue(i, r);
+  return { status: "computing" };
+}
+
+/** The slides of body i of the result shown, for the exports and the semantic contract: {slides} or {} (no parting line). */
+function slidesExport(r, i) {
+  if (r !== state.result) return {};
+  const field = partingField(i, r);
+  if (!field) return {};
+  const e = slidesReady(i, r);
+  if (!e) {
+    const error = slidesError(i, r);
+    if (error) return { slides: { status: "error", message: error } };
+    slidesQueue(i, r);
+    return { slides: { status: "computing" } };
+  }
+  const a = e.analysis;
+  const v = e.view;
+  const proposed = v.origin === "manual" ? proposedView(a) : null;
+  return {
+    slides: {
+      version: a.version,
+      method: a.method,
+      status: v.origin,
+      parting: { ...slidesParting(field), direction: field.direction },
+      count: v.counts.slides,
+      cores: v.counts.cores,
+      parting_zones: v.counts.parting,
+      ignored: v.counts.ignored,
+      slides: v.slides.slice(0, 20).map(slideExport),
+      cores_detail: v.cores.slice(0, 20).map(({ id, area_mm2, centroid_mm, reason }) => ({ id, area_mm2, centroid_mm, reason })),
+      parting_detail: v.parting.slice(0, 20).map(({ area_mm2, centroid_mm }) => ({ area_mm2, centroid_mm })),
+      undercut_area_mm2: a.undercut_area_mm2,
+      ignored_area_mm2: v.ignored.area_mm2,
+      not_analysed: a.not_analysed,
+      warnings: slidesWarnings(e),
+      sampled: a.sampled,
+      thresholds: a.thresholds,
+      signature: slidesSignatureOf(e),
+      edited: proposed ? slidesEdited(v, proposed) : null,
+      ...(proposed ? { proposed: { count: proposed.counts.slides, cores: proposed.counts.cores } } : {}),
+    },
+  };
+}
+
+// ---- 3D view
+
+let slidesPainted = null; // {i, e, counts (triangles per colour key), left (in yellow)}: what applyParting colours
+
+/**
+ * The colours of the slides for applyParting (the undercut triangles of body
+ * i), or null: « Tiroirs » unchecked, drawing by hand, or no slides known for
+ * the definition shown (the undercuts stay yellow). Slide Tn in its colour,
+ * a core brown, a zone to rework at the parting line salmon, a detail ignored
+ * pale; noise and zones not analysed yellow. A slide selected, or a zone
+ * picked while editing them: the other zones toward grey.
+ */
+function slidesTint(i, field) {
+  const card = $("parting-card");
+  card.dataset.slideArrows = "0";
+  card.dataset.slideColours = card.dataset.slideLeft = "";
+  slidesPainted = null;
+  const e = field && $("parting-slides-show").checked && !drawShown(i) ? slidesReady(i) : null;
+  if (!e?.view) return null;
+  const s = slidesOf();
+  const picked = partingOf().mode === "slides" ? s.selected.zone : null;
+  const chosen = s.selected.slide;
+  const cols = e.analysis.zones.map((z) => {
+    const k = e.view.zoneKind.get(z.id);
+    const [key, base] = k.kind === "slide" ? [k.slide, slideColour(Number(k.slide.slice(1)))] : k.kind === "core" ? ["N", SLIDE_CORE] : k.kind === "parting" ? ["P", SLIDE_PARTING] : ["I", SLIDE_IGNORED];
+    const color = base.clone();
+    if (picked != null ? z.id !== picked : chosen && k.key !== chosen) color.lerp(PARTING_FACE, SLIDE_DIMMED);
+    return { key, color };
+  });
+  const painted = (slidesPainted = { i, e, counts: new Map(), left: 0 });
+  return {
+    /** Triangle f in the colour of its zone (a piece of a triangle cut by the line: that of triangle f, not counted). */
+    colourOf(f, color, count = true) {
+      const z = e.zone[f];
+      const c = z >= 0 ? cols[z] : null;
+      if (!c) {
+        if (count) painted.left++;
+        return;
+      }
+      color.copy(c.color);
+      if (count) painted.counts.set(c.key, (painted.counts.get(c.key) ?? 0) + 1);
+    },
+  };
+}
+
+/**
+ * An arrow per slide coloured by slidesTint, in its colour, along its pull
+ * direction from where it leaves the part (its length the stroke, within 8 to
+ * 30 % of the body's size; wider for the slide selected); what the view
+ * shows, for scripts and tests.
+ */
+function addSlideArrows(group, i) {
+  const painted = slidesPainted;
+  if (painted?.i !== i) return;
+  const { view } = painted.e;
+  const reach = Math.max(...state.result.bodies[i].bbox.size);
+  const chosen = slidesOf().selected.slide;
+  for (const sl of view.slides) {
+    const s = vec3(sl.direction);
+    const length = Math.min(Math.max(sl.stroke_mm, 0.08 * reach), 0.3 * reach);
+    const origin = vec3(sl.exit_mm).addScaledVector(s, 0.05 * reach);
+    const arrow = new THREE.ArrowHelper(s, origin, length, slideColour(Number(sl.id.slice(1))), 0.25 * length, 0.15 * length * (sl.key === chosen ? 1.5 : 1));
+    arrow.traverse((o) => (o.renderOrder = ORDER_MARKERS));
+    arrow.userData.slide = sl.id;
+    group.add(arrow);
+  }
+  const card = $("parting-card");
+  const rank = (key) => (key[0] === "T" ? Number(key.slice(1)) : 1e6 + "NPI".indexOf(key));
+  card.dataset.slideArrows = String(view.slides.length);
+  card.dataset.slideColours = [...painted.counts].sort(([a], [b]) => rank(a) - rank(b)).map(([key, n]) => `${key}:${n}`).join(" ");
+  card.dataset.slideLeft = String(painted.left);
+}
+
+/** The legend of the slides' colours, after the parting line's: when they are shown. */
+function slidesLegend(p, i) {
+  return p.mode !== "draw" && $("parting-slides-show").checked && slidesReady(i)?.analysis.zones.length ? ` ${t("slides.legend")}` : "";
+}
+
+// ---- card
+
+/** The part "Tiroirs et noyaux" of the parting line card, for body i and the definition it shows (`field`, null: none). */
+function renderSlides(p, i, field) {
+  const card = $("parting-card");
+  const drawing = p.mode === "draw";
+  // Pressed while the zones are edited, whatever is shown (folding the card clicks the buttons pressed).
+  const editing = () => $("slides-edit").classList.toggle("active", p.mode === "slides");
+  $("slides").hidden = !field || drawing;
+  if (!partingShown() || drawing) {
+    card.dataset.slideArrows = "0";
+    card.dataset.slideColours = card.dataset.slideLeft = "";
+  }
+  if (!field) {
+    $("parting-slides-show").disabled = true;
+    card.dataset.slideStatus = card.dataset.slides = card.dataset.slideCores = "";
+    editing();
+    return;
+  }
+  const r = state.result;
+  if (!drawing) slidesRequest(i, r);
+  const s = slidesOf(r);
+  // Another body: the slide selected, the zone picked and the message were the other one's.
+  if (s.body !== i) {
+    s.body = i;
+    s.selected = { slide: null, zone: null };
+    s.message = null;
+  }
+  const e = slidesReady(i, r);
+  const error = slidesError(i, r);
+  card.dataset.slideStatus = drawing ? "drawing" : e ? "ready" : error ? "error" : "computing";
+  card.dataset.slides = e ? String(e.view.counts.slides) : "";
+  card.dataset.slideCores = e ? String(e.view.counts.cores) : "";
+  $("parting-slides-show").disabled = !e;
+  if (drawing) return editing();
+  const a = e?.analysis;
+  const pending = s.byBody.get(i);
+  const status = error ? t("slides.error", { message: tMessage(error) })
+    : !e ? t("slides.computing", { percent: pending?.percent != null ? `${pending.percent} %` : "" })
+      : a.status === "none" ? t("slides.none") : "";
+  $("slides-status").hidden = !status;
+  $("slides-status").textContent = status;
+  $("slides-retry").hidden = !error;
+  $("slides-peek").textContent = e ? t("slides.peek", { slides: e.view.counts.slides, cores: e.view.counts.cores }) : "";
+  const main = !!e && a.status !== "none";
+  $("slides-main").hidden = !main;
+  if (!main) {
+    if (p.mode === "slides") p.mode = null;
+    editing();
+    return;
+  }
+
+  const v = e.view;
+  const rs = a.thresholds.releaseShare;
+  $("slides-n").textContent = String(v.counts.slides);
+  $("slides-origin").textContent = t(`slides.origin.${v.origin}`);
+  $("slides-origin").classList.toggle("manual", v.origin === "manual");
+  const warn = [
+    ...(v.counts.slides > a.thresholds.manySlides ? [t("slides.many")] : []),
+    ...(a.warnings.includes("undercut_share_high") ? [t("slides.highUndercut", { share: fmtShare(a.undercut_share) })] : []),
+    ...(a.status === "capped" ? [t("slides.capped", { n: a.not_analysed.zones, area: fmtArea(a.not_analysed.area_mm2) })] : []),
+  ].join(" ");
+  $("slides-warn").hidden = !warn;
+  $("slides-warn").textContent = warn;
+
+  // The slides: a click selects one; its pull direction chosen among those that release all its zones.
+  if (s.selected.slide && !v.slides.some((sl) => sl.key === s.selected.slide)) s.selected.slide = null;
+  const chosen = s.selected.slide;
+  setHtml($("slides-table").tBodies[0], v.slides.map((sl) => {
+    const tags = slideTags(sl);
+    const share = (k) => Math.min(...sl.zones.map((id) => slideShare(a, id, k)));
+    const direction = sl.dir != null && sl.choices.length > 1 && sl.choices.includes(sl.dir)
+      ? `<select data-slide-dir="${escapeHtml(sl.key)}" title="${escapeHtml(t("slides.choice.title"))}">${sl.choices.map((k) => `<option value="${k}"${k === sl.dir ? " selected" : ""}>${escapeHtml(`${slideName(a.directions[k])} (${fmtShare(share(k))})`)}</option>`).join("")}</select>`
+      : escapeHtml(slideName(sl));
+    const title = [t("slides.row.title", { axis: sl.axis, area: fmtArea(sl.area_mm2), depth: fmtNum(sl.depth_mm, 1), half: t(`slides.half.${sl.half}`) }), ...tags.map(([x]) => x)].join(" · ");
+    return `<tr data-slide="${escapeHtml(sl.key)}" class="${sl.key === chosen ? "selected" : ""}" title="${escapeHtml(title)}">` +
+      `<td><span class="swatch" style="background:#${slideColour(Number(sl.id.slice(1))).getHexString()}"></span>${sl.id}${tags.map(([x, w]) => `<span class="slide-tag${w ? " warn" : ""}">${escapeHtml(x)}</span>`).join("")}</td>` +
+      `<td>${direction}</td><td class="num">${fmtNum(sl.stroke_mm, 1)} mm</td><td class="num">${slideSize(sl.size_mm)}</td><td class="num">${sl.zones.length}</td></tr>`;
+  }).join(""));
+
+  // The slide selected: its line, and the slides it can be merged with (a pull direction common to all their zones).
+  const sel = v.slides.find((sl) => sl.key === chosen);
+  $("slides-slide").hidden = !sel;
+  setHtml($("slides-slide"), !sel ? "" : `<span>${escapeHtml(t("slides.slide.line", {
+    slide: sel.id, direction: slideName(sel), stroke: fmtNum(sel.stroke_mm, 1), zones: sel.zones.length, area: fmtArea(sel.area_mm2), half: t(`slides.half.${sel.half}`),
+  }))}</span>${v.slides.length > 1 ? `<label>${escapeHtml(t("slides.merge"))} <select id="slides-merge"><option value="">—</option>${v.slides.filter((o) => o !== sel).map((o) => {
+    const ok = slidesCommon(a, [...sel.zones, ...o.zones]).length > 0;
+    return `<option value="${escapeHtml(o.key)}"${ok ? "" : ` disabled title="${escapeHtml(t("slides.merge.none"))}"`}>${escapeHtml(`${o.id} (${slideName(o)})${ok ? "" : ` — ${t("slides.merge.none")}`}`)}</option>`;
+  }).join("")}</select></label>` : ""}`);
+
+  // Cores, zones to rework at the parting line, details ignored.
+  const sum = (list) => list.reduce((n, x) => n + x.area_mm2, 0);
+  const one = v.cores.length === 1;
+  const stats = [
+    ...(v.cores.length ? [[t("slides.stats.cores"), t("slides.stats.cores.value", {
+      n: v.cores.length, area: fmtArea(sum(v.cores)), list: v.cores.map((c) => (one ? coreReason(a, c) : `${c.id} ${coreReason(a, c)}`)).join(", "),
+    })]] : []),
+    ...(v.parting.length ? [[t("slides.stats.parting"), t("slides.stats.parting.value", { n: v.parting.length, area: fmtArea(sum(v.parting)) })]] : []),
+    ...(v.ignored.zones.length ? [[t("slides.stats.ignored"), t("slides.stats.ignored.value", { n: v.ignored.zones.length, area: fmtArea(v.ignored.area_mm2) })]] : []),
+  ];
+  setHtml($("slides-stats"), stats.map(([k, x]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(x)}</dd>`).join(""));
+  $("slides-stats").hidden = !stats.length;
+  editing();
+  $("slides-reset").disabled = v.origin !== "manual";
+
+  // The zone picked on the 3D view: its line, and where it goes (a slide whose direction releases it, or can take one that releases them all).
+  const zone = p.mode === "slides" && s.selected.zone != null ? a.zones[s.selected.zone - 1] ?? null : null;
+  $("slides-zone").hidden = !zone;
+  let zoneHtml = "";
+  if (zone) {
+    const k = v.zoneKind.get(zone.id);
+    const released = zone.releases.filter((x) => x.share >= rs);
+    const line = released.length
+      ? t("slides.zone.line", { id: zone.id, area: fmtArea(zone.area_mm2), depth: fmtNum(released[0].depth_mm, 1), dirs: released.map((x) => slideName(a.directions[x.dir])).join(", ") })
+      : t("slides.zone.lineNone", { id: zone.id, area: fmtArea(zone.area_mm2) });
+    const current = k.kind === "slide" ? k.key : `kind:${k.kind}`;
+    const option = (value, label, disabled = false) => `<option value="${escapeHtml(value)}"${value === current ? " selected" : ""}${disabled ? " disabled" : ""}>${escapeHtml(label)}</option>`;
+    const options = [
+      ...v.slides.map((sl) => {
+        const ok = sl.key === k.key || slideShare(a, zone.id, sl.dir) >= rs || slidesCommon(a, [...sl.zones, zone.id]).length > 0;
+        return option(sl.key, `${sl.id} (${slideName(sl)})${ok ? "" : ` ${t("slides.zone.notReleased")}`}`, !ok);
+      }),
+      option("new", t("slides.zone.new")),
+      option("kind:core", t("slides.zone.core")),
+      option("kind:parting", t("slides.zone.parting")),
+      option("kind:ignored", t("slides.zone.ignored")),
+    ];
+    zoneHtml = `<span>${escapeHtml(line)}</span><label>${escapeHtml(t("slides.zone.in"))} <select id="slides-zone-to" data-zone="${zone.id}">${options.join("")}</select></label>`;
+  }
+  setHtml($("slides-zone"), zoneHtml);
+
+  const carried = v.messages.map((m) => (m.code === "dropped" ? t("slides.msg.dropped", { n: m.n }) : t(`slides.msg.${m.code}`))).join(" ");
+  const hint = s.message ?? (p.mode === "slides" && !zone ? t("slides.edit.hint") : carried);
+  $("slides-hint").hidden = !hint;
+  $("slides-hint").textContent = hint;
+}
+
+// ---- clicks and edits
+
+/** A click on triangle f of body i (at `point`, in its frame) while editing the zones: its zone picked (or why not); on a triangle the line crosses, that of the piece clicked, as coloured. */
+function slidesClick(i, f, point = null) {
+  const s = slidesOf();
+  const e = slidesReady(i);
+  if (!e) return renderParting();
+  const k = point ? pieceAt(i, f, point.toArray()) : -1;
+  const pieces = piecesShown?.pieces;
+  const z = k < 0 ? e.zone[f] : !pieces.undercut[k] ? -1 : pieces.near[k] >= 0 ? e.zone[pieces.near[k]] : -2;
+  s.message = z === -1 ? t("slides.notZone") : z < 0 ? t("slides.tiny") : null;
+  s.selected.zone = z >= 0 ? e.analysis.zones[z].id : null;
+  renderParting();
+  applyParting();
+}
+
+/** An edit of the slides of the card's body (editSlides): kept, shown, published; or why not. */
+function slidesEdit(op) {
+  const r = state.result;
+  const i = partingBody();
+  const s = slidesOf(r);
+  const e = i >= 0 ? slidesReady(i, r) : null;
+  if (!e) return;
+  const name = (view, key) => view.slides.find((sl) => sl.key === key)?.id ?? key;
+  const out = editSlides(e.analysis, e.state, op);
+  if (out.error) {
+    s.message = out.error === "no_common_direction" ? t("slides.err.no_common_direction")
+      : out.error === "not_released" ? t("slides.err.not_released", { slide: name(e.view, out.slide ?? op.slide ?? op.to), share: fmtShare(out.share ?? 0) }) : null;
+    // Not done: the lists show the slides as they are again.
+    for (const el of [$("slides-table").tBodies[0], $("slides-slide"), $("slides-zone")]) htmlShown.delete(el);
+    return renderParting();
+  }
+  e.state = out.state;
+  e.messages = [];
+  e.view = effectiveSlides(e.analysis, e.state);
+  s.message = out.message === "direction_changed" ? t("slides.msg.direction_changed", { slide: name(e.view, out.slide), direction: slideName(e.analysis.directions[out.dir]) }) : null;
+  saveSlideEntry(r, i, e);
+  renderParting();
+  if (partingShown()) applyParting();
+  updatePublished(r);
+}
+
+$("parting-slides-show").addEventListener("change", () => {
+  if (partingShown()) applyParting();
+  renderParting();
+});
+$("slides-retry").addEventListener("click", () => {
+  const i = partingBody();
+  const e = slidesOf()?.byBody.get(i);
+  if (!e) return;
+  e.sig = e.run = e.error = null;
+  renderParting();
+});
+// A row clicked: its slide selected (clicked again: no longer); its pull direction chosen in its list.
+$("slides-table").addEventListener("click", (e) => {
+  const row = e.target.closest("tr[data-slide]");
+  const s = slidesOf();
+  if (!row || !s || e.target.closest("select")) return;
+  s.selected.slide = s.selected.slide === row.dataset.slide ? null : row.dataset.slide;
+  s.message = null;
+  renderParting();
+  if (partingShown()) applyParting();
+});
+$("slides-table").addEventListener("change", (e) => {
+  const key = e.target.dataset?.slideDir;
+  if (key) slidesEdit({ op: "direction", slide: key, dir: Number(e.target.value) });
+});
+$("slides-slide").addEventListener("change", (e) => {
+  const s = slidesOf();
+  if (e.target.id === "slides-merge" && e.target.value && s?.selected.slide) slidesEdit({ op: "merge", a: s.selected.slide, b: e.target.value });
+});
+$("slides-zone").addEventListener("change", (e) => {
+  if (e.target.id !== "slides-zone-to") return;
+  const zone = Number(e.target.dataset.zone);
+  const to = e.target.value;
+  if (to === "new") slidesEdit({ op: "move", zone, to: "new" });
+  else if (to.startsWith("kind:")) slidesEdit({ op: "kind", zone, kind: to.slice(5) });
+  else slidesEdit({ op: "move", zone, to });
+});
+$("slides-edit").addEventListener("click", () => {
+  const s = slidesOf();
+  if (!s) return;
+  s.selected.zone = null;
+  s.message = null;
+  setPartingMode("slides");
+});
+$("slides-reset").addEventListener("click", () => {
+  const s = slidesOf();
+  if (!s) return;
+  s.selected = { slide: null, zone: null };
+  slidesEdit({ op: "reset" });
+});
+$("slides-costing").addEventListener("click", () => showPage("chiffrage"));
+// Open or folded: remembered in this browser; folded while editing the zones, the editing ends.
+try {
+  if (localStorage.getItem(SLIDES_OPEN_KEY) === "0") $("slides").open = false;
+} catch {
+  // open
+}
+$("slides").addEventListener("toggle", () => {
+  try {
+    localStorage.setItem(SLIDES_OPEN_KEY, $("slides").open ? "1" : "0");
+  } catch {
+    // not remembered: fine
+  }
+  if (!$("slides").open && partingOf()?.mode === "slides") setPartingMode("slides");
+});
+// Esc: the editing of the zones ends, the slide selected is no longer.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const p = partingOf();
+  const s = slidings.get(state.result);
+  if (!p || !s || (p.mode !== "slides" && !s.selected.slide)) return;
+  if (p.mode === "slides") p.mode = null;
+  s.selected = { slide: null, zone: null };
+  s.message = null;
+  renderParting();
+  if (partingShown()) applyParting();
+});
+
 // ---------------------------------------------------------------- risers and gating
 
 // Risers ("masselottes") and the ingate ("attaque de coulée") of a cast part
@@ -5246,14 +6196,22 @@ function feedingOf(r = state.result) {
 /** The body of the card: that of the parting line card. */
 const feedingBody = () => partingBody();
 
-/** The parting of body i as feeding.js takes it ({direction, side, segments}, or null) and what identifies it. */
+/**
+ * The parting of body i as feeding.js takes it ({direction, side, segments,
+ * up, process: the casting up and the process of its orientation}, or null),
+ * what identifies it (its definition and those options), and whether its
+ * orientation is still being computed (pending).
+ */
 function feedingParting(i, r = state.result) {
   const p = partingOf(r);
   const field = partingField(i, r);
+  // The definition by hand, or the proposal.
+  const def = field ? (field.manual ? p.current.get(i) : p.results[i]) : null;
+  const parting = field ? { direction: field.direction, side: field.side, segments: field.segments, ...castingUp(i, r) } : null;
   return {
-    // The definition by hand, or the proposal.
-    key: field ? (field.manual ? p.current.get(i) : p.results[i]) : null,
-    parting: field ? { direction: field.direction, side: field.side, segments: field.segments } : null,
+    key: def ? `${definitionId(def)}|${feedingOptionsKey({ parting })}` : null,
+    parting,
+    pending: !!(field && orientationShown(i, r)?.pending),
   };
 }
 
@@ -5269,7 +6227,8 @@ function feedingPlacement(i, r = state.result) {
   const f = feedingOf(r);
   const res = f?.results?.[i];
   if (!res) return null;
-  const { key, parting } = feedingParting(i, r);
+  const { key, parting, pending } = feedingParting(i, r);
+  if (pending) return null; // placed along the casting up once known
   const kept = f.placed.get(i);
   if (kept && kept.key === key) return kept;
   if (r === state.result && f.placing.get(i) !== key && f.queued.get(i)?.key !== key) {
@@ -5333,14 +6292,20 @@ function feedingField(i, r = state.result) {
   const manual = f.manual.get(i) ?? null;
   const risers = (manual?.risers ?? placed.placement.risers).map((x) => ({ ...x, mass_g: massOfVolume(x.volume_mm3) }));
   const gate = manual?.gate ?? placed.placement.gate;
+  // Fed from below (low pressure): the feed points, the main one the ingate (placed by hand: in its place).
+  const bottom = placed.placement.mode === "bottom";
+  const others = bottom ? (placed.placement.feed_points ?? []).slice(1) : [];
+  const feedPoints = bottom ? [gate, ...others].filter(Boolean) : [];
   return {
     manual: !!(manual?.risers || manual?.gate),
     // The risers by hand (added, moved, resized or deleted), apart from the ingate.
     manualRisers: !!manual?.risers,
     risers,
     gate,
-    yield: feedingYield(res.body.volume_mm3, risers, gate),
-    without: hotSpotsWithoutRiser(res.zones, risers),
+    bottom,
+    feedPoints,
+    yield: feedingYield(res.body.volume_mm3, risers, gate, others),
+    without: hotSpotsWithoutRiser(res.zones, risers, feedPoints),
     placement: placed.placement,
     res,
   };
@@ -5561,7 +6526,7 @@ function feedingClick(hits) {
     }
     // Moved: sized again from the zone it now touches, unless its D and H were typed in.
     const sized = moved?.sized_by_hand ? { diameter: moved.diameter_mm, height: moved.height_mm } : {};
-    riser = riserFromPoint(point, { triangle, normal, zones: field.res, direction: field.placement.direction, id: moved?.id ?? nextRiserId(field.risers), ...sized });
+    riser = riserFromPoint(point, { triangle, normal, zones: field.res, direction: field.placement.direction, up: field.placement.up, id: moved?.id ?? nextRiserId(field.risers), ...sized });
     if (!riser) {
       // A face turned down: no riser under the part; another face to click.
       f.message = t("feeding.faceDown");
@@ -5596,8 +6561,10 @@ function setFeedingMode(mode) {
   const p = partingOf();
   if (f.mode && p?.mode === "draw") leaveDrawing();
   else if (f.mode && p?.mode) {
+    const was = p.mode;
     p.mode = null;
     renderParting();
+    if (was === "slides") applyParting(); // the zones greyed by the one picked: coloured again
   }
   // Placed on the 3D view: shown there.
   if (f.mode && !f.show) {
@@ -5633,7 +6600,7 @@ function applyFeeding() {
   const f = feedingOf();
   const i = feedingBody();
   const field = f?.show && i >= 0 && state.meshes[i] ? feedingField(i) : null;
-  $("feeding-card").dataset.markers = field ? String(field.risers.length + (field.gate ? 1 : 0)) : "0";
+  $("feeding-card").dataset.markers = field ? String(field.risers.length + (field.bottom ? field.feedPoints.length : field.gate ? 1 : 0)) : "0";
   $("feeding-card").dataset.gateTip = "";
   // The other bodies faded, or given back (the colours of the view again).
   if (fadeStale()) applyThickness();
@@ -5661,15 +6628,16 @@ function applyFeeding() {
     cylinder.userData.cap = "riser"; // a solid: closed by the section (syncCaps)
     group.add(cylinder);
   }
-  if (field.gate) {
+  // Fed from below: an arrow per feed point (the main one first, as the ingate).
+  for (const gate of field.bottom ? field.feedPoints : field.gate ? [field.gate] : []) {
     // A solid arrow from outside the part, its tip at the ingate: the shaft as thick as the ingate, the cone as wide.
     const size = Math.max(...state.result.bodies[i].bbox.size);
-    const length = Math.max(2 * (field.gate.width_mm ?? 0), 0.15 * size);
+    const length = Math.max(2 * (gate.width_mm ?? 0), 0.15 * size);
     const head = 0.35 * length;
-    const coneRadius = Math.max((field.gate.width_mm ?? 0) / 2, 0.02 * size);
-    const shaftRadius = Math.max((field.gate.thickness_mm ?? 0) / 2, 0.008 * size);
-    const dir = new THREE.Vector3(...field.gate.direction).normalize();
-    const tip = new THREE.Vector3(...field.gate.position_mm);
+    const coneRadius = Math.max((gate.width_mm ?? 0) / 2, 0.02 * size);
+    const shaftRadius = Math.max((gate.thickness_mm ?? 0) / 2, 0.008 * size);
+    const dir = new THREE.Vector3(...gate.direction).normalize();
+    const tip = new THREE.Vector3(...gate.position_mm);
     // Opaque, but drawn with the translucent overlays: after the halves of the mould, not tinted by them.
     const material = new THREE.MeshStandardMaterial({ color: GATE_COLOR, transparent: true, opacity: 1, clippingPlanes: [sectionPlane] });
     const cone = new THREE.Mesh(new THREE.ConeGeometry(coneRadius, head, 32), material);
@@ -5709,6 +6677,8 @@ function feedingWhy(x) {
     short: x.riser_modulus_mm != null && !feeds(x) ? t("feeding.why.short") : "",
     wall: fmtNum(x.wall_sphere_mm, 1), thickness: fmtNum(x.thickness_mm, 1), width: fmtNum(x.width_mm, 1),
     away: t(`feeding.why.away.${away}`),
+    // A feed point from below: its diameter and its modulus (D/4).
+    d: fmtNum(x.diameter_mm, 1), feed: fmtNum(x.feed_modulus_mm, 2),
   };
   const key = `feeding.why.${x.reason}`;
   const text = t(key, params);
@@ -5766,6 +6736,13 @@ function renderFeeding() {
 
   // The risers: a click selects one (to move, resize or delete it).
   const zones = field.res.zones;
+  // Fed from below (low pressure): said, the feed points listed after the risers placed by hand.
+  $("feeding-mode").hidden = !field.bottom;
+  if (field.bottom) $("feeding-mode").textContent = `${t("feeding.bottom")} — ${t("feeding.bottom.points", { n: field.feedPoints.length })}`;
+  const feedRows = field.feedPoints.map((x) => `<tr class="feed-point" data-feed="${escapeHtml(x.id ?? "")}" title="${escapeHtml(feedingWhy(x))}">` +
+    `<td>${escapeHtml(x.id ?? "")}<br><span class="muted">${escapeHtml(t("feeding.type.bottom"))}</span></td>` +
+    `<td class="num">${zones[x.zone] ? `${x.zone + 1}<br><span class="muted">Ø ${fmtNum(zones[x.zone].sphere_mm, 1)}</span>` : "—"}</td>` +
+    `<td class="num">${fmtNum(x.modulus_mm, 2)}</td><td class="num">Ø ${fmtNum(x.diameter_mm, 1)}</td><td class="num">${escapeHtml(fmtVol(x.volume_mm3))}</td></tr>`).join("");
   setHtml($("feeding-risers").tBodies[0], field.risers.map((x) => {
     const zone = zones[x.zone];
     const weight = x.mass_g == null ? fmtVol(x.volume_mm3) : x.mass_g >= 1000 ? `${fmtNum(x.mass_g / 1000, 2)} kg` : `${fmtNum(x.mass_g, 0)} g`;
@@ -5775,7 +6752,7 @@ function renderFeeding() {
       `<td class="num">${fmtNum(x.modulus_mm, 2)}</td>` +
       `<td class="num">${fmtNum(x.diameter_mm, 1)} × ${fmtNum(x.height_mm, 1)}</td>` +
       `<td class="num">${escapeHtml(weight)}</td></tr>`;
-  }).join("") || `<tr><td colspan="5" class="muted">${escapeHtml(t("feeding.noRiser"))}</td></tr>`);
+  }).join("") + feedRows || `<tr><td colspan="5" class="muted">${escapeHtml(t("feeding.noRiser"))}</td></tr>`);
 
   const selected = field.risers.find((x) => x.id === f.selected) ?? null;
   $("feeding-editor").hidden = !selected;
@@ -5792,9 +6769,11 @@ function renderFeeding() {
   const g = field.gate;
   const rows = [
     // None: no parting line, or no point of it reached from outside the mould.
-    [t("feeding.gate"), g ? `${fmtPoint(g.position_mm)} mm` : t(feedingParting(i).parting?.segments?.length ? "feeding.gate.noneFree" : "feeding.gate.none")],
+    [t(field.bottom ? "feeding.feed" : "feeding.gate"), g ? `${fmtPoint(g.position_mm)} mm` : t(feedingParting(i).parting?.segments?.length ? "feeding.gate.noneFree" : "feeding.gate.none")],
     ...(g ? [
-      [t("feeding.gate.section"), t("feeding.gate.sectionValue", { thickness: fmtNum(g.thickness_mm, 1), width: fmtNum(g.width_mm, 1), area: fmtNum(g.section_mm2, 1) })],
+      [t("feeding.gate.section"), g.bottom_feed
+        ? t("feeding.feed.sectionValue", { d: fmtNum(g.diameter_mm, 1), area: fmtNum(g.section_mm2, 1) })
+        : t("feeding.gate.sectionValue", { thickness: fmtNum(g.thickness_mm, 1), width: fmtNum(g.width_mm, 1), area: fmtNum(g.section_mm2, 1) })],
       [t("feeding.gate.wall"), `Ø ${fmtNum(g.wall_sphere_mm, 1)} mm`],
     ] : []),
     [t("feeding.yield"), field.yield.value != null ? `${fmtNum(field.yield.value * 100, 1)} %` : "—"],
@@ -5806,7 +6785,7 @@ function renderFeeding() {
   const sampled = field.res.sampled;
   $("feeding-sampled").hidden = !sampled;
   if (sampled) $("feeding-sampled").textContent = t("feeding.sampled", { samples: fmtNum(sampled.samples, 0), triangles: fmtNum(sampled.triangles, 0) });
-  const hint = f.message ?? (f.mode ? t(`feeding.hint.${f.mode}`) : "");
+  const hint = f.message ?? (f.mode ? t(`feeding.hint.${f.mode === "gate" && field.bottom ? "feed" : f.mode}`) : "");
   $("feeding-hint").hidden = !hint;
   $("feeding-hint").textContent = hint;
   $("feeding-reset").disabled = !field.manual;
@@ -5828,6 +6807,11 @@ function feedingExport(r, i) {
       method: FEEDING_METHOD,
       draw_direction: placement.direction,
       parting_known: placement.parting_known,
+      // Along the casting up, for the process (fed from below: the feed points, no riser proposed).
+      up: placement.up ?? null,
+      process: placement.process ?? null,
+      mode: placement.mode ?? "top",
+      ...(field.bottom ? { feed_points: field.feedPoints } : {}),
       risers: field.risers,
       gate: field.gate,
       yield: field.yield,
@@ -5909,6 +6893,658 @@ document.addEventListener("keydown", (e) => {
   f.mode = null;
   f.message = null;
   renderFeeding();
+});
+
+// ---------------------------------------------------------------- casting process and orientation
+
+// The orientation of a cast part in its die for its casting process
+// (engine/orientation.js). The process of a body is that of the island the
+// costing retained for its piece (window.reader3d.setProcess, like the
+// material: « Coquille gravité » a vertical parting plane, poured from the
+// top; « Basse pression » a horizontal one, fed from below; the orientation
+// of the island in Paramètres), else the default (gravity die, vertical
+// plane); it can be chosen for the part on the parting card. The parting of
+// a body is proposed for its process and the margins of the dies of the
+// costing (the worker ranks the draw directions by their die block, the same
+// whatever the process, and orients each one for the process: up when cast),
+// again when they change, whichever body the card shows (renderParting).
+// Shown on the card: the process, the direction up when the metal is cast
+// (« haut de coulée »: by the feeding rule, again with the wall thickness
+// once computed, or chosen by hand; on a horizontal plane, another up turns
+// the halves over), the die blank (« brut
+// de coquille »: the smallest block round the part along its draw direction
+// plus the margins, one cavity) and its steel; on the 3D view an arrow « haut »
+// and the blank as a wire box. The risers and the ingate are placed along that
+// up (fed from below: the feed points, no riser). The process chosen and the
+// up chosen are kept per part in this browser, with the island the costing
+// told last (so that the parting is proposed for it before the costing page
+// is opened again).
+const ORIENT_KEY = "reader3d.orientation.v1";
+const ORIENT_PARTS = 200; // parts whose choices are kept, the latest
+const BRUT_COLOR = 0x46525c; // the die blank's wire box
+const BRUT_LINE_PX = 2;
+const UP_ARROW = 0x37474f; // the arrow « haut », darker than the draw direction's
+// The processes the card offers for a part.
+const PROCESS_CHOICES = {
+  "vertical-haut": { plan: "vertical", alimentation: "haut" },
+  "horizontal-haut": { plan: "horizontal", alimentation: "haut" },
+  "horizontal-bas": { plan: "horizontal", alimentation: "bas" },
+};
+const processValue = (p) => `${p.plan}-${p.alimentation}`;
+const validProcess = (p) => !!p && PLANS.includes(p.plan) && FEEDS.includes(p.alimentation);
+
+// ---- kept in this browser: {parts: {part id: {savedAt, bodies: {index: {process, up: {direction, up}, costing: {code, famille, orientation}}}}}, die: {marges, densite}}
+
+let orientMemory = null; // the choices of this visit, when this browser's storage refuses them
+
+const isRecord = (x) => !!x && typeof x === "object" && !Array.isArray(x);
+
+/**
+ * What this browser keeps, in that shape whatever was read (another version,
+ * edited by hand, cut short): a part or a body that is not an object left out,
+ * a part without its bodies given none, its savedAt a number.
+ */
+function orientClean(saved) {
+  if (!isRecord(saved)) return {};
+  const parts = {};
+  for (const [id, entry] of Object.entries(isRecord(saved.parts) ? saved.parts : {})) {
+    if (!isRecord(entry)) continue;
+    const bodies = Object.fromEntries(Object.entries(isRecord(entry.bodies) ? entry.bodies : {}).filter(([, v]) => isRecord(v)));
+    parts[id] = { ...entry, bodies, savedAt: Number.isFinite(entry.savedAt) ? entry.savedAt : 0 };
+  }
+  return { ...saved, parts };
+}
+
+function orientSaved() {
+  if (orientMemory) return orientMemory;
+  try {
+    return orientClean(JSON.parse(localStorage.getItem(ORIENT_KEY)));
+  } catch {
+    return {};
+  }
+}
+
+function orientWrite(all) {
+  const parts = isRecord(all.parts) ? all.parts : {};
+  // The latest parts only.
+  const ids = Object.keys(parts).sort((a, b) => (parts[b]?.savedAt ?? 0) - (parts[a]?.savedAt ?? 0));
+  for (const id of ids.slice(ORIENT_PARTS)) delete parts[id];
+  dieRead = null;
+  try {
+    localStorage.setItem(ORIENT_KEY, JSON.stringify(all));
+    orientMemory = null;
+  } catch {
+    orientMemory = all; // kept for this visit only
+  }
+}
+
+// Per result: {kept (body -> {process, up, costing}: read from this browser,
+// then as changed), oriented (definition -> Map(options -> {orientation,
+// error}): its orientation for other options or with the thickness, from the
+// worker), proposing (body -> the options its proposal is being computed for),
+// failed (body -> the options its proposal failed for: not asked again until Retry)}.
+const orientings = new WeakMap();
+
+function orientOf(r = state.result) {
+  if (!r) return null;
+  let o = orientings.get(r);
+  if (!o) {
+    const bodies = orientSaved().parts?.[partIdOf(r)]?.bodies ?? {};
+    o = { kept: new Map(Object.entries(bodies).map(([k, v]) => [Number(k), v])), oriented: new WeakMap(), proposing: new Map(), failed: new Map() };
+    orientings.set(r, o);
+  }
+  return o;
+}
+
+/** Body i of result r: `patch` ({process, up, costing}; null: forgotten) kept, for the part in this browser. */
+function orientKeep(i, patch, r = state.result) {
+  const o = orientOf(r);
+  const next = { ...o.kept.get(i), ...patch };
+  for (const k of Object.keys(next)) if (next[k] == null) delete next[k];
+  if (Object.keys(next).length) o.kept.set(i, next);
+  else o.kept.delete(i);
+  const partId = partIdOf(r);
+  if (!partId) return;
+  const all = orientSaved();
+  const parts = isRecord(all.parts) ? all.parts : (all.parts = {});
+  const entry = isRecord(parts[partId]) ? parts[partId] : {};
+  const bodies = isRecord(entry.bodies) ? { ...entry.bodies } : {};
+  if (Object.keys(next).length) bodies[i] = next;
+  else delete bodies[i];
+  if (Object.keys(bodies).length) parts[partId] = { ...entry, bodies, savedAt: Date.now() };
+  else delete parts[partId];
+  orientWrite(all);
+}
+
+// ---- the process and the die options
+
+/**
+ * The casting process of body i: chosen on the card for this part, else that
+ * of the island the costing retained for its piece (its orientation in
+ * Paramètres, else by its family), else the default (gravity die, vertical
+ * plane, poured from the top). {plan, alimentation, source ("part" |
+ * "costing" | "default"), island ({code, famille} retained, or null)}.
+ */
+function processOf(i, r = state.result) {
+  const kept = orientOf(r)?.kept.get(i) ?? {};
+  const island = kept.costing?.code ? kept.costing : null;
+  if (validProcess(kept.process)) return { plan: kept.process.plan, alimentation: kept.process.alimentation, source: "part", island };
+  const own = island ? processForIsland(island) : null;
+  if (own && own.source !== "default") return { plan: own.plan, alimentation: own.alimentation, source: "costing", island };
+  return { ...DEFAULT_PROCESS, source: "default", island };
+}
+
+// The die options as last read (asked for at every rendering): read again once written, here or by another page.
+let dieRead = null;
+window.addEventListener("storage", (e) => {
+  if (e.key === ORIENT_KEY || e.key === null) dieRead = null;
+});
+
+/** The die options of the parting jobs: the margins and the steel density of the costing's dies (as it told them last; else its defaults), one cavity (the blank shown is one cavity's). */
+function dieOptions() {
+  dieRead ??= { ...normalizeDie(orientSaved().die ?? null), cavities: 1 };
+  return dieRead;
+}
+
+/** What the parting of body i is proposed and classified for: {process ({plan, alimentation}), die, key (orientationKey)}. */
+function partingOptions(i, r = state.result) {
+  const { plan, alimentation } = processOf(i, r);
+  const process = { plan, alimentation };
+  const die = dieOptions();
+  return { process, die, key: orientationKey(process, die) };
+}
+
+/** The wall thickness of body i (the inscribed diameter of each triangle) when computed for the model shown, else null. */
+const thicknessOf = (i, r = state.result) => (r === state.result ? thick.results?.[i]?.sphere ?? null : null);
+
+/**
+ * The proposals kept with the results of a file, when they are of this engine
+ * and of these bodies: those of one set of options (every closed body the
+ * same process) only for these (partclient.js keptParting); each body for its
+ * own otherwise (a body proposed for others is proposed again:
+ * reproposeStale). Null: none, to compute.
+ */
+function keptPartings(data) {
+  const kept = data.cachedParting;
+  const options = data.bodies.flatMap((b, i) => (b.closed ? [partingOptions(i, data)] : []));
+  if (options.every((o) => o.key === options[0].key)) return keptParting(kept, data.bodies.length, options[0] ?? {});
+  return kept?.version === PARTING_VERSION && kept.bodies?.length === data.bodies.length ? kept.bodies : null;
+}
+
+/**
+ * Proposals for `bodies` (computeParting's; null: skipped) of result r, each
+ * body for its own process and the die options, with its wall thickness when
+ * computed: one job per set of options. {version, options_key (that of every
+ * body, or null when they differ), bodies}.
+ */
+async function proposeOriented(client, r, bodies, { onProgress = null } = {}) {
+  const groups = new Map();
+  bodies.forEach((b, i) => {
+    if (!b) return;
+    const o = partingOptions(i, r);
+    if (!groups.has(o.key)) groups.set(o.key, { ...o, list: bodies.map(() => null) });
+    groups.get(o.key).list[i] = { ...b, thickness: thicknessOf(i, r) };
+  });
+  const out = bodies.map(() => null);
+  let version = PARTING_VERSION;
+  let n = 0;
+  for (const g of groups.values()) {
+    const done = n++;
+    const results = await client.computeParting(g.list, {
+      owner: r, process: g.process, die: g.die,
+      onProgress: onProgress && (({ percent }) => onProgress({ percent: Math.floor(((done + percent / 100) / groups.size) * 100) })),
+    });
+    version = results.version;
+    results.bodies.forEach((b, i) => {
+      if (g.list[i]) out[i] = b;
+    });
+  }
+  return { version, options_key: groups.size === 1 ? [...groups.keys()][0] : null, bodies: out };
+}
+
+/**
+ * The bodies of r whose proposal is not for their process or die options now
+ * (changed by the costing, on the card, in Paramètres), and those of `flip`
+ * (a horizontal parting plane the thickness turns over): proposed again in
+ * the background, the definition before shown meanwhile, then kept with the
+ * results of the file. Their definitions by hand stay (oriented again:
+ * orientationShown).
+ */
+function reproposeStale(r, flip = []) {
+  const p = partingOf(r);
+  if (!p?.results || p.pending || r !== state.result) return;
+  const o = orientOf(r);
+  const wanted = new Map();
+  const bodies = r.bodies.map((b, i) => {
+    const res = p.results[i];
+    if (!b.closed || !res) return null;
+    const { key } = partingOptions(i, r);
+    const want = `${key}|${thicknessOf(i, r) ? "t" : ""}`;
+    if ((res.proposal.options_key === key && !flip.includes(i)) || o.proposing.get(i) === want || o.failed.get(i) === want) return null;
+    o.proposing.set(i, want);
+    wanted.set(i, want);
+    return bodyArrays(i);
+  });
+  if (!wanted.size) return;
+  partClient()
+    .then((client) => proposeOriented(client, r, bodies).then((results) => {
+      for (const [i, want] of wanted) {
+        if (o.proposing.get(i) !== want || !results.bodies[i]) continue; // asked for again since, for other options
+        o.proposing.delete(i);
+        p.results[i] = results.bodies[i];
+      }
+      const keys = r.bodies.flatMap((b, i) => (p.results[i] ? [p.results[i].proposal.options_key] : []));
+      client.saveParting(r.cacheKey, { version: results.version, options_key: keys.every((k) => k === keys[0]) ? keys[0] ?? null : null, bodies: p.results });
+    }))
+    .catch((err) => {
+      for (const [i, want] of wanted) {
+        if (o.proposing.get(i) !== want) continue;
+        o.proposing.delete(i);
+        if (!err.cancelled) o.failed.set(i, want);
+      }
+      if (!err.cancelled) p.error = err.message || String(err);
+    })
+    .finally(() => orientChanged(r));
+}
+
+/** The card, the 3D view and the risers again: the orientation of a body changed (or its proposal). */
+function orientChanged(r) {
+  if (r !== state.result) return;
+  renderParting();
+  if (partingShown()) applyParting();
+  refreshFeeding();
+}
+
+/**
+ * The island the costing retained for a piece (window.reader3d.setProcess):
+ * pieceKey "index:name" (ui.js piecesOf; null: every body of the part shown),
+ * info {code (null: none retained), famille, orientation (the island's,
+ * Paramètres), die ({marges, densite}: the costing's dies)}. Kept for the
+ * part; its parting proposed again for that process. Nothing when nothing
+ * changed (the costing tells it at each drawing of its page): neither kept
+ * nor drawn again. For the model shown. Returns whether anything changed.
+ */
+function setProcess(pieceKey, info) {
+  const r = state.result;
+  if (!r) return false;
+  let bodies = r.bodies.map((_, i) => i);
+  if (pieceKey != null) {
+    const m = /^(\d+):([\s\S]*)$/.exec(String(pieceKey));
+    const i = m ? Number(m[1]) : -1;
+    if (!(i < r.bodies.length) || i < 0 || r.bodies[i].name !== m[2]) return false;
+    bodies = [i];
+  }
+  let changed = false;
+  if (info?.die) {
+    const { marges, densite } = normalizeDie(info.die);
+    const all = orientSaved();
+    if (JSON.stringify(all.die ?? null) !== JSON.stringify({ marges, densite })) {
+      orientWrite({ ...all, die: { marges, densite } });
+      changed = true;
+    }
+  }
+  const costing = info?.code
+    ? { code: String(info.code), famille: info.famille ?? null, orientation: validProcess(info.orientation) ? { plan: info.orientation.plan, alimentation: info.orientation.alimentation } : null }
+    : null;
+  for (const i of bodies) {
+    if (JSON.stringify(orientOf(r).kept.get(i)?.costing ?? null) === JSON.stringify(costing)) continue;
+    orientKeep(i, { costing }, r);
+    changed = true;
+  }
+  // Told from within the costing page's drawing: the parting proposed again after it.
+  if (changed) setTimeout(() => orientChanged(r));
+  return changed;
+}
+
+// ---- the orientation shown
+
+// An id of each definition (an object of p.results or p.current): what a
+// placement of the risers or an orientation was made for.
+const definitionIds = new WeakMap();
+let definitionNext = 1;
+function definitionId(def) {
+  if (!definitionIds.has(def)) definitionIds.set(def, definitionNext++);
+  return definitionIds.get(def);
+}
+
+/** "+Z", "-X", or the components of a direction (as orientation.js writes up_axis). */
+function axisSigned(v) {
+  for (let k = 0; k < 3; k++) if (Math.abs(v[k]) >= 1 - 1e-6) return `${v[k] < 0 ? "-" : "+"}${"XYZ"[k]}`;
+  return `(${v.map((x) => Math.round(x * 1000) / 1000 + 0).join(", ")})`;
+}
+
+/** The orientation `s` (orientation.js summary) with another of its allowed up directions, `choice` (one of s.choices). */
+function upChosen(s, choice) {
+  return {
+    ...s, up: choice.up, up_axis: axisSigned(choice.up), up_side: choice.side,
+    upper_half_down: s.process?.plan === "horizontal" && choice.side === "-d", feeding_score: choice.score,
+  };
+}
+
+/** The allowed up direction of `s` nearest to `g` (a vector). */
+function nearestUp(s, g) {
+  let best = null;
+  for (const c of s.choices ?? []) if (!best || dot3(c.up, g) > dot3(best.up, g) + 1e-9) best = c;
+  return best && dot3(best.up, g) > 0.5 ? best : null;
+}
+
+/**
+ * The orientation of the definition body i shows (orientation.js summary,
+ * with source ("feeding" | "thickness" | "manual": what chose its up),
+ * rule_side (the up of the feeding rule), pending), or null without one: its
+ * own when classified for the options of now, else the worker's for them (and
+ * for the wall thickness once computed: asked for here); then the up chosen
+ * by hand for this draw direction, among the allowed ones. A proposal of
+ * other options is pending (being proposed again).
+ */
+function orientationShown(i, r = state.result) {
+  const field = r ? partingField(i, r) : null;
+  const own = field?.summary?.orientation;
+  if (!own) return null;
+  const opts = partingOptions(i, r);
+  const thickness = thicknessOf(i, r);
+  const stale = field.summary.options_key !== opts.key;
+  let base = own;
+  let pending = false;
+  if (stale && !field.manual) {
+    pending = true; // its proposal for these options on its way (reproposeStale)
+  } else if (stale || (thickness && own.feeding_basis !== "thickness")) {
+    const job = orientJob(i, field, opts, thickness, r);
+    if (job.orientation) base = job.orientation;
+    else pending = stale && !job.error;
+  }
+  let source = base.feeding_basis === "thickness" ? "thickness" : "feeding";
+  const rule = base.up_side;
+  const kept = orientOf(r).kept.get(i)?.up;
+  if (Array.isArray(kept?.direction) && Array.isArray(kept.up) && sameDirection(kept.direction, field.direction)) {
+    const choice = nearestUp(base, kept.up);
+    if (choice) {
+      base = upChosen(base, choice);
+      source = "manual";
+    }
+  }
+  return { ...base, source, rule_side: rule, pending };
+}
+
+/**
+ * The orientation of the definition `field` of body i for options `opts` and
+ * the thickness (or none), asked for once to the worker (orientDirection: the
+ * plane normal of a drawing as drawn, never turned over): {orientation, error}.
+ * A proposal on a horizontal parting plane the thickness turns over (its upper
+ * half down) is proposed again with the thickness.
+ */
+function orientJob(i, field, opts, thickness, r) {
+  const o = orientOf(r);
+  const def = field.manual ? partingOf(r).current.get(i) : partingOf(r).results[i];
+  let jobs = o.oriented.get(def);
+  if (!jobs) o.oriented.set(def, (jobs = new Map()));
+  const key = `${opts.key}|${thickness ? "t" : ""}`;
+  let job = jobs.get(key);
+  if (job || r !== state.result) return job ?? { orientation: null, error: null };
+  job = { orientation: null, error: null };
+  jobs.set(key, job);
+  partClient()
+    .then((client) => client.orientDirection({ ...bodyArrays(i), thickness }, field.direction, { owner: r, process: opts.process, die: opts.die }))
+    .then(({ orientation }) => {
+      job.orientation = orientation;
+      if (!field.manual && thickness && orientation.upper_half_down) reproposeStale(r, [i]);
+    })
+    .catch((err) => {
+      if (err.cancelled) jobs.delete(key);
+      else job.error = err.message || String(err);
+    })
+    .finally(() => orientChanged(r));
+  return job;
+}
+
+/** The casting up and the process of body i as feeding.js takes them ({up, process} beside its parting), or {}. */
+function castingUp(i, r = state.result) {
+  const o = orientationShown(i, r);
+  return o ? { up: o.up, process: { plan: o.process.plan, alimentation: o.process.alimentation } } : {};
+}
+
+/**
+ * The orientation of body i for the exports (the parting export, the semantic
+ * contract, the AI context, the foundry screen): {process: {plan,
+ * alimentation, source, island, famille}, orientation (orientation.js summary,
+ * with up_source)}, or {}.
+ */
+function orientationExport(r, i) {
+  const o = orientationShown(i, r);
+  if (!o) return {};
+  const p = processOf(i, r);
+  const { source, rule_side, pending, ...summary } = o;
+  return {
+    process: { plan: p.plan, alimentation: p.alimentation, source: p.source, island: p.island?.code ?? null, famille: p.island?.famille ?? null },
+    orientation: { ...summary, up_source: source },
+  };
+}
+
+/** The part oriented in its die for the costing (partFeatures): {orientedSize [a, b, c] (mm, c along the draw direction), orientedAxis}, or {}. */
+function orientedPart(i) {
+  const o = orientationShown(i);
+  return o?.raw_mm ? { orientedSize: o.raw_mm, orientedAxis: axisSigned(o.block_axes.d) } : {};
+}
+
+/** Body i turned over (a horizontal parting plane): classified along -d, up kept along it; its faces moved by hand to the other half. */
+async function flipHalves(i) {
+  const r = state.result;
+  const p = partingOf(r);
+  const field = partingField(i);
+  if (!field || field.drawn) return;
+  const seq = ++p.seq;
+  try {
+    const base = await partingDirection(i, field.direction.map((x) => -x + 0));
+    if (r !== state.result || seq !== p.seq) return;
+    orientKeep(i, { up: { direction: base.direction, up: base.direction } }, r);
+    const overrides = Object.fromEntries(Object.entries(field.overrides).map(([face, side]) => [face, side === SIDE_UPPER ? SIDE_LOWER : SIDE_UPPER]));
+    setPartingDefinition(i, { base, source: field.manual ? field.source : "up", overrides, candidate: null });
+  } catch (err) {
+    if (!err.cancelled) showError(`${t("parting.title")} : ${tMessage(err.message || String(err))}`);
+  }
+}
+
+// ---- 3D view
+
+// The label « haut » of the arrow, drawn once per language.
+const upLabels = new Map();
+function upLabel() {
+  const text = t("orient.up.label");
+  let texture = upLabels.get(text);
+  if (!texture) {
+    const canvas = document.createElement("canvas");
+    canvas.width = 128;
+    canvas.height = 48;
+    const g = canvas.getContext("2d");
+    g.font = "600 30px system-ui, sans-serif";
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.lineWidth = 6;
+    g.strokeStyle = "rgba(255, 255, 255, 0.9)";
+    g.strokeText(text, 64, 24);
+    g.fillStyle = "#37474f";
+    g.fillText(text, 64, 24);
+    texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    upLabels.set(text, texture);
+  }
+  return texture;
+}
+
+/**
+ * On the 3D view, with the parting of body i: an arrow « haut » along the
+ * casting up (beside the draw direction's when they are the same), and, the
+ * « Brut » box checked, the die blank as a wire box on the axes of its block.
+ * For scripts and tests: data-orient ("up", "brut") and data-brut (its
+ * sizes, mm) of the card.
+ */
+function addOrientationOverlay(group, i, { drawn, blocks }) {
+  const card = $("parting-card");
+  card.dataset.orient = card.dataset.brut = "";
+  const o = drawn ? null : orientationShown(i);
+  if (!o) return;
+  const sub = new THREE.Group();
+  const { min, max, size } = state.result.bodies[i].bbox;
+  const centre = new THREE.Vector3(...min.map((v, k) => (v + max[k]) / 2));
+  const reach = Math.max(...size);
+  const g = new THREE.Vector3(...o.up).normalize();
+  const along = Math.abs(g.x) * size[0] + Math.abs(g.y) * size[1] + Math.abs(g.z) * size[2];
+  const length = 0.35 * reach;
+  // Up along the draw direction (a horizontal plane): beside its arrow, along the longer side of the block.
+  const aside = Math.abs(g.dot(new THREE.Vector3(...o.block_axes.d))) > 0.9 ? new THREE.Vector3(...o.block_axes.u).multiplyScalar(0.3 * reach) : new THREE.Vector3();
+  const origin = centre.clone().addScaledVector(g, along / 2 + (blocks?.margin ?? 0) + 0.05 * reach).add(aside);
+  sub.add(new THREE.ArrowHelper(g, origin, length, UP_ARROW, 0.28 * length, 0.16 * length));
+  // The label as large on the screen whatever the zoom.
+  const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: upLabel(), depthTest: false, transparent: true, sizeAttenuation: false }));
+  label.scale.set(0.11, 0.041, 1);
+  label.center.set(-0.08, 0.5); // beside the tip of the arrow, not over it
+  label.position.copy(origin).addScaledVector(g, length);
+  label.renderOrder = ORDER_LINE + 1;
+  sub.add(label);
+  const shown = ["up"];
+  if ($("parting-brut").checked && o.die_block_mm) {
+    // The 12 edges of the blank: L along u, l along v, h along d, round the centre of the part's oriented box.
+    const [L, l, h] = o.die_block_mm;
+    const axes = ["u", "v", "d"].map((k) => new THREE.Vector3(...o.block_axes[k]));
+    const half = [L / 2, l / 2, h / 2];
+    const corner = (s) => new THREE.Vector3(...o.raw_centre_mm).add(axes[0].clone().multiplyScalar(s[0] * half[0])).add(axes[1].clone().multiplyScalar(s[1] * half[1])).add(axes[2].clone().multiplyScalar(s[2] * half[2]));
+    const points = [];
+    for (let k = 0; k < 3; k++) {
+      for (const a of [-1, 1]) for (const b of [-1, 1]) {
+        const s0 = [0, 0, 0], s1 = [0, 0, 0];
+        s0[k] = -1;
+        s1[k] = 1;
+        s0[(k + 1) % 3] = s1[(k + 1) % 3] = a;
+        s0[(k + 2) % 3] = s1[(k + 2) % 3] = b;
+        points.push(corner(s0), corner(s1));
+      }
+    }
+    // A line a few pixels wide at any size of the view (its resolution read before each frame).
+    const material = new LineMaterial({ color: BRUT_COLOR, linewidth: BRUT_LINE_PX, transparent: true, opacity: 0.85, clippingPlanes: [sectionPlane] });
+    const box = new LineSegments2(new LineSegmentsGeometry().setPositions(points.flatMap((p) => p.toArray())), material);
+    box.onBeforeRender = () => material.resolution.set(viewport.clientWidth, viewport.clientHeight);
+    box.renderOrder = ORDER_LINE;
+    box.userData.own = true;
+    sub.add(box);
+    shown.push("brut");
+    card.dataset.brut = o.die_block_mm.map((x) => fmtNum(x, 0)).join(" × ");
+  }
+  group.add(sub);
+  card.dataset.orient = shown.join(" ");
+}
+
+// ---- card
+
+/** The process of body i in words: « Procédé : Coquille gravité — plan de joint vertical, coulée par le haut (îlot CG3 retenu dans le chiffrage) ». */
+function processText(p) {
+  const famille = p.source === "costing" ? p.island?.famille ?? "" : "";
+  const low = /^basse pression/i.test(famille) || (!/^coquille/i.test(famille) && p.alimentation === "bas");
+  const origin = p.source === "part"
+    ? t(p.island ? "orient.origin.partCosting" : "orient.origin.part", { code: p.island?.code ?? "" })
+    : p.source === "costing" ? t("orient.origin.costing", { code: p.island.code })
+      : p.island ? t("orient.origin.noDie", { code: p.island.code, famille: p.island.famille ?? "" }) : t("orient.origin.none");
+  return t("orient.process.line", {
+    name: t(low ? "orient.name.lowPressure" : "orient.name.gravity"),
+    plane: t(`orient.plane.${p.plan}`),
+    feed: t(`orient.feed.${p.alimentation}`),
+    origin,
+  });
+}
+
+/** The steel of the die blank of a candidate (its orientation), for the table. */
+const brutKg = (c) => (Number.isFinite(c.orientation?.steel_kg) ? fmtNum(c.orientation.steel_kg, 0) : "—");
+
+/**
+ * The process, the casting up and the die blank of body i on the parting
+ * card (renderParting, which asks for the proposals of other options again).
+ */
+function renderOrientation(p, i, field) {
+  const r = state.result;
+  const proc = processOf(i, r);
+  $("parting-process-line").textContent = processText(proc);
+  const select = $("parting-process-select");
+  const value = processValue(proc);
+  // A process of an island set otherwise in Paramètres (vertical, fed from below): an option of its own.
+  let extra = select.querySelector("option[data-island]");
+  if (!PROCESS_CHOICES[value]) {
+    if (!extra) select.prepend((extra = new Option("", "")));
+    extra.dataset.island = "1";
+    extra.value = value;
+    extra.textContent = `${t(`orient.plane.${proc.plan}`)}, ${t(`orient.feed.${proc.alimentation}`)}`;
+  } else extra?.remove();
+  select.value = value;
+  select.disabled = p.mode === "draw";
+  $("parting-process-reset").hidden = proc.source !== "part";
+  const o = orientationShown(i, r);
+  const card = $("parting-card");
+  card.dataset.process = value;
+  card.dataset.up = o?.up_axis ?? "";
+  // The allowed up directions: the one of the feeding rule starred; on a horizontal plane, the other one turns the halves over.
+  const up = $("parting-up");
+  const options = (o?.choices ?? []).map((c) => {
+    const flips = o.process.plan === "horizontal" && sameDirection(c.up, field.direction.map((x) => -x + 0)) && !field.drawn;
+    const label = `${axisSigned(c.up)}${c.side === o.rule_side ? " ★" : ""}${flips ? ` ${t("orient.up.flips")}` : ""}`;
+    return `<option value="${escapeHtml(c.side)}"${c.side === o.up_side ? " selected" : ""}>${escapeHtml(label)}</option>`;
+  });
+  setHtml(up, options.join("") || `<option>—</option>`);
+  up.value = o?.up_side ?? "";
+  up.disabled = !o || o.pending || !!p.busy || p.mode === "draw";
+  const down = !!o?.upper_half_down;
+  $("parting-flip").hidden = !down || !!field.drawn;
+  $("parting-flip").disabled = !!p.busy || p.mode === "draw";
+  const note = !o ? "" : o.pending ? t("orient.note.pending")
+    : [down ? t(field.drawn ? "orient.note.upperDownDrawn" : "orient.note.upperDown") : "", o.source === "thickness" ? t("orient.note.thickness") : o.source === "manual" ? t("orient.note.manual") : ""].filter(Boolean).join(" ");
+  $("parting-up-note").hidden = !note;
+  $("parting-up-note").textContent = note;
+  $("parting-up-note").classList.toggle("warn", down && !o?.pending);
+  const rows = o?.die_block_mm ? [[
+    t("orient.brut"),
+    t("orient.brut.value", { L: fmtNum(o.die_block_mm[0], 0), l: fmtNum(o.die_block_mm[1], 0), h: fmtNum(o.die_block_mm[2], 0), kg: fmtNum(o.steel_kg, 0) }),
+    t("orient.brut.title", { a: fmtNum(o.raw_mm[0], 0), b: fmtNum(o.raw_mm[1], 0), c: fmtNum(o.raw_mm[2], 0) }),
+  ]] : [];
+  setHtml($("parting-orient"), rows.map(([k, v, title]) => `<dt title="${escapeHtml(title)}">${escapeHtml(k)}</dt><dd title="${escapeHtml(title)}">${escapeHtml(v)}</dd>`).join(""));
+}
+
+/** The legend of the arrow « haut » and of the blank, after the parting's. */
+const orientLegend = () => t("orient.legend");
+
+// Retry (the parting card): the proposals that failed for a process asked for again too.
+$("parting-retry").addEventListener("click", () => {
+  orientOf()?.failed.clear();
+  reproposeStale(state.result);
+});
+$("parting-brut").addEventListener("change", () => {
+  if (partingShown()) applyParting();
+});
+$("parting-process-select").addEventListener("change", (e) => {
+  const i = partingBody();
+  const process = PROCESS_CHOICES[e.target.value];
+  if (i < 0 || !process) return;
+  // Chosen for this part: the up chosen by hand for the process before forgotten.
+  orientKeep(i, { process, up: null });
+  orientChanged(state.result);
+});
+$("parting-process-reset").addEventListener("click", () => {
+  const i = partingBody();
+  if (i < 0) return;
+  orientKeep(i, { process: null, up: null });
+  orientChanged(state.result);
+});
+$("parting-up").addEventListener("change", (e) => {
+  const i = partingBody();
+  const field = i >= 0 ? partingField(i) : null;
+  const o = field ? orientationShown(i) : null;
+  const choice = o?.choices?.find((c) => c.side === e.target.value);
+  if (!choice) return;
+  // A horizontal plane: up along -d turns the halves over (a drawing by hand: said, not turned over).
+  if (o.process.plan === "horizontal" && !field.drawn && sameDirection(choice.up, field.direction.map((x) => -x + 0))) return flipHalves(i);
+  // The up of the feeding rule: no choice by hand.
+  orientKeep(i, { up: choice.side === o.rule_side ? null : { direction: field.direction, up: choice.up } });
+  orientChanged(state.result);
+});
+$("parting-flip").addEventListener("click", () => {
+  const i = partingBody();
+  if (i >= 0) flipHalves(i);
 });
 
 // ---------------------------------------------------------------- tabs
@@ -6566,6 +8202,16 @@ window.reader3d = {
   setMaterial(label, density) {
     setMaterial(label, density);
   },
+  /**
+   * The island the costing retained for a piece ("index:name"; null: every
+   * body of the part shown): {code (null: none), famille, orientation
+   * ({plan, alimentation} of Paramètres), die ({marges, densite} of its
+   * dies)}. The parting of the body is proposed for that casting process.
+   * Returns whether anything changed (false: the same as told last).
+   */
+  setProcess(pieceKey, info) {
+    return setProcess(pieceKey, info);
+  },
   /** Compute the wall thickness of the part shown (with progress), then return part(). */
   async computeThickness() {
     if (state.result?.bodies.some((b) => b.closed)) await ensureThickness();
@@ -6603,6 +8249,10 @@ function partFeatures() {
       area: b.area,
       bboxSize: b.bbox.size,
       thickness: b.closed ? thicknessOf([i]) : null,
+      // The slides of its parting line (the 3D analysis), proposed to « Tiroirs du moule ».
+      slides: b.closed ? slidesBrief(i) : null,
+      // Oriented in its die (the die blank of its draw direction): the size the die block is costed from.
+      ...(b.closed ? orientedPart(i) : {}),
     })),
   };
 }

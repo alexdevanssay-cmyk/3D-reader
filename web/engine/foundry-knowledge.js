@@ -156,6 +156,26 @@ function partingEvidence(body) {
 }
 
 /**
+ * The casting process of the body and its orientation in the die
+ * (orientation.js, given with its parting): the parting plane and the
+ * feeding of the island retained in the costing (or chosen for the part, or
+ * the default), up when cast, the die blank and its steel. Null without one.
+ */
+function orientationEvidence(body) {
+  const o = body?.parting?.orientation;
+  const p = body?.parting?.process;
+  if (!o || !p) return null;
+  return {
+    process: { plan: p.plan ?? null, alimentation: p.alimentation ?? null, source: p.source ?? null, island: p.island ?? null },
+    orientation: {
+      up: o.up ?? null, up_axis: o.up_axis ?? null, up_source: o.up_source ?? null, upper_half_down: o.upper_half_down === true,
+      block_axes: o.block_axes ?? null, raw_mm: o.raw_mm ?? null, die_block_mm: o.die_block_mm ?? null, steel_kg: o.steel_kg ?? null,
+      feeding_score: o.feeding_score ?? null, feeding_basis: o.feeding_basis ?? null,
+    },
+  };
+}
+
+/**
  * Risers and ingate of the body (feeding.js, given with the Reader body):
  * proposed from the inscribed spheres and the moduli (heuristics of the
  * modulus method, not a solidification simulation), or placed by hand.
@@ -184,10 +204,40 @@ function feedingEvidence(body) {
       position_mm: gate.position_mm ?? null,
       on_parting_line: gate.on_parting_line === true,
       section_mm2: gate.section_mm2 ?? null,
+      // Low pressure: the feed through the lower die, not at the parting line.
+      ...(gate.bottom_feed === true ? { bottom_feed: true } : {}),
     } : null,
+    // Fed from below (low pressure): no riser proposed, a feed point per zone.
+    ...(f.mode === "bottom" ? { mode: "bottom", feed_point_count: Array.isArray(f.feed_points) ? f.feed_points.length : 0 } : {}),
     yield: f.yield?.value ?? null,
     parting_known: f.parting_known ?? null,
     sampled: !!f.sampled,
+  };
+}
+
+/**
+ * The slides of the body (slides.js, given with the Reader body): its
+ * undercuts grouped by the lateral direction that releases them, by lines of
+ * sight; proposed, or edited by hand. Not a die design: the slides' draft and
+ * their room in the die are not checked.
+ */
+function slidesEvidence(body) {
+  const s = body?.slides;
+  if (!s || (s.status !== "proposed" && s.status !== "manual") || !finite(s.count)) return { status: "not_evaluated" };
+  const slides = Array.isArray(s.slides) ? s.slides : [];
+  const strokes = slides.map(x => x.stroke_mm).filter(finite);
+  return {
+    status: s.status,
+    count: s.count,
+    cores: s.cores ?? 0,
+    parting_zones: s.parting_zones ?? 0,
+    ignored: s.ignored ?? 0,
+    inclined: slides.filter(x => x.tags?.inclined || finite(x.tilt_deg)).length,
+    long_strokes: slides.filter(x => x.tags?.long_stroke).length,
+    max_stroke_mm: strokes.length ? Math.max(...strokes) : null,
+    enclosed_cavities: (s.cores_detail ?? []).filter(c => c.reason === "enclosed").length,
+    edited: !!s.edited,
+    capped: (s.warnings ?? []).includes("capped"),
   };
 }
 
@@ -195,6 +245,18 @@ function feedingEvidence(body) {
 const pct = (share) => (share > 0 && share < 0.0005 ? "< 0,1 %" : `${(Math.round(share * 1000) / 10).toLocaleString("fr-FR")} %`);
 const mm = (v) => `${(Math.round(v * 10) / 10).toLocaleString("fr-FR")} mm`;
 const mm2 = (v) => `${(Math.round(v * 10) / 10).toLocaleString("fr-FR")} mm²`;
+
+const fr = (v) => (Math.round(v * 10) / 10).toLocaleString("fr-FR");
+const plural = (n, one, many) => `${n} ${n > 1 ? many : one}`;
+const MANY_SLIDES = 4; // slides.js SLIDE_DEFAULTS.manySlides
+
+/** A pull direction of a slide in words: « +Y », « +Y +30° », « +Y, incliné de 20° vers le haut ». */
+function slideDirection(x) {
+  let name = String(x.reference_axis ?? x.axis ?? "").replace(/^-/, "−");
+  if (finite(x.angle_deg)) name += ` ${x.angle_deg > 0 ? "+" : "−"}${fr(Math.abs(x.angle_deg))}°`;
+  if (finite(x.tilt_deg)) name += `, incliné de ${fr(x.tilt_deg)}° vers le ${x.tilt_up === false ? "bas" : "haut"}`;
+  return name;
+}
 
 function issue(code, severity, basis, message, source_ids = [], extra = {}) {
   return { code, severity, basis, message, source_ids, ...extra };
@@ -207,6 +269,9 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
   const partingKnown = parting.status !== "not_evaluated";
   const feeding = feedingEvidence(body);
   const feedingKnown = feeding.status !== "not_evaluated";
+  const slides = slidesEvidence(body);
+  const slidesKnown = slides.status !== "not_evaluated";
+  const oriented = orientationEvidence(body);
   const undercut = partingKnown && parting.undercut_area_mm2 > 0;
   const zeroDraft = partingKnown && parting.zero_draft_area_mm2 > 0;
   const nonPlanar = partingKnown && parting.parting_line?.planar === false;
@@ -336,12 +401,56 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
     requiredChecks.push("select_parting_direction");
     requiredChecks.push("evaluate_draft_and_pattern_release");
   }
+  // The undercuts grouped into slides by the lateral direction that releases
+  // them (slides.js): a count proposed to the costing, to validate with the
+  // tooling; what no slide releases is a core (or machining).
+  if (slidesKnown) {
+    confirmedEvidence.push("slides_grouped_from_undercuts");
+    const list = Array.isArray(body.slides.slides) ? body.slides.slides : [];
+    const cores = Array.isArray(body.slides.cores_detail) ? body.slides.cores_detail : [];
+    const area = (items) => items.reduce((n, c) => n + (finite(c.area_mm2) ? c.area_mm2 : 0), 0);
+    const SLIDE_SOURCES = ["sfsa_design_steps", "asm_casting_design"];
+    const slideIssue = (code, severity, message, extra = {}) => risks.push(issue(code, severity, "measured_lateral_lines_of_sight", message, SLIDE_SOURCES, extra));
+    if (slides.count > 0) {
+      slideIssue("slides_proposed", "review",
+        `${plural(slides.count, "tiroir proposé", "tiroirs proposés")} (${list.map(x => `${x.id} ${slideDirection(x)}, course ${mm(x.stroke_mm)}`).join(" ; ")}) : à valider avec l'outillage.`,
+        { count: slides.count });
+    }
+    if (slides.cores > 0) {
+      slideIssue("probable_sand_core", "review", `${plural(slides.cores, "zone sans sortie latérale", "zones sans sortie latérale")} (noyau probable ou usinage) : ${mm2(area(cores))}.`, { cores: slides.cores });
+    }
+    const enclosed = cores.filter(c => c.reason === "enclosed");
+    if (enclosed.length) {
+      slideIssue("enclosed_cavity", "high",
+        `${enclosed.length > 1 ? `${enclosed.length} cavités fermées` : "Cavité fermée"} sans ouverture (${mm2(area(enclosed))}) : noyau sans portée, à revoir avec le client.`,
+        { cavities: enclosed.length });
+    }
+    if (slides.count > MANY_SLIDES) slideIssue("many_slides", "review", `${plural(slides.count, "tiroir", "tiroirs")}, plus de ${MANY_SLIDES} : revoir la direction de démoulage, ou des noyaux.`);
+    const inclined = list.filter(x => finite(x.tilt_deg));
+    if (inclined.length) {
+      slideIssue("inclined_slide", "review",
+        `${plural(inclined.length, "tiroir incliné", "tiroirs inclinés")} hors du plan de joint (${inclined.map(x => `${x.id} : ${fr(x.tilt_deg)}°`).join(", ")}) : moule plus complexe, à confirmer avec l'outillage.`);
+    }
+    const long = list.filter(x => x.tags?.long_stroke);
+    if (long.length) slideIssue("long_stroke", "review", `Course longue (${long.map(x => `${x.id} : ${mm(x.stroke_mm)}`).join(", ")}) : vérin et place dans le moule à vérifier.`);
+    if (slides.parting_zones > 0) {
+      slideIssue("undercut_to_rework_at_parting_line", "review",
+        `${plural(slides.parting_zones, "zone qu'une chape pourrait former", "zones qu'une chape pourrait former")} mais que la ligne de joint laisse en contre-dépouille : ligne étagée ou faces à réaffecter.`);
+    }
+    if (slides.count > 0) requiredChecks.push("validate_slides_with_tooling");
+    if (slides.cores > 0) requiredChecks.push("confirm_cores_for_unreleasable_undercuts");
+  }
   // Risers and ingate proposed from the geometry (feeding.js) or placed by
   // hand: a starting point, to be validated; a hot spot needing a riser left
   // without one is a likely shrinkage.
+  // Fed from below (low pressure) without a riser: the feed points, sized from
+  // the modulus of their zones, are the feeding, not risers.
+  const bottomFeedOnly = feedingKnown && feeding.mode === "bottom" && feeding.riser_count === 0;
   if (feedingKnown) {
-    confirmedEvidence.push(feeding.risers_status === "manual" ? "risers_placed_manually" : "risers_proposed_from_geometry");
+    confirmedEvidence.push(bottomFeedOnly ? "feed_points_sized_by_modulus"
+      : feeding.risers_status === "manual" ? "risers_placed_manually" : "risers_proposed_from_geometry");
     if (feeding.gate?.on_parting_line) confirmedEvidence.push("gate_on_parting_line");
+    if (feeding.gate?.bottom_feed) confirmedEvidence.push("bottom_feed_through_lower_die");
     if (feeding.hot_spots_without_riser.length) {
       risks.push(issue(
         "hot_spot_without_riser",
@@ -352,7 +461,8 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
         { zones: feeding.hot_spots_without_riser },
       ));
     }
-    if (feeding.gate && !feeding.gate.on_parting_line) {
+    // A feed from below (low pressure) goes through the lower die, not at the parting line.
+    if (feeding.gate && !feeding.gate.on_parting_line && !feeding.gate.bottom_feed) {
       risks.push(issue(
         "gate_off_parting_line",
         "review",
@@ -378,10 +488,13 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
     cores: partingKnown
       ? (undercut ? "undercuts_detected" : "no_undercut_for_the_chosen_axis")
       : cylindricalFaces.size + pocketCount > 0 ? "undetermined_without_concavity_test" : "not_detected",
+    slides: !slidesKnown ? "not_evaluated"
+      : slides.status === "manual" ? "edited_manually"
+        : slides.count === 0 && slides.cores === 0 ? "none_needed" : "proposed_from_undercut_regions",
     hot_spots: feedingKnown ? "located_by_inscribed_sphere_feeding_zones" : thickness.status === "measured" ? "screened_by_thickness_distribution" : "not_available",
     directional_solidification: feedingKnown ? "screened_by_section_necks_not_simulated" : "not_simulated",
-    risering: !feedingKnown ? "not_sized" : feeding.risers_status === "manual" ? "placed_manually" : "proposed_by_modulus_heuristic",
-    gating: !feedingKnown || !feeding.gate ? "not_sized" : feeding.gate.source === "manual" ? "placed_manually" : "proposed_on_parting_line",
+    risering: !feedingKnown ? "not_sized" : bottomFeedOnly ? "none_bottom_feed" : feeding.risers_status === "manual" ? "placed_manually" : "proposed_by_modulus_heuristic",
+    gating: !feedingKnown || !feeding.gate ? "not_sized" : feeding.gate.source === "manual" ? "placed_manually" : feeding.gate.bottom_feed ? "proposed_bottom_feed" : "proposed_on_parting_line",
     filling: "not_simulated",
     porosity: "not_simulated",
     distortion: "not_simulated",
@@ -414,6 +527,9 @@ export function buildFoundryAnalysis(body, features = [], principalAxes = null, 
       topology: body?.topology ?? null,
       thickness,
       parting,
+      // Beside the parting: the casting process and the orientation of the part in its die.
+      ...(oriented ?? {}),
+      slides,
       feeding,
       principal_axes: principalAxes,
       feature_counts: {

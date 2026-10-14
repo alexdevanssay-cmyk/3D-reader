@@ -22,6 +22,18 @@ import { ROOT, approx, fixturePath } from '../js/helpers.mjs';
 const DIST = join(ROOT, 'dist');
 const CAD_TIMEOUT = 180_000;
 
+/**
+ * The card's body cast in a gravity die with a horizontal parting plane (the
+ * process of the parting card; by default a vertical one, up across the draw
+ * direction): up when cast along the draw direction, the risers on top along
+ * it, as this test reads them. Kept for the part; once the risers are placed
+ * for it.
+ */
+async function horizontalPlane(page, body = 0) {
+  await page.selectOption('#parting-process-select', 'horizontal-haut');
+  await page.waitForFunction((i) => window.reader3d.semantic?.bodies?.[i]?.feeding?.process?.plan === 'horizontal', body, { timeout: 120_000 });
+}
+
 describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html')) && 'run `npm run build` first' }, () => {
   let server;
   let base;
@@ -76,6 +88,7 @@ describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html
     };
 
     await open();
+    await horizontalPlane(page);
     await waitStatus('proposed', '1');
     // Proposed: one zone (a plate of 20 mm), one open riser on the top face, its footprint clear of the hole.
     let shown = await card();
@@ -240,6 +253,7 @@ describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html
       await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
     };
     await open();
+    await horizontalPlane(page);
     // Drawn along Z: its top face z = 15 turned up, its front face y = -10 on the side.
     await page.waitForSelector('#parting-candidates tr[data-candidate]', { timeout: 60_000 });
     await page.click('#parting-candidates tr[data-candidate] >> text=Z');
@@ -331,6 +345,7 @@ describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html
     await page.click('#bodies tr[data-index="1"] td.name');
     await page.waitForFunction(() => document.getElementById('feeding-card').dataset.status === 'proposed', null, { timeout: 60_000 });
     await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
+    await horizontalPlane(page, 1);
     const faded = () => page.evaluate(() => document.getElementById('viewport').dataset.faded);
     // Orange pixels of the 3D view: the risers.
     const orange = async () => {

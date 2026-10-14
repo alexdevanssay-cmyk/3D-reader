@@ -12,7 +12,13 @@
 import { quote } from "./model.js";
 import { cavityFactor, estimateTooling, isGravityDie } from "./tooling.js";
 
-// Casting islands (codes of the profit centres of the workbook).
+// Casting islands (codes of the profit centres of the workbook). The islands
+// whose dies are made in-house have the orientation of their die
+// (engine/orientation.js, proposed on the 3D page for the piece the island is
+// retained for): plan, the parting plane ("vertical": the die opens
+// horizontally, poured from the top, sprue and risers in the parting plane;
+// "horizontal": the upper die moving); alimentation, the feeding ("haut":
+// from the top, risers; "bas": from below, through the lower die).
 export const DEFAULT_PROCESSES = {
   SSP: {
     famille: "Sous pression",
@@ -29,6 +35,7 @@ export const DEFAULT_PROCESSES = {
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 35000,
     rendement: { base: 0.88, parDoublement: 0.04, petitePiece: 0.03 },
     cycle: { base: 120, parKg: 4, exposant: 1, parModule2: 12 },
+    orientation: { plan: "horizontal", alimentation: "bas" },
   },
   CG1: {
     famille: "Coquille gravité (DFP5 New look)",
@@ -37,6 +44,7 @@ export const DEFAULT_PROCESSES = {
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 20000,
     rendement: { base: 0.68, parDoublement: 0.06, petitePiece: 0.04 },
     cycle: { base: 90, parKg: 6, exposant: 1, parModule2: 10 },
+    orientation: { plan: "vertical", alimentation: "haut" },
   },
   CG2: {
     famille: "Coquille gravité (Gauss 2)",
@@ -45,6 +53,7 @@ export const DEFAULT_PROCESSES = {
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 20000,
     rendement: { base: 0.68, parDoublement: 0.06, petitePiece: 0.04 },
     cycle: { base: 80, parKg: 6, exposant: 1, parModule2: 10 },
+    orientation: { plan: "vertical", alimentation: "haut" },
   },
   CG4: {
     famille: "Coquille gravité (SAB Auto)",
@@ -53,6 +62,7 @@ export const DEFAULT_PROCESSES = {
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 20000,
     rendement: { base: 0.68, parDoublement: 0.06, petitePiece: 0.04 },
     cycle: { base: 80, parKg: 6, exposant: 1, parModule2: 10 },
+    orientation: { plan: "vertical", alimentation: "haut" },
   },
   CG5: {
     famille: "Coquille gravité (Gauss 1)",
@@ -61,6 +71,7 @@ export const DEFAULT_PROCESSES = {
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 20000,
     rendement: { base: 0.68, parDoublement: 0.06, petitePiece: 0.04 },
     cycle: { base: 80, parKg: 6, exposant: 1, parModule2: 10 },
+    orientation: { plan: "vertical", alimentation: "haut" },
   },
   CG3: {
     famille: "Coquille gravité (traditionnel)",
@@ -69,6 +80,7 @@ export const DEFAULT_PROCESSES = {
     tth: true, noyaux: true, finitions: ["FCE", "FTR"], outillage: 10000,
     rendement: { base: 0.6, parDoublement: 0.06, petitePiece: 0.04 },
     cycle: { base: 150, parKg: 10, exposant: 1, parModule2: 12 },
+    orientation: { plan: "vertical", alimentation: "haut" },
   },
 };
 

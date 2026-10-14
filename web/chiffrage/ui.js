@@ -7,7 +7,7 @@ import { centreRates, indexAverage, quote, saleMetalPrice, solveMargin as minimu
 import { bestRoutes, buildRoute, cavityChoices, rankRoutes } from "./routes.js";
 import { coreBoxCost, coresPerPiece, newCore } from "./cores.js";
 import { filledFields, orderValues, programmeFor, programmeOf, readSeriesOrder, sameProgramme } from "./rfq.js";
-import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, demandeComparee, label as traceLabel, pieceNames, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
+import { ALERTES, SEUIL_TENDANCE, SOURCES as TRACE_SOURCES, demandeComparee, dieBasis, label as traceLabel, pieceNames, summarize, traceEnsemble, tracePiece, traceQuote } from "./provenance.js";
 import { compareCycles, countHistory, exportHistory, importHistory, mergeHistory, productionRecord } from "./history.js";
 import {
   SIMILAR, adoptEstimate, adoptedEstimate, anonymiseCycleData, cycleData, cycleNumbers, cycleQuestion, cycleText, fitCycleData, forgetAdoption, localCycleRules, readCycleAnswer, recordCycleData, undoAdoption,
@@ -18,6 +18,7 @@ import * as store from "./store.js";
 import { PROPOSAL_FIELDS, sameValue, valueLabel } from "./ai-apply.js";
 import * as network from "../network-folder.js";
 import { forgetRead, pendingCount, syncFeedback, writeFeedback } from "./feedback.js";
+import { adoptSlides, adoptedMessage, forgetSlidesAdoption, slidesLineModel, slidesProposal, undoSlides, undoneMessage } from "./slides3d.js";
 
 let el = null;
 let page = "chiffrage";
@@ -27,7 +28,7 @@ let indices = store.loadIndices();
 let layers = store.loadSettingsLayers(base);
 let settings = layers.effective;
 let q = store.loadQuote(base, indices);
-let message = null; // {kind: "ok" | "error", text}
+let message = null; // {kind: "ok" | "warn" | "error", text, read}: said until the user's next action (dismissMessage)
 let thicknessBusy = false;
 let traceOpen = false; // detail of the traced values unfolded (card "Traçabilité")
 
@@ -37,7 +38,9 @@ export function mount(targets) {
     container.addEventListener("change", onChange);
     container.addEventListener("click", onClick);
     container.addEventListener("pointerdown", (e) => {
-      if (e.target.closest("button, [data-action]")) pointerDown = true;
+      if (!e.target.closest("button, [data-action]")) return;
+      pointerDown = true;
+      press = { message };
     }, true);
     // A file dropped on the row of a data file replaces that file.
     container.addEventListener("dragover", (e) => {
@@ -60,7 +63,9 @@ export function mount(targets) {
       e.stopPropagation();
       zone.classList.remove("drop-target");
       const file = e.dataTransfer.files?.[0];
-      if (file) importFile({ files: [file], dataset: { file: zone.dataset.drop }, value: "" });
+      if (!file) return;
+      dismissMessage();
+      importFile({ files: [file], dataset: { file: zone.dataset.drop }, value: "" });
     });
   }
   document.addEventListener("reader3d-part", () => {
@@ -94,6 +99,41 @@ function pushMaterial() {
   if (q.alliage) window.reader3d?.setMaterial?.(q.alliage, densityOf(q.alliage));
 }
 
+/**
+ * The island retained for each piece of the 3D model costed (results of
+ * compute; none given, in Paramètres: computed again with the settings of
+ * now, on a copy of the quote, nothing saved), with its orientation
+ * (Paramètres: plan de joint, alimentation) and the margins and steel density
+ * of the dies, to the 3D page (app.js setProcess): the parting of the body is
+ * proposed for that process, its die block with these margins. At each
+ * drawing of the page; the 3D page does nothing when nothing changed. An
+ * error of the 3D page is its own: logged, the page drawn all the same.
+ */
+function pushProcesses(results = null) {
+  const setProcess = window.reader3d?.setProcess;
+  if (!setProcess || !base) return;
+  if (!results) {
+    const [quoteShown, keyShown] = [q, currentKey];
+    q = structuredClone(q);
+    try {
+      results = compute({ save: false })?.results ?? [];
+    } finally {
+      [q, currentKey] = [quoteShown, keyShown];
+    }
+  }
+  const die = { marges: settings.tooling?.marges ?? null, densite: settings.tooling?.densite ?? null };
+  for (const r of results) {
+    if (r.piece.index === undefined) continue; // the piece typed in: no 3D model
+    const code = r.route?.process ?? null;
+    const p = code ? settings.processes[code] : null;
+    try {
+      setProcess(r.piece.key, { code: p ? code : null, famille: p?.famille ?? null, orientation: p?.orientation ?? null, die });
+    } catch (err) {
+      console.warn("Island retained not told to the 3D page", err);
+    }
+  }
+}
+
 /** The data files, the settings and the quote read again from this browser's storage (tests). */
 export function reload() {
   base = store.loadBase();
@@ -104,6 +144,9 @@ export function reload() {
 
 export function show(name) {
   page = name;
+  // A page opened: a message read before is no longer said; one given while the pages were hidden (the values
+  // applied from the IA page, an import finished meanwhile) is said now.
+  if (message?.read) message = null;
   render();
   refreshNetwork(); // the retours d'expérience of the other PCs, in the background
 }
@@ -263,7 +306,9 @@ export function applyAIValues(target, proposals, origin = {}, { dryRun = false }
       const was = record[champ];
       // Not from a value reset by another island: what was there before was for that one.
       const keep = was && sameValue(piece[champ] ?? null, was.valeur) && (!["procede", "finition", ...ROUTE_FIELDS].includes(champ) || (was.procede === procede && was.cle !== "piece.ilot"));
-      record[champ] = { valeur, avant: keep ? was.avant : piece[champ] ?? null, procede, date, provider: origin.provider ?? null, model: origin.model ?? null, message: origin.message ?? null, cle, ...extra };
+      // A second one keeps the count of the 3D analysis the first replaced, back with an undo.
+      const earlier = keep && was.tiroirs3D ? { tiroirs3D: was.tiroirs3D } : {};
+      record[champ] = { valeur, avant: keep ? was.avant : piece[champ] ?? null, procede, date, provider: origin.provider ?? null, model: origin.model ?? null, message: origin.message ?? null, cle, ...earlier, ...extra };
       piece[champ] = valeur;
     };
     if (islandSet) {
@@ -273,8 +318,9 @@ export function applyAIValues(target, proposals, origin = {}, { dryRun = false }
     }
     for (const x of changes) {
       if (islandSet && ["procede", "finition"].includes(x.champ)) continue;
-      // An adopted estimate of the cycle replaced: kept with the record, back with an undo.
-      write(x.champ, x.apres, x.cle, x.champ === "cycle" && piece.cycleIA ? { cycleIA: piece.cycleIA } : {});
+      // An adopted estimate of the cycle, or count of slides of the 3D analysis, replaced: kept with the record, back with an undo.
+      write(x.champ, x.apres, x.cle, x.champ === "cycle" && piece.cycleIA ? { cycleIA: piece.cycleIA }
+        : x.champ === "outillageTiroirs" && piece.tiroirs3D ? { tiroirs3D: piece.tiroirs3D } : {});
     }
     // Cores checked by this application: a first core to describe, as the casting card does (taken back with an undo).
     if (changes.some((x) => x.champ === "noyaux" && x.apres === true) && !piece.cores?.length) {
@@ -282,6 +328,7 @@ export function applyAIValues(target, proposals, origin = {}, { dryRun = false }
       record.noyaux.cores = structuredClone(piece.cores);
     }
     forgetAdoption(piece);
+    forgetSlidesAdoption(piece);
     const list = [...changes, ...consequences].map(changeText).join(" ; ");
     q.analysesIA = [...(q.analysesIA ?? []), { date, provider: origin.provider ?? null, model: origin.model ?? null, question: "Appliquer les valeurs au chiffrage", answer: `Appliqué à « ${name} » : ${list}.`, verified: true, tache: "application_ia" }];
     out.saved = store.saveQuote(q) !== false;
@@ -334,11 +381,13 @@ export function undoAIValues(target, { message: answer = null } = {}) {
     if (a.avant === null) delete piece[champ];
     else piece[champ] = a.avant;
     if (champ === "cycle" && a.cycleIA) piece.cycleIA = a.cycleIA;
+    if (champ === "outillageTiroirs" && a.tiroirs3D) piece.tiroirs3D = a.tiroirs3D;
     if (champ === "noyaux" && a.cores && json(piece.cores) === json(a.cores)) delete piece.cores;
     undone.push({ champ, label, avant: a.valeur, apres: a.avant, unite: fieldOf(champ)?.unite ?? "" });
   }
   if (!Object.keys(record).length) delete piece.valeursIA;
   forgetAdoption(piece);
+  forgetSlidesAdoption(piece);
   const name = target.name ?? target.key;
   const list = undone.map(changeText).join(" ; ");
   q.analysesIA = [...(q.analysesIA ?? []), { date: new Date().toISOString(), provider: null, model: null, question: "Annuler l'application des valeurs de l'IA", answer: `Annulé pour « ${name} » : ${list || "aucune valeur (modifiées depuis)"}.`, verified: true, tache: "application_ia" }];
@@ -455,6 +504,7 @@ function readValue(target) {
 function onChange(event) {
   const target = event.target;
   const bind = target.dataset.bind;
+  if (bind || target.dataset.file || target.dataset.pref) dismissMessage();
   if (!bind) {
     if (target.dataset.file) importFile(target);
     // Box "Envoyer les pièces similaires de l'historique": a choice of this browser, not of the quote.
@@ -503,6 +553,7 @@ function onChange(event) {
       piece.cores = [{ ...newCore(0, poids), ...(piece.sableKg > 0 ? { masse: piece.sableKg } : {}) }];
     }
     forgetAdoption(piece);
+    forgetSlidesAdoption(piece);
     forgetAIValues(piece);
     store.saveQuote(q);
   } else {
@@ -518,6 +569,12 @@ function onChange(event) {
 async function onClick(event) {
   const button = event.target.closest("[data-action]");
   if (!button) return;
+  // Only the message said before the button was pressed goes, not one given while it was held down: the field it
+  // took the focus from (its change comes before the click, a value refused). A click of the keyboard (detail 0)
+  // has no press. None left (dismissed by that change): out of the page at once too.
+  const before = press && event.detail ? press.message : message;
+  press = null;
+  if (!message || message === before) dismissMessage();
   const action = button.dataset.action;
   if (action === "import-workbook" || action === "import-indices" || action === "import-tendances" || action === "import-rfq" || action === "import-historique") button.parentElement.querySelector("input[data-file]")?.click();
   else if (action === "show-parametres") document.querySelector('.tab[data-page="parametres"]')?.click();
@@ -537,9 +594,12 @@ async function onClick(event) {
     piece.finition = action === "auto" ? "auto" : button.dataset.finition;
     piece.cycle = piece.empreintes = piece.miseAuMille = piece.mode = null;
     forgetAdoption(piece);
+    forgetSlidesAdoption(piece);
     forgetAIValues(piece);
     store.saveQuote(q);
     render();
+  } else if (action === "use-slides-3d" || action === "undo-slides-3d" || action === "keep-slides-3d") {
+    slidesAction(action);
   } else if (action === "cavities" || action === "cavities-auto") {
     retainCavities(action === "cavities" ? Number(button.dataset.n) : null);
     render();
@@ -1019,8 +1079,11 @@ function computePiece(piece, { density, years, volumes, volumeTotal, metal, ener
     epaisseurMax: value("epaisseurMax") ?? 0,
     moduleMm: value("moduleMm") ?? 0,
     dimMax: value("dimMax") ?? 0,
-    // For the estimate of the tooling: the envelope, volume and surface of the 3D model.
+    // For the estimate of the tooling: the envelope, volume and surface of the 3D model; the part
+    // oriented in its die (the smallest block round it along its draw direction: the 3D page's parting).
     bboxSize: piece.bboxSize ?? null,
+    orientedSize: piece.orientedSize ?? null,
+    orientedAxis: piece.orientedAxis ?? null,
     volume: piece.volume ?? null,
     area: piece.area ?? null,
     volumeAnnuel: q.volumeAnnuel || 0,
@@ -1274,6 +1337,8 @@ function thicknessText(t) {
 // gets it back.
 let pointerDown = false;
 let pending = false;
+let shownResults = null; // the pieces costed in the page drawn (renderQuote), for pushProcesses
+let press = null; // {message}: the message said when a button was last pressed down (onClick)
 window.addEventListener("pointerup", () => {
   pointerDown = false;
   if (pending) setTimeout(render, 0);
@@ -1292,19 +1357,41 @@ function render() {
   // drawn again (a 3D result, the shared folder read), and a file picked in an
   // input no longer in the page would be lost.
   const files = new Map([...container.querySelectorAll("input[type=file][data-file]")].map((input) => [input.dataset.file, input]));
+  shownResults = null;
   container.innerHTML = page === "parametres" ? renderSettings() : renderQuote();
   for (const input of container.querySelectorAll("input[type=file][data-file]")) {
     const kept = files.get(input.dataset.file);
     if (kept) input.replaceWith(kept);
   }
+  // The islands retained (Chiffrage), or their settings changed (Paramètres): told to the 3D page.
+  if (page === "parametres" || shownResults) pushProcesses(shownResults);
   if (focused) container.querySelector(`[data-bind="${CSS.escape(focused)}"]`)?.focus();
+  // Drawn in the page in view: read (not said again when a page is opened, show).
+  if (message && !container.hidden) message.read = true;
 }
 
+/**
+ * The message of the last action (an import, a setting, a button, the values
+ * applied from the IA page), drawn again with the page each time it is drawn
+ * (a 3D result, the shared folder read): until the user's next action
+ * (dismissMessage), another tab (setTab) or a page opened once it was read
+ * (show).
+ */
 function messageHtml() {
-  if (!message) return "";
-  const html = `<div class="cmsg ${message.kind}">${esc(message.text)}</div>`;
+  return message ? `<div class="cmsg cnotice ${message.kind}">${esc(message.text)}</div>` : "";
+}
+
+/**
+ * The user acts on a costing page (a field or a box changed, a button
+ * clicked, a file dropped): the message of the action before is no longer
+ * said, also when the page is not drawn again (a file picker opened, a
+ * dialog cancelled). Left in the page while a button is being pressed: the
+ * page is drawn again once it is released (render). A click dismisses only
+ * the message said before its press (onClick).
+ */
+function dismissMessage() {
   message = null;
-  return html;
+  if (!pointerDown) for (const container of Object.values(el)) container.querySelector(".cnotice")?.remove();
 }
 
 function sourcesCard() {
@@ -1335,6 +1422,7 @@ function renderQuote() {
       ${historyCard()}</div>`;
   }
   const c = compute();
+  shownResults = c.results;
   const lists = base.lists;
   const typologies = indices?.typologies?.length ? indices.typologies.map((t) => t.name) : lists.typologies;
   const months = indices?.months ?? [];
@@ -1553,7 +1641,8 @@ function toolingCard(r) {
           ? field("Vendu à part", `<output>${eur(route.outillage * (1 + (q.margeOutillage || 0)), 0)} HT</output>`, "non compris dans le prix pièce (voir le détail du chiffrage)")
           : field("Amorti par pièce", `<output>${amortised === null ? "—" : eur(amortised, 3)}</output>`, `sur ${nf(r.part.volumeTotal, 0)} pièces du programme, compris dans le prix pièce`)}
       </div>
-      ${t ? `<p class="small muted">Méthode du classeur « Outillage fonderie » : moule ${nf(t.block.L, 0)} × ${nf(t.block.W, 0)} × ${nf(t.block.H, 0)} mm = encombrement de la pièce + marges, poids × coefficient, heures d'usinage, de scan et d'ajustage par tranche de poids, étude et FAO selon la complexité. Taux et tableaux dans Paramètres.</p>` : ""}
+      ${t ? slidesLine(r) : ""}
+      ${t ? `<p class="small muted">Méthode du classeur « Outillage fonderie » : moule ${nf(t.block.L, 0)} × ${nf(t.block.W, 0)} × ${nf(t.block.H, 0)} mm = ${esc(t.block.oriented ? dieBasis(t.block, r.part) : "encombrement de la pièce")} + marges, poids × coefficient, heures d'usinage, de scan et d'ajustage par tranche de poids, étude et FAO selon la complexité. Taux et tableaux dans Paramètres.</p>` : ""}
       ${route.boxes.length ? `<h4>Boîtes à noyau</h4>
       <div class="cscroll"><table class="ctable">
         <tbody>${route.boxes
@@ -1562,6 +1651,42 @@ function toolingCard(r) {
         <tfoot><tr><td><strong>Total outillage</strong></td><td class="muted small">moule ${total(route.outillageMoule)} + boîtes à noyau ${total(route.outillage - route.outillageMoule)}</td><td class="num"><strong>${total(route.outillage)}</strong></td></tr></tfoot>
       </table></div>` : ""}
     </section>`;
+}
+
+/**
+ * Under « Tiroirs du moule »: the slides of the 3D analysis (slides3d.js),
+ * their count per part × the cavities, and « Utiliser » (never applied
+ * without that click); once used, « Ne plus utiliser l'analyse 3D », and a
+ * change of the analysis since shown, the value kept.
+ */
+function slidesLine(r) {
+  const m = slidesLineModel(r, { defaut: settings.tooling?.tiroirs ?? 0 });
+  if (!m) return "";
+  const buttons = m.buttons.map((b) => ` <button type="button" class="small" data-action="${esc(b.action)}">${esc(b.label)}</button>`).join("");
+  return `<p class="cslides small${m.warn ? " cmsg warn" : ""}" data-slides-3d>${m.warn ? "⚠ " : ""}${esc(m.text)}${buttons}</p>`;
+}
+
+/** « Utiliser », « Ne plus utiliser l'analyse 3D », « Garder » of the slides of the 3D analysis, for the piece shown. */
+function slidesAction(action) {
+  const c = compute();
+  const r = c?.results.find((x) => x.piece.key === currentKey);
+  const proposal = r ? slidesProposal(r.piece, r.route) : null;
+  if (!proposal) return;
+  const piece = pieceStore(r.piece.key);
+  const defaut = settings.tooling?.tiroirs ?? 0;
+  if (action === "use-slides-3d") {
+    if (proposal.status !== "ready") return;
+    const record = adoptSlides(piece, r.inputs, proposal);
+    message = { kind: "ok", text: adoptedMessage(record, { defaut }) };
+  } else if (action === "undo-slides-3d") {
+    const record = undoSlides(piece);
+    if (record) message = { kind: "ok", text: undoneMessage(record) };
+  } else if (action === "keep-slides-3d") {
+    // The value stays, as a value typed in.
+    delete piece.tiroirs3D;
+  }
+  store.saveQuote(q);
+  render();
 }
 
 /**
@@ -1998,6 +2123,7 @@ export function retainCavities(n) {
   piece.empreintes = n;
   if (n !== null) piece.cycle = piece.outillagePrix = null;
   forgetAdoption(piece);
+  forgetSlidesAdoption(piece);
   forgetAIValues(piece);
   store.saveQuote(q);
   const after = compute()?.results.find((x) => x.piece.key === r.piece.key)?.route;
@@ -2853,6 +2979,13 @@ function sinput(path, value, opts = {}) {
   return `<span class="cval">${input(`s.${path}`, value, opts)}<span class="csrc ${p.source}" title="${esc(title)}">${opts.compact ? letter : label}</span></span>${trend}`;
 }
 
+/** A choice of the settings (select "s.<path>") in a table, with the letter of where its value comes from (as sinput). */
+function sselect(path, value, options) {
+  const p = layers.provenance(path);
+  const [label, letter] = SOURCES[p.source];
+  return `<span class="cval">${select(`s.${path}`, value, options)}<span class="csrc ${p.source}" title="${esc(label)}">${letter}</span></span>`;
+}
+
 /** The number of values of the trends `t`, those completed by the defaults left out. */
 const trendCount = (t) => store.countValues(t.values) - (t.completed?.length ?? 0);
 
@@ -2897,6 +3030,19 @@ function settingsSourcesCard() {
   </section>`;
 }
 
+/**
+ * The orientation of the die of an island (settings.processes[code].orientation,
+ * engine/orientation.js): its parting plane and its feeding, for the islands
+ * whose dies are made in-house (gravity dies, low pressure dies); « — » for
+ * the others (die casting: the 3D page takes the default).
+ */
+function orientationCells(code, p) {
+  if (!/^(Coquille gravité|Basse pression)/i.test(p.famille ?? "")) return `<td class="muted">—</td><td class="muted">—</td>`;
+  const o = p.orientation ?? {};
+  return `<td>${sselect(`processes.${code}.orientation.plan`, o.plan ?? "", [["vertical", "vertical"], ["horizontal", "horizontal"]])}</td>
+      <td>${sselect(`processes.${code}.orientation.alimentation`, o.alimentation ?? "", [["haut", "par le haut"], ["bas", "par le bas"]])}</td>`;
+}
+
 function renderSettings() {
   const centres = base?.centres ?? [];
   const processes = Object.entries(settings.processes);
@@ -2922,7 +3068,8 @@ function renderSettings() {
       <td>${sinput(`processes.${code}.cycle.exposant`, p.cycle.exposant ?? 1, { width: "60px", compact: true })}</td>
       <td>${sinput(`processes.${code}.cycle.parModule2`, p.cycle.parModule2, { width: "60px", compact: true })}</td>
       <td>${pnum(code, "qualite", { width: "50px" })}</td><td>${pnum(code, "outillage", { width: "80px" })}</td>
-      <td>${checkbox(`s.processes.${code}.tth`, p.tth, "")}</td><td>${checkbox(`s.processes.${code}.noyaux`, p.noyaux, "")}</td></tr>`,
+      <td>${checkbox(`s.processes.${code}.tth`, p.tth, "")}</td><td>${checkbox(`s.processes.${code}.noyaux`, p.noyaux, "")}</td>
+      ${orientationCells(code, p)}</tr>`,
     )
     .join("");
   const opRows = Object.entries(settings.operations)
@@ -2984,9 +3131,9 @@ function renderSettings() {
   <section class="ccard">
     <h3>Îlots de coulée et méthodes</h3>
     <div class="cscroll"><table class="ctable compact">
-      <thead><tr><th>Îlot</th><th>Toile mini (mm)</th><th>Épaisseur maxi (mm)</th><th>Poids maxi (kg)</th><th>Dimension maxi (mm)</th><th>Volume mini /an</th><th>Empreintes maxi</th><th>Grappe maxi (kg)</th><th>Mise au mille par défaut</th><th>Rendement type (%)</th><th>− % par doublement épaisseur maxi / toile</th><th>− % × ln(2 kg / poids)</th><th>Cycle : base (s)</th><th>+ coef × (kg coulés)^exp.</th><th>exposant</th><th>+ s / mm² de module</th><th>Qualité /10</th><th>Outillage (€)</th><th>TTH</th><th>Noyaux</th></tr></thead>
+      <thead><tr><th>Îlot</th><th>Toile mini (mm)</th><th>Épaisseur maxi (mm)</th><th>Poids maxi (kg)</th><th>Dimension maxi (mm)</th><th>Volume mini /an</th><th>Empreintes maxi</th><th>Grappe maxi (kg)</th><th>Mise au mille par défaut</th><th>Rendement type (%)</th><th>− % par doublement épaisseur maxi / toile</th><th>− % × ln(2 kg / poids)</th><th>Cycle : base (s)</th><th>+ coef × (kg coulés)^exp.</th><th>exposant</th><th>+ s / mm² de module</th><th>Qualité /10</th><th>Outillage (€)</th><th>TTH</th><th>Noyaux</th><th title="Orientation du moule proposée sur la page Analyse 3D (coquilles et moules basse pression réalisés sur place)">Plan de joint</th><th title="Coulée par le haut (masselottes) ou alimentation par le bas (basse pression)">Alimentation</th></tr></thead>
       <tbody>${processRows}</tbody></table></div>
-    <p class="small muted">Temps de cycle estimé = base + coef × (kg coulés par cycle)^exposant + (s/mm²) × module V/S² (exposant 1 : linéaire). Mise au mille estimée = 1 / rendement, rendement = rendement type − (% par doublement) × log₂(épaisseur maxi / toile mini) − (%) × ln(2 kg / poids) pour les pièces de moins de 2 kg, borné entre 30 et 95 % (valeur par défaut tant que les épaisseurs ne sont pas calculées). Un îlot est écarté si la toile mini, le poids, la dimension, le traitement thermique ou les noyaux sont hors de ses possibilités. Valeurs de départ à ajuster aux îlots réels.</p>
+    <p class="small muted">Temps de cycle estimé = base + coef × (kg coulés par cycle)^exposant + (s/mm²) × module V/S² (exposant 1 : linéaire). Mise au mille estimée = 1 / rendement, rendement = rendement type − (% par doublement) × log₂(épaisseur maxi / toile mini) − (%) × ln(2 kg / poids) pour les pièces de moins de 2 kg, borné entre 30 et 95 % (valeur par défaut tant que les épaisseurs ne sont pas calculées). Un îlot est écarté si la toile mini, le poids, la dimension, le traitement thermique ou les noyaux sont hors de ses possibilités. Plan de joint et alimentation (îlots dont le moule est réalisé sur place) : l'orientation du moule que la page Analyse 3D propose pour une pièce dont l'îlot est retenu — coquille gravité : plan de joint vertical, coulée par le haut (masselottes au-dessus des sections massives) ; basse pression : plan de joint horizontal, chape supérieure mobile, alimentation par le bas (sections massives en bas, près de l'attaque). Valeurs de départ à ajuster aux îlots réels.</p>
   </section>
   <section class="ccard">
     <h3>Autres opérations</h3>

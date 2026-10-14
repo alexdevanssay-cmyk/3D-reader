@@ -25,6 +25,7 @@
 // folder is forgotten.
 
 import { SUBFOLDERS, TRIES, chooseSharedFolder, fileNames, notFound, pause, readText, sharedDir, sharedFolder, writeFile } from "./network-folder.js";
+import { cleanFacts } from "./ai-facts.js";
 
 export { CHANGED as FOLDER_CHANGED, folderSupported } from "./network-folder.js";
 
@@ -66,7 +67,9 @@ function cleanMessage(m, id, date) {
   const out = { id, role: m.role, content: m.content, date };
   if (time(m.answered)) out.answered = m.answered;
   for (const k of ["provider", "model", "gateway", "notice"]) if (typeof m[k] === "string") out[k] = m[k];
-  for (const k of ["local", "amounts"]) if (m[k] === true) out[k] = true;
+  for (const k of ["local", "amounts", "incomplete"]) if (m[k] === true) out[k] = true;
+  // An answer in several parts (cut at the length allowed, its rest asked): how many.
+  if (Number.isInteger(m.parts) && m.parts > 1) out.parts = m.parts;
   const c = m.costing;
   if (c && typeof c === "object" && Array.isArray(c.inconnus)) {
     out.costing = { verifiee: c.verifiee === true, nombres: Number.isFinite(c.nombres) ? c.nombres : 0, inconnus: c.inconnus.filter((x) => typeof x === "string") };
@@ -83,6 +86,14 @@ function cleanMessage(m, id, date) {
   }
   const t = m.target;
   if (t && typeof t === "object" && Number.isInteger(t.tab)) out.target = { tab: t.tab, file: text(t.file) };
+  // An answer: the key facts of the data it was given (ai-facts.js); a question: what the AI was told had changed since.
+  const facts = cleanFacts(m.facts);
+  if (facts) out.facts = facts;
+  const u = m.update;
+  if (u && typeof u === "object" && Array.isArray(u.labels)) {
+    const strings = (list) => (Array.isArray(list) ? list.filter((x) => typeof x === "string") : []);
+    out.update = { labels: strings(u.labels), lines: strings(u.lines) };
+  }
   const a = m.application;
   if (a && typeof a === "object" && typeof a.message === "string") {
     out.application = {

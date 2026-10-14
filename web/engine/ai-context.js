@@ -71,6 +71,76 @@ function partingContext(p) {
 }
 
 /**
+ * The casting process of a body (the island retained in the costing, or
+ * chosen for the part; given with its parting): its parting plane, its
+ * feeding, where it comes from.
+ */
+function processContext(p) {
+  return { plan: p.plan ?? null, alimentation: p.alimentation ?? null, source: p.source ?? null, island: p.island ?? null };
+}
+
+/**
+ * The orientation of a body in its die for its process (orientation.js via
+ * its parting), compact: up when cast and what chose it, the die blank (the
+ * smallest block round the part along its draw direction, plus the margins)
+ * and its steel, the feeding score of that up and its basis.
+ */
+function orientationContext(o) {
+  return {
+    up: o.up ?? null,
+    up_axis: o.up_axis ?? null,
+    up_source: o.up_source ?? null,
+    ...(o.upper_half_down ? { upper_half_down: true } : {}),
+    block_axes: o.block_axes ?? null,
+    raw_mm: o.raw_mm ?? null,
+    die_block_mm: o.die_block_mm ?? null,
+    steel_kg: o.steel_kg ?? null,
+    feeding_score: o.feeding_score ?? null,
+    feeding_basis: o.feeding_basis ?? null,
+  };
+}
+
+/** The orientation in short (a compacted context): the process, up when cast, the die blank and its steel. */
+function shortOrientation(o, process) {
+  return {
+    ...(process ? { process: `${process.plan}-${process.alimentation}`, island: process.island ?? null } : {}),
+    up_axis: o.up_axis ?? null,
+    die_block_mm: o.die_block_mm ?? null,
+    steel_kg: o.steel_kg ?? null,
+  };
+}
+
+/**
+ * The slides of a body (slides.js via the semantic contract), compact: how
+ * many slides, probable cores, zones to rework at the parting line and
+ * details ignored; each slide's direction and stroke, each core's area and
+ * why. Not computed yet (or failed): its status only.
+ */
+function slidesContext(s) {
+  if (s.status !== "proposed" && s.status !== "manual") return { status: s.status ?? null };
+  return {
+    status: s.status,
+    count: s.count ?? null,
+    cores: s.cores ?? null,
+    parting_zones: s.parting_zones ?? null,
+    ignored: s.ignored ?? null,
+    edited: !!s.edited,
+    slides: (s.slides ?? []).map((x) => ({
+      id: x.id, axis: x.axis,
+      ...(x.angle_deg != null ? { angle_deg: x.angle_deg } : {}),
+      ...(x.tilt_deg != null ? { tilt_deg: x.tilt_deg, tilt_up: x.tilt_up ?? null } : {}),
+      stroke_mm: x.stroke_mm, zones: Array.isArray(x.zones) ? x.zones.length : x.zones ?? null,
+    })),
+    cores_detail: (s.cores_detail ?? []).map(({ id, area_mm2, reason }) => ({ id, area_mm2, reason })),
+  };
+}
+
+/** The slides in short (a compacted context): their count, the probable cores, the zones to rework at the parting line. */
+function shortSlides(s) {
+  return { status: s.status ?? null, count: s.count ?? null, cores: s.cores ?? null, parting_zones: s.parting_zones ?? null };
+}
+
+/**
  * The risers and ingate of a body (feeding.js via the semantic contract),
  * compact: where each riser stands, its kind and size, the hot spot and the
  * modulus it feeds; the ingate; the casting yield.
@@ -96,9 +166,13 @@ function feedingSummary(f) {
       direction: Array.isArray(gate.direction) ? gate.direction.map((x) => Math.round(x * 1000) / 1000) : null,
       section_mm2: r1(gate.section_mm2),
       on_parting_line: gate.on_parting_line === true,
+      // Low pressure: through the lower die, not at the parting line.
+      ...(gate.bottom_feed ? { bottom_feed: true } : {}),
     } : null,
     yield: finite(f.yield?.value) ? f.yield.value : null,
     ...(f.hot_spots_without_riser?.length ? { hot_spots_without_riser: f.hot_spots_without_riser.length } : {}),
+    // Fed from below (low pressure): no riser proposed, the feed points counted.
+    ...(f.mode === "bottom" ? { mode: "bottom", feed_points: (f.feed_points ?? []).length } : {}),
   };
 }
 
@@ -114,6 +188,8 @@ function shortFeeding(f) {
     gate: f.gate ? { position_mm: f.gate.position_mm, section_mm2: f.gate.section_mm2 } : null,
     yield: f.yield ?? null,
     ...(f.hot_spots_without_riser ? { hot_spots_without_riser: f.hot_spots_without_riser } : {}),
+    // Fed from below: no riser by design, the feed points counted (as feedingSummary).
+    ...(f.mode === "bottom" ? { mode: "bottom", feed_points: f.feed_points ?? 0 } : {}),
   };
 }
 
@@ -133,6 +209,10 @@ function bodyContext(body, task) {
     topology: body.topology ?? null,
     geometry: body.geometry ?? {},
     ...(body.parting ? { parting: partingContext(body.parting) } : {}),
+    // Beside the parting: the casting process and the orientation of the part in its die.
+    ...(body.parting?.process ? { process: processContext(body.parting.process) } : {}),
+    ...(body.parting?.orientation ? { orientation: orientationContext(body.parting.orientation) } : {}),
+    ...(body.slides ? { slides: slidesContext(body.slides) } : {}),
     ...(body.feeding ? { feeding: feedingSummary(body.feeding) } : {}),
     // Through and blind holes measured on the mesh, in short (semantic.js holeSummary).
     ...(body.holes ? { holes: body.holes } : {}),
@@ -353,6 +433,22 @@ function shortFoundry(foundry) {
 }
 
 /**
+ * The wall thickness of a body in short: kept at every level of the
+ * compaction, the last resort included. A measured fact the AI must have:
+ * without it, it asks for a thickness analysis that was already done.
+ * {status: "measured", min_mm, min_method, median_mm, max_mm}, or
+ * {status: "not_computed"} (« Analyser les épaisseurs » not run for this body).
+ */
+function thicknessBrief(b) {
+  const t = b.foundry?.evidence?.thickness ?? b.foundry?.thickness ?? null;
+  const r1 = (v) => (finite(v) ? Math.round(v * 10) / 10 : null);
+  if (t?.status === "measured") return { status: "measured", min_mm: r1(t.min_mm), min_method: t.min_method ?? null, median_mm: r1(t.median_mm), max_mm: r1(t.max_mm) };
+  const f = b.manufacturing?.functional_thickness;
+  if (f?.status === "measured") return { status: "measured", min_mm: r1(f.minimum_wall_thickness_mm), min_method: null, median_mm: null, max_mm: null };
+  return { status: "not_computed" };
+}
+
+/**
  * A smaller copy of an AI context (buildAIContext) for a model with a small
  * context window (the gateway's budget, a local LLM): the same facts, less
  * detail, until its JSON fits in `maxChars`. What is given up first is what
@@ -408,6 +504,9 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
       metrics: roundDeep(body.metrics),
       geometry: { ...roundDeep(geometry), analytic_surface_count: Array.isArray(analytic_surfaces) ? analytic_surfaces.length : 0 },
       ...(body.parting ? { parting: body.parting } : {}),
+      ...(body.process ? { process: body.process } : {}),
+      ...(body.orientation ? { orientation: body.orientation } : {}),
+      ...(body.slides ? { slides: body.slides } : {}),
       ...(body.feeding ? { feeding: body.feeding } : {}),
       ...(holes ? { holes } : {}),
       relation_counts: relationCounts(body.relations),
@@ -475,8 +574,11 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   // 4: the process in short.
   omitted.push("individual operations (counted by kind)", "foundry screen details (profile, risks and checks kept)");
   if (bodies3.some((b) => b.feeding)) omitted.push("risers one by one (counted, the largest kept)");
-  const bodies4 = bodies3.map((b) => ({
+  const bodies4 = bodies3.map(({ process, ...b }) => ({
     ...b,
+    // The process folded into the orientation in short.
+    ...(b.orientation ? { orientation: shortOrientation(b.orientation, process) } : {}),
+    ...(b.slides ? { slides: shortSlides(b.slides) } : {}),
     ...(b.feeding ? { feeding: shortFeeding(b.feeding) } : {}),
     ...(b.manufacturing ? { manufacturing: {
       process_candidates: b.manufacturing.process_candidates,
@@ -531,7 +633,7 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   // 7: only the largest bodies in detail.
   const byVolume = [...bodies6].sort((a, b) => (b.metrics?.volume_mm3 ?? 0) - (a.metrics?.volume_mm3 ?? 0));
   const detailed = new Set(byVolume.slice(0, detailedBodies).map((b) => b.id));
-  const brief = (b) => ({ id: b.id, name: b.name, role: b.role, metrics: { volume_mm3: b.metrics?.volume_mm3 ?? null, surface_area_mm2: b.metrics?.surface_area_mm2 ?? null, bbox_size_mm: b.metrics?.bbox_mm?.size ?? null }, ...(b.parting ? { parting: b.parting } : {}), ...(b.feeding ? { feeding: b.feeding } : {}), feature_count: b._features.length });
+  const brief = (b) => ({ id: b.id, name: b.name, role: b.role, metrics: { volume_mm3: b.metrics?.volume_mm3 ?? null, surface_area_mm2: b.metrics?.surface_area_mm2 ?? null, bbox_size_mm: b.metrics?.bbox_mm?.size ?? null }, ...(b.parting ? { parting: b.parting } : {}), ...(b.orientation ? { orientation: b.orientation } : {}), ...(b.slides ? { slides: b.slides } : {}), ...(b.feeding ? { feeding: b.feeding } : {}), thickness: thicknessBrief(b), feature_count: b._features.length });
   if (context.bodies.length > detailedBodies) {
     omitted.push(`details of the ${context.bodies.length - detailedBodies} smallest bodies`);
     out = build(bodies6.map((b) => (detailed.has(b.id) ? b : brief(b))), 7);
@@ -541,7 +643,13 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   // 8: every body reduced to its metrics and feature counts; the feature groups and foundry screen of the largest one.
   omitted.push("per-body foundry and manufacturing details (kept for the largest body only)");
   const largest = byVolume[0]?.id;
-  const level8 = (b) => (b.id === largest ? { ...brief(b), ...(b.holes ? { holes: b.holes } : {}), feature_groups: b.feature_groups, foundry: b.foundry } : brief(b));
+  // The thickness given once, by brief(b): not again in the foundry screen of the largest body.
+  const withoutThickness = (foundry) => {
+    if (!foundry) return foundry;
+    const { thickness, ...rest } = foundry;
+    return rest;
+  };
+  const level8 = (b) => (b.id === largest ? { ...brief(b), ...(b.holes ? { holes: b.holes } : {}), feature_groups: b.feature_groups, foundry: withoutThickness(b.foundry) } : brief(b));
   out = build(bodies6.map(level8), 8);
   if (size(out) <= maxChars) return out;
 
@@ -567,8 +675,9 @@ export function compactAIContext(context, { maxChars = 16000, detailedBodies = 6
   }
   // Last resort: the largest body without its foundry screen, nor the foundry notes that only explain it.
   omitted.push("foundry screen of the largest body", "foundry sources and policies");
+  if (out.bodies.some((b) => b.orientation)) omitted.push("orientation in the die");
   const { foundry_common, ...kept } = out;
-  out = { ...kept, bodies: out.bodies.map(({ foundry, feature_groups, ...b }) => b), compaction: { ...out.compaction, omitted: [...omitted] } };
+  out = { ...kept, bodies: out.bodies.map(({ foundry, feature_groups, orientation, ...b }) => b), compaction: { ...out.compaction, omitted: [...omitted] } };
   // Still over (a small budget): fewer warnings, down to none; their count stays.
   const warningsAt = omitted.findIndex((o) => / warnings$/.test(o));
   for (const keep of [3, 1, 0]) {
