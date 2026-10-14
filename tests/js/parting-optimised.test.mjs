@@ -14,7 +14,7 @@ import { analyseSlides, effectiveSlides, prepareSlides, slidesSignature, undercu
 import { HOLED, bossedTube, cylBosses, groovedBlock, holedBlock, studBlock, subdivided } from './cad-parts.mjs';
 import { BRACKET, Body, zBracket } from './curved-mesh.mjs';
 import { approx } from './helpers.mjs';
-import { lineLoops, looseEnds, shapeOfLine, undercutRegions, unlinedEdges } from './line-shape.mjs';
+import { lineLoops, looseEnds, shapeOfLine, undercutRegions, unlinedColourChanges } from './line-shape.mjs';
 import { voxels } from './meshes.mjs';
 
 /** The diagonal of the box of a mesh. */
@@ -29,17 +29,18 @@ function diagonal({ positions: P }) {
 
 /**
  * The split of `part` along d, checked clean: no loose end, no tooth, no
- * comb, no run turning back; the line along every edge between two whole
- * triangles of different halves (unlinedEdges: the colours never change
- * where no line is drawn). Returns {r (evaluateParting), loops, regions
- * (the areas of the undercut regions, largest first)}.
+ * comb, no run turning back; the line wherever the colours of the halves
+ * change, as the page shows them (unlinedColourChanges: the triangles the
+ * line crosses in their pieces, partingPieces). Returns {r
+ * (evaluateParting), loops, regions (the areas of the undercut regions,
+ * largest first)}.
  */
 function cleanSplit(part, d, label) {
   const r = evaluateParting(part.positions, part.indices, d);
   assert.equal(looseEnds(r.segments), 0, `${label}: loose ends`);
   assert.deepEqual(shapeOfLine(r.segments), { reversals: 0, teeth: 0, combs: 0 }, `${label}: shape`);
+  assert.deepEqual(unlinedColourChanges(part, r, d), [], `${label}: halves changing with no line`);
   const neighbours = lineMesh(part.positions, part.indices).neighbours;
-  assert.deepEqual(unlinedEdges(part, neighbours, r, d), [], `${label}: halves changing with no line`);
   const loops = lineLoops(r.segments);
   const regions = undercutRegions(part, neighbours, r.flags);
   return { r, loops, regions };
@@ -304,6 +305,13 @@ describe('the parting halves optimised over the surface', () => {
     assert.deepEqual([r.summary.parting.kind, r.plane, r.summary.parting.loops, loops.length], ['planar', 0, 3, 3]);
     // The outline and the rims of the two holes (16-gons of radius 0.6).
     approx(r.summary.parting.length_mm, 400 + 2 * 2 * n * rad * Math.sin(Math.PI / n), 0, 0.05, 'length');
+    // The line taken from round the holes, their walls in the upper half: the check finds each edge of their rims.
+    const S = r.segments, kept = [];
+    for (let j = 0; j < S.length; j += 6) {
+      const near = holes.some(([x, y]) => Math.hypot((S[j] + S[j + 3]) / 2 - x, (S[j + 1] + S[j + 4]) / 2 - y) < 2 * rad);
+      if (!near) kept.push(...S.slice(j, j + 6));
+    }
+    assert.equal(unlinedColourChanges(part, { ...r, segments: Float64Array.from(kept) }, [0, 0, 1]).length, 2 * n);
   });
 
   test('a cylinder with blended bosses meshed by OCCT, each triangle cut into 64 (227 000, above the coarse limit): the loops of the exact cut', () => {
@@ -312,7 +320,7 @@ describe('the parting halves optimised over the surface', () => {
     // faces facing one): islands of a patch or two in the other half, loops
     // of a millimetre round them (along X 5 loops for 1, along Y 4 for 2).
     // Now cut again on the triangles in a band round its line: the exact
-    // cut's loops.
+    // cut's loops, the colours and the line agreeing.
     const part = subdivided(cylBosses(), 3);
     assert.ok(part.indices.length / 3 > 200_000);
     for (const d of [[1, 0, 0], [0, 1, 0]]) {
@@ -324,6 +332,7 @@ describe('the parting halves optimised over the surface', () => {
       assert.deepEqual(lp.filter((l) => l.length < 5).map((l) => l.length), [], `${label}: small loops`);
       approx(patches.summary.parting.length_mm, exact.summary.parting.length_mm, 0.01, 0, `${label}: length`);
       approx(patches.summary.undercut_area_mm2, exact.summary.undercut_area_mm2, 1e-9, 0, `${label}: undercut`);
+      assert.deepEqual(unlinedColourChanges(part, patches, d), [], `${label}: halves changing with no line`);
     }
   });
 });

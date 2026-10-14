@@ -1,8 +1,8 @@
 // The shape of a parting line from its pieces (segments: xyz of both ends of
 // each), shared by the parting tests: loose ends, runs turning back (teeth,
-// combs), its loops (length, enclosed area); and the undercut regions of a
-// split (their areas).
-import { REACH_DOWN, REACH_UP, SHADOW, SIDE_NONE, SILHOUETTE } from '../../web/engine/parting.js';
+// combs), its loops (length, enclosed area); the undercut regions of a split
+// (their areas); where the colours of the halves change with no line.
+import { REACH_DOWN, REACH_UP, SIDE_NONE, lineMesh, partingPieces } from '../../web/engine/parting.js';
 
 /** The ends of the pieces of a line met by an odd number of pieces (within 1e-4 mm): 0 when it is in closed loops. */
 export function looseEnds(segments) {
@@ -172,36 +172,156 @@ export function undercutRegions({ positions: P, indices: I }, neighbours, flags)
 }
 
 /**
- * The edges between two triangles of different halves (`side`, neither an
- * undercut) that no piece of the line runs along, neither triangle cut by
- * it (by the plane `plane` along d, across it; else flagged SILHOUETTE or
- * SHADOW): the colours of the halves changing with no line there. [] when
- * the line and the halves agree.
+ * Where the colours of the halves change with no line drawn there, as the
+ * page shows a split `r` (evaluateParting) along d: each triangle the line
+ * crosses in the pieces partingPieces cuts it into (the line's cuts, the
+ * triangles of the hooks it took out put on the other side), each other one
+ * whole in its half (`side`). An undercut (a piece flagged so, a triangle
+ * with no REACH_* or no half) is in the colour of the undercuts, no half's:
+ * left out, so is a sliver narrower than 10 eps. Along every edge between
+ * two triangles, and across every triangle between two of its pieces, each
+ * stretch where the halves on either side differ is to be covered by
+ * segments of the line, within eps (1e-5 of the diagonal: a piece may end a
+ * hair before a vertex), or 1 % of the segment's length off it (a piece
+ * straight across two triangles at an angle, the colours cut in the plane of
+ * each). Returns the stretches not covered:
+ * [{f, g (-1: inside f), from, to (xyz), length}]; [] when the line and the
+ * colours agree.
  */
-export function unlinedEdges({ positions: P, indices: I }, neighbours, { side, flags, segments, plane = null }, d) {
-  const key = (a, b) => {
-    const k = (i) => `${Math.round(P[3 * i] * 1e4)},${Math.round(P[3 * i + 1] * 1e4)},${Math.round(P[3 * i + 2] * 1e4)}`;
-    const [x, y] = [k(a), k(b)];
-    return x < y ? `${x} ${y}` : `${y} ${x}`;
-  };
-  const lined = new Set();
-  const at = (j) => `${Math.round(segments[j] * 1e4)},${Math.round(segments[j + 1] * 1e4)},${Math.round(segments[j + 2] * 1e4)}`;
-  for (let j = 0; j < segments.length; j += 6) {
-    const [x, y] = [at(j), at(j + 3)];
-    lined.add(x < y ? `${x} ${y}` : `${y} ${x}`);
+export function unlinedColourChanges({ positions: P, indices: I }, r, d) {
+  const line = lineMesh(P, I);
+  const { neighbours } = line;
+  const nt = I.length / 3;
+  let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < P.length; i++) {
+    lo[i % 3] = Math.min(lo[i % 3], P[i]);
+    hi[i % 3] = Math.max(hi[i % 3], P[i]);
   }
-  const height = (i) => P[3 * i] * d[0] + P[3 * i + 1] * d[1] + P[3 * i + 2] * d[2] - plane;
-  const cut = (f) => {
-    if (plane == null) return (flags[f] & (SILHOUETTE | SHADOW)) !== 0;
-    const h = [0, 1, 2].map((k) => height(I[3 * f + k]));
-    return h.some((x) => x < -1e-6) && h.some((x) => x > 1e-6);
+  const eps = 1e-5 * Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+  const pc = partingPieces(line, r.side, d, { flags: r.flags, plane: r.plane, height: r.summary.mould_height_mm });
+  const pieces = new Map(); // triangle -> [{half, poly}]
+  for (let k = 0; k < pc.count; k++) {
+    const poly = [];
+    for (let c = pc.start[k]; c < pc.start[k + 1]; c++) poly.push([pc.points[3 * c], pc.points[3 * c + 1], pc.points[3 * c + 2]]);
+    // Its width (twice its area over its longest side): a sliver narrower than 10 eps shows no colour.
+    const n = [0, 0, 0];
+    let longest = 0;
+    poly.forEach((p, i) => {
+      const q = poly[(i + 1) % poly.length];
+      n[0] += (p[1] - q[1]) * (p[2] + q[2]);
+      n[1] += (p[2] - q[2]) * (p[0] + q[0]);
+      n[2] += (p[0] - q[0]) * (p[1] + q[1]);
+      longest = Math.max(longest, Math.hypot(q[0] - p[0], q[1] - p[1], q[2] - p[2]));
+    });
+    const visible = Math.hypot(n[0], n[1], n[2]) > 10 * eps * longest;
+    const list = pieces.get(pc.tri[k]) ?? [];
+    list.push({ half: pc.undercut[k] || !visible ? 0 : pc.half[k], poly });
+    pieces.set(pc.tri[k], list);
+  }
+  // The segments of the line in a grid of cells (each in every cell its box meets), for the stretches to look them up.
+  const S = r.segments;
+  const size = Math.max(1, (hi[0] - lo[0] + hi[1] - lo[1] + hi[2] - lo[2]) / 300);
+  const cellKey = (i, j, k) => `${i},${j},${k}`;
+  const grid = new Map();
+  const cellOf = (x, c) => Math.floor((x - lo[c]) / size);
+  for (let j = 0; j < S.length; j += 6) {
+    const a = [0, 1, 2].map((c) => cellOf(Math.min(S[j + c], S[j + 3 + c]) - eps, c)), b = [0, 1, 2].map((c) => cellOf(Math.max(S[j + c], S[j + 3 + c]) + eps, c));
+    for (let x = a[0]; x <= b[0]; x++) for (let y = a[1]; y <= b[1]; y++) for (let z = a[2]; z <= b[2]; z++) {
+      const key = cellKey(x, y, z);
+      (grid.get(key) ?? grid.set(key, []).get(key)).push(j);
+    }
+  }
+  const sub = (p, q) => [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+  const dot = (p, q) => p[0] * q[0] + p[1] * q[1] + p[2] * q[2];
+  // The distance of p from the line through a along unit u.
+  const off = (p, a, u) => {
+    const ap = sub(p, a), t = dot(ap, u);
+    return Math.hypot(ap[0] - t * u[0], ap[1] - t * u[1], ap[2] - t * u[2]);
   };
   const out = [];
-  for (let f = 0; f < I.length / 3; f++) {
+  // The stretch a-b covered by segments of the line (each along it, within eps)? Else noted.
+  const lined = (a, b, f, g) => {
+    const L = Math.hypot(...sub(b, a));
+    if (!(L > 10 * eps)) return;
+    const u = sub(b, a).map((x) => x / L);
+    const seen = new Set(), spans = [];
+    const ca = [0, 1, 2].map((c) => cellOf(Math.min(a[c], b[c]) - eps, c)), cb = [0, 1, 2].map((c) => cellOf(Math.max(a[c], b[c]) + eps, c));
+    for (let x = ca[0]; x <= cb[0]; x++) for (let y = ca[1]; y <= cb[1]; y++) for (let z = ca[2]; z <= cb[2]; z++) {
+      for (const j of grid.get(cellKey(x, y, z)) ?? []) {
+        if (seen.has(j)) continue;
+        seen.add(j);
+        const p = [S[j], S[j + 1], S[j + 2]], q = [S[j + 3], S[j + 4], S[j + 5]];
+        // Along it: within eps, or 1 % of its length (a piece straight across two triangles at an angle, the
+        // colours cut in the plane of each).
+        const tol = 10 * eps + 0.01 * Math.hypot(...sub(q, p));
+        if (off(p, a, u) > tol || off(q, a, u) > tol) continue;
+        const s0 = dot(sub(p, a), u), s1 = dot(sub(q, a), u);
+        spans.push([Math.min(s0, s1), Math.max(s0, s1)]);
+      }
+    }
+    spans.sort((x, y) => x[0] - y[0]);
+    let reach = 0;
+    for (const [s0, s1] of spans) {
+      if (s0 > reach + eps) break;
+      reach = Math.max(reach, s1);
+    }
+    if (reach < L - eps) out.push({ f, g, from: a, to: b, length: L });
+  };
+  // The halves along edge a-b of triangle f: [[t0, t1, half]] (t along a-b), from its pieces or whole.
+  const along = (f, a, b) => {
+    const list = pieces.get(f);
+    if (!list) return r.side[f] === SIDE_NONE || !(r.flags[f] & (REACH_UP | REACH_DOWN)) ? [] : [[0, 1, r.side[f]]];
+    const L2 = dot(sub(b, a), sub(b, a)), L = Math.sqrt(L2), u = sub(b, a).map((x) => x / L);
+    const runs = [];
+    for (const { half, poly } of list) {
+      if (!half) continue;
+      for (let i = 0; i < poly.length; i++) {
+        const p = poly[i], q = poly[(i + 1) % poly.length];
+        if (off(p, a, u) > eps || off(q, a, u) > eps) continue;
+        const t0 = dot(sub(p, a), sub(b, a)) / L2, t1 = dot(sub(q, a), sub(b, a)) / L2;
+        if (Math.abs(t1 - t0) * L > eps) runs.push([Math.min(t0, t1), Math.max(t0, t1), half]);
+      }
+    }
+    return runs;
+  };
+  const halfAt = (runs, t) => runs.find(([t0, t1]) => t >= t0 && t <= t1)?.[2];
+  const corner = (k) => [P[3 * k], P[3 * k + 1], P[3 * k + 2]];
+  for (let f = 0; f < nt; f++) {
     for (let e = 0; e < 3; e++) {
       const g = neighbours[3 * f + e];
-      if (g <= f || side[f] === SIDE_NONE || side[g] === SIDE_NONE || side[f] === side[g] || cut(f) || cut(g)) continue;
-      if (!lined.has(key(I[3 * f + e], I[3 * f + ((e + 1) % 3)]))) out.push([f, g]);
+      if (g <= f) continue;
+      const a = corner(I[3 * f + e]), b = corner(I[3 * f + ((e + 1) % 3)]);
+      const rf = along(f, a, b), rg = along(g, a, b);
+      if (!rf.length || !rg.length) continue;
+      const ts = [...new Set([0, 1, ...rf.flatMap(([t0, t1]) => [t0, t1]), ...rg.flatMap(([t0, t1]) => [t0, t1])])].filter((t) => t >= 0 && t <= 1).sort((x, y) => x - y);
+      for (let i = 0; i + 1 < ts.length; i++) {
+        const m = (ts[i] + ts[i + 1]) / 2;
+        const hf = halfAt(rf, m), hg = halfAt(rg, m);
+        if (hf === undefined || hg === undefined || hf === hg) continue;
+        const at = (t) => a.map((x, c) => x + t * (b[c] - x));
+        lined(at(ts[i]), at(ts[i + 1]), f, g);
+      }
+    }
+  }
+  // Inside a triangle: two of its pieces of different halves along a chord they share.
+  for (const [f, list] of pieces) {
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        if (!list[i].half || !list[j].half || list[i].half === list[j].half) continue;
+        const A = list[i].poly, B = list[j].poly;
+        for (let k = 0; k < A.length; k++) {
+          const p = A[k], q = A[(k + 1) % A.length];
+          const L = Math.hypot(...sub(q, p));
+          if (!(L > 10 * eps)) continue;
+          const u = sub(q, p).map((x) => x / L);
+          for (let m = 0; m < B.length; m++) {
+            const s = B[m], w = B[(m + 1) % B.length];
+            if (off(s, p, u) > eps || off(w, p, u) > eps) continue;
+            const s0 = Math.max(0, Math.min(dot(sub(s, p), u), dot(sub(w, p), u))), s1 = Math.min(L, Math.max(dot(sub(s, p), u), dot(sub(w, p), u)));
+            if (s1 - s0 > 10 * eps) lined(p.map((x, c) => x + s0 * u[c]), p.map((x, c) => x + s1 * u[c]), f, -1);
+          }
+        }
+      }
     }
   }
   return out;

@@ -2419,7 +2419,7 @@ function dropSmallLoops(line, pieces, hooks) {
     });
     if (wholeInside) continue;
     for (const k of loop) drop[k] = 1;
-    for (let i = 1; i + 1 < points.length; i++) hooks.push({ X: points[0], A: points[i], B: points[i + 1], kx: keys[0], ka: keys[i], kb: keys[i + 1] });
+    for (let i = 1; i + 1 < points.length; i++) hooks.push({ X: points[0], A: points[i], B: points[i + 1], kx: keys[0], ka: keys[i], kb: keys[i + 1], loop: true });
   }
   let m = 0;
   for (let k = 0; k < pieces.length; k++) if (!drop[k]) pieces[m++] = pieces[k];
@@ -2433,8 +2433,12 @@ function dropSmallLoops(line, pieces, hooks) {
  * chords across the edges of shadows (lineCuts: the same cuts as
  * partingLine); where the line takes out a hook (unhook), the triangle
  * between the hook and the piece put instead on the other side of it, in
- * the triangles whose plane it is in (one the line goes along the edges of
- * cut there too). The pieces of a triangle cover it once, convex polygons in
+ * every triangle it covers part of whose plane it is in or turned from by
+ * less than between the facets of a smooth surface (one the line goes along
+ * the edges of cut there too); where it takes out a small loop
+ * (dropSmallLoops), its inside on the other side (the fan of triangles from
+ * its first point, each in every triangle it covers, whatever its plane).
+ * The pieces of a triangle cover it once, convex polygons in
  * its plane wound as it is. Each piece:
  * - half: the side of the line it is on (SIDE_UPPER, SIDE_LOWER; an undercut
  *   region in the half it is joined to, undercutHalves);
@@ -2545,9 +2549,13 @@ export function partingPieces(line, side, d, options = {}) {
       return out;
     };
     const flip = (h) => (h === SIDE_UPPER ? SIDE_LOWER : SIDE_UPPER);
-    for (const { X, A, B, kx, ka, kb } of hooks) {
+    for (const { X, A, B, kx, ka, kb, loop = false } of hooks) {
+      // The triangles round its three points, and those next to every triangle it covers part of (a hook longer than
+      // the triangles, a small loop taken out round several: each of them).
       const near = round(kb, round(ka, round(kx, new Set())));
-      for (const g of [...near].sort((x, y) => x - y)) {
+      const queue = [...near].sort((x, y) => x - y);
+      for (let q = 0; q < queue.length; q++) {
+        const g = queue[q];
         // In the plane of g (2D, its corners counter-clockwise).
         const [c0, c1, c2] = corners(g);
         const u = [0, 1, 2].map((k) => c1[k] - c0[k]), w = [0, 1, 2].map((k) => c2[k] - c0[k]);
@@ -2555,10 +2563,20 @@ export function partingPieces(line, side, d, options = {}) {
         const lu = Math.hypot(u[0], u[1], u[2]), ln = Math.hypot(n[0], n[1], n[2]);
         if (!(lu > 0 && ln > 0)) continue;
         const ex = u.map((x) => x / lu), nn = n.map((x) => x / ln);
-        // A hook across a crease (its triangle off the plane of g by more than 1 % of its size): left as it is.
+        // A hook across a crease (its triangle off the plane of g by more than 1 % of its size, turned from it by more
+        // than between the facets of a smooth surface): left as it is. On a curved face, its triangle's shadow on g's
+        // plane. A small loop taken out (dropSmallLoops, its fan of triangles from its first point): every triangle of
+        // the fan, whatever its plane (in g's plane, the fan's flips come to the inside of the loop's shadow there,
+        // bounded by its pieces across g; one left out would leave a part of the loop's inside unflipped).
         const size = Math.max(Math.hypot(A[0] - X[0], A[1] - X[1], A[2] - X[2]), Math.hypot(B[0] - X[0], B[1] - X[1], B[2] - X[2]), Math.hypot(B[0] - A[0], B[1] - A[1], B[2] - A[2]));
         const offPlane = (p) => Math.abs((p[0] - c0[0]) * nn[0] + (p[1] - c0[1]) * nn[1] + (p[2] - c0[2]) * nn[2]);
-        if (Math.max(offPlane(X), offPlane(A), offPlane(B)) > HOOK_PLANE * size + onEdge) continue;
+        if (!loop && Math.max(offPlane(X), offPlane(A), offPlane(B)) > HOOK_PLANE * size + onEdge) {
+          const xa = [A[0] - X[0], A[1] - X[1], A[2] - X[2]], xb = [B[0] - X[0], B[1] - X[1], B[2] - X[2]];
+          const m = [xa[1] * xb[2] - xa[2] * xb[1], xa[2] * xb[0] - xa[0] * xb[2], xa[0] * xb[1] - xa[1] * xb[0]];
+          const lm = Math.hypot(m[0], m[1], m[2]);
+          // (A sliver of a triangle, its own plane uncertain: as across a crease.)
+          if (!(lm > HOOK_PLANE * size * size) || Math.abs(m[0] * nn[0] + m[1] * nn[1] + m[2] * nn[2]) < SMOOTH_FACETS * lm) continue;
+        }
         const ey = [nn[1] * ex[2] - nn[2] * ex[1], nn[2] * ex[0] - nn[0] * ex[2], nn[0] * ex[1] - nn[1] * ex[0]];
         const to2 = (p) => {
           const r = [p[0] - c0[0], p[1] - c0[1], p[2] - c0[2]];
@@ -2606,7 +2624,15 @@ export function partingPieces(line, side, d, options = {}) {
           }
           out.push({ poly: inside.map(to3), half: flip(piece.half) });
         }
-        if (touched) byTri.set(g, out);
+        if (!touched) continue;
+        byTri.set(g, out);
+        for (let e = 0; e < 3; e++) {
+          const h = neighbours[3 * g + e];
+          if (h >= 0 && !near.has(h)) {
+            near.add(h);
+            queue.push(h);
+          }
+        }
       }
     }
   }
