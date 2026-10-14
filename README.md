@@ -133,9 +133,11 @@ hand" of `web/app.js`:
   change of process moves neither the draw direction nor the blank (the card says so);
   once its orientation is in, the card says what changed (« Procédé changé : haut de
   coulée +Y → +Z ; alimentation par le bas (2 points) ; brut et chapes inchangés (même
-  direction de démoulage) ») and, the parting shown and the view not moved meanwhile, the
-  view turns to *Casting*. The costing sizes the die block of an in-house die from that
-  oriented blank. See
+  direction de démoulage) ») and, the parting shown, the view not moved and the part and
+  body not left meanwhile, the view turns to *Casting* (*Casting* is not offered while
+  that orientation is computed). New die margins or a definition chosen by hand meanwhile
+  are not the process's doing: then nothing is said. The costing sizes the die block of
+  an in-house die from that oriented blank. See
   [Mould orientation by casting process](#mould-orientation-by-casting-process-method-and-limits).
 - **Slides** ("tiroirs"), part *Tiroirs et noyaux* of the parting line card: the undercuts
   of the definition shown (proposed, chosen, reassigned or drawn by hand) grouped into

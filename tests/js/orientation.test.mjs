@@ -549,6 +549,39 @@ describe('the halves of the mould cut out of the die blank', () => {
     approx(signedVolume(free.lower) + signedVolume(free.upper), L * l * h, 1e-5, 0, 'both halves (line not planar)');
   });
 
+  test('a V on its edge turned 3.05° about Z: the blank along its draw direction though both are rounded, the halves cut out of it', () => {
+    // A quarter turn about y (its thickness along x), then 3.05° about z: drawn along (cos 3.05°, sin 3.05°, 0), which the
+    // proposal and the blank's d both round to 6 digits: their plain dot product falls 1e-6 short of 1.
+    const t = 3.05 * deg;
+    const edge = vBar();
+    const P = edge.positions;
+    for (let i = 0; i < P.length; i += 3) {
+      const x = P[i + 2], y = P[i + 1], z = -P[i];
+      P[i] = Math.cos(t) * x - Math.sin(t) * y + 100;
+      P[i + 1] = Math.sin(t) * x + Math.cos(t) * y - 40;
+      P[i + 2] = z + 7;
+    }
+    const { proposal, segments } = proposeParting(P, edge.indices);
+    const o = proposal.orientation;
+    const dir = proposal.direction;
+    approxVec(dir, [Math.cos(t), Math.sin(t), 0], 1e-6, 'draw direction');
+    const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    assert.ok(Math.abs(dot(o.block_axes.d, dir)) < 1 - 1e-6, 'a case the plain dot product missed');
+    const box = blankBox(o, dir);
+    assert.ok(box, 'the blank along the draw direction');
+    assert.deepEqual(blankBox(o, dir.map((x) => -x)), box, 'either sense');
+    assert.equal(blankBox(o, [0, 0, 1]), null, 'another axis');
+    assert.equal(blankBox(o, [Math.cos(t + 1e-3), Math.sin(t + 1e-3), 0]), null, 'a direction 0.06° off');
+    const level = proposal.parting?.planar ? proposal.parting.level_mm : null;
+    const blocks = mouldBlocks(P, dir, { segments, level, box });
+    assert.deepEqual(blocks.box, box);
+    const corners = boxCorners(box);
+    for (const p of blockCorners(blocks)) {
+      const gap = Math.min(...corners.map((q) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2])));
+      assert.ok(gap < 1e-3, `corner ${p}: ${gap} mm from the blank's`);
+    }
+  });
+
   test('without a blank, or one that does not fit: the halves round the extent of the body as before', () => {
     const { proposal, segments } = proposeParting(bar.positions, bar.indices);
     const level = proposal.parting.level_mm;

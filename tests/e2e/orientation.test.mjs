@@ -465,6 +465,11 @@ describe('orientation by casting process (dist/)', { skip: !existsSync(join(DIST
     const view = async (up, across, label) => {
       const shown = await page.evaluate(() => window.reader3d.view);
       shown.up.forEach((x, k) => approx(x, up[k], 0, 1e-9, `${label}: camera up [${k}]`));
+      // Looking at the centre of the blank (a named view: at the part's box), from above it by the casting view's tilt.
+      shown.target.forEach((x, k) => approx(x, o.raw_centre_mm[k], 0, 1e-6, `${label}: looking at the blank's centre [${k}]`));
+      const eye = shown.position.map((x, k) => x - shown.target[k]);
+      const tilt = (Math.asin(eye.reduce((s, x, k) => s + x * up[k], 0) / Math.hypot(...eye)) * 180) / Math.PI;
+      approx(tilt, across ? 12 : 20, 0, 1e-6, `${label}: seen from above by`);
       const [c, top, minus, plus] = await screen([o.raw_centre_mm, along(up, 50), along(o.block_axes.d, -50), along(o.block_axes.d, 50)]);
       assert.ok(c.y - top.y > 40 && Math.abs(top.x - c.x) < 1, `${label}: up when cast upright on the screen (${JSON.stringify([c, top])})`);
       const [dx, dy] = [plus.x - minus.x, plus.y - minus.y];
@@ -478,8 +483,18 @@ describe('orientation by casting process (dist/)', { skip: !existsSync(join(DIST
     await shot(page, 'v-casting-gravity', '#viewport');
 
     // Low pressure chosen for the part: the view turned once its orientation is in, the change said; the blank and the halves the same.
+    // « Coulée » at once, before that orientation is in: not offered (its up would be the gravity die's), the turn to come kept.
     await page.click('[data-view="iso"]');
-    await page.selectOption('#parting-process-select', 'horizontal-bas');
+    const atOnce = await page.evaluate(() => {
+      const select = document.getElementById('parting-process-select');
+      select.value = 'horizontal-bas';
+      select.dispatchEvent(new Event('change'));
+      const button = document.getElementById('view-casting');
+      const disabled = button.disabled;
+      button.click();
+      return { disabled, up: window.reader3d.view.up };
+    });
+    assert.deepEqual(atOnce, { disabled: true, up: [0, 0, 1] });
     await settled(page, 'Procédé : Basse pression — plan de joint horizontal, alimentation par le bas (choisi pour cette pièce)', '+Z');
     await page.waitForSelector('#parting-process-change:not([hidden])');
     assert.match(await page.textContent('#parting-process-change'),
@@ -503,6 +518,54 @@ describe('orientation by casting process (dist/)', { skip: !existsSync(join(DIST
     await page.selectOption('#parting-up', '-v');
     await page.waitForFunction(() => document.getElementById('parting-card').dataset.up === '(0.342, -0.94, 0)', null, { timeout: 60_000 });
     assert.equal(await page.isHidden('#parting-process-change'), true);
+
+    // The process changed, then another tab shown at once, while its orientation is computed: on coming back,
+    // the change said but the view left as it was (not turned late, under the user's eyes).
+    await page.click('[data-view="iso"]');
+    const left = await page.evaluate(() => {
+      const select = document.getElementById('parting-process-select');
+      select.value = 'horizontal-bas';
+      select.dispatchEvent(new Event('change'));
+      const view = window.reader3d.view;
+      document.querySelector('.doc-tab-new').click();
+      return view;
+    });
+    assert.equal(await page.evaluate(() => window.reader3d.tab.file), null);
+    await page.waitForTimeout(6000); // its orientation in meanwhile, in the background
+    await page.locator('.doc-tab').first().click({ position: { x: 10, y: 8 } });
+    await page.waitForFunction(() => window.reader3d.tab.file === 'V.stl', null, { timeout: 10_000 });
+    await page.waitForFunction(() => /^Procédé changé : haut de coulée \(0\.342, -0\.94, 0\) → \+Z ; alimentation par le bas/.test(document.getElementById('parting-process-change').textContent), null, { timeout: 120_000 });
+    await page.waitForTimeout(300);
+    assert.deepEqual(await page.evaluate(() => window.reader3d.view), left);
+
+    // Then only the margins of the dies told (as the costing does from its settings): a larger blank, not the
+    // process's doing: the line no longer said; the halves still the blank.
+    assert.equal(await page.evaluate(() => window.reader3d.setProcess(null, { code: null, die: { marges: { longueur: 80, largeur: 80, hauteur: 50, entreEmpreintes: 40 }, densite: 7.8 } })), true);
+    await page.waitForFunction(() => /^392 × 212 × 108 mm/.test(document.querySelector('#parting-orient dd')?.textContent ?? '')
+      && document.getElementById('parting-status').hidden && !document.getElementById('parting-up').disabled, null, { timeout: 120_000 });
+    assert.equal(await page.isHidden('#parting-process-change'), true);
+    const wider = await outline();
+    for (const p of wider.chapes) near(p, wider.brut, 'corner of the mould halves (the margins of 80 mm)');
+
+    // Another draw direction chosen by hand (a candidate), then the process changed and the proposal taken back at
+    // once: the direction changed by the user, not by the process: nothing said, the view left as it was.
+    await page.locator('#parting-candidates tr[data-candidate]').nth(1).click();
+    await page.waitForFunction(() => document.getElementById('parting-origin').textContent === 'manuel'
+      && document.getElementById('parting-status').hidden && !document.getElementById('parting-up').disabled, null, { timeout: 60_000 });
+    assert.notEqual(await page.textContent('#parting-axis'), 'Z');
+    await page.click('[data-view="iso"]');
+    const kept = await page.evaluate(() => {
+      const select = document.getElementById('parting-process-select');
+      select.value = 'vertical-haut';
+      select.dispatchEvent(new Event('change'));
+      document.getElementById('parting-reset').click();
+      return window.reader3d.view;
+    });
+    await page.waitForFunction(() => document.getElementById('parting-axis').textContent === 'Z' && /^Procédé : Coquille gravité/.test(document.getElementById('parting-process-line').textContent)
+      && document.getElementById('parting-card').dataset.up === '(-0.342, 0.94, 0)' && document.getElementById('parting-status').hidden && !document.getElementById('parting-up').disabled, null, { timeout: 120_000 });
+    await page.waitForTimeout(300);
+    assert.equal(await page.isHidden('#parting-process-change'), true);
+    assert.deepEqual(await page.evaluate(() => window.reader3d.view), kept);
     assert.deepEqual(errors, []);
     await context.close();
   });

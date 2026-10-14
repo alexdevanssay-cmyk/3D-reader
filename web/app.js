@@ -22,7 +22,7 @@ import {
   resizeRiser, riserFromPoint,
 } from "./engine/feeding.js";
 import { capOrders, capQuad, planeCutsBox } from "./section.js";
-import { DEFAULT_PROCESS, FEEDS, PLANS, blankBox, normalizeDie, orientationKey, processForIsland } from "./engine/orientation.js";
+import { DEFAULT_PROCESS, FEEDS, PLANS, blankBox, dieKey, normalizeDie, orientationKey, processForIsland } from "./engine/orientation.js";
 import { keptParting } from "./engine/partclient.js";
 import {
   SLIDES_VERSION, editSlides, effectiveSlides, matchSlideState, pickSlideEntry, serializeSlideState, slideExport, slidesSideHash, slidesSignature, slidesViewHash,
@@ -2902,7 +2902,7 @@ function renderParting() {
   const card = $("parting-card");
   const r = state.result;
   card.hidden = !r;
-  $("view-casting").disabled = !castingPose(); // the « Vue de coulée » of the card's body, once oriented
+  renderCastingView(); // the « Vue de coulée » of the card's body, once oriented; a turn awaited for another one dropped
   // A crosshair while placing on the 3D view (here, or a riser or the ingate).
   renderer.domElement.style.cursor = feedingOf(r)?.mode ? "crosshair" : "";
   syncDrawView(partingOf(r), partingBody()); // drawing by hand: left when its body is no longer the card's (or no model); the view's controls
@@ -7180,6 +7180,10 @@ function setProcess(pieceKey, info) {
     bodies = [i];
   }
   let changed = false;
+  // The card's body: what its process changes said on the card (and the view turned) once oriented for it;
+  // taken before the die options told are written (new margins are not the process's doing).
+  const shown = partingBody();
+  const before = bodies.includes(shown) ? processBefore(shown, r) : null;
   if (info?.die) {
     const { marges, densite } = normalizeDie(info.die);
     const all = orientSaved();
@@ -7191,9 +7195,6 @@ function setProcess(pieceKey, info) {
   const costing = info?.code
     ? { code: String(info.code), famille: info.famille ?? null, orientation: validProcess(info.orientation) ? { plan: info.orientation.plan, alimentation: info.orientation.alimentation } : null }
     : null;
-  // The card's body: what its process changes said on the card (and the view turned) once oriented for it.
-  const shown = partingBody();
-  const before = bodies.includes(shown) ? processBefore(shown, r) : null;
   for (const i of bodies) {
     if (JSON.stringify(orientOf(r).kept.get(i)?.costing ?? null) === JSON.stringify(costing)) continue;
     orientKeep(i, { costing }, r);
@@ -7562,9 +7563,7 @@ $("parting-flip").addEventListener("click", () => {
 
 /** The die blank the halves of the mould of the definition `field` of body i are cut out of (blankBox), or null: drawn by hand, not oriented, oriented along another axis. */
 function castingBlank(i, field) {
-  if (field.drawn) return null;
-  const box = blankBox(orientationShown(i));
-  return box && Math.abs(dot3(box.d, field.direction)) > 1 - 1e-6 ? box : null;
+  return field.drawn ? null : blankBox(orientationShown(i), field.direction);
 }
 
 /**
@@ -7618,13 +7617,18 @@ function blocksCorners({ lower, upper, frame: { u, v, d } }) {
 // whole blank in sight when the halves or the blank are shown, else the part.
 const CAST_VIEW = { vertical: { tilt: 12, turn: 45 }, horizontal: { tilt: 20, turn: 30 } };
 
-/** The pose of the « Vue de coulée » of the card's body ({position, up, target, light, near, far}), or null: not oriented. */
+/**
+ * The pose of the « Vue de coulée » of the card's body ({position, up,
+ * target, light, near, far}), or null: not oriented, or its orientation for
+ * another process being computed (its up is the process's before: the view
+ * turns by itself once it is in, renderProcessChange).
+ */
 function castingPose() {
   const r = state.result;
   const i = r ? partingBody() : -1;
   const o = i >= 0 ? orientationShown(i, r) : null;
   const box = blankBox(o);
-  if (!box || !Array.isArray(o.up)) return null;
+  if (!box || !Array.isArray(o.up) || o.pending) return null;
   const g = vec3(o.up).normalize();
   // To the right on the screen: d on a vertical plane, u on a horizontal one (square to g).
   const order = o.process?.plan === "horizontal" ? [box.u, box.v, box.d] : [box.d, box.u, box.v];
@@ -7660,22 +7664,44 @@ function castingView() {
 }
 $("view-casting").addEventListener("click", () => castingView());
 
+/** The button « Coulée » (disabled without a pose); the automatic turn of a change of process left for another tab or body dropped. */
+function renderCastingView() {
+  $("view-casting").disabled = !castingPose();
+  // Its orientation would come in while the user looks at something else: on coming back, the view is left as it was.
+  const c = turnAwaited;
+  if (c && (c.done || c.r !== state.result || c.i !== partingBody())) {
+    c.pose = null;
+    turnAwaited = null;
+  }
+}
+
 // A change of the process of the card's body (chosen on the card, back to
 // the costing's, told by the costing) moves neither the draw direction nor
 // the blank (they depend on the part). Once the orientation for the new
 // process is in, the card says what changed (the casting up, the feeding,
-// the blank and the halves) and the view turns to the « Vue de coulée » (the
-// parting shown, the camera not moved since). Per result: {i, to (the
-// process, processValue), from (what the card showed: {up, d, axis,
-// blank}), pose (the camera then), done (the orientation it ended on: {up,
-// d}; null until then)}.
+// the halves) and the view turns to the « Vue de coulée »: the parting
+// shown, the camera not moved since, the change's part and body shown all
+// along (renderCastingView). What the user changes meanwhile is not the
+// process's doing: a definition chosen by hand, other die margins (then the
+// blank differs) supersede the change, neither said nor turned to. Per
+// result: {r, i, to (the process, processValue), from (what the card
+// showed: {up, d, axis}), def (the definition by hand then, or null), die
+// (dieKey of the die options then), pose (the camera then; null: no turn),
+// done (the orientation it ended on: {up, d}, or {superseded}; null until
+// then)}.
 const processChanges = new WeakMap();
+let turnAwaited = null; // the change whose automatic turn is still to come
 
-/** What body i shows before its process changes: {value (processValue), shown ({up, d, axis, blank}; null: not oriented)}. */
+/** What body i shows before its process changes: {value (processValue), shown ({up, d, axis}; null: not oriented), def, die}. */
 function processBefore(i, r = state.result) {
   const o = orientationShown(i, r);
   const field = partingField(i, r);
-  return { value: processValue(processOf(i, r)), shown: o && field ? { up: o.up_axis, d: o.block_axes.d, axis: field.summary.axis, blank: o.die_block_mm } : null };
+  return {
+    value: processValue(processOf(i, r)),
+    shown: o && field ? { up: o.up_axis, d: o.block_axes.d, axis: field.summary.axis } : null,
+    def: partingOf(r)?.current.get(i) ?? null,
+    die: dieKey(dieOptions()),
+  };
 }
 
 /** The process of body i changed since `before` (processBefore), it oriented then: the change noted, the camera stopped where it is. */
@@ -7683,23 +7709,29 @@ function processAfter(i, before, r = state.result) {
   const to = processValue(processOf(i, r));
   if (to === before.value || !before.shown) return;
   stopInertia();
-  processChanges.set(r, { i, to, from: before.shown, pose: currentPose(), done: null });
+  const change = { r, i, to, from: before.shown, def: before.def, die: before.die, pose: currentPose(), done: null };
+  processChanges.set(r, change);
+  turnAwaited = change;
 }
 
 /**
  * The line « Procédé changé : … » of the card (body i, `o` its orientation
  * shown): the change done once the orientation for the new process is in
- * (the view turned then); said while the card shows what it ended on.
+ * (the view turned then, unless left or moved meanwhile); said while the
+ * card shows what it ended on, unless superseded.
  */
 function renderProcessChange(i = partingBody(), o = i >= 0 ? orientationShown(i) : null) {
-  const change = state.result ? processChanges.get(state.result) : null;
+  const r = state.result;
+  const change = r ? processChanges.get(r) : null;
   let text = "";
   if (change?.i === i && o?.block_axes) {
-    if (!change.done && !o.pending && processValue(o.process) === change.to) {
-      change.done = { up: o.up_axis, d: o.block_axes.d };
-      if (partingShown() && samePose(currentPose(), change.pose)) castingView();
+    const superseded = (partingOf(r)?.current.get(i) ?? null) !== change.def || dieKey(dieOptions()) !== change.die;
+    if (!change.done && (superseded || (!o.pending && processValue(o.process) === change.to))) {
+      change.done = superseded ? { superseded } : { up: o.up_axis, d: o.block_axes.d };
+      if (!superseded && change.pose && partingShown() && samePose(currentPose(), change.pose)) castingView();
     }
-    if (change.done && change.done.up === o.up_axis && sameDirection(change.done.d, o.block_axes.d)) text = processChangeText(change.from, o, i);
+    const { done } = change;
+    if (!superseded && done && !done.superseded && done.up === o.up_axis && sameDirection(done.d, o.block_axes.d)) text = processChangeText(change.from, o, i);
   }
   $("parting-process-change").hidden = !text;
   $("parting-process-change").textContent = text;
@@ -7720,13 +7752,12 @@ function processChangeText(from, o, i) {
   const what = below ? "points" : "risers";
   const count = n == null ? "" : ` (${t(n === 0 ? `orient.change.${what}.none` : n === 1 ? `orient.change.${what}.one` : `orient.change.${what}`, { n })})`;
   parts.push(t(`orient.feed.${below ? "bas" : "haut"}`) + count);
-  // The blank and the halves: the same along the same draw direction; along its other sense, the halves swapped.
+  // The blank and the halves (the die margins the same, else superseded): the same along the same draw
+  // direction; along its other sense, the halves swapped.
   const d = o.block_axes.d;
   const axis = partingField(i)?.summary.axis ?? axisSigned(d);
-  const size = (b) => b.map((x) => fmtNum(x, 0)).join(" × ");
   if (sameDirection(from.d, d)) {
-    const resized = from.blank && o.die_block_mm && from.blank.some((x, k) => Math.abs(x - o.die_block_mm[k]) > 0.05);
-    parts.push(resized ? t("orient.change.blank", { from: size(from.blank), to: size(o.die_block_mm) }) : t("orient.change.blankSame"));
+    parts.push(t("orient.change.blankSame"));
   } else if (sameDirection(from.d, d.map((x) => -x))) {
     parts.push(t("orient.change.halvesSwapped", { to: axis }));
   } else {

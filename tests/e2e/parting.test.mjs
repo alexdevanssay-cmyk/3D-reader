@@ -450,6 +450,9 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     assert.ok(shown.undercuts > 0, 'the walls of the slot coloured as undercuts');
     const withBlocks = await viewColours(page);
     assert.ok(withBlocks.red > 200, `the line, thick and red: ${JSON.stringify(withBlocks)}`);
+    // Above the part (its top at z = 40), in front of the part: inside the upper half only.
+    const above = [[10, 0, 50], [50, 0, 50]];
+    const aboveWith = await coloursAt(page, above);
 
     // Without the blocks: the line and the colours stay; the walls of the slot in yellow.
     await page.uncheck('#parting-blocks');
@@ -459,10 +462,13 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     const without = await viewColours(page);
     assert.ok(without.red > 200, JSON.stringify(without));
     assert.ok(without.yellow > 500, `the undercuts in yellow: ${JSON.stringify(without)}`);
-    // The blocks, over the page: the die blank cut in two, wider than this view framed on the part (its upper
-    // half in front of the camera); seen whole in the casting view, blue above the line and green under it
-    // (side by side on this vertical parting plane).
-    assert.ok(withBlocks.blue > without.blue + 5000, `${JSON.stringify(withBlocks)} / ${JSON.stringify(without)}`);
+    const aboveWithout = await coloursAt(page, above);
+    // The blocks, over the page: the die blank cut in two, wider than this view framed on the part. Above the
+    // part only the upper half is crossed: blue there, the page without the blocks (under the line both halves
+    // are crossed, their colours mixed). Seen whole in the casting view: blue and green (side by side on this
+    // vertical parting plane).
+    const isBlue = ([r, g, b]) => b > r + 25 && b > g + 10;
+    assert.ok(aboveWith.every(isBlue) && !aboveWithout.some(isBlue), `above the part: ${JSON.stringify(aboveWith)} / ${JSON.stringify(aboveWithout)}`);
     await page.check('#parting-blocks');
     assert.equal((await overlay()).overlay, 'lower upper line');
     await page.click('#view-casting');
