@@ -70,6 +70,8 @@ export const STEEL_TIE = 0.05;
 const AREA_TIE = 1e-6;
 // Axes closer to a frame axis than this (|cosine|) are as close.
 const AXIS_TIE = 1e-9;
+// Two unit directions whose cosine is within this of 1 are the same axis (6-digit rounding: ~1e-12).
+const SAME_AXIS = 1e-9;
 
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
@@ -655,6 +657,35 @@ export function orientationFor(om, direction, { process = null, die = null, thic
     centroids_mm: { area: model(om.centroids.area), feeding: model(feeder) },
   };
   return { summary, steel: block.steel_kg, side: chosen.side, up: chosen.g, frame };
+}
+
+/**
+ * The die blank of an orientation (orientationFor's summary) as a box, one
+ * cavity: {centre (raw_centre_mm), u, v, d (block_axes), size [L, l, h] (mm:
+ * raw_mm plus twice the margins along u, v, d)}. The « Brut » box of the 3D
+ * view; the halves of the mould are cut out of it (parting.js mouldBlocks
+ * box). Null when the summary lacks any of them, or, a `direction` given,
+ * when its d is not along it (either sense; both normalised: the summary and
+ * a proposal round their unit vectors to 6 digits, their dot product alone
+ * can fall 1e-6 short of 1).
+ */
+export function blankBox(s, direction = null) {
+  const axes = s?.block_axes;
+  const vector = (x, n = 3) => Array.isArray(x) && x.length === n && x.every(Number.isFinite);
+  if (!axes || !vector(axes.u) || !vector(axes.v) || !vector(axes.d) || !vector(s.raw_mm) || !vector(s.raw_centre_mm)) return null;
+  if (direction != null) {
+    const a = normalize(axes.d), b = vector(direction) ? normalize(direction) : null;
+    if (!a || !b || Math.abs(dot(a, b)) < 1 - SAME_AXIS) return null;
+  }
+  const { marges: m } = normalizeDie({ marges: s.margins_mm });
+  const [a, b, c] = s.raw_mm;
+  return {
+    centre: [...s.raw_centre_mm],
+    u: [...axes.u],
+    v: [...axes.v],
+    d: [...axes.d],
+    size: [a + 2 * m.longueur, b + 2 * m.largeur, c + 2 * m.hauteur],
+  };
 }
 
 /**

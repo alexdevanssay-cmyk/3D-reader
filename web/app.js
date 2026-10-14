@@ -22,7 +22,7 @@ import {
   resizeRiser, riserFromPoint,
 } from "./engine/feeding.js";
 import { capOrders, capQuad, planeCutsBox } from "./section.js";
-import { DEFAULT_PROCESS, FEEDS, PLANS, normalizeDie, orientationKey, processForIsland } from "./engine/orientation.js";
+import { DEFAULT_PROCESS, FEEDS, PLANS, blankBox, dieKey, normalizeDie, orientationKey, processForIsland } from "./engine/orientation.js";
 import { keptParting } from "./engine/partclient.js";
 import {
   SLIDES_VERSION, editSlides, effectiveSlides, matchSlideState, pickSlideEntry, serializeSlideState, slideExport, slidesSideHash, slidesSignature, slidesViewHash,
@@ -211,7 +211,7 @@ function clearModel() {
   state.selected = -1;
   // The hooks of the view for scripts and tests: nothing faded, no parting shown.
   noteFaded();
-  $("parting-card").dataset.overlay = $("parting-card").dataset.undercuts = $("parting-card").dataset.pieces = "";
+  $("parting-card").dataset.overlay = $("parting-card").dataset.undercuts = $("parting-card").dataset.pieces = $("parting-card").dataset.chapes = "";
 }
 
 /**
@@ -2459,21 +2459,23 @@ function removePartingOverlay(mesh) {
   mesh.userData.partingOverlay = null;
 }
 
-// The halves of the mould of a parting line (mouldBlocks), by its segments: computed once.
+// The halves of the mould of a parting line (mouldBlocks), by its segments and the die blank they are cut out of: computed once.
 const blocksKept = new WeakMap();
 
-/** The halves of the mould round body i for its parting `field` (null: none). */
+/** The halves of the mould round body i for its parting `field` (null: none): its die blank cut in two (castingBlank), else round the part. */
 function partingBlocks(i, field) {
-  let blocks = blocksKept.get(field.segments);
-  if (blocks === undefined) {
+  const box = castingBlank(i, field);
+  const key = box ? JSON.stringify(box) : "";
+  let kept = blocksKept.get(field.segments);
+  if (kept?.key !== key) {
     const line = field.summary.parting;
     // A planar line: flat at its level. Without a line, the body is in one
     // half: under it (the upper half forms it), else over it.
     const level = line?.planar ? line.level_mm : line?.kind ? null : field.side.includes(SIDE_UPPER) ? -Infinity : Infinity;
-    blocks = mouldBlocks(bodyArrays(i).positions, field.direction, { segments: field.segments, level });
-    blocksKept.set(field.segments, blocks);
+    kept = { key, blocks: mouldBlocks(bodyArrays(i).positions, field.direction, { segments: field.segments, level, box }) };
+    blocksKept.set(field.segments, kept);
   }
-  return blocks;
+  return kept.blocks;
 }
 
 /** A translucent block of a half of the mould, with faint edges so that it reads as a block. */
@@ -2515,7 +2517,7 @@ function applyParting() {
   const i = partingBody();
   const field = p?.show && i >= 0 ? partingField(i) : null;
   const card = $("parting-card");
-  card.dataset.overlay = card.dataset.undercuts = card.dataset.orient = card.dataset.brut = card.dataset.pieces = "";
+  card.dataset.overlay = card.dataset.undercuts = card.dataset.orient = card.dataset.brut = card.dataset.brutBox = card.dataset.pieces = card.dataset.chapes = "";
   piecesShown = null;
   const tint = slidesTint(i, field); // the colours of the slides (null: the undercuts in yellow)
   if (!field) {
@@ -2565,6 +2567,7 @@ function applyParting() {
   card.dataset.pieces = pieces ? String(pieces.count) : "";
   const blocks = $("parting-blocks").checked && !drawn ? partingBlocks(i, field) : null;
   if (blocks) group.add(...blockMeshes(blocks.lower, PARTING_LOWER, "lower"), ...blockMeshes(blocks.upper, PARTING_UPPER, "upper"));
+  card.dataset.chapes = blocks ? blocksCorners(blocks) : ""; // their outline, for scripts and tests
   if (field.segments.length && !drawn) {
     // Width in pixels (the resolution: the size of the view, kept by resize()); drawn last, over the blocks.
     const material = new LineMaterial({ color: PARTING_LINE, linewidth: PARTING_LINE_PX, transparent: true, clippingPlanes: [sectionPlane] });
@@ -2583,7 +2586,7 @@ function applyParting() {
   const along = Math.abs(d.x) * size[0] + Math.abs(d.y) * size[1] + Math.abs(d.z) * size[2];
   const length = 0.35 * reach;
   // (While drawing: the rotation axis of the drawing instead.)
-  if (!drawn) group.add(new THREE.ArrowHelper(d, centre.clone().addScaledVector(d, along / 2 + (blocks?.margin ?? 0) + 0.05 * reach), length, PARTING_ARROW, 0.3 * length, 0.15 * length));
+  if (!drawn) group.add(new THREE.ArrowHelper(d, pastBlocks(blocks, d, centre, along / 2).addScaledVector(d, 0.05 * reach), length, PARTING_ARROW, 0.3 * length, 0.15 * length));
   if (!drawn) addSlideArrows(group, i, field); // an arrow per slide, along its pull direction
   addOrientationOverlay(group, i, { drawn, blocks }); // the arrow « haut », the die blank
   mesh.add(group);
@@ -2605,7 +2608,7 @@ function partingOff() {
     mesh.userData.parting = false; // coloured by the thickness next
   });
   const card = $("parting-card");
-  card.dataset.overlay = card.dataset.undercuts = card.dataset.pieces = "";
+  card.dataset.overlay = card.dataset.undercuts = card.dataset.pieces = card.dataset.chapes = "";
   piecesShown = null;
   renderParting();
 }
@@ -2926,6 +2929,7 @@ function renderParting() {
   const card = $("parting-card");
   const r = state.result;
   card.hidden = !r;
+  renderCastingView(); // the « Vue de coulée » of the card's body, once oriented; a turn awaited for another one dropped
   // A crosshair while placing on the 3D view (here, or a riser or the ingate).
   renderer.domElement.style.cursor = feedingOf(r)?.mode ? "crosshair" : "";
   syncDrawView(partingOf(r), partingBody()); // drawing by hand: left when its body is no longer the card's (or no model); the view's controls
@@ -6450,6 +6454,7 @@ function restoreFeeding() {
 /** The card and the markers again, and the published results: the parting, the zones or a definition changed. */
 function refreshFeeding() {
   renderFeeding();
+  renderProcessChange(); // its risers or feed points, once placed
   applyFeeding();
   if (state.result) updatePublished(state.result);
 }
@@ -7202,6 +7207,10 @@ function setProcess(pieceKey, info) {
     bodies = [i];
   }
   let changed = false;
+  // The card's body: what its process changes said on the card (and the view turned) once oriented for it;
+  // taken before the die options told are written (new margins are not the process's doing).
+  const shown = partingBody();
+  const before = bodies.includes(shown) ? processBefore(shown, r) : null;
   if (info?.die) {
     const { marges, densite } = normalizeDie(info.die);
     const all = orientSaved();
@@ -7218,6 +7227,7 @@ function setProcess(pieceKey, info) {
     orientKeep(i, { costing }, r);
     changed = true;
   }
+  if (before) processAfter(shown, before, r);
   // Told from within the costing page's drawing: the parting proposed again after it.
   if (changed) setTimeout(() => orientChanged(r));
   return changed;
@@ -7401,13 +7411,14 @@ function upLabel() {
 /**
  * On the 3D view, with the parting of body i: an arrow « haut » along the
  * casting up (beside the draw direction's when they are the same), and, the
- * « Brut » box checked, the die blank as a wire box on the axes of its block.
- * For scripts and tests: data-orient ("up", "brut") and data-brut (its
- * sizes, mm) of the card.
+ * « Brut » box checked, the die blank as a wire box on the axes of its block
+ * (the outline of the halves of the mould, cut out of it). For scripts and
+ * tests: data-orient ("up", "brut"), data-brut (its sizes, mm) and
+ * data-brut-box (its corners, blankCorners) of the card.
  */
 function addOrientationOverlay(group, i, { drawn, blocks }) {
   const card = $("parting-card");
-  card.dataset.orient = card.dataset.brut = "";
+  card.dataset.orient = card.dataset.brut = card.dataset.brutBox = "";
   const o = drawn ? null : orientationShown(i);
   if (!o) return;
   const sub = new THREE.Group();
@@ -7419,7 +7430,7 @@ function addOrientationOverlay(group, i, { drawn, blocks }) {
   const length = 0.35 * reach;
   // Up along the draw direction (a horizontal plane): beside its arrow, along the longer side of the block.
   const aside = Math.abs(g.dot(new THREE.Vector3(...o.block_axes.d))) > 0.9 ? new THREE.Vector3(...o.block_axes.u).multiplyScalar(0.3 * reach) : new THREE.Vector3();
-  const origin = centre.clone().addScaledVector(g, along / 2 + (blocks?.margin ?? 0) + 0.05 * reach).add(aside);
+  const origin = pastBlocks(blocks, g, centre, along / 2).addScaledVector(g, 0.05 * reach).add(aside);
   sub.add(new THREE.ArrowHelper(g, origin, length, UP_ARROW, 0.28 * length, 0.16 * length));
   // The label as large on the screen whatever the zoom.
   const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: upLabel(), depthTest: false, transparent: true, sizeAttenuation: false }));
@@ -7429,32 +7440,22 @@ function addOrientationOverlay(group, i, { drawn, blocks }) {
   label.renderOrder = ORDER_LINE + 1;
   sub.add(label);
   const shown = ["up"];
-  if ($("parting-brut").checked && o.die_block_mm) {
-    // The 12 edges of the blank: L along u, l along v, h along d, round the centre of the part's oriented box.
-    const [L, l, h] = o.die_block_mm;
-    const axes = ["u", "v", "d"].map((k) => new THREE.Vector3(...o.block_axes[k]));
-    const half = [L / 2, l / 2, h / 2];
-    const corner = (s) => new THREE.Vector3(...o.raw_centre_mm).add(axes[0].clone().multiplyScalar(s[0] * half[0])).add(axes[1].clone().multiplyScalar(s[1] * half[1])).add(axes[2].clone().multiplyScalar(s[2] * half[2]));
+  const blank = $("parting-brut").checked && o.die_block_mm ? blankBox(o) : null;
+  if (blank) {
+    // The 12 edges of the blank (the outline of the halves of the mould): L along u, l along v, h along d, round the centre of the part's oriented box.
+    const corners = blankCorners(blank);
     const points = [];
-    for (let k = 0; k < 3; k++) {
-      for (const a of [-1, 1]) for (const b of [-1, 1]) {
-        const s0 = [0, 0, 0], s1 = [0, 0, 0];
-        s0[k] = -1;
-        s1[k] = 1;
-        s0[(k + 1) % 3] = s1[(k + 1) % 3] = a;
-        s0[(k + 2) % 3] = s1[(k + 2) % 3] = b;
-        points.push(corner(s0), corner(s1));
-      }
-    }
+    for (let k = 0; k < 8; k++) for (const bit of [1, 2, 4]) if (!(k & bit)) points.push(...corners[k], ...corners[k | bit]);
     // A line a few pixels wide at any size of the view (its resolution read before each frame).
     const material = new LineMaterial({ color: BRUT_COLOR, linewidth: BRUT_LINE_PX, transparent: true, opacity: 0.85, clippingPlanes: [sectionPlane] });
-    const box = new LineSegments2(new LineSegmentsGeometry().setPositions(points.flatMap((p) => p.toArray())), material);
+    const box = new LineSegments2(new LineSegmentsGeometry().setPositions(points), material);
     box.onBeforeRender = () => material.resolution.set(viewport.clientWidth, viewport.clientHeight);
     box.renderOrder = ORDER_LINE;
     box.userData.own = true;
     sub.add(box);
     shown.push("brut");
     card.dataset.brut = o.die_block_mm.map((x) => fmtNum(x, 0)).join(" × ");
+    card.dataset.brutBox = JSON.stringify(corners.map((p) => p.map((x) => round(x, 4))));
   }
   group.add(sub);
   card.dataset.orient = shown.join(" ");
@@ -7503,6 +7504,7 @@ function renderOrientation(p, i, field) {
   select.disabled = p.mode === "draw";
   $("parting-process-reset").hidden = proc.source !== "part";
   const o = orientationShown(i, r);
+  renderProcessChange(i, o); // what a change of the process changed, once its orientation is in (the view turned then)
   const card = $("parting-card");
   card.dataset.process = value;
   card.dataset.up = o?.up_axis ?? "";
@@ -7547,14 +7549,18 @@ $("parting-process-select").addEventListener("change", (e) => {
   const i = partingBody();
   const process = PROCESS_CHOICES[e.target.value];
   if (i < 0 || !process) return;
+  const before = processBefore(i);
   // Chosen for this part: the up chosen by hand for the process before forgotten.
   orientKeep(i, { process, up: null });
+  processAfter(i, before);
   orientChanged(state.result);
 });
 $("parting-process-reset").addEventListener("click", () => {
   const i = partingBody();
   if (i < 0) return;
+  const before = processBefore(i);
   orientKeep(i, { process: null, up: null });
+  processAfter(i, before);
   orientChanged(state.result);
 });
 $("parting-up").addEventListener("change", (e) => {
@@ -7573,6 +7579,220 @@ $("parting-flip").addEventListener("click", () => {
   const i = partingBody();
   if (i >= 0) flipHalves(i);
 });
+
+// ---- the halves of the mould in the die blank, the « Vue de coulée »
+
+// The halves of the mould shown are the die blank of the orientation (the
+// « Brut » box: the smallest block round the part along its draw direction,
+// centred on it, plus the margins of the costing) cut in two along the
+// parting surface (mouldBlocks with that box). A line drawn by hand, or a
+// definition not oriented, keeps the blocks round the extent of the part.
+
+/** The die blank the halves of the mould of the definition `field` of body i are cut out of (blankBox), or null: drawn by hand, not oriented, oriented along another axis. */
+function castingBlank(i, field) {
+  return field.drawn ? null : blankBox(orientationShown(i), field.direction);
+}
+
+/**
+ * Where an arrow along `g` (unit, THREE) over the halves of the mould starts:
+ * on the face of their box along g when cut out of the die blank; else
+ * `along` (half the extent of the part along g) and their margin from the
+ * centre of the part.
+ */
+function pastBlocks(blocks, g, centre, along) {
+  if (!blocks?.box) return centre.clone().addScaledVector(g, along + (blocks?.margin ?? 0));
+  const { frame: { u, v, d }, box: { centre: c, size } } = blocks;
+  const half = [u, v, d].reduce((sum, axis, k) => sum + (Math.abs(g.dot(vec3(axis))) * size[k]) / 2, 0);
+  return vec3(c).addScaledVector(g, half);
+}
+
+/** The 8 corners of a box {centre, u, v, d, size} (blankBox): corner k at the signs of its bits (4: +u, 2: +v, 1: +d). */
+function blankCorners({ centre, u, v, d, size }) {
+  return Array.from({ length: 8 }, (_, k) => {
+    const s = [k & 4 ? 1 : -1, k & 2 ? 1 : -1, k & 1 ? 1 : -1];
+    return centre.map((c, j) => c + (s[0] * size[0] * u[j] + s[1] * size[1] * v[j] + s[2] * size[2] * d[j]) / 2);
+  });
+}
+
+/** The outline of the halves of the mould, for scripts and tests: the 8 corners of the extent of their vertices along their frame (JSON, mm, in the order of blankCorners). */
+function blocksCorners({ lower, upper, frame: { u, v, d } }) {
+  const axes = [u, v, d];
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (const P of [lower.positions, upper.positions]) {
+    for (let p = 0; p < P.length; p += 3) {
+      for (let k = 0; k < 3; k++) {
+        const x = P[p] * axes[k][0] + P[p + 1] * axes[k][1] + P[p + 2] * axes[k][2];
+        if (x < lo[k]) lo[k] = x;
+        if (x > hi[k]) hi[k] = x;
+      }
+    }
+  }
+  return JSON.stringify(Array.from({ length: 8 }, (_, k) => {
+    const w = [k & 4 ? hi[0] : lo[0], k & 2 ? hi[1] : lo[1], k & 1 ? hi[2] : lo[2]];
+    return [0, 1, 2].map((j) => round(w[0] * u[j] + w[1] * v[j] + w[2] * d[j], 4));
+  }));
+}
+
+// The « Vue de coulée »: the die of the card's body as it stands when the
+// metal is cast. The casting up g upright on the screen (camera.up = g), the
+// die seen from the side, from a little above (tilt: the top, where the
+// risers stand), turned towards the right (turn, degrees: CAST_VIEW). On a
+// vertical parting plane the draw direction across the screen (the halves
+// side by side, the lower one on the left), turned further: the part lies
+// in the parting plane, seen less askew. On a horizontal one the longer side
+// of the blank across the screen (the upper half over the lower one). The
+// whole blank in sight when the halves or the blank are shown, else the part.
+const CAST_VIEW = { vertical: { tilt: 12, turn: 45 }, horizontal: { tilt: 20, turn: 30 } };
+
+/**
+ * The pose of the « Vue de coulée » of the card's body ({position, up,
+ * target, light, near, far}), or null: not oriented, or its orientation for
+ * another process being computed (its up is the process's before: the view
+ * turns by itself once it is in, renderProcessChange).
+ */
+function castingPose() {
+  const r = state.result;
+  const i = r ? partingBody() : -1;
+  const o = i >= 0 ? orientationShown(i, r) : null;
+  const box = blankBox(o);
+  if (!box || !Array.isArray(o.up) || o.pending) return null;
+  const g = vec3(o.up).normalize();
+  // To the right on the screen: d on a vertical plane, u on a horizontal one (square to g).
+  const order = o.process?.plan === "horizontal" ? [box.u, box.v, box.d] : [box.d, box.u, box.v];
+  const right = vec3(order.find((a) => Math.abs(dot3(a, o.up)) < 0.5) ?? order[0]);
+  right.addScaledVector(g, -right.dot(g));
+  if (right.lengthSq() < 1e-12) return null;
+  right.normalize();
+  // Towards the camera: square to both (then `right` is to the right), turned towards the right, lifted.
+  const front = right.clone().cross(g);
+  const { tilt, turn } = CAST_VIEW[o.process?.plan === "horizontal" ? "horizontal" : "vertical"];
+  const [a, b] = [turn, tilt].map((x) => (x * Math.PI) / 180);
+  const dir = front.clone().multiplyScalar(Math.cos(a)).addScaledVector(right, Math.sin(a))
+    .multiplyScalar(Math.cos(b)).addScaledVector(g, Math.sin(b)).normalize();
+  const die = partingShown() && ($("parting-blocks").checked || $("parting-brut").checked);
+  const { min, max, size } = r.bodies[i].bbox;
+  const centre = die ? vec3(box.centre) : new THREE.Vector3(...min.map((x, k) => (x + max[k]) / 2));
+  const radius = (die ? Math.hypot(...box.size) : Math.hypot(...size)) / 2 || 1;
+  const pose = viewPose(dir, g, centre, radius);
+  // The key light above the die, in front of it and to the right.
+  pose.light = centre.clone().addScaledVector(g, 3 * radius).addScaledVector(front, 2 * radius).addScaledVector(right, radius).toArray();
+  return pose;
+}
+
+/** The view turned to the « Vue de coulée » (its button; the process changed): false when the card's body is not oriented. */
+function castingView() {
+  const pose = castingPose();
+  if (!pose) return false;
+  finishTurn(); // a turn by the arrows of the drawing by hand ends first
+  applyPose(pose);
+  stopInertia();
+  controls.update();
+  return true;
+}
+$("view-casting").addEventListener("click", () => castingView());
+
+/** The button « Coulée » (disabled without a pose); the automatic turn of a change of process left for another tab or body dropped. */
+function renderCastingView() {
+  $("view-casting").disabled = !castingPose();
+  // Its orientation would come in while the user looks at something else: on coming back, the view is left as it was.
+  const c = turnAwaited;
+  if (c && (c.done || c.r !== state.result || c.i !== partingBody())) {
+    c.pose = null;
+    turnAwaited = null;
+  }
+}
+
+// A change of the process of the card's body (chosen on the card, back to
+// the costing's, told by the costing) moves neither the draw direction nor
+// the blank (they depend on the part). Once the orientation for the new
+// process is in, the card says what changed (the casting up, the feeding,
+// the halves) and the view turns to the « Vue de coulée »: the parting
+// shown, the camera not moved since, the change's part and body shown all
+// along (renderCastingView). What the user changes meanwhile is not the
+// process's doing: a definition chosen by hand, other die margins (then the
+// blank differs) supersede the change, neither said nor turned to. Per
+// result: {r, i, to (the process, processValue), from (what the card
+// showed: {up, d, axis}), def (the definition by hand then, or null), die
+// (dieKey of the die options then), pose (the camera then; null: no turn),
+// done (the orientation it ended on: {up, d}, or {superseded}; null until
+// then)}.
+const processChanges = new WeakMap();
+let turnAwaited = null; // the change whose automatic turn is still to come
+
+/** What body i shows before its process changes: {value (processValue), shown ({up, d, axis}; null: not oriented), def, die}. */
+function processBefore(i, r = state.result) {
+  const o = orientationShown(i, r);
+  const field = partingField(i, r);
+  return {
+    value: processValue(processOf(i, r)),
+    shown: o && field ? { up: o.up_axis, d: o.block_axes.d, axis: field.summary.axis } : null,
+    def: partingOf(r)?.current.get(i) ?? null,
+    die: dieKey(dieOptions()),
+  };
+}
+
+/** The process of body i changed since `before` (processBefore), it oriented then: the change noted, the camera stopped where it is. */
+function processAfter(i, before, r = state.result) {
+  const to = processValue(processOf(i, r));
+  if (to === before.value || !before.shown) return;
+  stopInertia();
+  const change = { r, i, to, from: before.shown, def: before.def, die: before.die, pose: currentPose(), done: null };
+  processChanges.set(r, change);
+  turnAwaited = change;
+}
+
+/**
+ * The line « Procédé changé : … » of the card (body i, `o` its orientation
+ * shown): the change done once the orientation for the new process is in
+ * (the view turned then, unless left or moved meanwhile); said while the
+ * card shows what it ended on, unless superseded.
+ */
+function renderProcessChange(i = partingBody(), o = i >= 0 ? orientationShown(i) : null) {
+  const r = state.result;
+  const change = r ? processChanges.get(r) : null;
+  let text = "";
+  if (change?.i === i && o?.block_axes) {
+    const superseded = (partingOf(r)?.current.get(i) ?? null) !== change.def || dieKey(dieOptions()) !== change.die;
+    if (!change.done && (superseded || (!o.pending && processValue(o.process) === change.to))) {
+      change.done = superseded ? { superseded } : { up: o.up_axis, d: o.block_axes.d };
+      if (!superseded && change.pose && partingShown() && samePose(currentPose(), change.pose)) castingView();
+    }
+    const { done } = change;
+    if (!superseded && done && !done.superseded && done.up === o.up_axis && sameDirection(done.d, o.block_axes.d)) text = processChangeText(change.from, o, i);
+  }
+  $("parting-process-change").hidden = !text;
+  $("parting-process-change").textContent = text;
+}
+
+/**
+ * What a change of the process of body i changed, from what the card showed
+ * (`from`, processBefore) to its orientation `o`: « Procédé changé : haut de
+ * coulée +Y → +Z ; alimentation par le bas (2 points) ; brut et chapes
+ * inchangés (même direction de démoulage) ».
+ */
+function processChangeText(from, o, i) {
+  const parts = [from.up !== o.up_axis ? t("orient.change.up", { from: from.up, to: o.up_axis }) : t("orient.change.upSame", { to: o.up_axis })];
+  // The feeding: from the top (its risers) or from below (its feed points), counted once placed.
+  const feed = feedingField(i);
+  const below = feed ? feed.bottom : o.process.alimentation === "bas";
+  const n = feed ? (below ? feed.feedPoints.length : feed.risers.length) : null;
+  const what = below ? "points" : "risers";
+  const count = n == null ? "" : ` (${t(n === 0 ? `orient.change.${what}.none` : n === 1 ? `orient.change.${what}.one` : `orient.change.${what}`, { n })})`;
+  parts.push(t(`orient.feed.${below ? "bas" : "haut"}`) + count);
+  // The blank and the halves (the die margins the same, else superseded): the same along the same draw
+  // direction; along its other sense, the halves swapped.
+  const d = o.block_axes.d;
+  const axis = partingField(i)?.summary.axis ?? axisSigned(d);
+  if (sameDirection(from.d, d)) {
+    parts.push(t("orient.change.blankSame"));
+  } else if (sameDirection(from.d, d.map((x) => -x))) {
+    parts.push(t("orient.change.halvesSwapped", { to: axis }));
+  } else {
+    const [L, l, h] = (o.die_block_mm ?? []).map((x) => fmtNum(x, 0));
+    parts.push(t("orient.change.direction", { from: from.axis, to: axis, L, l, h }));
+  }
+  return t("orient.change", { parts: parts.join(t("orient.change.sep")) });
+}
 
 // ---------------------------------------------------------------- tabs
 

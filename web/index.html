@@ -97,6 +97,7 @@
         <button data-view="front" data-i18n="view.front.label" data-i18n-title="view.front" title="Front view (−Y)">Front</button>
         <button data-view="top" data-i18n="view.top.label" data-i18n-title="view.top" title="Top view (+Z)">Top</button>
         <button data-view="right" data-i18n="view.right.label" data-i18n-title="view.right" title="Right view (+X)">Right</button>
+        <button id="view-casting" disabled data-i18n="view.casting.label" data-i18n-title="view.casting" title="Casting view: the die of the parting card's body as it stands when the metal is cast, up when cast at the top of the screen, seen from the side (a vertical parting plane: the halves side by side; a horizontal one: one over the other)">Casting</button>
         <button id="fit" data-i18n="view.fit.label" data-i18n-title="view.fit" title="Fit to view">Fit</button>
         <span class="sep"></span>
         <button id="toggle-wire" class="toggle" data-i18n="view.wire.label" data-i18n-title="view.wire" title="Show triangle edges">Wireframe</button>
@@ -284,9 +285,9 @@
           <h3 data-i18n="parting.title">Parting line</h3>
           <span class="card-checks">
             <label class="check" data-i18n-title="parting.show.title" title="Show on the 3D view: the parting line in red, the undercuts in yellow, the halves of the mould as translucent blocks (the upper one blue, the lower one green) and the draw direction; the other bodies faded"><input type="checkbox" id="parting-show"> <span data-i18n="parting.show">Show</span></label>
-            <label class="check" data-i18n-title="parting.blocks.title" title="The halves of the mould as translucent blocks round the part: the upper one blue, the lower one green; they meet along the parting surface"><input type="checkbox" id="parting-blocks" checked> <span data-i18n="parting.blocks">Mould halves</span></label>
+            <label class="check" data-i18n-title="parting.blocks.title" title="The halves of the mould as translucent blocks: the die blank (the smallest block round the part along its draw direction, plus the margins of the costing) cut in two along the parting surface; the upper one blue, the lower one green"><input type="checkbox" id="parting-blocks" checked> <span data-i18n="parting.blocks">Mould halves</span></label>
             <label class="check" data-i18n-title="slides.show.title" title="Colour each slide on the 3D view (the first one in the yellow of the undercuts), with an arrow along its pull direction"><input type="checkbox" id="parting-slides-show" checked> <span data-i18n="slides.show">Slides</span></label>
-            <label class="check" data-i18n-title="orient.brut.show.title" title="The die blank on the 3D view: the smallest block round the part along its draw direction, plus the margins of the costing (one cavity), in grey wire"><input type="checkbox" id="parting-brut"> <span data-i18n="orient.brut.show">Blank</span></label>
+            <label class="check" data-i18n-title="orient.brut.show.title" title="The outline of the die blank on the 3D view, in grey wire: the smallest block round the part along its draw direction, plus the margins of the costing (one cavity); the mould halves are its two parts"><input type="checkbox" id="parting-brut"> <span data-i18n="orient.brut.show">Blank</span></label>
           </span>
         </div>
         <p class="small muted" id="parting-body" hidden></p>
@@ -301,6 +302,8 @@
           <!-- The casting process of the body (the island retained in the costing, or chosen here) and the orientation of the part in its die: up when cast, the die blank (engine/orientation.js). -->
           <div id="parting-process" class="parting-process">
             <p class="small" id="parting-process-line"></p>
+            <p class="small" id="parting-process-change" hidden></p>
+            <p class="small muted parting-process-why" data-i18n="orient.process.why">The draw direction and the die blank depend on the part; the process sets the casting up and the feeding.</p>
             <div class="parting-controls">
               <label class="parting-select" data-i18n-title="orient.process.choose.title" title="The casting process the die of this part is oriented for; by default the island retained in the costing">
                 <span data-i18n="orient.process.choose">Process for this part</span>

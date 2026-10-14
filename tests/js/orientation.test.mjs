@@ -1,6 +1,7 @@
 // Orientation of a part in its die by casting process (web/engine/orientation.js):
 // the minimum-area rectangle and the die block of a draw direction, the
 // direction up when cast; the draw directions ranked with them (parting.js);
+// the halves of the mould cut out of the die blank (parting.js mouldBlocks);
 // the risers and the feed placed along up (feeding.js). Synthetic meshes.
 //
 //   node --test tests/js/orientation.test.mjs
@@ -13,13 +14,13 @@ import {
   riserFromPoint, snapToPartingLine,
 } from '../../web/engine/feeding.js';
 import {
-  DIE_DEFAULTS, blockFrame, convexHull, dieBlock, dieKey, minAreaRect, normalizeDie, normalizeProcess, orientationKey, orientationMesh,
+  DIE_DEFAULTS, blankBox, blockFrame, convexHull, dieBlock, dieKey, minAreaRect, normalizeDie, normalizeProcess, orientationKey, orientationMesh,
   orientationOf, planeBasis, processForIsland,
 } from '../../web/engine/orientation.js';
-import { SIDE_LOWER, SIDE_UPPER, evaluateParting, proposeParting } from '../../web/engine/parting.js';
+import { SIDE_LOWER, SIDE_UPPER, evaluateParting, mouldBlocks, proposeParting } from '../../web/engine/parting.js';
 import { analyseSlides, effectiveSlides, prepareSlides, slidesSignature, undercutMask } from '../../web/engine/slides.js';
 import { approx } from './helpers.mjs';
-import { prism, revolve, voxels } from './meshes.mjs';
+import { prism, revolve, vBar, voxels } from './meshes.mjs';
 
 const LOW_PRESSURE = { plan: 'horizontal', alimentation: 'bas' };
 const GRAVITY_HORIZONTAL = { plan: 'horizontal', alimentation: 'haut' };
@@ -473,6 +474,145 @@ describe('draw directions ranked by their die block, oriented by their feeding',
     console.log(`orientation of a body of 2M triangles: ${ms(times)} ms of processor (${ms(walls)} ms); a frame ${frame.toFixed(0)} ms`);
     for (const t of times) assert.ok(t < 1500, `${t} ms`);
     assert.ok(frame < 1000, `frame ${frame} ms`);
+  });
+});
+
+/** The signed volume of a closed triangle mesh (positive: turned outwards). */
+function signedVolume({ positions: P, indices: I }) {
+  let volume = 0;
+  for (let t = 0; t < I.length; t += 3) {
+    const [a, b, c] = [0, 1, 2].map((k) => 3 * I[t + k]);
+    volume += (P[a] * (P[b + 1] * P[c + 2] - P[b + 2] * P[c + 1]) + P[a + 1] * (P[b + 2] * P[c] - P[b] * P[c + 2]) + P[a + 2] * (P[b] * P[c + 1] - P[b + 1] * P[c])) / 6;
+  }
+  return volume;
+}
+
+/** The 8 corners of a box {centre, u, v, d, size}, in the order of the signs (-, -, -), (-, -, +)… */
+const boxCorners = ({ centre, u, v, d, size }) => [-1, 1].flatMap((a) => [-1, 1].flatMap((b) => [-1, 1].map((c) =>
+  [0, 1, 2].map((k) => centre[k] + (a * size[0] * u[k] + b * size[1] * v[k] + c * size[2] * d[k]) / 2))));
+
+/** The 8 outer corners of the halves of the mould (their vertices' extent along their frame), in the same order. */
+function blockCorners({ lower, upper, frame: { u, v, d } }) {
+  const axes = [u, v, d];
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (const P of [lower.positions, upper.positions]) {
+    for (let i = 0; i < P.length; i += 3) {
+      for (let k = 0; k < 3; k++) {
+        const x = P[i] * axes[k][0] + P[i + 1] * axes[k][1] + P[i + 2] * axes[k][2];
+        lo[k] = Math.min(lo[k], x);
+        hi[k] = Math.max(hi[k], x);
+      }
+    }
+  }
+  return [lo[0], hi[0]].flatMap((a) => [lo[1], hi[1]].flatMap((b) => [lo[2], hi[2]].map((c) => [0, 1, 2].map((k) => a * u[k] + b * v[k] + c * d[k]))));
+}
+
+describe('the halves of the mould cut out of the die blank', () => {
+  // A bent flat bar (two arms 120 × 20 mm, 150° apart, 8 thick) turned 20° about Z, away from the origin.
+  const TURN = 20 * deg;
+  const bar = vBar({ turn: 20, offset: [30, -15, 5] });
+
+  test('a V turned in its plane: the blank along the line joining the ends of its arms, centred on it; the halves are that blank cut at the parting surface', () => {
+    const { proposal, segments } = proposeParting(bar.positions, bar.indices);
+    assert.deepEqual([proposal.axis, proposal.parting.planar, proposal.parting.level_mm], ['Z', true, 5]);
+    const o = proposal.orientation;
+    approxVec(o.block_axes.u, [Math.cos(TURN), Math.sin(TURN), 0], 1e-6, 'u along the line joining the ends of the arms');
+    approxVec(o.raw_mm, [231.82, 51.76, 8], 0.006, 'raw');
+    // The centre of its smallest rectangle: half-way between the ends of the arms along u, between its corner and the ends along v.
+    const mid = (Math.cos(75 * deg) * 120) / 2;
+    approxVec(o.raw_centre_mm, [30 - Math.sin(TURN) * mid, -15 + Math.cos(TURN) * mid, 9], 1e-3, 'raw centre');
+    const box = blankBox(o);
+    approxVec(box.size, o.die_block_mm, 0.05, 'the blank, one cavity');
+    assert.deepEqual(box.size, [o.raw_mm[0] + 120, o.raw_mm[1] + 120, o.raw_mm[2] + 100]);
+
+    const level = proposal.parting.level_mm;
+    const blocks = mouldBlocks(bar.positions, proposal.direction, { segments, level, box });
+    assert.deepEqual(blocks.box, box);
+    approxVec(blocks.frame.u, box.u, 1e-6, 'frame u');
+    approxVec(blocks.frame.v, box.v, 1e-6, 'frame v');
+    // Their outline is the blank: corner by corner.
+    const corners = boxCorners(box);
+    blockCorners(blocks).forEach((p, k) => approxVec(p, corners[k], 1e-3, `corner ${k}`));
+    // Flat at the level of the line, closed, turned outwards: the lower one from under the blank up to the line, the upper one on.
+    assert.deepEqual([...blocks.heights], [level, level, level, level]);
+    const [L, l, h] = box.size;
+    approx(signedVolume(blocks.lower), L * l * (level - (box.centre[2] - h / 2)), 1e-5, 0, 'lower half');
+    approx(signedVolume(blocks.upper), L * l * (box.centre[2] + h / 2 - level), 1e-5, 0, 'upper half');
+    // The arrows above the blocks clear them: the largest margin round the body.
+    approx(blocks.margin, 60, 0, 0.01, 'margin');
+
+    // A line that is not planar (its points, no level): the interface between the extremes of the body, the outline still the blank.
+    const free = mouldBlocks(bar.positions, proposal.direction, { segments, box });
+    assert.ok(free.cells[0] > 1 && free.cells[1] > 1);
+    assert.ok([...free.heights].every((x) => x >= 5 - 1e-9 && x <= 13 + 1e-9));
+    blockCorners(free).forEach((p, k) => approxVec(p, corners[k], 1e-3, `corner ${k} (line not planar)`));
+    approx(signedVolume(free.lower) + signedVolume(free.upper), L * l * h, 1e-5, 0, 'both halves (line not planar)');
+  });
+
+  test('a V on its edge turned 3.05° about Z: the blank along its draw direction though both are rounded, the halves cut out of it', () => {
+    // A quarter turn about y (its thickness along x), then 3.05° about z: drawn along (cos 3.05°, sin 3.05°, 0), which the
+    // proposal and the blank's d both round to 6 digits: their plain dot product falls 1e-6 short of 1.
+    const t = 3.05 * deg;
+    const edge = vBar();
+    const P = edge.positions;
+    for (let i = 0; i < P.length; i += 3) {
+      const x = P[i + 2], y = P[i + 1], z = -P[i];
+      P[i] = Math.cos(t) * x - Math.sin(t) * y + 100;
+      P[i + 1] = Math.sin(t) * x + Math.cos(t) * y - 40;
+      P[i + 2] = z + 7;
+    }
+    const { proposal, segments } = proposeParting(P, edge.indices);
+    const o = proposal.orientation;
+    const dir = proposal.direction;
+    approxVec(dir, [Math.cos(t), Math.sin(t), 0], 1e-6, 'draw direction');
+    const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    assert.ok(Math.abs(dot(o.block_axes.d, dir)) < 1 - 1e-6, 'a case the plain dot product missed');
+    const box = blankBox(o, dir);
+    assert.ok(box, 'the blank along the draw direction');
+    assert.deepEqual(blankBox(o, dir.map((x) => -x)), box, 'either sense');
+    assert.equal(blankBox(o, [0, 0, 1]), null, 'another axis');
+    assert.equal(blankBox(o, [Math.cos(t + 1e-3), Math.sin(t + 1e-3), 0]), null, 'a direction 0.06° off');
+    const level = proposal.parting?.planar ? proposal.parting.level_mm : null;
+    const blocks = mouldBlocks(P, dir, { segments, level, box });
+    assert.deepEqual(blocks.box, box);
+    const corners = boxCorners(box);
+    for (const p of blockCorners(blocks)) {
+      const gap = Math.min(...corners.map((q) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2])));
+      assert.ok(gap < 1e-3, `corner ${p}: ${gap} mm from the blank's`);
+    }
+  });
+
+  test('without a blank, or one that does not fit: the halves round the extent of the body as before', () => {
+    const { proposal, segments } = proposeParting(bar.positions, bar.indices);
+    const level = proposal.parting.level_mm;
+    const plain = mouldBlocks(bar.positions, proposal.direction, { segments, level });
+    // Two axes square to Z (Y, -X), the margin 15 % of the largest extent, no box.
+    assert.deepEqual([plain.frame.u, plain.frame.v, plain.box], [[0, 1, 0], [-1, 0, 0], null]);
+    const [u0, u1] = plain.extent.u, [v0, v1] = plain.extent.v;
+    assert.equal(plain.margin, 0.15 * Math.max(u1 - u0, v1 - v0, 8));
+    const box = blankBox(proposal.orientation);
+    const same = (blocks, label) => {
+      assert.equal(blocks.box, null, label);
+      assert.deepEqual([blocks.frame, blocks.margin, blocks.extent, [...blocks.heights]], [plain.frame, plain.margin, plain.extent, [...plain.heights]], label);
+      assert.deepEqual([...blocks.lower.positions], [...plain.lower.positions], label);
+      assert.deepEqual([...blocks.upper.positions], [...plain.upper.positions], label);
+    };
+    // A blank smaller than the body; the blank of another draw direction (X); axes not square to each other; no blank.
+    same(mouldBlocks(bar.positions, proposal.direction, { segments, level, box: { ...box, size: [200, 40, 8] } }), 'too small');
+    const along = blankBox(orientationOf(bar.positions, bar.indices, [1, 0, 0]));
+    same(mouldBlocks(bar.positions, proposal.direction, { segments, level, box: along }), 'another direction');
+    same(mouldBlocks(bar.positions, proposal.direction, { segments, level, box: { ...box, v: box.u } }), 'not square');
+    same(mouldBlocks(bar.positions, proposal.direction, { segments, level, box: null }), 'none');
+    assert.equal(blankBox(null), null);
+    assert.equal(blankBox({ ...proposal.orientation, raw_mm: null }), null);
+    // Its axes left-handed with d (v turned round): the same box, the halves still turned outwards.
+    const flipped = mouldBlocks(bar.positions, proposal.direction, { segments, level, box: { ...box, v: box.v.map((x) => -x) } });
+    assert.ok(signedVolume(flipped.lower) > 0 && signedVolume(flipped.upper) > 0);
+    blockCorners(flipped).forEach((p, k) => assert.ok(boxCorners(box).some((q) => Math.hypot(...p.map((x, c) => x - q[c])) < 1e-3), `corner ${k}`));
+    // The draw direction the other way (-Z): the same blank round it, the halves swapped.
+    const down = mouldBlocks(bar.positions, [0, 0, -1], { level: -level, box });
+    assert.ok(down.box && signedVolume(down.lower) > 0 && signedVolume(down.upper) > 0);
+    approx(signedVolume(down.upper), box.size[0] * box.size[1] * (level - (box.centre[2] - box.size[2] / 2)), 1e-5, 0, 'the upper half under the line');
   });
 });
 

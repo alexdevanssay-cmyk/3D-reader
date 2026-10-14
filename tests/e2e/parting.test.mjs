@@ -451,6 +451,9 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     assert.ok(shown.undercuts > 0, 'the walls of the slot coloured as undercuts');
     const withBlocks = await viewColours(page);
     assert.ok(withBlocks.red > 200, `the line, thick and red: ${JSON.stringify(withBlocks)}`);
+    // Above the part (its top at z = 40), in front of the part: inside the upper half only.
+    const above = [[10, 0, 50], [50, 0, 50]];
+    const aboveWith = await coloursAt(page, above);
 
     // Without the blocks: the line and the colours stay; the walls of the slot in yellow.
     await page.uncheck('#parting-blocks');
@@ -460,10 +463,22 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     const without = await viewColours(page);
     assert.ok(without.red > 200, JSON.stringify(without));
     assert.ok(without.yellow > 500, `the undercuts in yellow: ${JSON.stringify(without)}`);
-    // The blocks: blue above the line, green under it, over the page.
-    assert.ok(withBlocks.blue > without.blue + 5000 && withBlocks.green > without.green + 5000, `${JSON.stringify(withBlocks)} / ${JSON.stringify(without)}`);
+    const aboveWithout = await coloursAt(page, above);
+    // The blocks, over the page: the die blank cut in two, wider than this view framed on the part. Above the
+    // part only the upper half is crossed: blue there, the page without the blocks (under the line both halves
+    // are crossed, their colours mixed). Seen whole in the casting view: blue and green (side by side on this
+    // vertical parting plane).
+    const isBlue = ([r, g, b]) => b > r + 25 && b > g + 10;
+    assert.ok(aboveWith.every(isBlue) && !aboveWithout.some(isBlue), `above the part: ${JSON.stringify(aboveWith)} / ${JSON.stringify(aboveWithout)}`);
     await page.check('#parting-blocks');
     assert.equal((await overlay()).overlay, 'lower upper line');
+    await page.click('#view-casting');
+    const die = await viewColours(page);
+    await page.uncheck('#parting-blocks');
+    const dieWithout = await viewColours(page);
+    assert.ok(die.blue > dieWithout.blue + 5000 && die.green > dieWithout.green + 5000, `${JSON.stringify(die)} / ${JSON.stringify(dieWithout)}`);
+    await page.check('#parting-blocks');
+    await page.click('[data-view="front"]');
     assert.match(await page.textContent('#parting-legend'), /^ligne de joint contre-dépouille faces de la pièce \(plus clair : sans dépouille\) chape supérieure chape inférieure/);
 
     // Not shown: no overlay, the part in its own colour.

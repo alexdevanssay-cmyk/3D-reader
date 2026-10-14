@@ -50,9 +50,11 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   across a long CAD triangle) in pieces cut on the line, so that the colours change on it,
   not in steps along the triangles (the figures of the card stay by triangle, as for every
   candidate and the slides; the parts of faces a planar line traps were counted to the
-  plane already), and the two halves of the mould ("chapes") as translucent blocks round
-  the part, the upper one blue and the lower one green, a margin of the larger of 5 mm and
-  15 % of the part round it (*Mould halves* hides them). The blocks meet flat at the level of a
+  plane already), and the two halves of the mould ("chapes") as translucent blocks, the
+  upper one blue and the lower one green: the die blank of the orientation (below) cut in
+  two, centred on the part along the sides of its smallest rectangle and as large as the
+  blank (a line drawn by hand, or a part not oriented yet: round the part, a margin of the
+  larger of 5 mm and 15 % of it; *Mould halves* hides them). The blocks meet flat at the level of a
   planar line; for a stepped or warped line, on a surface interpolated from the points of
   the line (a height field of at most 48 × 48 cells, inverse distance weighting), so the
   interface follows the line near it and goes from one level to the other between its
@@ -130,8 +132,19 @@ hand" of `web/app.js`:
   the other side turns the halves over) and the die blank (« brut de coquille »: the
   smallest block round the part along its draw direction plus the margins of the
   costing, one cavity, with its steel; a « Brut (kg) » column for each candidate). On the
-  3D view an arrow « haut » and, *Brut* checked, the blank as a grey wire box. The
-  costing sizes the die block of an in-house die from that oriented blank. See
+  3D view an arrow « haut » and, *Brut* checked, the blank as a grey wire box (the
+  outline of the halves of the mould). *Casting* (« Coulée ») next to the named views
+  turns the view so that up when cast is up on the screen, the die seen from the side and
+  a little above: on a vertical plane the halves side by side, on a horizontal one the
+  upper over the lower, the risers on top or the feed points under the part in place. A
+  change of process moves neither the draw direction nor the blank (the card says so);
+  once its orientation is in, the card says what changed (« Procédé changé : haut de
+  coulée +Y → +Z ; alimentation par le bas (2 points) ; brut et chapes inchangés (même
+  direction de démoulage) ») and, the parting shown, the view not moved and the part and
+  body not left meanwhile, the view turns to *Casting* (*Casting* is not offered while
+  that orientation is computed). New die margins or a definition chosen by hand meanwhile
+  are not the process's doing: then nothing is said. The costing sizes the die block of
+  an in-house die from that oriented blank. See
   [Mould orientation by casting process](#mould-orientation-by-casting-process-method-and-limits).
 - **Slides** ("tiroirs"), part *Tiroirs et noyaux* of the parting line card: the undercuts
   of the definition shown (proposed, chosen, reassigned or drawn by hand) grouped into
