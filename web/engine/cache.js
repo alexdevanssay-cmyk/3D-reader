@@ -99,7 +99,10 @@ export async function loadResult(key) {
 
 /**
  * Keep a part of the results: record {data} (the analysis, first),
- * {thickness}, {parting}, {feeding} or {holes} (added to the analysis already kept). Never throws:
+ * {thickness}, {parting}, {feeding} or {holes} (added to the analysis already
+ * kept); or the analysis with parts of it ({data, thickness}), in one
+ * transaction: a page closed before it is committed keeps all of them or
+ * none, never the analysis without the rest. Never throws:
  * the cache is an extra, a full disk or a private window just leave it out.
  * Resolves to whether it was kept (then it may go to the shared network
  * folder, client.js).
@@ -109,17 +112,21 @@ export async function saveResult(key, record, { file = '' } = {}) {
   let d = null;
   try {
     d = await db();
-    const [part] = Object.keys(record);
-    const bytes = sizeOf(record[part]);
-    if (bytes > MAX_BYTES / 2) return false; // one model would push out everything else
+    // One model would push out everything else: a part that large is not kept (nor anything without its analysis).
+    const sizes = {};
+    for (const part of PARTS) if (part in record) sizes[part] = sizeOf(record[part]);
+    for (const part of Object.keys(sizes)) if (sizes[part] > MAX_BYTES / 2) delete sizes[part];
+    const given = Object.keys(sizes);
+    const fresh = 'data' in record;
+    if (!given.length || (fresh && !('data' in sizes))) return false;
     const tx = d.transaction(['meta', 'data'], 'readwrite');
     const meta = await request(tx.objectStore('meta').get(key));
-    if (part !== 'data' && !meta) return false; // the analysis is no longer kept
-    tx.objectStore('data').put(record[part], partKey(key, part));
-    // A new analysis (refreshed, or its open surfaces closed): the thickness kept was of the former one.
-    const former = part === 'data' ? {} : meta?.parts;
-    if (part === 'data') for (const other of PARTS) if (other !== 'data') tx.objectStore('data').delete(partKey(key, other));
-    const parts = { ...former, [part]: bytes };
+    if (!fresh && !meta) return false; // the analysis is no longer kept
+    for (const part of given) tx.objectStore('data').put(record[part], partKey(key, part));
+    // A new analysis (refreshed, or its open surfaces closed): the parts kept, not given with it, were of the former one.
+    const former = fresh ? {} : meta?.parts;
+    if (fresh) for (const other of PARTS) if (!given.includes(other)) tx.objectStore('data').delete(partKey(key, other));
+    const parts = { ...former, ...sizes };
     tx.objectStore('meta').put({ key, file: meta?.file ?? file, savedAt: meta?.savedAt ?? Date.now(), parts, bytes: Object.values(parts).reduce((a, b) => a + b, 0), usedAt: Date.now() });
     await done(tx);
   } catch {

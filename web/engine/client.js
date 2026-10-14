@@ -301,12 +301,14 @@ async function readFromNetwork(key, onProgress) {
   }
 }
 
-/** Results read from the shared folder, kept in this browser too (the analysis, then its thickness). */
+/**
+ * Results read from the shared folder, kept in this browser too: the analysis
+ * and its thickness in one transaction. A page closed or reloaded before it
+ * is committed keeps both or neither: never the analysis alone, which would
+ * open from this browser without the thickness the folder has.
+ */
 function keep(key, shared, name) {
-  keeping(key, saveResult(key, { data: shared.data }, { file: name }).then(async (kept) => {
-    if (kept && shared.thickness) await saveResult(key, { thickness: shared.thickness });
-    return kept;
-  }));
+  keeping(key, saveResult(key, shared.thickness ? { data: shared.data, thickness: shared.thickness } : { data: shared.data }, { file: name }));
 }
 
 /** Write in the shared folder in the background (writeShared); a failure is said to the page (onShared), never thrown. */
