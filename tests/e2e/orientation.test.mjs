@@ -6,8 +6,10 @@
 // costing's; the casting up chosen by hand (a horizontal plane turned over),
 // again with the wall thickness; the die blank (« Brut ») on the 3D view and
 // its size and steel on the card; the islands' orientation in Paramètres; the
-// costing's die block from the part oriented in its die, and its trace. With a
-// made-up costing workbook (tests/js/costing-fixture.mjs), in French.
+// costing's die block from the part oriented in its die, and its trace; the
+// mould halves cut out of that blank and the « Vue de coulée » turned with the
+// process (a V bent bar). With a made-up costing workbook
+// (tests/js/costing-fixture.mjs), in French.
 //
 //   npm run build && node --test tests/e2e/orientation.test.mjs
 //   SHOTS_DIR=… also writes screenshots of the card, the 3D view and the costing there.
@@ -23,7 +25,7 @@ import { chromium } from 'playwright';
 import { createStaticServer } from '../../scripts/serve.mjs';
 import { ROOT, approx, fixturePath } from '../js/helpers.mjs';
 import { costingWorkbook } from '../js/costing-fixture.mjs';
-import { prism } from '../js/meshes.mjs';
+import { prism, vBar } from '../js/meshes.mjs';
 
 const DIST = join(ROOT, 'dist');
 const CAD_TIMEOUT = 180_000;
@@ -407,6 +409,100 @@ describe('orientation by casting process (dist/)', { skip: !existsSync(join(DIST
     await page.click('.tab[data-page="viewer"]');
     await page.waitForFunction(() => window.reader3d.semantic?.bodies?.[1]?.parting?.orientation?.margins_mm?.longueur === 80, null, { timeout: 120_000 });
     assert.deepEqual(await body(), { plan: 'horizontal', feeding: 'horizontal', margin: 80, block: [270, 220, 160] });
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('a V bent bar: the mould halves are its die blank cut in two; the « Vue de coulée » turned with the process, what changed said', { timeout: 2 * CAD_TIMEOUT }, async () => {
+    const { context, page, errors } = await newPage();
+    assert.equal(await page.isDisabled('#view-casting'), true, 'no model, no casting view');
+    // Two arms 120 × 20 mm, 150° apart, 8 thick, turned 20° about Z: drawn along Z, its blank along the line joining
+    // the ends of its arms (231.8 × 51.8 × 8 mm), not along X and Y; cast in a gravity die, its shorter side (v) upright.
+    const turn = (20 * Math.PI) / 180;
+    const u = [Math.cos(turn), Math.sin(turn), 0];
+    await open(page, stlFile('V.stl', vBar({ turn: 20, offset: [30, -15, 5] })));
+    await settled(page, GRAVITY_DEFAULT, '(-0.342, 0.94, 0)');
+    assert.equal(await page.isDisabled('#view-casting'), false);
+    const o = (await exported(page, 'vertical')).parting.orientation;
+    assert.equal(o.block_axes.d.join(), '0,0,1');
+    o.block_axes.u.forEach((x, k) => approx(x, u[k], 0, 1e-6, `u [${k}]`));
+    o.raw_mm.forEach((x, k) => approx(x, [231.82, 51.76, 8][k], 0, 0.006, `raw [${k}]`));
+    // Centred on the part: half-way between the ends of the arms along u, between the bend and the ends along v.
+    const mid = (Math.cos((75 * Math.PI) / 180) * 120) / 2;
+    o.raw_centre_mm.forEach((x, k) => approx(x, [30 - Math.sin(turn) * mid, -15 + Math.cos(turn) * mid, 9][k], 0, 1e-3, `centre [${k}]`));
+    assert.deepEqual(o.die_block_mm, [351.8, 171.8, 108]);
+    assert.match((await card(page)).orient['Brut de coquille'], /^352 × 172 × 108 mm, \d+ kg d'acier$/);
+    // Up when cast: v (as the card rounds it), the arms of the V up.
+    const g = o.up.map((x) => x / Math.hypot(...o.up));
+    g.forEach((x, k) => approx(x, [-Math.sin(turn), Math.cos(turn), 0][k], 0, 1e-5, `up [${k}]`));
+
+    // The halves of the mould and the « Brut » box: the same box, the blank of the orientation (one cavity, the margins of the costing).
+    await page.check('#parting-show');
+    await page.check('#parting-brut');
+    assert.equal(await page.getAttribute('#parting-card', 'data-overlay'), 'lower upper line');
+    const outline = () => page.evaluate(() => {
+      const el = document.getElementById('parting-card');
+      return { chapes: JSON.parse(el.dataset.chapes || 'null'), brut: JSON.parse(el.dataset.brutBox || 'null') };
+    });
+    const { chapes, brut } = await outline();
+    const half = [o.raw_mm[0] / 2 + 60, o.raw_mm[1] / 2 + 60, o.raw_mm[2] / 2 + 50];
+    const axes = [o.block_axes.u, o.block_axes.v, o.block_axes.d];
+    const blank = [-1, 1].flatMap((a) => [-1, 1].flatMap((b) => [-1, 1].map((c) => [0, 1, 2].map((k) => o.raw_centre_mm[k] + [a, b, c].reduce((s, sign, j) => s + sign * half[j] * axes[j][k], 0)))));
+    const near = (p, list, label) => {
+      const gap = Math.min(...list.map((q) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2])));
+      assert.ok(gap < 1e-3, `${label} ${p}: ${gap} mm from the nearest corner of the blank`);
+    };
+    assert.deepEqual([chapes.length, brut.length], [8, 8]);
+    for (const p of chapes) near(p, brut, 'corner of the mould halves');
+    for (const p of brut) near(p, chapes, 'corner of the « Brut » box');
+    for (const p of brut) near(p, blank, 'corner of the « Brut » box against the orientation');
+    await page.click('[data-view="iso"]');
+    await shot(page, 'v-cad', '#viewport');
+
+    // Seen where it is screened: the « Vue de coulée », g up on the screen.
+    const screen = (points) => page.evaluate((list) => list.map((p) => window.reader3d.screenOf(p)), points);
+    const along = (w, s) => o.raw_centre_mm.map((x, k) => x + s * w[k]);
+    const view = async (up, across, label) => {
+      const shown = await page.evaluate(() => window.reader3d.view);
+      shown.up.forEach((x, k) => approx(x, up[k], 0, 1e-9, `${label}: camera up [${k}]`));
+      const [c, top, minus, plus] = await screen([o.raw_centre_mm, along(up, 50), along(o.block_axes.d, -50), along(o.block_axes.d, 50)]);
+      assert.ok(c.y - top.y > 40 && Math.abs(top.x - c.x) < 1, `${label}: up when cast upright on the screen (${JSON.stringify([c, top])})`);
+      const [dx, dy] = [plus.x - minus.x, plus.y - minus.y];
+      // A vertical parting plane: the halves side by side (the upper one on the right); a horizontal one: one over the other.
+      assert.ok(across ? dx > 2 * Math.abs(dy) : -dy > 2 * Math.abs(dx), `${label}: the draw direction ${across ? 'across' : 'upright on'} the screen (${dx}, ${dy})`);
+    };
+    await page.click('#view-casting');
+    await view(g, true, 'gravity, vertical parting plane');
+    assert.equal(await page.isHidden('#parting-process-change'), true, 'no change of process yet');
+    await page.waitForTimeout(300);
+    await shot(page, 'v-casting-gravity', '#viewport');
+
+    // Low pressure chosen for the part: the view turned once its orientation is in, the change said; the blank and the halves the same.
+    await page.click('[data-view="iso"]');
+    await page.selectOption('#parting-process-select', 'horizontal-bas');
+    await settled(page, 'Procédé : Basse pression — plan de joint horizontal, alimentation par le bas (choisi pour cette pièce)', '+Z');
+    await page.waitForSelector('#parting-process-change:not([hidden])');
+    assert.match(await page.textContent('#parting-process-change'),
+      /^Procédé changé : haut de coulée \(-0\.342, 0\.94, 0\) → \+Z ; alimentation par le bas( \(\d+ points?\))? ; brut et chapes inchangés \(même direction de démoulage\)$/);
+    await view([0, 0, 1], false, 'low pressure');
+    assert.deepEqual(await outline(), { chapes, brut });
+    await page.waitForTimeout(300);
+    await shot(page, 'v-casting-low-pressure', '#viewport');
+    await page.locator('#parting-process').scrollIntoViewIfNeeded();
+    await shot(page, 'v-card-low-pressure', '#parting-card');
+    // Its feed points once placed, from below.
+    await page.waitForFunction(() => / \(\d+ points?\) ; /.test(document.getElementById('parting-process-change').textContent), null, { timeout: 60_000 });
+
+    // Back to the costing's process (none retained: the default): the gravity die again, the view turned back.
+    await page.click('[data-view="top"]');
+    await page.click('#parting-process-reset');
+    await settled(page, GRAVITY_DEFAULT, '(-0.342, 0.94, 0)');
+    await page.waitForFunction(() => /^Procédé changé : haut de coulée \+Z → \(-0\.342, 0\.94, 0\) ; coulée par le haut/.test(document.getElementById('parting-process-change').textContent), null, { timeout: 60_000 });
+    await view(g, true, 'gravity again');
+    // Another up chosen by hand: the line no longer said (it was about the process).
+    await page.selectOption('#parting-up', '-v');
+    await page.waitForFunction(() => document.getElementById('parting-card').dataset.up === '(0.342, -0.94, 0)', null, { timeout: 60_000 });
+    assert.equal(await page.isHidden('#parting-process-change'), true);
     assert.deepEqual(errors, []);
     await context.close();
   });

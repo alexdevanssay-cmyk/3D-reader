@@ -459,10 +459,19 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     const without = await viewColours(page);
     assert.ok(without.red > 200, JSON.stringify(without));
     assert.ok(without.yellow > 500, `the undercuts in yellow: ${JSON.stringify(without)}`);
-    // The blocks: blue above the line, green under it, over the page.
-    assert.ok(withBlocks.blue > without.blue + 5000 && withBlocks.green > without.green + 5000, `${JSON.stringify(withBlocks)} / ${JSON.stringify(without)}`);
+    // The blocks, over the page: the die blank cut in two, wider than this view framed on the part (its upper
+    // half in front of the camera); seen whole in the casting view, blue above the line and green under it
+    // (side by side on this vertical parting plane).
+    assert.ok(withBlocks.blue > without.blue + 5000, `${JSON.stringify(withBlocks)} / ${JSON.stringify(without)}`);
     await page.check('#parting-blocks');
     assert.equal((await overlay()).overlay, 'lower upper line');
+    await page.click('#view-casting');
+    const die = await viewColours(page);
+    await page.uncheck('#parting-blocks');
+    const dieWithout = await viewColours(page);
+    assert.ok(die.blue > dieWithout.blue + 5000 && die.green > dieWithout.green + 5000, `${JSON.stringify(die)} / ${JSON.stringify(dieWithout)}`);
+    await page.check('#parting-blocks');
+    await page.click('[data-view="front"]');
     assert.match(await page.textContent('#parting-legend'), /^ligne de joint contre-dépouille faces de la pièce \(plus clair : sans dépouille\) chape supérieure chape inférieure/);
 
     // Not shown: no overlay, the part in its own colour.
