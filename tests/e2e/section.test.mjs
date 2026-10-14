@@ -269,7 +269,8 @@ describe('section view: closed cuts (dist/)', { skip: !existsSync(join(DIST, 'in
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}?lang=fr`);
+    // Every body checked (a file of several bodies shows its largest one alone by default): all of them shown.
+    await page.goto(`${base}?lang=fr&bodies=all`);
     // Three bodies 20 mm side by side along X: A a closed cube, B a box without its top (open), C a closed cube.
     const lines = [];
     const faces = [];
@@ -329,7 +330,8 @@ describe('section view: closed cuts (dist/)', { skip: !existsSync(join(DIST, 'in
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}?lang=fr`);
+    // Every body checked (a file of several bodies shows its largest one alone by default): all of them shown.
+    await page.goto(`${base}?lang=fr&bodies=all`);
     const caps = () => capsShown(page);
     const open = async (name, boxes) => {
       await page.setInputFiles('#file-input', { name, mimeType: 'text/plain', buffer: objOf(boxes) });

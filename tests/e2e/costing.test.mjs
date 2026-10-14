@@ -1434,6 +1434,11 @@ describe('costing pages (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.waitForSelector('#page-chiffrage .ccard');
     await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
     await page.waitForSelector('#page-chiffrage [data-bind="q.piece"]');
+    // The largest body alone checked on the 3D page by default: that piece alone costed. The set
+    // chosen here: every body checked there.
+    assert.equal(await page.inputValue('#page-chiffrage [data-bind="q.piece"]'), '0:Équerre');
+    await page.selectOption('#page-chiffrage [data-bind="q.piece"]', 'tout');
+    await page.waitForFunction(() => [...document.querySelectorAll('#bodies tr[data-index] input')].every((box) => box.checked));
     // Wall thickness of each piece (bracket 5 mm, pin 8 mm across).
     await page.click('#page-chiffrage [data-action="thickness"]');
     // In the rows of the pieces (the card of the traced values has other sizes in mm, such as 45,00 mm).

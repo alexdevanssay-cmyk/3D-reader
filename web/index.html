@@ -269,6 +269,8 @@
             <button id="export-json" class="small" data-i18n="export.json" data-i18n-title="export.json.title">JSON</button>
           </div>
         </div>
+        <!-- Several bodies: the largest one alone is checked at first (app.js defaultBodies). -->
+        <p class="muted small" id="bodies-note" hidden></p>
         <table class="bodies">
           <thead><tr><th><input type="checkbox" id="bodies-all" data-i18n-title="bodies.all" title="Select all the bodies"></th><th data-i18n="bodies.name">Name</th><th class="num" data-i18n="bodies.volume">Volume</th><th class="num">%</th></tr></thead>
           <tbody id="bodies"></tbody>

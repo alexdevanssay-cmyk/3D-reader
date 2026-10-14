@@ -92,6 +92,22 @@ function triangleCount(b) {
 }
 
 /**
+ * Index of the largest of the bodies (of the result contract): the largest volume
+ * (absolute value, an estimated one too); when no body has a finite volume (all open),
+ * the largest axis-aligned envelope. Equals: the first of them. -1 without a body.
+ */
+export function largestBody(bodies) {
+  const finite = (v) => (Number.isFinite(v) ? Math.abs(v) : -1);
+  const byVolume = bodies.some((b) => Number.isFinite(b.volume));
+  const size = (b) => (byVolume ? finite(b.volume) : finite(b.bbox?.size?.reduce((p, x) => p * x, 1)));
+  let best = -1;
+  bodies.forEach((b, i) => {
+    if (best < 0 || size(b) > size(bodies[best])) best = i;
+  });
+  return best;
+}
+
+/**
  * Smallest-volume oriented bounding box of the vertices used by the bodies' faces,
  * compared with the axis-aligned box (model.py `_oriented_box`). Sizes are sorted in
  * decreasing order. The vertices are taken in double precision: `mesh.positions64`

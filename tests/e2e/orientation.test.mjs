@@ -141,13 +141,13 @@ describe('orientation by casting process (dist/)', { skip: !existsSync(join(DIST
     rmSync(dir, { recursive: true, force: true });
   });
 
-  /** A page in French with the costing workbook imported. */
-  async function newPage() {
+  /** A page in French with the costing workbook imported; `query`: more parameters of its address. */
+  async function newPage(query = '') {
     const context = await browser.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 } });
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}?lang=fr`);
+    await page.goto(`${base}?lang=fr${query}`);
     await page.click('.tab[data-page="chiffrage"]');
     await page.waitForSelector('#page-chiffrage .ccard');
     await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
@@ -379,7 +379,8 @@ describe('orientation by casting process (dist/)', { skip: !existsSync(join(DIST
   });
 
   test('every body proposed again for its process, whichever body the card shows (an open one)', { timeout: 2 * CAD_TIMEOUT }, async () => {
-    const { context, page, errors } = await newPage();
+    // Every body checked (a file of several bodies shows its largest one alone by default): both bodies in the costing and the semantic contract.
+    const { context, page, errors } = await newPage('&bodies=all');
     // An open square (body 0: the groups of an OBJ are read last first) beside the inverted T (body 1).
     const square = { positions: Float32Array.from([-100, 0, 0, -50, 0, 0, -50, 50, 0, -100, 50, 0]), indices: Uint32Array.from([0, 1, 2, 0, 2, 3]) };
     await open(page, objFile('T et plaque.obj', [{ name: 'T', ...tPart() }, { name: 'plaque', ...square }]));

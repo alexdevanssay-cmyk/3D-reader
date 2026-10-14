@@ -44,7 +44,9 @@
   (button “Open file…”), or run JavaScript in the page:</p>
   <pre>const result = await reader3d.analyze(fileOrBlobOrUrl, { name: "part.step" });
 console.log(reader3d.report());   // plain-text summary</pre>
-  <p>Then read the results as above, or click <strong>Excel</strong>, <strong>CSV</strong> or <strong>JSON</strong> to download them.</p>
+  <p>Then read the results as above, or click <strong>Excel</strong>, <strong>CSV</strong> or <strong>JSON</strong> to download them.
+  A file of several bodies gives the results of its largest body alone unless the page was opened with
+  <code>?bodies=all</code> (or after <code>reader3d.setSelection</code> with every index): see <code>bodies</code> below.</p>
 
   <h2>3. Agent or script that can run Python</h2>
   <pre>pip install "git+https://github.com/alexdevanssay-cmyk/3D-reader"
@@ -58,6 +60,7 @@ reader3d analyze part.step --json</pre>
     <tr><td><code>name</code></td><td>File name to use when the URL does not end with one (its extension selects the format).</td></tr>
     <tr><td><code>report=1</code></td><td>Show the results as plain text at the top of the results panel.</td></tr>
     <tr><td><code>export</code></td><td><code>json</code>, <code>xlsx</code> or <code>csv</code>: download the results when done.</td></tr>
+    <tr><td><code>bodies</code></td><td><code>all</code> or <code>largest</code>: the bodies checked when the file has several. The results (JSON, report, <code>window.reader3d</code>) are those of the bodies checked. By default the largest one alone, as a person opening the file sees it, but every body with <code>report</code> or <code>export</code>; <code>bodies=largest</code> keeps the largest one alone in those too. <code>reader3d.setSelection(indices)</code> changes them afterwards.</td></tr>
     <tr><td><code>thickness=1</code></td><td>Also compute the wall thickness of the closed bodies (inscribed-sphere method): <code>thickness</code> {method, min, median, max} in mm in the JSON, per body and for the whole model, and a <code>wall_thickness</code> line in the report. The exports always include it.</td></tr>
     <tr><td><code>unit</code></td><td>Unit of mesh files: <code>mm</code>, <code>cm</code>, <code>m</code>, <code>in</code>, <code>ft</code> (default: auto).</td></tr>
     <tr><td><code>quality</code></td><td>Display tessellation of CAD files: <code>coarse</code>, <code>normal</code>, <code>fine</code> (does not change the volume).</td></tr>

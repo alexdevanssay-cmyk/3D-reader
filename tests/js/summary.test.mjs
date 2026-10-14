@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { analyzeMesh, analyzeMeshParts } from '../../web/engine/meshanalysis.js';
-import { minVolumeBox, summarize } from '../../web/engine/summary.js';
+import { largestBody, minVolumeBox, summarize } from '../../web/engine/summary.js';
 import { approx, approxVec } from './helpers.mjs';
 
 // ----------------------------------------------------------------------------- helpers
@@ -328,6 +328,23 @@ test('bodies without display mesh keep the axis-aligned box', () => {
   const body = pointBody([[0, 0, 0], [1, 2, 3]], { mesh: undefined });
   const s = summarize([body]);
   assert.deepEqual(s.obb.size, [3, 2, 1]);
+});
+
+// ----------------------------------------------------------------------------- largest body
+
+test('the largest body: by volume (absolute, an estimate too), the first of equals, else by envelope', () => {
+  const body = (volume, size = [1, 1, 1]) => ({ volume, bbox: { size } });
+  assert.equal(largestBody([]), -1);
+  assert.equal(largestBody([body(5)]), 0);
+  // Not the first one; a negative volume (inverted mesh) counts by its size.
+  assert.equal(largestBody([body(10), body(-30), body(20)]), 1);
+  // Equal volumes: the first of them.
+  assert.equal(largestBody([body(1), body(7), body(7)]), 1);
+  // An open body (no volume, however large its envelope) never wins over a volume, nor does a non-finite one.
+  assert.equal(largestBody([body(null, [100, 100, 100]), body(2), body(NaN), body(Infinity)]), 1);
+  // All open: the largest envelope; equal (flat sheets: 0): the first.
+  assert.equal(largestBody([body(null, [1, 2, 3]), body(undefined, [2, 2, 2]), body(null, [3, 1, 1])]), 1);
+  assert.equal(largestBody([body(null, [5, 5, 0]), body(null, [9, 9, 0])]), 0);
 });
 
 // ----------------------------------------------------------------------------- scale
