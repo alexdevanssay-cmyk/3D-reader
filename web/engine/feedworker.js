@@ -19,25 +19,31 @@ self.onmessage = ({ data: msg }) => {
     }
     if (msg.type !== 'zones') return;
     // Bodies: {positions, indices, sphere (inscribed diameters, or null)} or null (open bodies: no inside).
-    const total = Math.max(1, msg.bodies.reduce((n, b) => n + (b ? b.indices.length : 0), 0));
+    // A body whose zones cannot be found: {error} for it alone, the others found all the same.
+    const total = Math.max(1, msg.bodies.reduce((n, b) => n + (b?.indices?.length ?? 0), 0));
     let done = 0;
     let last = -1;
     const bodies = msg.bodies.map((b) => {
-      if (!b || !b.indices.length) return null;
+      if (!b || !b.indices?.length) return null;
       const size = b.indices.length;
-      const { zone, sphere, ...rest } = feedingZones(b.positions, b.indices, {
-        sphere: b.sphere ?? null,
-        onProgress: (f) => {
-          const percent = Math.floor(((done + f * size) / total) * 100);
-          if (percent === last) return;
-          last = percent;
-          postMessage({ type: 'progress', id: msg.id, percent });
-        },
-      });
-      done += size;
-      return { ...rest, zone, sphere };
+      try {
+        const { zone, sphere, ...rest } = feedingZones(b.positions, b.indices, {
+          sphere: b.sphere ?? null,
+          onProgress: (f) => {
+            const percent = Math.floor(((done + f * size) / total) * 100);
+            if (percent === last) return;
+            last = percent;
+            postMessage({ type: 'progress', id: msg.id, percent });
+          },
+        });
+        return { ...rest, zone, sphere };
+      } catch (err) {
+        return { error: err?.message || String(err) };
+      } finally {
+        done += size;
+      }
     });
-    const buffers = bodies.flatMap((r) => (r ? [r.zone.buffer, r.sphere.buffer] : []));
+    const buffers = bodies.flatMap((r) => (r && !r.error ? [r.zone.buffer, r.sphere.buffer] : []));
     postMessage({ type: 'result', id: msg.id, result: { version: FEEDING_VERSION, bodies } }, buffers);
   } catch (err) {
     postMessage({ type: 'error', id: msg.id, message: err?.message || String(err) });

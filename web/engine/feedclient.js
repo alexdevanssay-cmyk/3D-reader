@@ -54,7 +54,8 @@ function call(kind, message, onProgress = null) {
  *           triangle, from the wall thickness, or null: computed)} (copied,
  *           the caller keeps its arrays) or null to skip it (open bodies)
  * Resolves to {version, bodies: per body {zones, body, sphere_source,
- * sampled, neck_ratio, version, zone, sphere} or null}.
+ * sampled, neck_ratio, version, zone, sphere}, {error} (that body alone: its
+ * zones not found) or null}.
  */
 export function computeFeeding(bodies, { onProgress } = {}) {
   const list = bodies.map((b) => (b ? { positions: b.positions, indices: b.indices, sphere: b.sphere ?? null } : null));

@@ -46,7 +46,15 @@
 console.log(reader3d.report());   // plain-text summary</pre>
   <p>Then read the results as above, or click <strong>Excel</strong>, <strong>CSV</strong> or <strong>JSON</strong> to download them.
   A file of several bodies gives the results of its largest body alone unless the page was opened with
-  <code>?bodies=all</code> (or after <code>reader3d.setSelection</code> with every index): see <code>bodies</code> below.</p>
+  <code>?bodies=all</code> (or after <code>reader3d.setSelection</code> with every index): see <code>bodies</code> below.
+  Every result (the summary, the thickness, the parting line, the risers, the semantic contract, the AI context) is of the
+  bodies checked alone, and says which (the AI context when they are not all of them): <code>scope</code> {<code>mode</code> (<code>all</code>, <code>checked</code> or
+  <code>none</code>), <code>bodies</code>, <code>bodies_in_file</code>, <code>indices</code>}. After
+  <code>reader3d.setSelection(indices)</code> the summary is theirs at once; what is missing for the bodies newly checked
+  (the wall thickness once computed, the parting line, the slides, the risers) follows a moment later, published once,
+  complete: wait for <code>reader3d.scope.updating</code> to be <code>false</code> (or for the event
+  <code>reader3d-part</code>, sent then). Nothing is published while it runs (the JSON result says
+  <code>"updating": true</code> if another tab was shown meanwhile).</p>
 
   <h2>3. Agent or script that can run Python</h2>
   <pre>pip install "git+https://github.com/alexdevanssay-cmyk/3D-reader"
@@ -60,8 +68,8 @@ reader3d analyze part.step --json</pre>
     <tr><td><code>name</code></td><td>File name to use when the URL does not end with one (its extension selects the format).</td></tr>
     <tr><td><code>report=1</code></td><td>Show the results as plain text at the top of the results panel.</td></tr>
     <tr><td><code>export</code></td><td><code>json</code>, <code>xlsx</code> or <code>csv</code>: download the results when done.</td></tr>
-    <tr><td><code>bodies</code></td><td><code>all</code> or <code>largest</code>: the bodies checked when the file has several. The results (JSON, report, <code>window.reader3d</code>) are those of the bodies checked. By default the largest one alone, as a person opening the file sees it, but every body with <code>report</code> or <code>export</code>; <code>bodies=largest</code> keeps the largest one alone in those too. <code>reader3d.setSelection(indices)</code> changes them afterwards.</td></tr>
-    <tr><td><code>thickness=1</code></td><td>Also compute the wall thickness of the closed bodies (inscribed-sphere method): <code>thickness</code> {method, min, median, max} in mm in the JSON, per body and for the whole model, and a <code>wall_thickness</code> line in the report. The exports always include it.</td></tr>
+    <tr><td><code>bodies</code></td><td><code>all</code> or <code>largest</code>: the bodies checked when the file has several. The results (JSON, report, <code>window.reader3d</code>) are those of the bodies checked. By default the largest one alone, as a person opening the file sees it, but every body with <code>report</code> or <code>export</code>; <code>bodies=largest</code> keeps the largest one alone in those too. <code>reader3d.setSelection(indices)</code> changes them afterwards; <code>reader3d.scope</code> says which they are.</td></tr>
+    <tr><td><code>thickness=1</code></td><td>Also compute the wall thickness of the closed bodies checked (inscribed-sphere method): <code>thickness</code> {method, min, median, max} in mm in the JSON, per body and for the whole model, and a <code>wall_thickness</code> line in the report. The exports always include it.</td></tr>
     <tr><td><code>unit</code></td><td>Unit of mesh files: <code>mm</code>, <code>cm</code>, <code>m</code>, <code>in</code>, <code>ft</code> (default: auto).</td></tr>
     <tr><td><code>quality</code></td><td>Display tessellation of CAD files: <code>coarse</code>, <code>normal</code>, <code>fine</code> (does not change the volume).</td></tr>
     <tr><td><code>lang</code></td><td><code>fr</code> or <code>en</code>.</td></tr>
@@ -158,6 +166,7 @@ const featureContext = reader3d.aiContext({
   "file": "part.step", "kind": "cad" | "mesh", "source_unit": "mm",
   "units": { "length": "mm", "area": "mm2", "volume": "mm3", "mass": "g", "density": "g/cm3" },
   "density": 2.7,
+  "scope": { "mode": "all", "bodies": 1, "bodies_in_file": 1, "indices": [0] },
   "summary": {
     "volume": 113716.81, "area": 18913.27, "mass": 307.04,
     "bbox": { "min": [0,0,0], "max": [100,60,20], "size": [100,60,20], "volume": 120000 },

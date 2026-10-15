@@ -197,7 +197,8 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     await filesWritten(page, 'analyses-3d', '.r3d.gz', 2);
     const names = Object.keys(await folderFiles(page, 'analyses-3d')).sort();
     assert.match(names[0], new RegExp(`^${key}__[0-9a-f]{8}\\.r3d\\.gz$`));
-    assert.match(names[1], new RegExp(`^${key}__[0-9a-f]{8}__epaisseur-[0-9a-f]{16}\\.r3d\\.gz$`));
+    // The thickness per body (shared-cache.js: a name the versions before do not read).
+    assert.match(names[1], new RegExp(`^${key}__[0-9a-f]{8}__epaisseur-corps-[0-9a-f]{16}\\.r3d\\.gz$`));
     // gzip of the container: its magic, its header (the key, the part), then the bytes of its arrays.
     const header = await page.evaluate(async (name) => {
       const file = await (await (await (await navigator.storage.getDirectory()).getDirectoryHandle('analyses-3d')).getFileHandle(name)).getFile();

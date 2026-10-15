@@ -1170,6 +1170,8 @@ export function buildSemantic3D(result) {
     },
     units:{length:"mm",area:"mm2",volume:"mm3",mass:"g",density:"g/cm3"},
     model:{
+      // The bodies of the file the contract is of (those checked on the 3D page), when the result says so.
+      ...(result.scope ? {scope:result.scope} : {}),
       body_count:s.bodies ?? result.bodies?.length ?? 0,
       solid_count:s.solids ?? null,
       open_body_count:s.open_bodies ?? null,
