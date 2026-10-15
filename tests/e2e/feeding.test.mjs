@@ -302,7 +302,8 @@ describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}?lang=fr`);
+    // Every body checked (a file of several bodies shows its largest one alone by default): both shown.
+    await page.goto(`${base}?lang=fr&bodies=all`);
     // A cube and a cylinder, two bodies (glTF, read in mm).
     await page.selectOption('#unit', 'mm');
     await page.setInputFiles('#file-input', fixturePath('two_objects.glb'));
@@ -330,7 +331,8 @@ describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}?lang=fr`);
+    // Every body checked (a file of several bodies shows its largest one alone by default): both shown.
+    await page.goto(`${base}?lang=fr&bodies=all`);
     // Two versions of a block 80 × 40 × 20 mm, in the same place: an ASCII STL of two solids.
     const facets = [];
     const v = (i) => [i & 1 ? 80 : 0, i & 2 ? 40 : 0, i & 4 ? 20 : 0];
@@ -347,10 +349,10 @@ describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html
     await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
     await horizontalPlane(page, 1);
     const faded = () => page.evaluate(() => document.getElementById('viewport').dataset.faded);
-    // Orange pixels of the 3D view: the risers.
+    // Orange pixels of the 3D view: the risers (the view triad masked: the edges of its red axis are orange).
     const orange = async () => {
       await page.waitForTimeout(300);
-      const png = await page.locator('#viewport canvas').screenshot();
+      const png = await page.locator('#viewport canvas').screenshot({ mask: [page.locator('#view-triad')] });
       return page.evaluate(async (b64) => {
         const img = new Image();
         img.src = `data:image/png;base64,${b64}`;

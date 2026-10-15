@@ -96,10 +96,11 @@ function voxelsObj(bodies, [nx, ny, nz], size) {
 /**
  * Pixels of the 3D view by colour: red (the parting line), yellow (the
  * undercuts), bluish and greenish (the halves of the mould over the page).
+ * The view triad masked (its axes are red, green and blue).
  */
 async function viewColours(page) {
   await page.waitForTimeout(300); // a frame drawn
-  const png = await page.locator('#viewport canvas').screenshot();
+  const png = await page.locator('#viewport canvas').screenshot({ mask: [page.locator('#view-triad')] });
   return page.evaluate(async (b64) => {
     const img = new Image();
     img.src = `data:image/png;base64,${b64}`;
@@ -357,7 +358,8 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}?lang=fr`);
+    // Every body checked (a file of several bodies shows its largest one alone by default): all of them shown.
+    await page.goto(`${base}?lang=fr&bodies=all`);
     await page.setInputFiles('#file-input', { name: 'blocks.obj', mimeType: 'text/plain', buffer: blocksObj() });
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
@@ -450,6 +452,9 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     assert.ok(shown.undercuts > 0, 'the walls of the slot coloured as undercuts');
     const withBlocks = await viewColours(page);
     assert.ok(withBlocks.red > 200, `the line, thick and red: ${JSON.stringify(withBlocks)}`);
+    // Above the part (its top at z = 40), in front of the part: inside the upper half only.
+    const above = [[10, 0, 50], [50, 0, 50]];
+    const aboveWith = await coloursAt(page, above);
 
     // Without the blocks: the line and the colours stay; the walls of the slot in yellow.
     await page.uncheck('#parting-blocks');
@@ -459,16 +464,28 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     const without = await viewColours(page);
     assert.ok(without.red > 200, JSON.stringify(without));
     assert.ok(without.yellow > 500, `the undercuts in yellow: ${JSON.stringify(without)}`);
-    // The blocks: blue above the line, green under it, over the page.
-    assert.ok(withBlocks.blue > without.blue + 5000 && withBlocks.green > without.green + 5000, `${JSON.stringify(withBlocks)} / ${JSON.stringify(without)}`);
+    const aboveWithout = await coloursAt(page, above);
+    // The blocks, over the page: the die blank cut in two, wider than this view framed on the part. Above the
+    // part only the upper half is crossed: blue there, the page without the blocks (under the line both halves
+    // are crossed, their colours mixed). Seen whole in the casting view: blue and green (side by side on this
+    // vertical parting plane).
+    const isBlue = ([r, g, b]) => b > r + 25 && b > g + 10;
+    assert.ok(aboveWith.every(isBlue) && !aboveWithout.some(isBlue), `above the part: ${JSON.stringify(aboveWith)} / ${JSON.stringify(aboveWithout)}`);
     await page.check('#parting-blocks');
     assert.equal((await overlay()).overlay, 'lower upper line');
+    await page.click('#view-casting');
+    const die = await viewColours(page);
+    await page.uncheck('#parting-blocks');
+    const dieWithout = await viewColours(page);
+    assert.ok(die.blue > dieWithout.blue + 5000 && die.green > dieWithout.green + 5000, `${JSON.stringify(die)} / ${JSON.stringify(dieWithout)}`);
+    await page.check('#parting-blocks');
+    await page.click('[data-view="front"]');
     assert.match(await page.textContent('#parting-legend'), /^ligne de joint contre-dépouille faces de la pièce \(plus clair : sans dépouille\) chape supérieure chape inférieure/);
 
     // Not shown: no overlay, the part in its own colour.
     await page.uncheck('#parting-show');
     assert.deepEqual(await overlay(), { overlay: '', undercuts: 0, faded: '0' });
-    // (The axes of the frame: a few red and orange pixels.)
+    // (No axes at the origin of the part any more; the triad masked.)
     const plain = await viewColours(page);
     assert.ok(plain.red < 0.1 * without.red && plain.yellow < 0.05 * without.yellow, `${JSON.stringify(plain)} / ${JSON.stringify(without)}`);
     // In English.
@@ -624,7 +641,8 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}?lang=fr`);
+    // Every body checked (a file of several bodies shows its largest one alone by default): all of them shown.
+    await page.goto(`${base}?lang=fr&bodies=all`);
     // Two blocks 60 × 20 × 20 mm: A at y -40..-20, in front of B at y 20..40 seen from the front.
     const box = () => true;
     const obj = voxelsObj([['a', box, [-30, -40, 0]], ['b', box, [-30, 20, 0]]], [12, 4, 4], 5);
@@ -914,14 +932,15 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     assert.equal(await page.textContent('#parting-draw-kept'), 'Tracé en cours gardé : 2 point(s)');
 
     // 11. A view too narrow for the step and the actions side by side with their labels (beside the panel, windows of
-    // 1024 and 1100 px): their compact form, none over another. A phone: within the view too; no horizontal scroll.
+    // 1024 and 1100 px): their compact form, none over another, nor the view triad (above the actions). A phone: within
+    // the view too; no horizontal scroll. A view too short for the triad at its size under the left arrow: smaller.
     await page.setViewportSize({ width: 1024, height: 768 });
     await page.click('#parting-draw');
     for (const width of [1024, 1100]) {
       await page.setViewportSize({ width, height: 768 });
       const narrow = await page.evaluate(() => {
         const r = (id) => document.getElementById(id).getBoundingClientRect().toJSON();
-        return { view: r('viewport'), boxes: ['turn-left', 'turn-right', 'turn-step', 'draw-actions'].map(r) };
+        return { view: r('viewport'), boxes: ['turn-left', 'turn-right', 'turn-step', 'draw-actions', 'view-triad'].map(r) };
       });
       assert.ok(narrow.view.width < 800, JSON.stringify(narrow.view));
       for (const b of narrow.boxes) assert.ok(b.left >= narrow.view.left && b.right <= narrow.view.right && b.bottom <= narrow.view.bottom, JSON.stringify(narrow));
@@ -934,7 +953,7 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
       return {
         page: document.documentElement.scrollWidth,
         view: r('viewport'),
-        boxes: ['turn-left', 'turn-right', 'turn-step', 'draw-actions'].map(r),
+        boxes: ['turn-left', 'turn-right', 'turn-step', 'draw-actions', 'view-triad'].map(r),
         table: r('parting-draw-segments'),
         wide: [...document.querySelectorAll('#parting-card *')].filter((x) => x.offsetParent && x.getBoundingClientRect().right > 375).map((x) => x.id || x.className || x.tagName),
       };
@@ -944,6 +963,14 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     assert.ok(phone.table.right <= 375);
     for (const b of phone.boxes) assert.ok(b.left >= phone.view.left && b.right <= phone.view.right && b.top >= phone.view.top && b.bottom <= phone.view.bottom, JSON.stringify(phone));
     for (let a = 0; a < phone.boxes.length; a++) for (let b = a + 1; b < phone.boxes.length; b++) assert.ok(!overlap(phone.boxes[a], phone.boxes[b]), `${a} over ${b}: ${JSON.stringify(phone.boxes)}`);
+    await page.setViewportSize({ width: 1280, height: 420 });
+    const short = await page.evaluate(() => {
+      const r = (id) => document.getElementById(id).getBoundingClientRect().toJSON();
+      return { view: r('viewport'), boxes: ['turn-left', 'turn-right', 'turn-step', 'draw-actions', 'view-triad'].map(r) };
+    });
+    const triad = short.boxes[4];
+    assert.ok(short.view.height < 400 && triad.width < 96 && triad.width >= 56 && Math.abs(triad.width - triad.height) < 0.5, JSON.stringify(short));
+    for (let a = 0; a < short.boxes.length; a++) for (let b = a + 1; b < short.boxes.length; b++) assert.ok(!overlap(short.boxes[a], short.boxes[b]), `short: ${a} over ${b}: ${JSON.stringify(short.boxes)}`);
 
     // 12. In English.
     await page.setViewportSize({ width: 1280, height: 900 });
@@ -1126,7 +1153,8 @@ describe('parting line (dist/)', { skip: !existsSync(join(DIST, 'index.html')) &
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}?lang=fr`);
+    // Every body checked (a file of several bodies shows its largest one alone by default): all of them shown.
+    await page.goto(`${base}?lang=fr&bodies=all`);
     await page.setInputFiles('#file-input', { name: 'blocks.obj', mimeType: 'text/plain', buffer: blocksObj() });
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });

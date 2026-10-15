@@ -12,6 +12,7 @@ import {
 import { LEVEL, SHADOW, SIDE_NONE, SILHOUETTE, TRAPPED, ZERO_DRAFT } from '../../web/engine/parting.js';
 import { BRACKET, MUSHROOM, PEG, mushroom, peg, zBracket } from './curved-mesh.mjs';
 import { approx } from './helpers.mjs';
+import { looseEnds, shapeOfLine } from './line-shape.mjs';
 import { PLATE, castPlate } from './plate-mesh.mjs';
 
 // The synthetic meshes, shared with the tests of the line drawn by hand.
@@ -223,13 +224,6 @@ function triangleGeometry(positions, indices) {
     const len = Math.hypot(...n);
     return { c: [0, 1, 2].map((k) => (P[a + k] + P[b + k] + P[c + k]) / 3), n: n.map((x) => x / len), area: len / 2 };
   });
-}
-
-/** The ends of the pieces of a line met by an odd number of pieces (within 1e-4 mm): 0 when it is in closed loops. */
-function looseEnds(segments) {
-  const ends = [];
-  for (let i = 0; i < segments.length; i += 3) ends.push([segments[i], segments[i + 1], segments[i + 2]]);
-  return ends.filter((p) => ends.filter((q) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]) < 1e-4).length % 2).length;
 }
 
 /** Area of the part of a triangle (xy) where keep(p) >= 0 for every half-plane `keep` (Sutherland-Hodgman). */
@@ -505,74 +499,6 @@ describe('flat faces along the draw direction (a CAD body: flat faces cut into l
   });
 });
 
-/**
- * The shape of a line from its pieces (ends within 1e-4 mm), its pieces in a
- * straight row merged into runs: `reversals`, the points where two runs turn
- * back by more than 135° (a zigzag along long triangles, a spike round one);
- * `teeth`, the runs shorter than 3 mm at such a point (a notch, a tooth along
- * the short edges of triangles); `combs`, the runs (1 mm long at least) along
- * another within 3° and 1 mm of it over half their length (the parallel lines
- * of a comb across a band of long thin triangles, the two sides of a spike).
- */
-function shapeOfLine(segments) {
-  const m = segments.length / 6;
-  const key = (j) => `${Math.round(segments[j] * 1e4)},${Math.round(segments[j + 1] * 1e4)},${Math.round(segments[j + 2] * 1e4)}`;
-  const at = (j) => [segments[j], segments[j + 1], segments[j + 2]];
-  const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-  const len = (a) => Math.hypot(...a);
-  const other = (j) => (j % 6 === 0 ? j + 3 : j - 3);
-  const ends = new Map();
-  for (let j = 0; j < segments.length; j += 3) (ends.get(key(j)) ?? ends.set(key(j), []).get(key(j))).push(j);
-  // Runs: pieces in a row (turning by less than 1°) merged.
-  const root = Int32Array.from({ length: m }, (_, k) => k);
-  const find = (k) => (root[k] === k ? k : (root[k] = find(root[k])));
-  const bends = [];
-  for (const list of ends.values()) {
-    if (list.length !== 2) continue;
-    const [u, v] = list.map((j) => sub(at(other(j)), at(j)));
-    const turn = dot(u, v) / (len(u) * len(v));
-    if (turn < -Math.cos(Math.PI / 180)) root[find(list[0] / 6 | 0)] = find(list[1] / 6 | 0);
-    else bends.push([list[0], list[1], turn]);
-  }
-  const length = new Float64Array(m);
-  for (let k = 0; k < m; k++) length[find(k)] += len(sub(at(6 * k + 3), at(6 * k)));
-  let reversals = 0;
-  const teeth = new Set();
-  for (const [a, b, turn] of bends) {
-    if (turn <= Math.cos(Math.PI / 4)) continue;
-    reversals++;
-    for (const j of [a, b]) if (length[find(j / 6 | 0)] < 3) teeth.add(find(j / 6 | 0));
-  }
-  // The ends of each run: the ends of its pieces not inside it.
-  const runEnds = new Map();
-  for (let j = 0; j < segments.length; j += 3) {
-    const r = find(j / 6 | 0);
-    const list = ends.get(key(j));
-    if (list.length === 2 && find(list[0] / 6 | 0) === find(list[1] / 6 | 0)) continue;
-    (runEnds.get(r) ?? runEnds.set(r, []).get(r)).push(at(j));
-  }
-  const runs = [...runEnds].filter(([r, e]) => e.length === 2 && length[r] >= 1).map(([, [a, b]]) => ({ a, b, l: len(sub(b, a)) }));
-  // A run along a longer one: within 3° of it, over half its length, 1 mm off it at most.
-  const along = (s, t) => {
-    const u = sub(t.b, t.a).map((x) => x / t.l), w = sub(s.b, s.a);
-    if (Math.abs(dot(u, w)) < Math.cos((3 * Math.PI) / 180) * s.l) return false;
-    const ta = dot(sub(s.a, t.a), u), tb = dot(sub(s.b, t.a), u);
-    const overlap = Math.min(Math.max(ta, tb), t.l) - Math.max(Math.min(ta, tb), 0);
-    const off = (p, tp) => len(sub(sub(p, t.a), u.map((x) => x * tp)));
-    return overlap >= s.l / 2 && Math.max(off(s.a, ta), off(s.b, tb)) < 1;
-  };
-  const comb = new Uint8Array(runs.length);
-  for (let i = 0; i < runs.length; i++) {
-    for (let k = i + 1; k < runs.length; k++) {
-      const [s, t] = runs[i].l < runs[k].l ? [runs[i], runs[k]] : [runs[k], runs[i]];
-      if (along(s, t)) comb[i] = comb[k] = 1;
-    }
-  }
-  const combs = comb.reduce((n, c) => n + c, 0);
-  return { reversals, teeth: teeth.size, combs };
-}
-
 /** Faces (B-rep) whose triangles are in both halves; undercuts (SIDE_NONE) left out. */
 function facesSplit(face, side) {
   const halves = new Map();
@@ -678,7 +604,11 @@ describe('curved faces and faces along the draw direction of a CAD body (long, t
     assert.ok([...flags].some((f) => f & SHADOW));
     assert.deepEqual([summary.parting.kind, summary.parting.loops, looseEnds(segments)], ['stepped', 2, 0]);
     assert.deepEqual(shapeOfLine(segments), { reversals: 0, teeth: 0, combs: 0 });
-    approx(summary.undercut_area_mm2, 3212.5, 0, 0.05, 'undercut');
+    // Two slivers of the underside at the edge of the shadow (x = 29.3, 0.2 mm²
+    // each), undercut by their points, are formed with the half beside them:
+    // a region that small costs more line round it than its area (3212.5 mm²
+    // before the halves were optimised).
+    approx(summary.undercut_area_mm2, 3212.1, 0, 0.05, 'undercut');
   });
 
   test('the edge of a shadow across the long strips of a cylinder, obliquely: a curve across them, not a comb along them', () => {
@@ -689,7 +619,9 @@ describe('curved faces and faces along the draw direction of a CAD body (long, t
     // long edges of the strips), the line round it along the wall and spikes
     // along the strips (518 mm in all). Now the undercut in the upper half
     // (its border with the lower one across the strips, not along them) and
-    // the line along the edge of the ledge's shadow, x = 25 + 0.4 y.
+    // the line along the edge of the ledge's shadow, x = 25 + 0.4 y. The front
+    // of the ledge, under the peg only the lower half reaches, is in the
+    // lower half whole: the line climbs its ends and runs along its top edge.
     const part = peg();
     const { summary, segments } = evaluateParting(part.positions, part.indices, [0, 0, 1]);
     const { ledge, peg: g } = PEG;
@@ -697,9 +629,9 @@ describe('curved faces and faces along the draw direction of a CAD body (long, t
     let across = 0, worst = 0;
     for (let i = 0; i < segments.length; i += 6) {
       const ends = [i, i + 3].map((j) => [segments[j], segments[j + 1], segments[j + 2]]);
-      // Not on the wall (x = 0), the end of the peg (x = 50), the bottom.
+      // Not on the wall (x = 0); on the peg, not at its end (x = 50).
       assert.ok(!ends.every((p) => Math.abs(p[0]) < 1e-4 && p[2] > 1e-4), `a piece on the wall: ${ends}`);
-      if (!ends.every((p) => p[0] > 1 && p[0] < g.length - 1 && p[2] > 1e-4)) continue;
+      if (!ends.every((p) => p[0] > 1 && p[0] < g.length - 1 && Math.abs(Math.hypot(p[1], p[2] - g.z) - g.r) < 0.5)) continue;
       across += Math.hypot(ends[1][0] - ends[0][0], ends[1][1] - ends[0][1], ends[1][2] - ends[0][2]);
       for (const p of ends) worst = Math.max(worst, Math.abs(p[0] - front(p[1])));
     }
@@ -721,7 +653,9 @@ describe('curved faces and faces along the draw direction of a CAD body (long, t
     assert.ok(worst < 0.15, `${worst} mm off the edge of the shadow`);
     assert.deepEqual([summary.parting.loops, looseEnds(segments)], [2, 0]);
     assert.deepEqual(shapeOfLine(segments), { reversals: 0, teeth: 0, combs: 0 });
-    approx(summary.parting.length_mm, 271.1, 0, 0.5, 'length');
+    // 271.1 mm along the bottom edge of the ledge's front; + 2 × 10 mm up its ends.
+    approx(summary.parting.length_mm, 291.1, 0, 0.5, 'length');
+    assert.deepEqual([summary.parting.kind, summary.parting.levels_mm], ['stepped', [0, 10]]);
   });
 
   test('a planar line across cylinders along d: on their silhouettes, the edges between their facets there', () => {

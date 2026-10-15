@@ -608,7 +608,8 @@ describe('built site in Chromium', () => {
     test(`${name}: total volume matches the Python engine`, { timeout }, async (t) => {
       const reference = expected[name];
       assert.ok(reference, `${name} is missing from expected.json`);
-      const { page, problems } = await openPage();
+      // Every body checked (a file of several bodies shows its largest one alone by default): the total of the file, as the Python engine gives it.
+      const { page, problems } = await openPage('?bodies=all');
       try {
         await analyzeInPage(page, name, timeout - 15_000);
         await checkResults(t, page, name, reference);

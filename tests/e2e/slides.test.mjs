@@ -90,11 +90,11 @@ const twoBlocks = () => voxelsObj([['a', slotted], ['b', slotted, [100, 0, 0]]],
 
 /**
  * Pixels of the 3D view by colour (parting.test.mjs), and teal (the second
- * slide's colour, #00a6b8, shaded).
+ * slide's colour, #00a6b8, shaded). The view triad masked.
  */
 async function viewColours(page) {
   await page.waitForTimeout(300); // a frame drawn
-  const png = await page.locator('#viewport canvas').screenshot();
+  const png = await page.locator('#viewport canvas').screenshot({ mask: [page.locator('#view-triad')] });
   return page.evaluate(async (b64) => {
     const img = new Image();
     img.src = `data:image/png;base64,${b64}`;
@@ -169,13 +169,13 @@ describe('slides (dist/)', { skip: !existsSync(join(DIST, 'index.html')) && 'run
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
-  /** A page in French, its errors kept. */
-  async function newPage(viewport = { width: 1280, height: 900 }) {
+  /** A page in French, its errors kept; `query`: more parameters of its address. */
+  async function newPage(viewport = { width: 1280, height: 900 }, query = '') {
     const context = await browser.newContext({ locale: 'fr-FR', viewport });
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}?lang=fr`);
+    await page.goto(`${base}?lang=fr${query}`);
     return { context, page, errors };
   }
 
@@ -385,7 +385,8 @@ describe('slides (dist/)', { skip: !existsSync(join(DIST, 'index.html')) && 'run
   });
 
   test('two bodies: the slide selected and the zone picked stay with their body', { timeout: 2 * CAD_TIMEOUT }, async () => {
-    const { context, page, errors } = await newPage();
+    // Every body checked (a file of several bodies shows its largest one alone by default): both shown.
+    const { context, page, errors } = await newPage(undefined, '&bodies=all');
     await open(page, { name: 'two_blocks.obj', mimeType: 'text/plain', buffer: twoBlocks() });
     const body = async (i) => {
       await page.click(`#bodies tr[data-index="${i}"] td.name`);

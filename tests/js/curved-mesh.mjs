@@ -16,7 +16,7 @@
 import { ShapeUtils, Vector2 } from 'three';
 
 /** A body built face by face: {face (its B-rep faces' triangles), mesh()}. */
-class Body {
+export class Body {
   constructor() {
     this.positions = [];
     this.indices = [];

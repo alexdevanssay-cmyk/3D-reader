@@ -60,7 +60,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
 
   test('French interface, progress in percent, memory gauge', { timeout: CAD_TIMEOUT }, async () => {
     const { page, errors } = await newPage('fr-FR');
-    await page.goto(base);
+    // Every body checked (a file of several bodies shows its largest one alone by default): the volume of the assembly.
+    await page.goto(`${base}?bodies=all`);
     assert.equal(await page.textContent('#open-file'), 'Ouvrir un fichier…');
     // Record every percentage the page shows while analysing.
     await page.evaluate(() => {
@@ -84,7 +85,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
 
   test('Excel export: one value per cell, numbers as numbers', { timeout: CAD_TIMEOUT }, async () => {
     const { page } = await newPage('fr-FR');
-    await page.goto(base);
+    // Every body checked (a file of several bodies shows its largest one alone by default): a row per body.
+    await page.goto(`${base}?bodies=all`);
     await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     const [download] = await Promise.all([page.waitForEvent('download'), page.click('#export-xlsx')]);
@@ -383,7 +385,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
 
   test('wall thickness of several bodies: the values are those of the bodies checked', { timeout: CAD_TIMEOUT }, async () => {
     const { page, errors } = await newPage('fr-FR');
-    await page.goto(base);
+    // Every body checked (a file of several bodies shows its largest one alone by default): both bodies first.
+    await page.goto(`${base}?bodies=all`);
     await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     await page.selectOption('#thick-method', 'wall');
@@ -455,7 +458,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     });
     await new Promise((resolve) => ollama.listen(0, '127.0.0.1', resolve));
     const { page, errors } = await newPage('fr-FR');
-    await page.goto(base);
+    // Every body checked (a file of several bodies shows its largest one alone by default): the whole part sent.
+    await page.goto(`${base}?bodies=all`);
     // Without a 3D model: general questions are allowed.
     await page.click('.tab[data-page="ia"]');
     await page.selectOption('#ai-provider', 'ollama');
@@ -598,9 +602,18 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
     assert.equal(await page.textContent('#ai-status'), 'Modèle analysé : posez votre question');
 
+    // Two bodies, the largest one alone checked by default: that body only, said so.
+    assert.equal(await page.textContent('#ai-scope'), "Envoyé à l'IA : le corps coché « Équerre » seulement (1 sur 2).");
+    let sent = await ask();
+    assert.deepEqual([sent.bodies.length, sent.selection.mode, sent.selection.bodies_sent, sent.selection.bodies_in_file], [1, 'checked', 1, 2]);
+    // Every body checked in the list.
+    await page.click('.tab[data-page="viewer"]');
+    await page.check('#bodies-all');
+    await page.click('.tab[data-page="ia"]');
+
     // The whole part: both bodies, said so.
     assert.equal(await page.textContent('#ai-scope'), "Envoyé à l'IA : toute la pièce « named_assembly.step » (2 corps).");
-    let sent = await ask();
+    sent = await ask();
     assert.deepEqual([sent.bodies.length, sent.selection.mode, sent.selection.bodies_sent, sent.selection.bodies_in_file], [2, 'all', 2, 2]);
     // The answer laid out: bold, a table, a list; the tag of the answer kept as text.
     const reply = page.locator('#ai-chat .ai-assistant').last();
@@ -875,7 +888,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       })));
     });
     const { page, errors } = await newPage('fr-FR');
-    await page.goto(base);
+    // Every body checked (a file of several bodies shows its largest one alone by default): both bodies sent.
+    await page.goto(`${base}?bodies=all`);
     await page.click('.tab[data-page="ia"]');
     await page.selectOption('#ai-provider', 'openai');
     await page.fill('#ai-url', `http://127.0.0.1:${gateway.address().port}/api/ai`);
@@ -1008,7 +1022,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
       })));
     });
     const { page, errors } = await newPage('fr-FR');
-    await page.goto(base);
+    // Every body checked (a file of several bodies shows its largest one alone by default): both bodies sent.
+    await page.goto(`${base}?bodies=all`);
     await page.click('.tab[data-page="viewer"]');
     await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: CAD_TIMEOUT });
@@ -1158,7 +1173,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
     t.mock.method(console, 'error', () => {}); // the gateway logs the refusals of the provider
 
     const { page, errors } = await newPage('fr-FR');
-    await page.goto(base);
+    // Every body checked (a file of several bodies shows its largest one alone by default): both bodies sent.
+    await page.goto(`${base}?bodies=all`);
     // A phone: every field and button of the IA page within 375 px, no horizontal scroll, for both providers.
     await page.setViewportSize({ width: 375, height: 800 });
     await page.click('.tab[data-page="ia"]');
@@ -1502,7 +1518,8 @@ describe('site features (dist/)', { skip: !existsSync(join(DIST, 'index.html')) 
 
   test('tabs: several parts open side by side, each with its own analysis', { timeout: CAD_TIMEOUT }, async () => {
     const { page, errors } = await newPage('fr-FR');
-    await page.goto(base);
+    // Every body checked (a file of several bodies shows its largest one alone by default): the volume of the assembly.
+    await page.goto(`${base}?bodies=all`);
     assert.equal(await page.textContent('.doc-tab.active .doc-tab-name'), 'Nouvel onglet');
     // A file opened while the tab shown is still analysing another one goes to a new tab.
     await page.setInputFiles('#file-input', fixturePath('named_assembly.step'));

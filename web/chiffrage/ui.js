@@ -30,6 +30,7 @@ let settings = layers.effective;
 let q = store.loadQuote(base, indices);
 let message = null; // {kind: "ok" | "warn" | "error", text, read}: said until the user's next action (dismissMessage)
 let thicknessBusy = false;
+let processesHeld = false; // the islands not told to the 3D page while it was updating its bodies (pushProcesses)
 let traceOpen = false; // detail of the traced values unfolded (card "Traçabilité")
 
 export function mount(targets) {
@@ -70,6 +71,8 @@ export function mount(targets) {
   }
   document.addEventListener("reader3d-part", () => {
     if (!el.chiffrage.hidden) render();
+    // The islands not told while the 3D page was updating its bodies (pushProcesses): told now, with its figures.
+    else if (processesHeld) pushProcesses();
   });
   // The shared folder chosen or granted in the IA page: checked again, its retours d'expérience read
   // (one changed by a button of the Paramètres row is checked once, after that button's action).
@@ -112,6 +115,10 @@ function pushMaterial() {
 function pushProcesses(results = null) {
   const setProcess = window.reader3d?.setProcess;
   if (!setProcess || !base) return;
+  // The 3D page computing what is missing for the bodies just checked: not told islands chosen with the figures of a
+  // part of them (a thinnest wall of 0, a thickness not known yet); told once it is done ("reader3d-part").
+  processesHeld = !!window.reader3d?.scope?.updating;
+  if (processesHeld) return;
   if (!results) {
     const [quoteShown, keyShown] = [q, currentKey];
     q = structuredClone(q);
@@ -1428,8 +1435,10 @@ function renderQuote() {
   const months = indices?.months ?? [];
   const ensemble = c.selected === "ensemble";
   const r = ensemble ? null : c.results.find((x) => x.piece.key === c.selected);
+  // The thickness of the bodies just checked being computed on the 3D page (asked for there already): said, not offered.
+  const thicknessComputing = thicknessBusy || !!c.p3d?.thicknessUpdating;
   const thicknessButton = c.p3d && !c.p3d.thickness
-    ? ` <button type="button" class="small" data-action="thickness"${thicknessBusy ? " disabled" : ""}>${thicknessBusy ? "Calcul…" : "Calculer les épaisseurs"}</button>`
+    ? ` <button type="button" class="small" data-action="thickness"${thicknessComputing ? " disabled" : ""}>${thicknessComputing ? "Calcul…" : "Calculer les épaisseurs"}</button>`
     : "";
   const pieceSelect = c.allPieces.length > 1
     ? field("Pièce chiffrée", select("q.piece", c.selected === "ensemble" && c.pieces.length === c.allPieces.length ? "tout" : c.selected ?? "", [

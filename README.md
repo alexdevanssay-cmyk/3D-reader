@@ -26,6 +26,40 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
 - **Envelope**: axis-aligned bounding box (L × W × H and its volume), the minimum
   oriented bounding box, and the **fill ratio** (material volume ÷ envelope volume).
 - Surface area, centre of mass, and **mass** from a material density (preset list or custom).
+- **Several bodies** in a file: only the largest one (the largest volume; the largest envelope
+  when none has a volume) is checked and shown at first, the others unchecked and hidden, as a
+  note of the *Bodies* card says. **The analysis covers the bodies checked, and only them**:
+  the volume, the mass, the area, the envelopes and the centre of mass, the wall thickness
+  (its figures, histogram and scale), the parting line, the orientation and die blank, the
+  slides and the risers (their card shows the body selected in the list when it is checked,
+  else the largest closed body checked: never a body left out), the exports, the part given
+  to the costing (`reader3d.part()`: the figures of the bodies checked; the other bodies
+  listed, to be chosen there, without any result of the analysis), the semantic contract,
+  the AI context and the IA page, the report and `reader3d.analyze()`. The cards say which
+  bodies they cover (*Analyse sur 1 corps sur 3 (corps cochés)*); the results say it too
+  (`scope`: `{mode: "all" | "checked" | "none", bodies, bodies_in_file, indices}`, also in
+  the semantic contract, and in the AI context when not every body is checked). With no body checked the page says so and shows
+  no figure (an export is refused, the results are empty). When the bodies checked change,
+  what is known of them shows at once, and what was already asked for is completed for the
+  bodies newly checked by itself a moment after the last click (300 ms: a burst of clicks
+  starts one update): the wall thickness once launched (computed for those bodies only; never
+  launched, it stays a button, which computes the bodies checked only), the parting proposal
+  and the feeding zones of each body checked, then the slides, the orientation and the risers
+  of the card's body. Meanwhile the cards concerned say *Mise à jour…* rather than show the
+  figures of the bodies before; the costing page and the published results get the new part
+  once the update is done, with the slides, die blocks and risers of every body checked
+  (`reader3d.scope.updating` false, then one event `reader3d-part`): nothing is published
+  while it runs, never the figures of a part of the bodies, and the costing tells the 3D
+  page its islands only then. A body whose parting or feeding zones cannot be computed says
+  so on its own card (*Retry*; the costing reads its slides as failed), and is not asked
+  again with the bodies checked after it; a thickness that fails is said on its card and
+  computed again by its button only. The results of each body are kept, in memory and with
+  the results of the file in this browser and the shared folder (one record per file, a
+  value per body): a body unchecked then checked again is not computed again, a body
+  unchecked while it is computed keeps its results without showing them. Each tab keeps
+  its own choice; one shown again resumes the thickness of its bodies checked. The link modes for scripts
+  (`report=1`, `export=…`) check every body; `?bodies=all` checks every body at first,
+  `?bodies=largest` the largest one alone in those modes too.
 - **Wall thickness** for casting design ("épaisseur de toile"), button *Thickness*: colour
   scale of the thickness (switchable), histogram of the surface per thickness over a
   graduated scale, and a cursor that highlights the zones of one thickness (± a tolerance).
@@ -43,9 +77,11 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   across a long CAD triangle) in pieces cut on the line, so that the colours change on it,
   not in steps along the triangles (the figures of the card stay by triangle, as for every
   candidate and the slides; the parts of faces a planar line traps were counted to the
-  plane already), and the two halves of the mould ("chapes") as translucent blocks round
-  the part, the upper one blue and the lower one green, a margin of the larger of 5 mm and
-  15 % of the part round it (*Mould halves* hides them). The blocks meet flat at the level of a
+  plane already), and the two halves of the mould ("chapes") as translucent blocks, the
+  upper one blue and the lower one green: the die blank of the orientation (below) cut in
+  two, centred on the part along the sides of its smallest rectangle and as large as the
+  blank (a line drawn by hand, or a part not oriented yet: round the part, a margin of the
+  larger of 5 mm and 15 % of it; *Mould halves* hides them). The blocks meet flat at the level of a
   planar line; for a stepped or warped line, on a surface interpolated from the points of
   the line (a height field of at most 48 × 48 cells, inverse distance weighting), so the
   interface follows the line near it and goes from one level to the other between its
@@ -123,8 +159,19 @@ hand" of `web/app.js`:
   the other side turns the halves over) and the die blank (« brut de coquille »: the
   smallest block round the part along its draw direction plus the margins of the
   costing, one cavity, with its steel; a « Brut (kg) » column for each candidate). On the
-  3D view an arrow « haut » and, *Brut* checked, the blank as a grey wire box. The
-  costing sizes the die block of an in-house die from that oriented blank. See
+  3D view an arrow « haut » and, *Brut* checked, the blank as a grey wire box (the
+  outline of the halves of the mould). *Casting* (« Coulée ») next to the named views
+  turns the view so that up when cast is up on the screen, the die seen from the side and
+  a little above: on a vertical plane the halves side by side, on a horizontal one the
+  upper over the lower, the risers on top or the feed points under the part in place. A
+  change of process moves neither the draw direction nor the blank (the card says so);
+  once its orientation is in, the card says what changed (« Procédé changé : haut de
+  coulée +Y → +Z ; alimentation par le bas (2 points) ; brut et chapes inchangés (même
+  direction de démoulage) ») and, the parting shown, the view not moved and the part and
+  body not left meanwhile, the view turns to *Casting* (*Casting* is not offered while
+  that orientation is computed). New die margins or a definition chosen by hand meanwhile
+  are not the process's doing: then nothing is said. The costing sizes the die block of
+  an in-house die from that oriented blank. See
   [Mould orientation by casting process](#mould-orientation-by-casting-process-method-and-limits).
 - **Slides** ("tiroirs"), part *Tiroirs et noyaux* of the parting line card: the undercuts
   of the definition shown (proposed, chosen, reassigned or drawn by hand) grouped into
@@ -163,7 +210,11 @@ hand" of `web/app.js`:
 - Viewer: orbit, pan, zoom, standard views, wireframe, envelope display, section plane
   (the solids it cuts, bodies, risers and ingate, are closed: the cut shows as a solid
   face, a body's darker than its own colour; open bodies, meshes whose triangles had to be
-  turned round or held duplicates, and the mould halves stay open).
+  turned round or held duplicates, and the mould halves stay open). A view triad in the
+  bottom left corner of the view, always in sight over the part and its section: the axes
+  X (red), Y (green) and Z (blue) of the part turned as the camera turns, an axis seen
+  end-on marked ⊙ towards the viewer or ⊗ away, as on a drawing (above the actions of the
+  drawing by hand while they are shown).
 - Side panel of the 3D view, condensed at will: each card folds to its title (its chevron,
   a click on the title, or « Tout replier / Tout déplier »), its head's controls still at
   hand and its key value (volume, mass, thinnest wall) beside the title; the panel's width
@@ -195,7 +246,9 @@ hand" of `web/app.js`:
 - **Shared network folder** (Chrome or Edge; chosen once per PC in *Paramètres*): a
   folder of the company network where every PC writes, and reads, the results of its 3D
   analyses (`analyses-3d`: a part analysed on one PC opens at once on another, wall
-  thickness included), the cycle times measured in production (`retours-experience`,
+  thickness included: a value per body, those a PC computed merged with those the folder
+  has of the others; `…__epaisseur-corps-…`, the files of the versions before, every
+  closed body, still read but never written), the cycle times measured in production (`retours-experience`,
   merged into the history, the newer record of a reference winning) and the
   conversations of the IA page (`historique-ia`). Nothing goes anywhere else.
 - Export of the results to **Excel** (.xlsx, one value per cell: a row per body, a
@@ -207,7 +260,10 @@ hand" of `web/app.js`:
   of the CAD engine, of the page and of the device) that warns before a file that could
   make the browser stop the page; the CAD engine gives its memory back after a large file.
 - **AI assistants and scripts** can use the online reader by link
-  (`?url=<model URL>&report=1`), through `window.reader3d.analyze()` in the page, or
+  (`?url=<model URL>&report=1`, every body of the file), through `window.reader3d.analyze()`
+  in the page (the bodies checked, the largest one alone by default, said by the `scope` of
+  its results: add `?bodies=all` to the page's address for every body; `reader3d.scope` and
+  `reader3d.setSelection(indices)` read and change them), or
   with the Python package: see [web/ai.html](web/ai.html) (published at `/ai.html`).
 - Units: everything is reported in mm / mm² / mm³ (switchable to cm³, dm³, m³, in³).
   CAD files are converted from their own unit automatically. Mesh files have no unit,

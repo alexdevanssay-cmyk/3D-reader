@@ -5,7 +5,8 @@ import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
 import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
 import { applyToPage, language, locale, setLanguage, t, tMessage } from "./i18n.js";
 import { engravingMask, thicknessHistogram, thicknessStats } from "./engine/thickness.js";
-import { summarize } from "./engine/summary.js";
+import { largestBody, summarize } from "./engine/summary.js";
+import { cardBody, emptySummary, mergeBodies, missingBodies, scopeInfo, scopeOf } from "./engine/scope.js";
 import { buildSemantic3D, SEMANTIC_VERSION } from "./engine/semantic.js";
 import { buildAIContext, AI_CONTEXT_VERSION } from "./engine/ai-context.js";
 import {
@@ -22,7 +23,7 @@ import {
   resizeRiser, riserFromPoint,
 } from "./engine/feeding.js";
 import { capOrders, capQuad, planeCutsBox } from "./section.js";
-import { DEFAULT_PROCESS, FEEDS, PLANS, normalizeDie, orientationKey, processForIsland } from "./engine/orientation.js";
+import { DEFAULT_PROCESS, FEEDS, PLANS, blankBox, dieKey, normalizeDie, orientationKey, processForIsland } from "./engine/orientation.js";
 import { keptParting } from "./engine/partclient.js";
 import {
   SLIDES_VERSION, editSlides, effectiveSlides, matchSlideState, pickSlideEntry, serializeSlideState, slideExport, slidesSideHash, slidesSignature, slidesViewHash,
@@ -105,7 +106,6 @@ camera.add(headLight);
 const modelGroup = new THREE.Group();
 scene.add(modelGroup);
 let boxHelper = null;
-let axes = null;
 
 const sectionPlane = new THREE.Plane(new THREE.Vector3(0, 0, -1), 0);
 let sectionOn = false;
@@ -116,7 +116,8 @@ const state = {
   meshes: [], // THREE.Mesh per body
   edges: [], // wireframe overlays
   selected: -1,
-  included: new Set(), // bodies checked in the list: the volume, the exports and the costing are theirs
+  included: new Set(), // bodies checked in the list: the analysis covers them alone (scopeOf), whatever it shows, exports, pushes or gives
+  largestOnly: false, // the largest body alone checked when shown first (defaultBodies), the selection not changed since
   bounds: new THREE.Box3(),
 };
 
@@ -167,6 +168,7 @@ renderer.setAnimationLoop(() => {
   syncCaps();
   renderer.render(scene, camera);
   drawFrame(); // the numbers of its points, where they are on the view
+  drawTriad(); // the axes in the corner, turned as the camera
 });
 // Drawn again as soon as the view changes size (the panel's splitter dragged,
 // panels.js; its page shown again): the canvas resized after the frame was drawn
@@ -210,7 +212,7 @@ function clearModel() {
   state.selected = -1;
   // The hooks of the view for scripts and tests: nothing faded, no parting shown.
   noteFaded();
-  $("parting-card").dataset.overlay = $("parting-card").dataset.undercuts = $("parting-card").dataset.pieces = "";
+  $("parting-card").dataset.overlay = $("parting-card").dataset.undercuts = $("parting-card").dataset.pieces = $("parting-card").dataset.chapes = "";
 }
 
 /**
@@ -301,7 +303,12 @@ function buildModel(result) {
   // The wireframe is only built when shown (on a large model it takes longer than the rest of the view).
   if ($("toggle-wire").classList.contains("active")) showWireframe(true);
 
-  state.included = new Set(result.bodies.map((_, i) => i));
+  // Shown for the first time in this tab: the largest body alone when there are several, the others
+  // unchecked and hidden as if unchecked in the list (setIncluded); a note says so (renderBodies).
+  const shown = defaultBodies(result);
+  state.included = new Set(shown);
+  state.meshes.forEach((m, i) => (m.visible = state.included.has(i)));
+  state.largestOnly = shown.length < result.bodies.length;
   state.subsetSummary = null;
   const s = result.summary.bbox;
   state.bounds.set(new THREE.Vector3(...s.min), new THREE.Vector3(...s.max));
@@ -309,20 +316,139 @@ function buildModel(result) {
   setView("iso");
 }
 
-/** The envelope and the axes of the model shown (none without a model), and the section plane. */
+/**
+ * The bodies checked when a result is first shown in a tab: with several, the
+ * largest one alone (engine/summary.js largestBody). Every body for the link
+ * modes that publish the results for a script (report=1, export=…), or with
+ * bodies=all; bodies=largest keeps the largest one alone in those too.
+ */
+function defaultBodies(result) {
+  const all = result.bodies.map((_, i) => i);
+  const asked = params.get("bodies");
+  const publishing = Boolean(params.get("report") || params.get("export"));
+  if (all.length < 2 || asked === "all" || (publishing && asked !== "largest")) return all;
+  return [largestBody(result.bodies)];
+}
+
+/** The envelope of the model shown and the view triad (none without a model), and the section plane. */
 function placeHelpers() {
   if (boxHelper) scene.remove(boxHelper);
-  if (axes) scene.remove(axes);
-  boxHelper = axes = null;
+  boxHelper = null;
   if (!state.bounds.isEmpty()) {
     boxHelper = new THREE.Box3Helper(state.bounds, 0xff8800);
     boxHelper.visible = $("toggle-box").classList.contains("active");
     scene.add(boxHelper);
-    const size = state.bounds.getSize(new THREE.Vector3());
-    axes = new THREE.AxesHelper(Math.max(size.x, size.y, size.z) * 0.25);
-    scene.add(axes);
   }
+  $("view-triad").hidden = state.bounds.isEmpty();
   updateSection();
+}
+
+// ---- the view triad
+
+// The axes X, Y, Z of the part, red, green and blue (a right-handed frame), in
+// the bottom left corner of the 3D view, where they are always seen (the axes
+// drawn before at the origin of the model were inside or behind the part, cut
+// by the section, or off the view). An SVG over the canvas (#view-triad),
+// turned after each frame (drawTriad) by the camera's rotation alone: its
+// quaternion, whatever its up (the trackball and the « Coulée » view turn it),
+// neither moved nor zoomed. Over the part, never cut by the section, sharp at
+// any pixel ratio, no pointer events (a drag over it turns the view), hidden
+// from screen readers. Rather than a second scene drawn in a corner of the
+// canvas: nothing to fit into the frames of the section's caps (stencil,
+// scissor), real text, and "#viewport canvas" still one element. Screenshots
+// of the page have it, to read their orientation (the app itself makes no
+// image of the view; the e2e counts of the colours of the view mask it). Not
+// drawn while the page of the view is hidden (nor is the view); the frame
+// drawn again when the view is resized leaves it as it is (not in the
+// canvas). Shown with a model (placeHelpers); above the actions of the
+// drawing by hand while they are shown, in the same corner (style.css,
+// --draw-actions-h). The axis nearest the viewer is drawn over the others,
+// one pointing away fades; seen end-on (the third axis of the Face, Dessus and
+// Droite views) it is marked as on a drawing, ⊙ towards the viewer, ⊗ away,
+// over the foot of the two others, its letter beside it on the side they
+// leave free.
+const TRIAD_AXIS = 30; // px from the centre to the tip of an axis seen across (the triad: 96 px)
+const TRIAD_HEAD = [8, 4]; // its arrowhead seen across: length and half-width (px)
+const TRIAD_LABEL = 11; // px from the tip of an axis to the centre of its letter
+const TRIAD_GAP = 16; // px at least between the centres of two letters
+const TRIAD_DOT = "M-1.2,0a1.2,1.2 0 1,0 2.4,0a1.2,1.2 0 1,0 -2.4,0"; // ⊙ (its path stroked)
+const TRIAD_CROSS = "M-2.5,-2.5L2.5,2.5M-2.5,2.5L2.5,-2.5"; // ⊗
+const triad = {
+  svg: $("view-triad").querySelector("svg"),
+  axes: ["x", "y", "z"].map((name, k) => {
+    const g = $("view-triad").querySelector(`[data-axis="${name}"]`);
+    const [line, head, end, mark, text] = ["line", "polygon", ".triad-end", ".triad-end path", "text"].map((sel) => g.querySelector(sel));
+    return { name, g, line, head, end, mark, text, unit: new THREE.Vector3().setComponent(k, 1), seen: new THREE.Vector3(), s: 1, at: [0, 0], toward: null };
+  }),
+  drawn: new THREE.Quaternion(0, 0, 0, 0), // the camera's rotation drawn (none yet)
+  order: "", // the axes in drawing order ("yxz": z the nearest)
+};
+// The height of the actions of the drawing by hand (0 while hidden): the triad stands above them.
+new ResizeObserver(() => viewport.style.setProperty("--draw-actions-h", `${$("draw-actions").offsetHeight}px`)).observe($("draw-actions"));
+
+/** The triad as the camera now turns (after each frame of the view; nothing to do when it has not turned). */
+function drawTriad() {
+  if (triad.drawn.equals(camera.quaternion)) return;
+  triad.drawn.copy(camera.quaternion);
+  const toCamera = camera.quaternion.clone().invert();
+  // Each axis in the camera's frame (x to the right, y up, z towards the viewer); on the screen, y down.
+  for (const a of triad.axes) a.seen.copy(a.unit).applyQuaternion(toCamera);
+  const [headLength, headWidth] = TRIAD_HEAD;
+  const f = (x) => x.toFixed(2);
+  for (const a of triad.axes) {
+    const x = a.seen.x, y = -a.seen.y, across = Math.hypot(x, y);
+    const [ux, uy] = across > 1e-6 ? [x / across, y / across] : [1, 0];
+    // 1 seen across, 0 end-on: its arrowhead shrinks to nothing, its ⊙ or ⊗ comes.
+    a.s = Math.min(1, across / 0.3);
+    const s = a.s;
+    const tx = TRIAD_AXIS * x, ty = TRIAD_AXIS * y;
+    const bx = tx - headLength * across * ux, by = ty - headLength * across * uy;
+    const w = headWidth * s;
+    a.line.setAttribute("x2", f(bx));
+    a.line.setAttribute("y2", f(by));
+    a.head.setAttribute("points", `${f(tx)},${f(ty)} ${f(bx - w * uy)},${f(by + w * ux)} ${f(bx + w * uy)},${f(by - w * ux)}`);
+    a.end.style.opacity = f(1 - s);
+    if (a.toward !== a.seen.z >= 0) {
+      a.toward = a.seen.z >= 0;
+      a.mark.setAttribute("d", a.toward ? TRIAD_DOT : TRIAD_CROSS);
+      a.g.classList.toggle("toward", a.toward);
+    }
+    // Its letter beyond its tip; end-on, on the side the two others leave free (the bottom left when they are opposite).
+    let [fx, fy] = [0, 0];
+    for (const b of triad.axes) if (b !== a) [fx, fy] = [fx - b.seen.x, fy + b.seen.y];
+    const free = Math.hypot(fx, fy);
+    [fx, fy] = free > 0.1 ? [fx / free, fy / free] : [-Math.SQRT1_2, Math.SQRT1_2];
+    const [dx, dy] = [s * ux + (1 - s) * fx, s * uy + (1 - s) * fy];
+    const d = Math.hypot(dx, dy) || 1;
+    const gap = TRIAD_LABEL + 3 * (1 - s); // (clear of the ⊙ or ⊗)
+    a.at = [tx + (gap * dx) / d, ty + (gap * dy) / d];
+    // Fainter as it points away from the viewer, from 49° off straight away (the three axes of the Iso view plain); not end-on, where ⊗ says it.
+    a.g.style.opacity = f(1 - 0.5 * s * Math.min(1, Math.max(0, (-a.seen.z - 0.65) / 0.3)));
+  }
+  // Two letters too close (two axes seen almost one over the other) moved apart, half each.
+  for (const [p, q] of [[0, 1], [0, 2], [1, 2]]) {
+    const a = triad.axes[p].at, b = triad.axes[q].at;
+    const d = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (d >= TRIAD_GAP) continue;
+    const r = Math.hypot(...a) || 1;
+    const [nx, ny] = d > 1e-6 ? [(b[0] - a[0]) / d, (b[1] - a[1]) / d] : [-a[1] / r, a[0] / r];
+    const push = (TRIAD_GAP - d) / 2;
+    a[0] -= push * nx;
+    a[1] -= push * ny;
+    b[0] += push * nx;
+    b[1] += push * ny;
+  }
+  for (const a of triad.axes) {
+    a.text.setAttribute("x", f(a.at[0]));
+    a.text.setAttribute("y", f(a.at[1]));
+  }
+  const depth = (a) => (a.s < 1 ? 2 : a.seen.z); // end-on: over the others
+  const order = [...triad.axes].sort((p, q) => depth(p) - depth(q));
+  const key = order.map((a) => a.name).join("");
+  if (key !== triad.order) {
+    triad.order = key;
+    triad.svg.append(...order.map((a) => a.g));
+  }
 }
 
 // ---------------------------------------------------------------- engines
@@ -653,7 +779,9 @@ function showError(msg) {
 function renderPanel() {
   const r = state.result;
   if (!r) return;
-  const s = currentSummary() ?? { volume: null, area: null, centroid: null, bodies: 0, solids: 0, open_bodies: 0, bbox: { size: [NaN, NaN, NaN], volume: null }, obb: null, fill_ratio: null };
+  // No body checked: no figure at all (never those of the bodies left out), said so.
+  const none = !state.included.size;
+  const s = currentSummary() ?? emptySummary();
   const partial = s !== r.summary;
 
   for (const id of ["summary-card", "mass-card", "bodies-card"]) $(id).hidden = false;
@@ -662,7 +790,6 @@ function renderPanel() {
   const estimated = r.bodies.filter((b, i) => state.included.has(i) && isEstimate(b)).length;
   $("total-volume").textContent = (estimated ? "≈ " : "") + fmtVol(s.volume);
   const method = $("method");
-  method.classList.toggle("warn", s.open_bodies > 0 || s.volume == null || estimated > 0);
   const how = r.kind === "cad" ? t("method.cad") : t("method.mesh", { unit: r.source_unit });
   const notes = [];
   if (estimated) notes.push(t("method.estimated", { n: estimated }));
@@ -672,7 +799,9 @@ function renderPanel() {
   // (why it failed, said in French by the folder's modules, in the French note only: the English one leaves {message} out).
   const net = r.networkNote;
   if (net) notes.push(net.kind === "prompt" ? t("method.networkPrompt") : t(net.write ? "method.networkWrite" : "method.networkRead", { message: net.message }));
-  method.textContent = s.volume == null ? t("method.none") : [how, ...notes].join(" ");
+  method.textContent = none ? t("scope.none") : s.volume == null ? t("method.none") : [how, ...notes].join(" ");
+  method.classList.toggle("warn", none || s.open_bodies > 0 || s.volume == null || estimated > 0);
+  renderScopeNote($("summary-scope"));
 
   $("total-area").textContent = fmtArea(s.area);
   $("bbox-size").textContent = s.bodies ? fmtSize(s.bbox.size) : "—";
@@ -720,10 +849,22 @@ function currentSummary(indices = includedIndices()) {
   return summary;
 }
 
-/** Check exactly these bodies (from the list, or from the costing page). */
+/**
+ * Check exactly these bodies (from the list, or from the costing page): the
+ * analysis covers them alone. What is known of them is shown at once (the
+ * summary, the thickness of the bodies computed, the card's body moved to a
+ * checked one), what is missing a moment later, by one update for a burst of
+ * clicks (scheduleScope).
+ */
 function setIncluded(indices) {
-  state.included = new Set(indices);
+  const next = new Set(indices);
+  const changed = next.size !== state.included.size || [...next].some((i) => !state.included.has(i));
+  // The selection changed (by the list, the costing page or a script): the note of the largest body alone, gone.
+  if (changed) state.largestOnly = false;
+  state.included = next;
   state.meshes.forEach((m, i) => (m.visible = state.included.has(i)));
+  // Asked for before the cards are drawn: they say « mise à jour… », and start nothing for the bodies just checked.
+  if (changed) scheduleScope();
   renderPanel();
   renderParting();
   applyParting();
@@ -731,11 +872,161 @@ function setIncluded(indices) {
   applyFeeding();
   // The wall thickness card: the values of the bodies checked, on a scale fitted to them.
   if (thick.results) {
-    if (!thick.userMax) thick.max = niceCeil((thickQuantiles([0.99]) ?? [thick.max])[0]);
+    fitThickScale();
     applyThickness();
-    renderThickness();
   }
-  updatePublished(state.result);
+  renderThickness();
+}
+
+// ---- the bodies analysed
+
+// The analysis covers the bodies checked in the list (state.included): every
+// figure shown, exported, pushed to the costing, given to the AI or returned
+// to a script is theirs, and says which they are (scopeInfo; on the cards,
+// « Analyse sur 1 corps sur 3 (corps cochés) »). When the bodies checked
+// change, what was asked for already is completed for the bodies newly
+// checked a moment after the last click (SCOPE_MS: a burst of clicks starts
+// one update): the wall thickness once launched, the parting proposals and
+// the feeding zones (computed in the background), the slides, the
+// orientation and the risers of the card's body. Each body's results are
+// kept, in memory and with the results of the file (cache.js, the shared
+// folder): a body checked again is not computed again; a body unchecked
+// while it is computed keeps its results, never shown while it is not
+// checked. Meanwhile the cards concerned say « mise à jour… »; the costing
+// page and the published results get the new part once the update is done.
+// What was never asked for (the thickness not launched) stays manual.
+const SCOPE_MS = 300;
+// {timer (the update waiting), waiting (the result it is for), runs (updates
+// started since the page was opened), busy (result -> its update running),
+// done (result -> the promise of its last update), jobs (result -> the jobs
+// of its cards asked for while they are drawn: the slides, the orientations,
+// the risers placed; waited for by its update before it publishes)}.
+const scope = { timer: 0, waiting: null, runs: 0, busy: new WeakMap(), done: new WeakMap(), jobs: new WeakMap() };
+
+/** A job of the cards of result r (its promise, which never rejects): waited for by an update of its bodies (scopeUpdate). */
+function trackJob(r, promise) {
+  let jobs = scope.jobs.get(r);
+  if (!jobs) scope.jobs.set(r, (jobs = new Set()));
+  jobs.add(promise);
+  promise.finally(() => jobs.delete(promise));
+  return promise;
+}
+
+/** An update of the bodies analysed, a moment after the last change of the bodies checked. */
+function scheduleScope() {
+  clearTimeout(scope.timer);
+  scope.waiting = state.result;
+  scope.timer = setTimeout(runScope, SCOPE_MS);
+}
+
+/** The update waiting started now (its tab left, an export asked for). */
+function flushScope() {
+  if (!scope.waiting) return;
+  clearTimeout(scope.timer);
+  runScope();
+}
+
+/** An update of the bodies analysed of the model shown, now (its tab shown again, a thickness to resume). */
+function startScope() {
+  clearTimeout(scope.timer);
+  scope.waiting = state.result;
+  runScope();
+}
+
+/** Once the update of the bodies analysed of r is done (none waiting nor running): at once without one. */
+async function scopeDone(r = state.result) {
+  flushScope();
+  while (r && scope.busy.has(r)) await scope.done.get(r);
+}
+
+/** Whether the bodies checked of result r just changed, their update not started yet: no job is started for them meanwhile. */
+const scopeWaiting = (r = state.result) => !!r && scope.waiting === r;
+
+/** Whether the bodies analysed of result r are being updated (waiting, or computing). */
+const scopeBusy = (r = state.result) => scopeWaiting(r) || (!!r && scope.busy.has(r));
+
+/** The update of the bodies analysed waiting started (scopeUpdate), its promise kept (scopeDone). */
+function runScope() {
+  const r = scope.waiting;
+  clearTimeout(scope.timer);
+  scope.waiting = null;
+  scope.timer = 0;
+  if (!r || r !== state.result) return null;
+  const run = ++scope.runs;
+  scope.busy.set(r, run);
+  const update = scopeUpdate(r, run);
+  scope.done.set(r, update);
+  return update;
+}
+
+/**
+ * The update of the bodies analysed of the model shown: what is missing for
+ * the bodies checked computed (the wall thickness once asked for, unless it
+ * failed: then by its button; the parting proposals and the feeding zones,
+ * not those that failed: by Retry), then what the part given to the costing
+ * reads of each of them (its slides, its orientation and die block, its
+ * risers), the cards drawn again; then, all of it done, the part published
+ * once (costing page, IA page, scripts), never before with the figures of a
+ * part of the bodies (updatePublished).
+ */
+async function scopeUpdate(r, run) {
+  const current = () => scope.busy.get(r) === run && r === state.result;
+  // (The proposals of a body checked again made for other options than its own now: proposed again.)
+  const jobs = [computePartings(r), reproposeStale(r), computeFeedings(r)];
+  if (thick.asked && !thick.failed && thickMissing().length) jobs.push(ensureThickness());
+  // And those still running for its bodies, started before (an update before, the opening of the model).
+  for (const computing of [partingOf(r).computing, feedingOf(r).computing]) for (const job of computing.values()) jobs.push(job.promise);
+  renderScope();
+  await Promise.allSettled(jobs.filter(Boolean));
+  // Then, each in turn (the orientation waits for the proposal, the risers for the orientation): asked for, waited for.
+  for (let round = 0; round < 4 && current(); round++) {
+    for (const i of includedIndices()) {
+      if (!r.bodies[i].closed) continue;
+      slidesBrief(i);
+      orientedPart(i);
+      feedingField(i, r);
+    }
+    await null; // the jobs asked for at the end of this task (slidesQueue, feedingPlacement) sent
+    const running = [...(scope.jobs.get(r) ?? [])];
+    if (!running.length) break;
+    await Promise.allSettled(running);
+  }
+  if (scope.busy.get(r) !== run) return; // a later update of its bodies took over
+  scope.busy.delete(r);
+  // Its tab no longer shown: drawn and published when it is shown again (showTab).
+  if (r !== state.result) return;
+  renderScope();
+  updatePublished(r);
+}
+
+/** The cards of the results of the bodies analysed drawn again: what they cover, what is being updated. */
+function renderScope() {
+  renderThickness();
+  renderParting();
+  if (partingShown()) applyParting();
+  renderFeeding();
+  applyFeeding();
+}
+
+/**
+ * Which bodies the figures cover, said when the file has several: « Analyse
+ * sur 1 corps sur 3 (corps cochés) »; nothing when none is checked (each card
+ * says so in its own words, instead of its figures).
+ */
+function scopeText() {
+  const r = state.result;
+  if (!r || r.bodies.length < 2) return "";
+  const s = scopeOf(r.bodies.length, state.included);
+  if (s.none) return "";
+  if (s.all) return t("scope.all", { total: s.total });
+  return t(s.count === 1 ? "scope.some.one" : "scope.some", { n: s.count, total: s.total });
+}
+
+/** The note of a card saying which bodies its figures cover (hidden for a file of one body). */
+function renderScopeNote(el) {
+  const text = scopeText();
+  el.hidden = !text;
+  el.textContent = text;
 }
 
 function isEstimate(body) {
@@ -757,6 +1048,10 @@ function renderBodies() {
   const r = state.result;
   const tbody = $("bodies");
   tbody.innerHTML = "";
+  // Several bodies, the largest one alone checked by default: said until the selection is changed.
+  const note = $("bodies-note");
+  note.hidden = !(state.largestOnly && state.included.size < r.bodies.length);
+  note.textContent = note.hidden ? "" : t("bodies.largestOnly", { n: r.bodies.length });
   const total = currentSummary()?.volume || 0;
   r.bodies.forEach((b, i) => {
     const tr = document.createElement("tr");
@@ -843,7 +1138,7 @@ function select(i) {
   });
   document.querySelectorAll("#bodies tr").forEach((tr) => tr.classList.toggle("selected", +tr.dataset.index === i));
   renderBodyDetail();
-  // The parting line card is the body selected's (a message about the body before it, gone), and the risers card.
+  // The parting line card is the body selected's when it is checked (a message about the body before it, gone), and the risers card.
   const p = partingOf();
   if (p) p.message = null;
   renderParting();
@@ -855,10 +1150,15 @@ function select(i) {
 
 // ---------------------------------------------------------------- exports
 
-/** Results without the display meshes, for files and for scripts. */
+/**
+ * Results without the display meshes, for files and for scripts: of the
+ * bodies checked (or of these bodies, indices into r.bodies), which they
+ * are said (scope); none checked, no figure.
+ */
 function exportableResult(r, indices = includedIndices()) {
   const density = parseFloat($("density").value);
   const mass = (v) => (v != null && Number.isFinite(density) && density >= 0 ? (v / 1000) * density : null);
+  const summary = (indices.length ? currentSummary(indices) : null) ?? emptySummary();
   return {
     file: r.file,
     kind: r.kind,
@@ -866,7 +1166,9 @@ function exportableResult(r, indices = includedIndices()) {
     units: { length: "mm", area: "mm2", volume: "mm3", mass: "g", density: "g/cm3" },
     engine: r.engine ?? "python",
     density,
-    summary: { ...(currentSummary(indices) ?? r.summary), mass: mass((currentSummary(indices) ?? r.summary).volume) },
+    // The bodies the figures are of: those checked in the list of the 3D page.
+    scope: scopeInfo(r.bodies, indices),
+    summary: { ...summary, mass: mass(summary.volume) },
     bodies: indices.map((i) => {
       const { mesh, ...b } = r.bodies[i];
       return { ...b, mass: mass(b.volume), ...thicknessExport(r, [i]), ...partingExport(r, i), ...slidesExport(r, i), ...feedingExport(r, i) };
@@ -879,11 +1181,12 @@ function exportableResult(r, indices = includedIndices()) {
 /**
  * Wall thickness of bodies of the result shown, for the exports:
  * {thickness: {method, min, median, max, sphere, wall}} (mm), or {} when not
- * computed. sphere and wall: {min, median, max} of those methods, whichever
+ * computed for every closed one of them (never the figures of a part of
+ * them). sphere and wall: {min, median, max} of those methods, whichever
  * method the view shows (the foundry screen of the AI context reads them).
  */
 function thicknessExport(r, indices) {
-  if (r !== state.result || !thick.results) return {};
+  if (r !== state.result || !thickCovers(indices)) return {};
   const stats = thickStats(indices);
   // The thinnest wall always by the "wall" method (see thickness.js).
   const wall = thickStats(indices, "wall");
@@ -903,9 +1206,19 @@ function thicknessExport(r, indices) {
   };
 }
 
-/** Exports include the wall thickness: compute it first if needed (closed bodies only). */
+/**
+ * Exports include the wall thickness: computed first if needed (the closed
+ * bodies checked only), the update of the bodies checked first. None checked:
+ * nothing to export, said.
+ */
 async function withThickness() {
-  if (state.result?.bodies.some((b) => b.closed)) await ensureThickness();
+  const r = state.result;
+  if (!r) return;
+  if (!state.included.size) throw new Error(t("export.none"));
+  // The bodies just checked: their parting, slides and risers first (their update), as the page then shows them.
+  await scopeDone(r);
+  if (r !== state.result) return;
+  if (r.bodies.some((b, i) => b.closed && state.included.has(i))) await ensureThickness();
 }
 
 function download(name, blob) {
@@ -1500,7 +1813,9 @@ const thick = {
   markings: loadMarkings(), // {on, depth mm}
   markCache: new Map(), // body -> {key, mask, regions, depth}
   minOverride: null, // mm: thinnest wall typed in for the quote (the model was misjudged), or null
-  results: null, // per body {ray, sphere} (Float32Array per triangle) or null
+  results: null, // per body {ray, sphere, wall} (Float32Array per triangle), or null (open, or not computed: a body not checked)
+  asked: false, // computed once for this model (or kept from an earlier opening): the bodies checked next are computed by themselves
+  failed: null, // why its last computation failed (not cancelled): said, not tried again by itself (its button tries again)
   pending: null, // promise of the computation in progress
   colors: false,
   highlight: false,
@@ -1609,45 +1924,88 @@ function thickQuantiles(fractions) {
   });
 }
 
+/** The closed bodies of `indices` (default: those checked) whose thickness is not computed. */
+function thickMissing(indices = includedIndices()) {
+  return state.result ? missingBodies(state.result.bodies, indices, thick.results) : [];
+}
+
+/** Whether the thickness of every closed body of `indices` (default: those checked) is known, one at least: the figures of the set. */
+function thickCovers(indices = includedIndices()) {
+  return indices.some((i) => thickValues(i)) && !thickMissing(indices).length;
+}
+
 /** A new model is shown: forget the previous thicknesses, recompute if in use. */
 function thicknessNewModel(kept = null) {
   thick.results = null;
+  thick.asked = false;
+  thick.failed = null;
   thick.scale = null;
   thick.markCache = new Map();
   thick.minOverride = null;
   thick.pending = null;
   thick.userMax = false;
   thick.value = null;
-  // Kept from an earlier opening of the same file: shown at once.
-  if (kept) return adoptThickness(kept);
+  // Kept from an earlier opening of the same file: shown at once; the bodies checked not computed then, now.
+  if (kept) {
+    thick.asked = true;
+    adoptThickness(kept);
+    if (thickMissing().length) ensureThickness();
+    return;
+  }
   renderThickness();
   if (thick.colors || thick.highlight) ensureThickness();
 }
 
-/** Thicknesses of the model shown, computed or kept from an earlier opening. */
+/** Thicknesses of the model shown (per body), computed or kept from an earlier opening; the scale fitted to the bodies checked. */
 function adoptThickness(results) {
   thick.results = results;
-  const [p50, p99] = thickQuantiles([0.5, 0.99]) ?? [NaN, NaN];
-  if (!thick.userMax) thick.max = niceCeil(p99);
-  thick.value ??= Number.isFinite(p50) ? Math.round(p50 * 10) / 10 : thick.max / 2;
-  thick.tol ??= Math.max(0.1, Math.round(thick.max * 2) / 100);
+  fitThickScale();
   updatePublished(state.result);
   applyThickness();
   renderThickness();
 }
 
-/** Compute the thicknesses of the model shown (once), with progress. */
-async function ensureThickness() {
-  if (thick.results || !state.result) return thick.results;
-  if (thick.pending) return thick.pending;
+/**
+ * The colour scale fitted to the values of the bodies checked (unless set by
+ * hand), and the thickness highlighted chosen, once they have values (a
+ * thickness kept for other bodies only: once the bodies checked have theirs).
+ */
+function fitThickScale() {
+  const [p50, p99] = thickQuantiles([0.5, 0.99]) ?? [NaN, NaN];
+  if (!Number.isFinite(p99)) return;
+  if (!thick.userMax) thick.max = niceCeil(p99);
+  thick.value ??= Number.isFinite(p50) ? Math.round(p50 * 10) / 10 : thick.max / 2;
+  thick.tol ??= Math.max(0.1, Math.round(thick.max * 2) / 100);
+}
+
+/**
+ * The thickness of the closed bodies of `indices` (default: those checked)
+ * computed, those not known yet only, with progress; then each body's values
+ * kept, in memory and with the results of the file: a body checked again is
+ * not computed again, one unchecked meanwhile keeps its values. From then on
+ * the thickness is asked for: the bodies checked next are computed by the
+ * update of the bodies analysed (runScope). One computation at a time: the
+ * bodies still missing after the one running. Resolves to the thicknesses of
+ * the model shown (per body), or null when not computed (failed, cancelled,
+ * another file).
+ */
+async function ensureThickness(indices = includedIndices()) {
   const result = state.result;
+  if (!result) return null;
+  thick.asked = true;
+  thick.failed = null; // asked for again: tried again
+  for (let pending; (pending = thick.pending); ) {
+    if (!(await pending) || state.result !== result) return null;
+  }
+  const missing = thickMissing(indices);
+  if (!missing.length) return (thick.results ??= result.bodies.map(() => null));
   const tab = activeTab; // the computation goes on if another tab is shown
   const meshes = state.meshes;
   const run = (async () => {
     const client = await browserClient();
     const bodies = meshes.map((mesh, i) => {
-      // Open bodies have no inside: no thickness.
-      if (!result.bodies[i].closed) return null;
+      // Open bodies have no inside: no thickness; those not checked, not now.
+      if (!missing.includes(i)) return null;
       const geom = mesh.userData.indexed ?? mesh.geometry;
       return { positions: geom.attributes.position.array, indices: geom.index.array };
     });
@@ -1659,8 +2017,11 @@ async function ensureThickness() {
     }
     renderTabs();
     try {
-      const results = await client.computeThickness(bodies, { onProgress: (p) => showProgress(p, tab) });
+      const fresh = await client.computeThickness(bodies, { onProgress: (p) => showProgress(p, tab) });
       if (tab.result !== result) return null; // another file was opened meanwhile
+      // With those of the bodies computed before (the tab's, whether shown or not), kept together.
+      const kept = tab === activeTab ? thick : tab.view?.thick;
+      const results = mergeBodies(kept?.results, fresh, result.bodies.length);
       client.saveThickness(result.cacheKey, results, result.bodies);
       if (tab === activeTab) adoptThickness(results);
       else if (tab.view) {
@@ -1672,6 +2033,13 @@ async function ensureThickness() {
     } catch (err) {
       if (!err.cancelled) showError(`${t("thick.title")} : ${tMessage(err.message || String(err))}`);
       if (tab === activeTab) thick.colors = thick.highlight = false;
+      // Stopped (Cancel): no longer computed by itself for the bodies checked next, until asked for again.
+      // Failed: said on the card, not tried again by itself at each click of the list (its button tries again).
+      const kept = tab === activeTab ? thick : tab.view?.thick;
+      if (kept && tab.result === result) {
+        if (err.cancelled) kept.asked = false;
+        else kept.failed = err.message || String(err);
+      }
       return null;
     } finally {
       if (tab.result === result) {
@@ -1743,10 +2111,13 @@ function overlayBody() {
 /** How many bodies are faded, on the 3D view (for scripts and tests). */
 const noteFaded = () => (viewport.dataset.faded = String(state.meshes.filter((mesh) => mesh.userData.faded).length));
 
-/** The bodies not faded as they should be (the overlays shown or hidden, another body on the card). */
+/** Whether body j is faded while the overlays of body i (-1: none) are shown: another one, shown (one unchecked is hidden, not faded). */
+const fadedBy = (i, j) => i >= 0 && j !== i && !!state.meshes[j]?.visible;
+
+/** The bodies not faded as they should be (the overlays shown or hidden, another body on the card, a body checked or not). */
 function fadeStale() {
   const i = overlayBody();
-  return state.meshes.some((mesh, j) => !!mesh.userData.faded !== (i >= 0 && j !== i));
+  return state.meshes.some((mesh, j) => !!mesh.userData.faded !== fadedBy(i, j));
 }
 
 /** A mesh in its own colour: its indexed geometry back (and its colour, after being faded). */
@@ -1793,7 +2164,7 @@ function applyThickness() {
   // The risers of a body shown: the other bodies faded.
   const overlay = overlayBody();
   state.meshes.forEach((mesh, i) => {
-    if (overlay >= 0 && i !== overlay) return fadeBody(mesh);
+    if (fadedBy(overlay, i)) return fadeBody(mesh);
     const values = thickValues(i);
     setSeeThrough(mesh, active && thick.highlight);
     if (!active) return plainColors(mesh);
@@ -1840,9 +2211,22 @@ function renderThickness() {
   const card = $("thickness-card");
   card.hidden = !state.result;
   if (!state.result) return;
-  const ready = !!thick.results;
-  $("thick-compute").hidden = ready || !!thick.pending;
+  // Of the bodies checked: shown once known for every closed one of them; the bodies newly checked
+  // being computed (asked for already), « mise à jour… »; none checked, or none closed, said.
+  const none = !state.included.size;
+  const missing = thickMissing();
+  const updating = missing.length > 0 && (!!thick.pending || (thick.asked && !thick.failed && scopeBusy()));
+  const ready = thickCovers();
+  $("thick-compute").hidden = none || !missing.length || updating;
   $("thick-body").hidden = !ready;
+  const status = none ? t("scope.none")
+    : updating ? t(thick.results?.some(Boolean) ? "thick.updating" : "thick.computing")
+      : missing.length && thick.failed ? t("thick.failed", { message: tMessage(thick.failed) })
+        : !ready && !missing.length ? t("thick.none") : "";
+  $("thick-status").hidden = !status;
+  $("thick-status").textContent = status;
+  renderScopeNote($("thick-scope"));
+  card.dataset.updating = updating ? "1" : ""; // for scripts and tests
   $("thick-colors").checked = thick.colors;
   $("thick-highlight").checked = thick.highlight;
   $("toggle-thickness").classList.toggle("active", thick.colors);
@@ -2118,35 +2502,37 @@ const ORDER_LINE = 3;
 
 const partClient = () => (partClient.module ??= import("./engine/partclient.js"));
 
-// Per result: {results (per body {proposal, side, flags, plane, segments} or
-// null), pending, percent, error, current (body -> definition by hand), geom
-// (body -> its faces and edges), evaluated (directions classified), show,
-// mode ("pick" | "assign" | null), busy (directions being classified), seq
-// (the choices made on the card: a direction classified after a later
-// choice is not applied), message, restored, draw (body -> its drawing by
-// hand, see "drawing by hand"; mode "draw"), drawBody (the body drawn on)}.
+// Per result: {results (per body {proposal, side, flags, plane, segments}, or
+// null: open, or not proposed yet: a body not checked), computing (body ->
+// {percent} of the job proposing it), failed (body -> why its proposal, or
+// its proposal again, failed: not asked again until Retry), current (body ->
+// definition by hand), geom (body -> its faces and edges), evaluated
+// (directions classified), show, mode ("pick" | "assign" | null), busy
+// (directions being classified), seq (the choices made on the card: a
+// direction classified after a later choice is not applied), message,
+// restored (the bodies whose definition kept was put back), draw (body -> its
+// drawing by hand, see "drawing by hand"; mode "draw"), drawBody (the body
+// drawn on)}.
 const partings = new WeakMap();
 
 function partingOf(r = state.result) {
   if (!r) return null;
   let p = partings.get(r);
   if (!p) {
-    p = { results: null, pending: null, percent: null, error: null, current: new Map(), geom: new Map(), evaluated: new Map(), show: false, mode: null, busy: 0, seq: 0, message: null, restored: false, draw: new Map(), drawBody: -1 };
+    p = { results: null, computing: new Map(), failed: new Map(), current: new Map(), geom: new Map(), evaluated: new Map(), show: false, mode: null, busy: 0, seq: 0, message: null, restored: new Set(), draw: new Map(), drawBody: -1 };
     partings.set(r, p);
   }
   return p;
 }
 
-/** The body of the card: the one selected in the list, else the largest closed body checked (-1: none). */
+/**
+ * The body of the card: the one selected in the list when it is checked,
+ * else the largest closed body checked (-1: none). Always one of the bodies
+ * analysed: unchecked, the card moves to another one.
+ */
 function partingBody() {
   const r = state.result;
-  if (!r) return -1;
-  if (state.selected >= 0 && state.selected < r.bodies.length) return state.selected;
-  let best = -1;
-  for (const i of includedIndices()) {
-    if (r.bodies[i].closed && (best < 0 || (r.bodies[i].volume ?? 0) > (r.bodies[best].volume ?? 0))) best = i;
-  }
-  return best;
+  return r ? cardBody(r.bodies, includedIndices(), state.selected) : -1;
 }
 
 /** The id of the part of a result ("sha256:…" of its file), for its definitions by hand. */
@@ -2213,51 +2599,66 @@ function savePartingDef(partId, body, def, { draft = false } = {}) {
 
 // ---- computation
 
-/** A new model is shown: its parting, kept from an earlier opening, else computed in the background. */
+/** A new model is shown: the parting of its bodies checked, kept from an earlier opening, else computed in the background. */
 function partingNewModel(data) {
   const p = partingOf(data);
   // Kept for the process of each body and the die options of now (casting process and orientation).
   if (!p.results) p.results = keptPartings(data);
   if (p.results) restoreParting();
-  else computePartings(data);
+  computePartings(data);
   renderParting();
 }
 
-/** Propose the parting of the closed bodies of the model shown, in the background. */
+/**
+ * Propose the parting of the closed bodies checked of the model shown not
+ * proposed yet (nor being proposed), in the background; each proposal kept
+ * with those of the other bodies, in memory and with the results of the file.
+ * A promise, or null when none is missing.
+ */
 function computePartings(r) {
   const p = partingOf(r);
-  if (p.results || p.pending || r !== state.result) return;
-  const bodies = r.bodies.map((b, i) => (b.closed ? bodyArrays(i) : null));
-  if (!bodies.some(Boolean)) {
-    p.results = r.bodies.map(() => null);
-    return;
-  }
-  p.error = null;
-  p.percent = 0;
-  p.pending = partClient()
+  if (r !== state.result) return null;
+  p.results ??= r.bodies.map(() => null);
+  // (A body whose proposal failed: not again until Retry, nor with the others.)
+  const want = missingBodies(r.bodies, includedIndices(), p.results, p.computing, p.failed);
+  if (!want.length) return null;
+  const bodies = r.bodies.map((b, i) => (want.includes(i) ? bodyArrays(i) : null));
+  const job = { percent: 0, promise: null };
+  for (const i of want) p.computing.set(i, job);
+  return (job.promise = partClient()
     .then((client) => proposeOriented(client, r, bodies, {
       onProgress: ({ percent }) => {
-        p.percent = percent;
+        job.percent = percent;
         if (r === state.result) renderParting();
       },
     }).then((results) => {
-      p.results = results.bodies;
-      client.saveParting(r.cacheKey, results);
+      // Each body its proposal, or why it has none (that body alone).
+      for (const i of want) {
+        const res = results.bodies[i];
+        if (res?.error) p.failed.set(i, res.error);
+        else if (res) p.results[i] = res;
+      }
+      savePartings(client, r, results.version);
     }))
     .catch((err) => {
-      p.error = err.message || String(err);
+      if (!err.cancelled) for (const i of want) p.failed.set(i, err.message || String(err));
     })
     .finally(() => {
-      p.pending = null;
+      for (const i of want) if (p.computing.get(i) === job) p.computing.delete(i);
       if (r !== state.result) return;
       renderParting();
-      if (p.results) {
-        restoreParting();
-        applyParting();
-      }
+      restoreParting();
+      applyParting();
       // The risers and the ingate placed for this parting line (or along +Z without one).
       refreshFeeding();
-    });
+    }));
+}
+
+/** The proposals of every body of r known kept with the results of its file (one options key when they share it). */
+function savePartings(client, r, version) {
+  const p = partingOf(r);
+  const keys = r.bodies.flatMap((b, i) => (p.results[i] ? [p.results[i].proposal.options_key] : []));
+  client.saveParting(r.cacheKey, { version, options_key: keys.every((k) => k === keys[0]) ? keys[0] ?? null : null, bodies: p.results });
 }
 
 /** The faces (B-rep faces, else regions) and the edges of body i, computed once. */
@@ -2360,25 +2761,30 @@ function resetParting(i) {
   refreshFeeding();
 }
 
-/** The definitions by hand kept for the part shown, once its proposals are known. */
+/** The definitions by hand kept for the part shown, of each body once its proposal is known (a body checked later, then). */
 async function restoreParting() {
   const r = state.result;
   const p = partingOf(r);
-  if (!p?.results || p.restored) return;
-  p.restored = true;
+  if (!p?.results) return;
   const entry = partingSaved()[partIdOf(r)];
   restoreDrafts(p, entry?.drafts); // the drawings by hand not applied, to go on with
   const defs = entry?.bodies ?? {};
+  const restorable = (i) => !!p.results[i] && !p.restored.has(i);
   for (const [key, def] of Object.entries(defs)) {
     const i = Number(key);
-    if (!p.results[i] || !Array.isArray(def?.direction) || def.direction.length !== 3) continue;
+    if (!restorable(i)) continue;
+    p.restored.add(i);
+    if (!Array.isArray(def?.direction) || def.direction.length !== 3) continue;
     try {
       const seq = p.seq;
       const base = await partingDirection(i, def.direction);
-      // A choice made on the card meanwhile: it stands.
-      if (seq !== p.seq) return;
+      // A choice made on the card meanwhile: it stands (the definitions kept of the bodies known, left).
+      if (seq !== p.seq) {
+        for (const k of Object.keys(defs)) if (restorable(Number(k))) p.restored.add(Number(k));
+        return;
+      }
       if (r !== state.result) {
-        p.restored = false; // finished when its tab is shown again
+        p.restored.delete(i); // finished when its tab is shown again
         return;
       }
       // A line drawn by hand: its points, its segments and its halves rebuilt (else its direction only).
@@ -2432,21 +2838,23 @@ function removePartingOverlay(mesh) {
   mesh.userData.partingOverlay = null;
 }
 
-// The halves of the mould of a parting line (mouldBlocks), by its segments: computed once.
+// The halves of the mould of a parting line (mouldBlocks), by its segments and the die blank they are cut out of: computed once.
 const blocksKept = new WeakMap();
 
-/** The halves of the mould round body i for its parting `field` (null: none). */
+/** The halves of the mould round body i for its parting `field` (null: none): its die blank cut in two (castingBlank), else round the part. */
 function partingBlocks(i, field) {
-  let blocks = blocksKept.get(field.segments);
-  if (blocks === undefined) {
+  const box = castingBlank(i, field);
+  const key = box ? JSON.stringify(box) : "";
+  let kept = blocksKept.get(field.segments);
+  if (kept?.key !== key) {
     const line = field.summary.parting;
     // A planar line: flat at its level. Without a line, the body is in one
     // half: under it (the upper half forms it), else over it.
     const level = line?.planar ? line.level_mm : line?.kind ? null : field.side.includes(SIDE_UPPER) ? -Infinity : Infinity;
-    blocks = mouldBlocks(bodyArrays(i).positions, field.direction, { segments: field.segments, level });
-    blocksKept.set(field.segments, blocks);
+    kept = { key, blocks: mouldBlocks(bodyArrays(i).positions, field.direction, { segments: field.segments, level, box }) };
+    blocksKept.set(field.segments, kept);
   }
-  return blocks;
+  return kept.blocks;
 }
 
 /** A translucent block of a half of the mould, with faint edges so that it reads as a block. */
@@ -2488,7 +2896,7 @@ function applyParting() {
   const i = partingBody();
   const field = p?.show && i >= 0 ? partingField(i) : null;
   const card = $("parting-card");
-  card.dataset.overlay = card.dataset.undercuts = card.dataset.orient = card.dataset.brut = card.dataset.pieces = "";
+  card.dataset.overlay = card.dataset.undercuts = card.dataset.orient = card.dataset.brut = card.dataset.brutBox = card.dataset.pieces = card.dataset.chapes = "";
   piecesShown = null;
   const tint = slidesTint(i, field); // the colours of the slides (null: the undercuts in yellow)
   if (!field) {
@@ -2501,11 +2909,10 @@ function applyParting() {
   // While drawing by hand on it: the colours of the drawing, its own line and points, no blocks.
   const drawn = drawShown(i);
   if (drawn) drawn.shownTint = drawn.stage === "halves" ? drawn.tint : null;
-  // The card's body unchecked in the list (hidden, with its overlays): the others in their own look, not faded.
-  const fade = state.meshes[i].visible;
+  // The other bodies shown faded (those unchecked are hidden: in their own look, not faded).
   state.meshes.forEach((mesh, j) => {
     mesh.userData.parting = j === i;
-    if (j !== i) return fade ? fadeBody(mesh) : (setSeeThrough(mesh, false), plainColors(mesh));
+    if (j !== i) return fadedBy(i, j) ? fadeBody(mesh) : (setSeeThrough(mesh, false), plainColors(mesh));
     setSeeThrough(mesh, false);
     const geom = flatGeometry(mesh);
     const colors = geom.attributes.color.array;
@@ -2538,6 +2945,7 @@ function applyParting() {
   card.dataset.pieces = pieces ? String(pieces.count) : "";
   const blocks = $("parting-blocks").checked && !drawn ? partingBlocks(i, field) : null;
   if (blocks) group.add(...blockMeshes(blocks.lower, PARTING_LOWER, "lower"), ...blockMeshes(blocks.upper, PARTING_UPPER, "upper"));
+  card.dataset.chapes = blocks ? blocksCorners(blocks) : ""; // their outline, for scripts and tests
   if (field.segments.length && !drawn) {
     // Width in pixels (the resolution: the size of the view, kept by resize()); drawn last, over the blocks.
     const material = new LineMaterial({ color: PARTING_LINE, linewidth: PARTING_LINE_PX, transparent: true, clippingPlanes: [sectionPlane] });
@@ -2556,7 +2964,7 @@ function applyParting() {
   const along = Math.abs(d.x) * size[0] + Math.abs(d.y) * size[1] + Math.abs(d.z) * size[2];
   const length = 0.35 * reach;
   // (While drawing: the rotation axis of the drawing instead.)
-  if (!drawn) group.add(new THREE.ArrowHelper(d, centre.clone().addScaledVector(d, along / 2 + (blocks?.margin ?? 0) + 0.05 * reach), length, PARTING_ARROW, 0.3 * length, 0.15 * length));
+  if (!drawn) group.add(new THREE.ArrowHelper(d, pastBlocks(blocks, d, centre, along / 2).addScaledVector(d, 0.05 * reach), length, PARTING_ARROW, 0.3 * length, 0.15 * length));
   if (!drawn) addSlideArrows(group, i, field); // an arrow per slide, along its pull direction
   addOrientationOverlay(group, i, { drawn, blocks }); // the arrow « haut », the die blank
   mesh.add(group);
@@ -2578,7 +2986,7 @@ function partingOff() {
     mesh.userData.parting = false; // coloured by the thickness next
   });
   const card = $("parting-card");
-  card.dataset.overlay = card.dataset.undercuts = card.dataset.pieces = "";
+  card.dataset.overlay = card.dataset.undercuts = card.dataset.pieces = card.dataset.chapes = "";
   piecesShown = null;
   renderParting();
 }
@@ -2638,6 +3046,8 @@ function cutPiecesOf(i, field, drawn) {
   const key = field.manual ? p.current.get(i) : p.results[i];
   if (!key) return null;
   let kept = piecesKept.get(key);
+  // The bodies checked just changed: cut by their update (runScope), not by each click of a burst.
+  if (!kept && scopeWaiting(r)) return null;
   if (!kept) {
     kept = { pieces: mayBeCut(i, field) ? null : NO_PIECES };
     piecesKept.set(key, kept);
@@ -2899,6 +3309,7 @@ function renderParting() {
   const card = $("parting-card");
   const r = state.result;
   card.hidden = !r;
+  renderCastingView(); // the « Vue de coulée » of the card's body, once oriented; a turn awaited for another one dropped
   // A crosshair while placing on the 3D view (here, or a riser or the ingate).
   renderer.domElement.style.cursor = feedingOf(r)?.mode ? "crosshair" : "";
   syncDrawView(partingOf(r), partingBody()); // drawing by hand: left when its body is no longer the card's (or no model); the view's controls
@@ -2914,15 +3325,20 @@ function renderParting() {
   $("parting-body").hidden = !named;
   if (named) $("parting-body").textContent = t("parting.body", { name: r.bodies[i].name });
   let status = "";
-  if (i < 0) status = t("parting.none");
+  const job = i >= 0 ? p.computing.get(i) : null;
+  if (i < 0) status = t(state.included.size ? "parting.none" : "scope.none");
   else if (!r.bodies[i].closed) status = t("parting.open");
-  else if (p.pending) status = t("parting.computing", { percent: p.percent != null ? `${p.percent} %` : "" });
-  else if (p.error) status = t("parting.error", { message: tMessage(p.error) });
+  else if (job) status = t("parting.computing", { percent: job.percent != null ? `${job.percent} %` : "" });
+  // Its own proposal failed (another body's says nothing here).
+  else if (p.failed.has(i)) status = t("parting.error", { message: tMessage(p.failed.get(i)) });
+  // Checked a moment ago: proposed by the update of the bodies analysed.
+  else if (!p.results?.[i]) status = t("scope.updatingCard");
   else if (p.busy) status = t("parting.busy");
   else if (r.bodies[i].closed && orientOf(r).proposing.has(i)) status = t("parting.reproposing");
   $("parting-status").hidden = !status;
   $("parting-status").textContent = status;
-  $("parting-retry").hidden = !(p.error && !p.pending);
+  card.dataset.updating = i >= 0 && r.bodies[i].closed && !p.results?.[i] && !p.failed.has(i) ? "1" : ""; // for scripts and tests
+  $("parting-retry").hidden = !(i >= 0 && p.failed.has(i) && !job);
   $("parting-show").checked = p.show && !!field;
   $("parting-show").disabled = !field;
   $("parting-blocks").disabled = !field;
@@ -2997,7 +3413,8 @@ $("parting-blocks").addEventListener("change", () => {
 $("parting-retry").addEventListener("click", () => {
   const p = partingOf();
   if (!p) return;
-  p.error = null;
+  // Every body whose proposal failed, asked for again (those checked; the others when checked).
+  p.failed.clear();
   computePartings(state.result);
   renderParting();
 });
@@ -5527,9 +5944,13 @@ function slidesError(i, r = state.result) {
   return e?.error && e.run === m.run ? e.error : null;
 }
 
-/** The slides of body i for the definition shown asked for, unless known or being computed (the model shown). */
+/**
+ * The slides of body i for the definition shown asked for, unless known or
+ * being computed (the model shown; the bodies checked just changed: by their
+ * update, runScope).
+ */
 function slidesRequest(i, r = state.result) {
-  if (r !== state.result) return;
+  if (r !== state.result || scopeWaiting(r)) return;
   const m = slidesMask(i, r);
   if (!m) return;
   const e = slidesEntry(slidesOf(r), i);
@@ -5540,7 +5961,7 @@ function slidesRequest(i, r = state.result) {
   e.pending = run;
   e.percent = null;
   const draftDeg = field.summary?.draft_angle_deg ?? partingOf(r).results[i]?.proposal?.draft_angle_deg ?? 1;
-  slideClient()
+  trackJob(r, slideClient()
     .then((client) => client.computeSlides(
       // The body prepared kept by the worker under the content of the file, else under this result only.
       { positions, indices, bodyKey: `${r.cacheKey ?? slidesResultId(r)}|${i}|${indices.length / 3}` },
@@ -5563,7 +5984,7 @@ function slidesRequest(i, r = state.result) {
         return;
       }
       slidesArrived(r, i, run, null, err.message || String(err));
-    });
+    }));
 }
 
 const slidesResults = new WeakMap(); // result -> its id for the worker's cache, without a key of its content
@@ -5743,16 +6164,23 @@ const slidesParting = (field) => ({ axis: field.summary?.axis ?? null, status: f
 
 /**
  * The slides of body i of the model shown for the costing (partFeatures):
- * {status ("ready" | "computing" | "error" | "idle": a body not checked |
- * "none": no parting line), count, cores, parting_zones, ignored, warnings,
- * signature (another definition or an edit, another one), edited, parting,
- * slides [{id, axis, reference_axis, angle_deg, tilt_deg, tilt_up,
- * stroke_mm}], message}. Asks for them when they are not known.
+ * {status ("ready" | "computing" | "error" | "idle": a body not checked,
+ * left out of the analysis | "none": no parting line), count, cores,
+ * parting_zones, ignored, warnings, signature (another definition or an
+ * edit, another one), edited, parting, slides [{id, axis, reference_axis,
+ * angle_deg, tilt_deg, tilt_up, stroke_mm}], message}. Asks for them when
+ * they are not known.
  */
 function slidesBrief(i) {
   const r = state.result;
-  const field = r ? partingField(i, r) : null;
-  if (!field) return { status: r?.bodies[i]?.closed && partingOf(r)?.pending ? "computing" : "none" };
+  if (!r || !state.included.has(i)) return { status: "idle" };
+  const field = partingField(i, r);
+  if (!field) {
+    const p = partingOf(r);
+    // Its proposal failed: why; being computed, or about to be by the update of the bodies analysed; else none.
+    if (p.failed.has(i)) return { status: "error", message: p.failed.get(i) };
+    return { status: r.bodies[i]?.closed && (p.computing.has(i) || scopeBusy(r)) ? "computing" : "none" };
+  }
   const e = slidesReady(i, r);
   if (e) {
     const v = e.view;
@@ -5771,7 +6199,6 @@ function slidesBrief(i) {
   }
   const error = slidesError(i, r);
   if (error) return { status: "error", message: error, parting: slidesParting(field) };
-  if (!includedIndices().includes(i) && i !== partingBody()) return { status: "idle" };
   slidesQueue(i, r);
   return { status: "computing" };
 }
@@ -6173,21 +6600,24 @@ const GATE_COLOR = 0xc040d0;
 
 const feedClient = () => (feedClient.module ??= import("./engine/feedclient.js"));
 
-// Per result: {results (per body {zones, body, zone, sphere, …} or null),
-// pending, percent, error, manual (body -> {risers: [...] or null (the
-// proposal's), gate: {...} or null (the proposal's)}), placed (body -> the
-// placement for a parting: {key, placement, error}), placing (body -> the
-// parting key being placed in the worker), queued (body -> {key, parting},
-// to send), outward (body -> 1, or -1 when its triangles turn inwards), show,
-// mode ("add" | "move" | "gate" | null), selected (a riser id), body (the
-// card's, for the selection), message, restored}.
+// Per result: {results (per body {zones, body, zone, sphere, …}, or null:
+// open, or not computed yet: a body not checked), computing (body ->
+// {percent} of the job finding its zones), failed (body -> why its zones
+// were not found: not asked again until Retry), manual (body -> {risers:
+// [...] or null (the proposal's), gate: {...} or null (the proposal's)}),
+// placed (body -> the placement for a parting: {key, placement, error}),
+// placing (body -> the parting key being placed in the worker), queued (body
+// -> {key, parting}, to send), outward (body -> 1, or -1 when its triangles
+// turn inwards), show, mode ("add" | "move" | "gate" | null), selected (a
+// riser id), body (the card's, for the selection), message, restored (the
+// bodies whose definition kept was put back)}.
 const feedings = new WeakMap();
 
 function feedingOf(r = state.result) {
   if (!r) return null;
   let f = feedings.get(r);
   if (!f) {
-    f = { results: null, pending: null, percent: null, error: null, manual: new Map(), placed: new Map(), placing: new Map(), queued: new Map(), outward: new Map(), show: false, mode: null, selected: null, body: -1, message: null, restored: false };
+    f = { results: null, computing: new Map(), failed: new Map(), manual: new Map(), placed: new Map(), placing: new Map(), queued: new Map(), outward: new Map(), show: false, mode: null, selected: null, body: -1, message: null, restored: new Set() };
     feedings.set(r, f);
   }
   return f;
@@ -6231,7 +6661,8 @@ function feedingPlacement(i, r = state.result) {
   if (pending) return null; // placed along the casting up once known
   const kept = f.placed.get(i);
   if (kept && kept.key === key) return kept;
-  if (r === state.result && f.placing.get(i) !== key && f.queued.get(i)?.key !== key) {
+  // (The bodies checked just changed: placed by their update, runScope.)
+  if (r === state.result && !scopeWaiting(r) && f.placing.get(i) !== key && f.queued.get(i)?.key !== key) {
     // Asked for in one go with the others asked for now (the bodies of an export), sent at the end of this task.
     if (!f.queued.size) queueMicrotask(() => placeQueued(r));
     f.queued.set(i, { key, parting });
@@ -6265,10 +6696,10 @@ function placeQueued(r) {
       });
       if (r === state.result) refreshFeeding();
     };
-    feedClient()
+    trackJob(r, feedClient()
       .then((client) => client.placeFeedings(bodies))
       .then((placements) => done((n) => ({ placement: placements[n], error: null })))
-      .catch((err) => done(() => ({ placement: null, error: err.message || String(err) })));
+      .catch((err) => done(() => ({ placement: null, error: err.message || String(err) }))));
   }
 }
 
@@ -6286,7 +6717,7 @@ const massOfVolume = (mm3, density = densityShown()) => (density && Number.isFin
 function feedingField(i, r = state.result) {
   const f = feedingOf(r);
   const res = f?.results?.[i];
-  if (!res || partingOf(r)?.pending) return null;
+  if (!res || partingOf(r)?.computing.has(i)) return null;
   const placed = feedingPlacement(i, r);
   if (!placed?.placement) return null;
   const manual = f.manual.get(i) ?? null;
@@ -6357,61 +6788,70 @@ const validGate = (x) => x && typeof x === "object" && isPoint(x.position_mm) &&
 
 // ---- computation
 
-/** A new model is shown: its feeding zones, kept from an earlier opening, else computed in the background. */
+/** A new model is shown: the feeding zones of its bodies checked, kept from an earlier opening, else computed in the background. */
 function feedingNewModel(data) {
   const f = feedingOf(data);
   const kept = data.cachedFeeding;
   if (!f.results && kept?.version === FEEDING_VERSION && kept.bodies?.length === data.bodies.length) f.results = kept.bodies;
   if (f.results) restoreFeeding();
-  else computeFeedings(data);
+  computeFeedings(data);
   renderFeeding();
 }
 
-/** Find the feeding zones of the closed bodies of the model shown, in the background. */
+/**
+ * Find the feeding zones of the closed bodies checked of the model shown not
+ * known yet (nor being found), in the background; each body's kept with those
+ * of the other bodies, in memory and with the results of the file. A promise,
+ * or null when none is missing.
+ */
 function computeFeedings(r) {
   const f = feedingOf(r);
-  if (f.results || f.pending || r !== state.result) return;
+  if (r !== state.result) return null;
+  f.results ??= r.bodies.map(() => null);
+  const want = missingBodies(r.bodies, includedIndices(), f.results, f.computing, f.failed);
+  if (!want.length) return null;
   // The inscribed spheres of the wall thickness when computed now (the same values, on every
   // core); not those kept from an earlier opening, maybe by an older engine.
-  const spheres = thick.results && thick.results !== r.cachedThickness ? thick.results : null;
-  const bodies = r.bodies.map((b, i) => (b.closed ? { ...bodyArrays(i), sphere: spheres?.[i]?.sphere ?? null } : null));
-  if (!bodies.some(Boolean)) {
-    f.results = r.bodies.map(() => null);
-    return;
-  }
-  f.error = null;
-  f.percent = 0;
-  f.pending = feedClient()
+  const sphereOf = (i) => (thick.results?.[i] && thick.results[i] !== r.cachedThickness?.[i] ? thick.results[i].sphere : null);
+  const bodies = r.bodies.map((b, i) => (want.includes(i) ? { ...bodyArrays(i), sphere: sphereOf(i) } : null));
+  const job = { percent: 0, promise: null };
+  for (const i of want) f.computing.set(i, job);
+  return (job.promise = feedClient()
     .then((client) => client.computeFeeding(bodies, {
       onProgress: ({ percent }) => {
-        f.percent = percent;
+        job.percent = percent;
         if (r === state.result) renderFeeding();
       },
     }).then((results) => {
-      f.results = results.bodies;
-      client.saveFeeding(r.cacheKey, results);
+      // Each body its zones, or why it has none (that body alone).
+      for (const i of want) {
+        const res = results.bodies[i];
+        if (res?.error) f.failed.set(i, res.error);
+        else if (res) f.results[i] = res;
+      }
+      client.saveFeeding(r.cacheKey, { ...results, bodies: f.results });
     }))
     .catch((err) => {
-      f.error = err.message || String(err);
+      for (const i of want) f.failed.set(i, err.message || String(err));
     })
     .finally(() => {
-      f.pending = null;
+      for (const i of want) if (f.computing.get(i) === job) f.computing.delete(i);
       if (r !== state.result) return;
-      if (f.results) restoreFeeding();
+      restoreFeeding();
       refreshFeeding();
-    });
+    }));
 }
 
-/** The definitions by hand kept for the part shown, once its zones are known. */
+/** The definitions by hand kept for the part shown, of each body once its zones are known (a body checked later, then). */
 function restoreFeeding() {
   const r = state.result;
   const f = feedingOf(r);
-  if (!f?.results || f.restored) return;
-  f.restored = true;
+  if (!f?.results) return;
   const defs = feedingSaved()[partIdOf(r)]?.bodies ?? {};
   for (const [key, def] of Object.entries(defs)) {
     const i = Number(key);
-    if (!f.results[i] || !state.meshes[i]) continue;
+    if (!f.results[i] || !state.meshes[i] || f.restored.has(i)) continue;
+    f.restored.add(i);
     // Of this body as read now (not in another unit, nor at another quality).
     if (def?.mesh !== feedingMeshTag(i)) continue;
     const risers = Array.isArray(def?.risers) ? def.risers.filter(validRiser) : null;
@@ -6423,6 +6863,7 @@ function restoreFeeding() {
 /** The card and the markers again, and the published results: the parting, the zones or a definition changed. */
 function refreshFeeding() {
   renderFeeding();
+  renderProcessChange(); // its risers or feed points, once placed
   applyFeeding();
   if (state.result) updatePublished(state.result);
 }
@@ -6700,19 +7141,24 @@ function renderFeeding() {
   $("feeding-body").hidden = !named;
   if (named) $("feeding-body").textContent = t("parting.body", { name: r.bodies[i].name });
   let status = "";
-  if (i < 0) status = t("feeding.none");
+  const job = i >= 0 ? f.computing.get(i) : null;
+  if (i < 0) status = t(state.included.size ? "feeding.none" : "scope.none");
   else if (!r.bodies[i].closed) status = t("feeding.open");
-  else if (f.pending) status = t("feeding.computing", { percent: f.percent != null ? `${f.percent} %` : "" });
-  else if (f.error) status = t("feeding.error", { message: tMessage(f.error) });
-  else if (p?.pending) status = t("feeding.waitParting");
-  else if (f.results?.[i] && !field) {
+  else if (job) status = t("feeding.computing", { percent: job.percent != null ? `${job.percent} %` : "" });
+  // Its own zones not found (another body's says nothing here).
+  else if (f.failed.has(i)) status = t("feeding.error", { message: tMessage(f.failed.get(i)) });
+  else if (p?.computing.has(i)) status = t("feeding.waitParting");
+  // Checked a moment ago: its zones found and its risers placed by the update of the bodies analysed.
+  else if (!f.results?.[i] || (scopeWaiting(r) && !field)) status = t("scope.updatingCard");
+  else if (!field) {
     // Being placed in the worker, or not placed.
     const placed = f.placed.get(i);
     status = placed?.error && placed.key === feedingParting(i).key ? t("feeding.error", { message: tMessage(placed.error) }) : t("feeding.placing");
   }
   $("feeding-status").hidden = !status;
   $("feeding-status").textContent = status;
-  $("feeding-retry").hidden = !((f.error && !f.pending) || (i >= 0 && f.placed.get(i)?.error));
+  card.dataset.updating = i >= 0 && r.bodies[i].closed && !f.results?.[i] && !f.failed.has(i) ? "1" : ""; // for scripts and tests
+  $("feeding-retry").hidden = !(i >= 0 && ((f.failed.has(i) && !job) || f.placed.get(i)?.error));
   $("feeding-show").checked = f.show && !!field;
   $("feeding-show").disabled = !field;
   $("feeding-main").hidden = !field;
@@ -6837,8 +7283,8 @@ $("feeding-show").addEventListener("change", (e) => {
 $("feeding-retry").addEventListener("click", () => {
   const f = feedingOf();
   if (!f) return;
-  f.error = null;
-  // The placements that failed, asked for again.
+  // Every body whose zones were not found, asked for again (those checked; the others when checked), and the placements that failed.
+  f.failed.clear();
   for (const [i, placed] of f.placed) if (placed.error) f.placed.delete(i);
   computeFeedings(state.result);
   refreshFeeding();
@@ -7103,21 +7549,23 @@ async function proposeOriented(client, r, bodies, { onProgress = null } = {}) {
 }
 
 /**
- * The bodies of r whose proposal is not for their process or die options now
- * (changed by the costing, on the card, in Paramètres), and those of `flip`
- * (a horizontal parting plane the thickness turns over): proposed again in
- * the background, the definition before shown meanwhile, then kept with the
- * results of the file. Their definitions by hand stay (oriented again:
- * orientationShown).
+ * The bodies checked of r whose proposal is not for their process or die
+ * options now (changed by the costing, on the card, in Paramètres), and those
+ * of `flip` (a horizontal parting plane the thickness turns over): proposed
+ * again in the background, the definition before shown meanwhile, then kept
+ * with the results of the file. Their definitions by hand stay (oriented
+ * again: orientationShown). A body not checked keeps its proposal until it is
+ * checked again (by the update of the bodies analysed then). A promise, or
+ * null when none is proposed again.
  */
 function reproposeStale(r, flip = []) {
   const p = partingOf(r);
-  if (!p?.results || p.pending || r !== state.result) return;
+  if (!p?.results || r !== state.result || scopeWaiting(r)) return null;
   const o = orientOf(r);
   const wanted = new Map();
   const bodies = r.bodies.map((b, i) => {
     const res = p.results[i];
-    if (!b.closed || !res) return null;
+    if (!b.closed || !res || !state.included.has(i) || p.computing.has(i) || p.failed.has(i)) return null;
     const { key } = partingOptions(i, r);
     const want = `${key}|${thicknessOf(i, r) ? "t" : ""}`;
     if ((res.proposal.options_key === key && !flip.includes(i)) || o.proposing.get(i) === want || o.failed.get(i) === want) return null;
@@ -7125,24 +7573,28 @@ function reproposeStale(r, flip = []) {
     wanted.set(i, want);
     return bodyArrays(i);
   });
-  if (!wanted.size) return;
-  partClient()
+  if (!wanted.size) return null;
+  return partClient()
     .then((client) => proposeOriented(client, r, bodies).then((results) => {
       for (const [i, want] of wanted) {
         if (o.proposing.get(i) !== want || !results.bodies[i]) continue; // asked for again since, for other options
         o.proposing.delete(i);
-        p.results[i] = results.bodies[i];
+        // That body alone not proposed again: its proposal before kept, said on its card.
+        if (results.bodies[i].error) {
+          o.failed.set(i, want);
+          p.failed.set(i, results.bodies[i].error);
+        } else p.results[i] = results.bodies[i];
       }
-      const keys = r.bodies.flatMap((b, i) => (p.results[i] ? [p.results[i].proposal.options_key] : []));
-      client.saveParting(r.cacheKey, { version: results.version, options_key: keys.every((k) => k === keys[0]) ? keys[0] ?? null : null, bodies: p.results });
+      savePartings(client, r, results.version);
     }))
     .catch((err) => {
       for (const [i, want] of wanted) {
         if (o.proposing.get(i) !== want) continue;
         o.proposing.delete(i);
-        if (!err.cancelled) o.failed.set(i, want);
+        if (err.cancelled) continue;
+        o.failed.set(i, want);
+        p.failed.set(i, err.message || String(err));
       }
-      if (!err.cancelled) p.error = err.message || String(err);
     })
     .finally(() => orientChanged(r));
 }
@@ -7175,6 +7627,10 @@ function setProcess(pieceKey, info) {
     bodies = [i];
   }
   let changed = false;
+  // The card's body: what its process changes said on the card (and the view turned) once oriented for it;
+  // taken before the die options told are written (new margins are not the process's doing).
+  const shown = partingBody();
+  const before = bodies.includes(shown) ? processBefore(shown, r) : null;
   if (info?.die) {
     const { marges, densite } = normalizeDie(info.die);
     const all = orientSaved();
@@ -7191,6 +7647,7 @@ function setProcess(pieceKey, info) {
     orientKeep(i, { costing }, r);
     changed = true;
   }
+  if (before) processAfter(shown, before, r);
   // Told from within the costing page's drawing: the parting proposed again after it.
   if (changed) setTimeout(() => orientChanged(r));
   return changed;
@@ -7280,10 +7737,11 @@ function orientJob(i, field, opts, thickness, r) {
   if (!jobs) o.oriented.set(def, (jobs = new Map()));
   const key = `${opts.key}|${thickness ? "t" : ""}`;
   let job = jobs.get(key);
-  if (job || r !== state.result) return job ?? { orientation: null, error: null };
+  // (The bodies checked just changed: asked for by their update, runScope.)
+  if (job || r !== state.result || scopeWaiting(r)) return job ?? { orientation: null, error: null };
   job = { orientation: null, error: null };
   jobs.set(key, job);
-  partClient()
+  trackJob(r, partClient()
     .then((client) => client.orientDirection({ ...bodyArrays(i), thickness }, field.direction, { owner: r, process: opts.process, die: opts.die }))
     .then(({ orientation }) => {
       job.orientation = orientation;
@@ -7293,7 +7751,7 @@ function orientJob(i, field, opts, thickness, r) {
       if (err.cancelled) jobs.delete(key);
       else job.error = err.message || String(err);
     })
-    .finally(() => orientChanged(r));
+    .finally(() => orientChanged(r)));
   return job;
 }
 
@@ -7374,13 +7832,14 @@ function upLabel() {
 /**
  * On the 3D view, with the parting of body i: an arrow « haut » along the
  * casting up (beside the draw direction's when they are the same), and, the
- * « Brut » box checked, the die blank as a wire box on the axes of its block.
- * For scripts and tests: data-orient ("up", "brut") and data-brut (its
- * sizes, mm) of the card.
+ * « Brut » box checked, the die blank as a wire box on the axes of its block
+ * (the outline of the halves of the mould, cut out of it). For scripts and
+ * tests: data-orient ("up", "brut"), data-brut (its sizes, mm) and
+ * data-brut-box (its corners, blankCorners) of the card.
  */
 function addOrientationOverlay(group, i, { drawn, blocks }) {
   const card = $("parting-card");
-  card.dataset.orient = card.dataset.brut = "";
+  card.dataset.orient = card.dataset.brut = card.dataset.brutBox = "";
   const o = drawn ? null : orientationShown(i);
   if (!o) return;
   const sub = new THREE.Group();
@@ -7392,7 +7851,7 @@ function addOrientationOverlay(group, i, { drawn, blocks }) {
   const length = 0.35 * reach;
   // Up along the draw direction (a horizontal plane): beside its arrow, along the longer side of the block.
   const aside = Math.abs(g.dot(new THREE.Vector3(...o.block_axes.d))) > 0.9 ? new THREE.Vector3(...o.block_axes.u).multiplyScalar(0.3 * reach) : new THREE.Vector3();
-  const origin = centre.clone().addScaledVector(g, along / 2 + (blocks?.margin ?? 0) + 0.05 * reach).add(aside);
+  const origin = pastBlocks(blocks, g, centre, along / 2).addScaledVector(g, 0.05 * reach).add(aside);
   sub.add(new THREE.ArrowHelper(g, origin, length, UP_ARROW, 0.28 * length, 0.16 * length));
   // The label as large on the screen whatever the zoom.
   const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: upLabel(), depthTest: false, transparent: true, sizeAttenuation: false }));
@@ -7402,32 +7861,22 @@ function addOrientationOverlay(group, i, { drawn, blocks }) {
   label.renderOrder = ORDER_LINE + 1;
   sub.add(label);
   const shown = ["up"];
-  if ($("parting-brut").checked && o.die_block_mm) {
-    // The 12 edges of the blank: L along u, l along v, h along d, round the centre of the part's oriented box.
-    const [L, l, h] = o.die_block_mm;
-    const axes = ["u", "v", "d"].map((k) => new THREE.Vector3(...o.block_axes[k]));
-    const half = [L / 2, l / 2, h / 2];
-    const corner = (s) => new THREE.Vector3(...o.raw_centre_mm).add(axes[0].clone().multiplyScalar(s[0] * half[0])).add(axes[1].clone().multiplyScalar(s[1] * half[1])).add(axes[2].clone().multiplyScalar(s[2] * half[2]));
+  const blank = $("parting-brut").checked && o.die_block_mm ? blankBox(o) : null;
+  if (blank) {
+    // The 12 edges of the blank (the outline of the halves of the mould): L along u, l along v, h along d, round the centre of the part's oriented box.
+    const corners = blankCorners(blank);
     const points = [];
-    for (let k = 0; k < 3; k++) {
-      for (const a of [-1, 1]) for (const b of [-1, 1]) {
-        const s0 = [0, 0, 0], s1 = [0, 0, 0];
-        s0[k] = -1;
-        s1[k] = 1;
-        s0[(k + 1) % 3] = s1[(k + 1) % 3] = a;
-        s0[(k + 2) % 3] = s1[(k + 2) % 3] = b;
-        points.push(corner(s0), corner(s1));
-      }
-    }
+    for (let k = 0; k < 8; k++) for (const bit of [1, 2, 4]) if (!(k & bit)) points.push(...corners[k], ...corners[k | bit]);
     // A line a few pixels wide at any size of the view (its resolution read before each frame).
     const material = new LineMaterial({ color: BRUT_COLOR, linewidth: BRUT_LINE_PX, transparent: true, opacity: 0.85, clippingPlanes: [sectionPlane] });
-    const box = new LineSegments2(new LineSegmentsGeometry().setPositions(points.flatMap((p) => p.toArray())), material);
+    const box = new LineSegments2(new LineSegmentsGeometry().setPositions(points), material);
     box.onBeforeRender = () => material.resolution.set(viewport.clientWidth, viewport.clientHeight);
     box.renderOrder = ORDER_LINE;
     box.userData.own = true;
     sub.add(box);
     shown.push("brut");
     card.dataset.brut = o.die_block_mm.map((x) => fmtNum(x, 0)).join(" × ");
+    card.dataset.brutBox = JSON.stringify(corners.map((p) => p.map((x) => round(x, 4))));
   }
   group.add(sub);
   card.dataset.orient = shown.join(" ");
@@ -7476,6 +7925,7 @@ function renderOrientation(p, i, field) {
   select.disabled = p.mode === "draw";
   $("parting-process-reset").hidden = proc.source !== "part";
   const o = orientationShown(i, r);
+  renderProcessChange(i, o); // what a change of the process changed, once its orientation is in (the view turned then)
   const card = $("parting-card");
   card.dataset.process = value;
   card.dataset.up = o?.up_axis ?? "";
@@ -7520,14 +7970,18 @@ $("parting-process-select").addEventListener("change", (e) => {
   const i = partingBody();
   const process = PROCESS_CHOICES[e.target.value];
   if (i < 0 || !process) return;
+  const before = processBefore(i);
   // Chosen for this part: the up chosen by hand for the process before forgotten.
   orientKeep(i, { process, up: null });
+  processAfter(i, before);
   orientChanged(state.result);
 });
 $("parting-process-reset").addEventListener("click", () => {
   const i = partingBody();
   if (i < 0) return;
+  const before = processBefore(i);
   orientKeep(i, { process: null, up: null });
+  processAfter(i, before);
   orientChanged(state.result);
 });
 $("parting-up").addEventListener("change", (e) => {
@@ -7547,6 +8001,220 @@ $("parting-flip").addEventListener("click", () => {
   if (i >= 0) flipHalves(i);
 });
 
+// ---- the halves of the mould in the die blank, the « Vue de coulée »
+
+// The halves of the mould shown are the die blank of the orientation (the
+// « Brut » box: the smallest block round the part along its draw direction,
+// centred on it, plus the margins of the costing) cut in two along the
+// parting surface (mouldBlocks with that box). A line drawn by hand, or a
+// definition not oriented, keeps the blocks round the extent of the part.
+
+/** The die blank the halves of the mould of the definition `field` of body i are cut out of (blankBox), or null: drawn by hand, not oriented, oriented along another axis. */
+function castingBlank(i, field) {
+  return field.drawn ? null : blankBox(orientationShown(i), field.direction);
+}
+
+/**
+ * Where an arrow along `g` (unit, THREE) over the halves of the mould starts:
+ * on the face of their box along g when cut out of the die blank; else
+ * `along` (half the extent of the part along g) and their margin from the
+ * centre of the part.
+ */
+function pastBlocks(blocks, g, centre, along) {
+  if (!blocks?.box) return centre.clone().addScaledVector(g, along + (blocks?.margin ?? 0));
+  const { frame: { u, v, d }, box: { centre: c, size } } = blocks;
+  const half = [u, v, d].reduce((sum, axis, k) => sum + (Math.abs(g.dot(vec3(axis))) * size[k]) / 2, 0);
+  return vec3(c).addScaledVector(g, half);
+}
+
+/** The 8 corners of a box {centre, u, v, d, size} (blankBox): corner k at the signs of its bits (4: +u, 2: +v, 1: +d). */
+function blankCorners({ centre, u, v, d, size }) {
+  return Array.from({ length: 8 }, (_, k) => {
+    const s = [k & 4 ? 1 : -1, k & 2 ? 1 : -1, k & 1 ? 1 : -1];
+    return centre.map((c, j) => c + (s[0] * size[0] * u[j] + s[1] * size[1] * v[j] + s[2] * size[2] * d[j]) / 2);
+  });
+}
+
+/** The outline of the halves of the mould, for scripts and tests: the 8 corners of the extent of their vertices along their frame (JSON, mm, in the order of blankCorners). */
+function blocksCorners({ lower, upper, frame: { u, v, d } }) {
+  const axes = [u, v, d];
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (const P of [lower.positions, upper.positions]) {
+    for (let p = 0; p < P.length; p += 3) {
+      for (let k = 0; k < 3; k++) {
+        const x = P[p] * axes[k][0] + P[p + 1] * axes[k][1] + P[p + 2] * axes[k][2];
+        if (x < lo[k]) lo[k] = x;
+        if (x > hi[k]) hi[k] = x;
+      }
+    }
+  }
+  return JSON.stringify(Array.from({ length: 8 }, (_, k) => {
+    const w = [k & 4 ? hi[0] : lo[0], k & 2 ? hi[1] : lo[1], k & 1 ? hi[2] : lo[2]];
+    return [0, 1, 2].map((j) => round(w[0] * u[j] + w[1] * v[j] + w[2] * d[j], 4));
+  }));
+}
+
+// The « Vue de coulée »: the die of the card's body as it stands when the
+// metal is cast. The casting up g upright on the screen (camera.up = g), the
+// die seen from the side, from a little above (tilt: the top, where the
+// risers stand), turned towards the right (turn, degrees: CAST_VIEW). On a
+// vertical parting plane the draw direction across the screen (the halves
+// side by side, the lower one on the left), turned further: the part lies
+// in the parting plane, seen less askew. On a horizontal one the longer side
+// of the blank across the screen (the upper half over the lower one). The
+// whole blank in sight when the halves or the blank are shown, else the part.
+const CAST_VIEW = { vertical: { tilt: 12, turn: 45 }, horizontal: { tilt: 20, turn: 30 } };
+
+/**
+ * The pose of the « Vue de coulée » of the card's body ({position, up,
+ * target, light, near, far}), or null: not oriented, or its orientation for
+ * another process being computed (its up is the process's before: the view
+ * turns by itself once it is in, renderProcessChange).
+ */
+function castingPose() {
+  const r = state.result;
+  const i = r ? partingBody() : -1;
+  const o = i >= 0 ? orientationShown(i, r) : null;
+  const box = blankBox(o);
+  if (!box || !Array.isArray(o.up) || o.pending) return null;
+  const g = vec3(o.up).normalize();
+  // To the right on the screen: d on a vertical plane, u on a horizontal one (square to g).
+  const order = o.process?.plan === "horizontal" ? [box.u, box.v, box.d] : [box.d, box.u, box.v];
+  const right = vec3(order.find((a) => Math.abs(dot3(a, o.up)) < 0.5) ?? order[0]);
+  right.addScaledVector(g, -right.dot(g));
+  if (right.lengthSq() < 1e-12) return null;
+  right.normalize();
+  // Towards the camera: square to both (then `right` is to the right), turned towards the right, lifted.
+  const front = right.clone().cross(g);
+  const { tilt, turn } = CAST_VIEW[o.process?.plan === "horizontal" ? "horizontal" : "vertical"];
+  const [a, b] = [turn, tilt].map((x) => (x * Math.PI) / 180);
+  const dir = front.clone().multiplyScalar(Math.cos(a)).addScaledVector(right, Math.sin(a))
+    .multiplyScalar(Math.cos(b)).addScaledVector(g, Math.sin(b)).normalize();
+  const die = partingShown() && ($("parting-blocks").checked || $("parting-brut").checked);
+  const { min, max, size } = r.bodies[i].bbox;
+  const centre = die ? vec3(box.centre) : new THREE.Vector3(...min.map((x, k) => (x + max[k]) / 2));
+  const radius = (die ? Math.hypot(...box.size) : Math.hypot(...size)) / 2 || 1;
+  const pose = viewPose(dir, g, centre, radius);
+  // The key light above the die, in front of it and to the right.
+  pose.light = centre.clone().addScaledVector(g, 3 * radius).addScaledVector(front, 2 * radius).addScaledVector(right, radius).toArray();
+  return pose;
+}
+
+/** The view turned to the « Vue de coulée » (its button; the process changed): false when the card's body is not oriented. */
+function castingView() {
+  const pose = castingPose();
+  if (!pose) return false;
+  finishTurn(); // a turn by the arrows of the drawing by hand ends first
+  applyPose(pose);
+  stopInertia();
+  controls.update();
+  return true;
+}
+$("view-casting").addEventListener("click", () => castingView());
+
+/** The button « Coulée » (disabled without a pose); the automatic turn of a change of process left for another tab or body dropped. */
+function renderCastingView() {
+  $("view-casting").disabled = !castingPose();
+  // Its orientation would come in while the user looks at something else: on coming back, the view is left as it was.
+  const c = turnAwaited;
+  if (c && (c.done || c.r !== state.result || c.i !== partingBody())) {
+    c.pose = null;
+    turnAwaited = null;
+  }
+}
+
+// A change of the process of the card's body (chosen on the card, back to
+// the costing's, told by the costing) moves neither the draw direction nor
+// the blank (they depend on the part). Once the orientation for the new
+// process is in, the card says what changed (the casting up, the feeding,
+// the halves) and the view turns to the « Vue de coulée »: the parting
+// shown, the camera not moved since, the change's part and body shown all
+// along (renderCastingView). What the user changes meanwhile is not the
+// process's doing: a definition chosen by hand, other die margins (then the
+// blank differs) supersede the change, neither said nor turned to. Per
+// result: {r, i, to (the process, processValue), from (what the card
+// showed: {up, d, axis}), def (the definition by hand then, or null), die
+// (dieKey of the die options then), pose (the camera then; null: no turn),
+// done (the orientation it ended on: {up, d}, or {superseded}; null until
+// then)}.
+const processChanges = new WeakMap();
+let turnAwaited = null; // the change whose automatic turn is still to come
+
+/** What body i shows before its process changes: {value (processValue), shown ({up, d, axis}; null: not oriented), def, die}. */
+function processBefore(i, r = state.result) {
+  const o = orientationShown(i, r);
+  const field = partingField(i, r);
+  return {
+    value: processValue(processOf(i, r)),
+    shown: o && field ? { up: o.up_axis, d: o.block_axes.d, axis: field.summary.axis } : null,
+    def: partingOf(r)?.current.get(i) ?? null,
+    die: dieKey(dieOptions()),
+  };
+}
+
+/** The process of body i changed since `before` (processBefore), it oriented then: the change noted, the camera stopped where it is. */
+function processAfter(i, before, r = state.result) {
+  const to = processValue(processOf(i, r));
+  if (to === before.value || !before.shown) return;
+  stopInertia();
+  const change = { r, i, to, from: before.shown, def: before.def, die: before.die, pose: currentPose(), done: null };
+  processChanges.set(r, change);
+  turnAwaited = change;
+}
+
+/**
+ * The line « Procédé changé : … » of the card (body i, `o` its orientation
+ * shown): the change done once the orientation for the new process is in
+ * (the view turned then, unless left or moved meanwhile); said while the
+ * card shows what it ended on, unless superseded.
+ */
+function renderProcessChange(i = partingBody(), o = i >= 0 ? orientationShown(i) : null) {
+  const r = state.result;
+  const change = r ? processChanges.get(r) : null;
+  let text = "";
+  if (change?.i === i && o?.block_axes) {
+    const superseded = (partingOf(r)?.current.get(i) ?? null) !== change.def || dieKey(dieOptions()) !== change.die;
+    if (!change.done && (superseded || (!o.pending && processValue(o.process) === change.to))) {
+      change.done = superseded ? { superseded } : { up: o.up_axis, d: o.block_axes.d };
+      if (!superseded && change.pose && partingShown() && samePose(currentPose(), change.pose)) castingView();
+    }
+    const { done } = change;
+    if (!superseded && done && !done.superseded && done.up === o.up_axis && sameDirection(done.d, o.block_axes.d)) text = processChangeText(change.from, o, i);
+  }
+  $("parting-process-change").hidden = !text;
+  $("parting-process-change").textContent = text;
+}
+
+/**
+ * What a change of the process of body i changed, from what the card showed
+ * (`from`, processBefore) to its orientation `o`: « Procédé changé : haut de
+ * coulée +Y → +Z ; alimentation par le bas (2 points) ; brut et chapes
+ * inchangés (même direction de démoulage) ».
+ */
+function processChangeText(from, o, i) {
+  const parts = [from.up !== o.up_axis ? t("orient.change.up", { from: from.up, to: o.up_axis }) : t("orient.change.upSame", { to: o.up_axis })];
+  // The feeding: from the top (its risers) or from below (its feed points), counted once placed.
+  const feed = feedingField(i);
+  const below = feed ? feed.bottom : o.process.alimentation === "bas";
+  const n = feed ? (below ? feed.feedPoints.length : feed.risers.length) : null;
+  const what = below ? "points" : "risers";
+  const count = n == null ? "" : ` (${t(n === 0 ? `orient.change.${what}.none` : n === 1 ? `orient.change.${what}.one` : `orient.change.${what}`, { n })})`;
+  parts.push(t(`orient.feed.${below ? "bas" : "haut"}`) + count);
+  // The blank and the halves (the die margins the same, else superseded): the same along the same draw
+  // direction; along its other sense, the halves swapped.
+  const d = o.block_axes.d;
+  const axis = partingField(i)?.summary.axis ?? axisSigned(d);
+  if (sameDirection(from.d, d)) {
+    parts.push(t("orient.change.blankSame"));
+  } else if (sameDirection(from.d, d.map((x) => -x))) {
+    parts.push(t("orient.change.halvesSwapped", { to: axis }));
+  } else {
+    const [L, l, h] = (o.die_block_mm ?? []).map((x) => fmtNum(x, 0));
+    parts.push(t("orient.change.direction", { from: from.axis, to: axis, L, l, h }));
+  }
+  return t("orient.change", { parts: parts.join(t("orient.change.sep")) });
+}
+
 // ---------------------------------------------------------------- tabs
 
 // Several parts open side by side, like the tabs of a browser: a part can be
@@ -7560,7 +8228,7 @@ let activeTab = null;
 let nextTabId = 1;
 let defaultMaterial = null; // material of a new tab: the one of the page at start
 // The wall thickness state of a tab (see `thick`), put aside with its model.
-const TAB_THICK = ["results", "markCache", "minOverride", "pending", "value", "tol", "max", "userMax", "spots"];
+const TAB_THICK = ["results", "asked", "failed", "markCache", "minOverride", "pending", "value", "tol", "max", "userMax", "spots"];
 
 function createTab() {
   const tab = { id: nextTabId++, file: null, handle: null, result: null, view: null, material: null, seq: 0, loading: null, progress: null, serverRequest: null };
@@ -7579,6 +8247,7 @@ function freeTab() {
 
 /** Put the model of the tab shown aside (its meshes kept, out of the scene). */
 function stashTab(tab) {
+  flushScope(); // the update of the bodies just checked started, for this tab's model
   leaveDrawing(); // drawing by hand: left (the drawing kept), its turn of the view ended
   const option = $("material").selectedOptions[0];
   tab.material = { value: $("material").value, alloy: option?.dataset.alloy ?? null, density: $("density").value };
@@ -7589,6 +8258,7 @@ function stashTab(tab) {
         edges: state.edges,
         selected: state.selected,
         included: state.included,
+        largestOnly: state.largestOnly,
         subsetSummary: state.subsetSummary,
         bounds: state.bounds.clone(),
         camera: { position: camera.position.clone(), up: camera.up.clone(), near: camera.near, far: camera.far, target: controls.target.clone() },
@@ -7623,6 +8293,7 @@ function showTab(tab) {
     state.edges = view.edges;
     state.selected = view.selected;
     state.included = view.included;
+    state.largestOnly = view.largestOnly;
     state.subsetSummary = view.subsetSummary;
     if (view.meshes.length) modelGroup.add(...view.meshes);
     state.bounds.copy(view.bounds);
@@ -7652,6 +8323,9 @@ function showTab(tab) {
     restoreFeeding();
     renderFeeding();
     applyFeeding();
+    // The thickness of bodies checked asked for, its computation left while the tab was hidden (an update waiting for
+    // another one): taken up again by an update of its bodies.
+    if (thick.asked && !thick.failed && !thick.pending && thickMissing().length) startScope();
   } else if (tab.result) {
     showModel(tab.result);
   } else {
@@ -7667,7 +8341,8 @@ function showTab(tab) {
   }
   renderLoading();
   setStatus(tab.loading && !tab.result ? "analysing" : tab.result ? "done" : "idle");
-  if (tab.result) updatePublished(tab.result);
+  // Told even while its bodies are being updated: the pages that follow the tab shown (costing, IA) must know it.
+  if (tab.result) updatePublished(tab.result, { force: true });
   else {
     $("reader3d-result").textContent = "null";
     publishSemantic();
@@ -7952,6 +8627,9 @@ setInterval(() => document.visibilityState === "visible" && !$("memory-card").hi
 //   &lang=fr|en  &unit=mm|cm|m|in|ft  &quality=coarse|normal|fine
 //   &export=json|xlsx|csv         download the results once analysed
 //   &report=1                     show the results as plain text in the page
+//   &bodies=all|largest           bodies checked when a file has several: all of them, or the
+//                                 largest one alone (by default: the largest one alone, but all
+//                                 of them with report or export, which publish the results)
 // The results are also in <script id="reader3d-result" type="application/json">,
 // <body data-status="analysing|done|error"> and window.reader3d.
 const params = new URLSearchParams(location.search);
@@ -7978,12 +8656,14 @@ function plainReport(data) {
     `kind: ${data.kind} (${data.kind === "cad" ? "exact B-rep volume" : "closed-mesh volume"}), source unit: ${data.source_unit}`,
     `volume: ${n(s.volume, "mm3")}`,
     `surface_area: ${n(s.area, "mm2")}`,
-    `envelope_aabb: ${s.bbox.size.map((x) => +x.toPrecision(10)).join(" x ")} mm (volume ${n(s.bbox.volume, "mm3")})`,
+    `envelope_aabb: ${s.bodies ? `${s.bbox.size.map((x) => +x.toPrecision(10)).join(" x ")} mm` : "—"} (volume ${n(s.bbox.volume, "mm3")})`,
     `envelope_min_oriented: ${s.obb ? s.obb.size.map((x) => +x.toPrecision(10)).join(" x ") + " mm" : "—"}`,
     `fill_ratio: ${s.fill_ratio == null ? "—" : +(s.fill_ratio * 100).toPrecision(6) + " %"}`,
     `centre_of_mass: ${s.centroid ? s.centroid.map((x) => +x.toPrecision(10)).join(", ") + " mm" : "—"}`,
     `mass: ${n(s.mass, "g")} (density ${data.density} g/cm3)`,
     `bodies: ${s.bodies} (${s.open_bodies} open)`,
+    // Which bodies of the file the figures are of: those checked (every body by default in this mode).
+    `scope: ${data.scope.mode}, ${data.scope.bodies} of ${data.scope.bodies_in_file} bodies (checked)`,
     ...(data.thickness
       ? [`wall_thickness (${data.thickness.method}): min ${n(data.thickness.min, "mm")}, median ${n(data.thickness.median, "mm")}, max ${n(data.thickness.max, "mm")}${data.thickness.details ? `, lettering below ${data.thickness.floor} mm: (${n(data.thickness.details.min, "mm")})` : ""}`]
       : []),
@@ -8002,12 +8682,18 @@ function publishResult(r) {
   else if (format === "csv") exportCsv().catch((err) => showError(err.message));
 }
 
-/** The machine-readable result in the page (and the text report), kept up to date. */
-function updatePublished(r) {
-  // First: a listener of the event that asks for the contract gets the new one.
-  publishSemantic();
-  document.dispatchEvent(new CustomEvent("reader3d-part"));
+/**
+ * The machine-readable result in the page (and the text report), kept up to
+ * date, then told ("reader3d-part"). While the bodies analysed of r are being
+ * updated, nothing: their update publishes once it is done (scopeUpdate),
+ * never the figures of a part of them. `force`: all the same (another tab
+ * shown: the pages that follow it must know it), said to be updating.
+ */
+function updatePublished(r, { force = false } = {}) {
+  const updating = scopeBusy(r);
+  if (updating && !force) return;
   const data = exportableResult(r);
+  if (updating) data.updating = true; // the bodies just checked still computed: the figures follow
   // "<" escaped so that a part name cannot close the script element.
   $("reader3d-result").textContent = JSON.stringify(data).replace(/</g, "\\u003c");
   if (params.get("report")) {
@@ -8020,6 +8706,9 @@ function updatePublished(r) {
     }
     pre.textContent = plainReport(data);
   }
+  // Then told: a listener of the event reads the result written, and the contract of now when it asks for it.
+  publishSemantic();
+  document.dispatchEvent(new CustomEvent("reader3d-part"));
 }
 
 // The semantic contract (engine/semantic.js) of the result shown, for the IA
@@ -8049,13 +8738,14 @@ function currentSemantic(indices = includedIndices()) {
 
 /**
  * The bodies the IA page sends: the body selected in the list (its row
- * clicked) when there is one, else the bodies checked; and which they are,
- * for the page to say it (names never sent: the context has the counts).
+ * clicked) when it is checked, else the bodies checked (never a body left
+ * out of the analysis); and which they are, for the page to say it (names
+ * never sent: the context has the counts).
  */
 function aiPart({ withSemantic = true } = {}) {
   const r = state.result;
   if (!r) return null;
-  const selected = state.selected >= 0 && state.selected < r.bodies.length;
+  const selected = state.selected >= 0 && state.selected < r.bodies.length && state.included.has(state.selected);
   const indices = selected ? [state.selected] : includedIndices();
   return {
     // Seconds on a large part: not built when only the scope is wanted.
@@ -8120,7 +8810,20 @@ window.reader3d = {
   get semantic() {
     return currentSemantic();
   },
-  /** For the IA page: {semantic, scope} of the body selected in the list, else of the bodies checked (null without a result). */
+  /**
+   * The bodies the analysis covers, those checked in the list: {mode ("all" |
+   * "checked" | "none"), bodies, bodies_in_file, indices, names, updating (the
+   * bodies just checked being computed: the results follow, "reader3d-part"),
+   * updates (the updates of the bodies analysed started since the page was
+   * opened: one per burst of clicks)}; null without a result.
+   */
+  get scope() {
+    const r = state.result;
+    if (!r) return null;
+    const indices = includedIndices();
+    return { ...scopeInfo(r.bodies, indices), names: indices.map((i) => r.bodies[i].name), updating: scopeBusy(r), updates: scope.runs };
+  },
+  /** For the IA page: {semantic, scope} of the body selected in the list when checked, else of the bodies checked (null without a result). */
   aiPart(options) {
     return aiPart(options);
   },
@@ -8152,7 +8855,11 @@ window.reader3d = {
   part() {
     return partFeatures();
   },
-  /** Check these bodies (indices into result.bodies): the volume and the costing become theirs. */
+  /**
+   * Check these bodies (indices into result.bodies): the analysis becomes
+   * theirs (the summary at once; what is missing for them a moment later,
+   * then "reader3d-part" and scope.updating false).
+   */
   setSelection(indices) {
     if (state.result) setIncluded(indices.filter((i) => i >= 0 && i < state.result.bodies.length));
     return partFeatures();
@@ -8212,48 +8919,66 @@ window.reader3d = {
   setProcess(pieceKey, info) {
     return setProcess(pieceKey, info);
   },
-  /** Compute the wall thickness of the part shown (with progress), then return part(). */
+  /** Compute the wall thickness of the closed bodies checked of the part shown (with progress), then return part(). */
   async computeThickness() {
-    if (state.result?.bodies.some((b) => b.closed)) await ensureThickness();
+    flushScope(); // the update of the bodies just checked started (it computes their thickness along with the rest when asked for)
+    if (state.result?.bodies.some((b, i) => b.closed && state.included.has(i))) await ensureThickness();
     return partFeatures();
   },
 };
 
+/**
+ * The part shown for the costing page (reader3d.part()): the figures of the
+ * bodies checked, the analysis of each one of them (its thickness, slides and
+ * oriented size); the bodies not checked listed (to be chosen there), without
+ * any result of the analysis.
+ */
 function partFeatures() {
   const r = state.result;
   if (!r) return null;
+  const indices = includedIndices();
   const s = currentSummary() ?? { volume: null, area: null, bbox: { size: [0, 0, 0] }, bodies: 0, open_bodies: 0 };
-  const thicknessOf = (indices) => {
-    if (!thick.results) return null;
-    const wall = thickStats(indices, "wall");
-    const sphere = thickStats(indices, "sphere");
+  // Of the bodies given, once known for every closed one of them (never the figures of a part of them).
+  const thicknessOf = (bodies) => {
+    if (!thickCovers(bodies)) return null;
+    const wall = thickStats(bodies, "wall");
+    const sphere = thickStats(bodies, "sphere");
     // The thinnest wall of the quote: typed in, else the one detected.
     return { min: thick.minOverride ?? wall.min, detected: wall.min, details: wall.details, floor: thick.floor, markings: wall.markings, median: sphere.median, max: sphere.max };
   };
   return {
     file: r.file,
+    // The bodies the figures are of (those checked), and whether those just checked are still computed.
+    scope: scopeInfo(r.bodies, indices),
+    updating: scopeBusy(r),
+    // Their thickness being computed (asked for already): the costing waits for it rather than offer to compute it.
+    thicknessUpdating: thickMissing(indices).length > 0 && (!!thick.pending || (thick.asked && !thick.failed && scopeBusy(r))),
     volume: s.volume,
     area: s.area,
     bboxSize: s.bbox.size,
     bodies: s.bodies,
     openBodies: s.open_bodies,
-    thickness: includedIndices().length ? thicknessOf(includedIndices()) : null,
+    thickness: indices.length ? thicknessOf(indices) : null,
     // The bodies checked in the list of the 3D page: what is quoted.
-    selected: includedIndices(),
-    // Every body of the file: the costing page can quote them one by one.
-    parts: r.bodies.map((b, i) => ({
-      index: i,
-      name: b.name,
-      closed: b.closed,
-      volume: b.volume,
-      area: b.area,
-      bboxSize: b.bbox.size,
-      thickness: b.closed ? thicknessOf([i]) : null,
-      // The slides of its parting line (the 3D analysis), proposed to « Tiroirs du moule ».
-      slides: b.closed ? slidesBrief(i) : null,
-      // Oriented in its die (the die blank of its draw direction): the size the die block is costed from.
-      ...(b.closed ? orientedPart(i) : {}),
-    })),
+    selected: indices,
+    // Every body of the file, to be quoted one by one; the analysis of the bodies checked only.
+    parts: r.bodies.map((b, i) => {
+      const checked = state.included.has(i);
+      return {
+        index: i,
+        name: b.name,
+        closed: b.closed,
+        checked,
+        volume: b.volume,
+        area: b.area,
+        bboxSize: b.bbox.size,
+        thickness: b.closed && checked ? thicknessOf([i]) : null,
+        // The slides of its parting line (the 3D analysis), proposed to « Tiroirs du moule » ("idle": not checked).
+        slides: b.closed ? slidesBrief(i) : null,
+        // Oriented in its die (the die blank of its draw direction): the size the die block is costed from.
+        ...(b.closed && checked ? orientedPart(i) : {}),
+      };
+    }),
   };
 }
 

@@ -133,7 +133,10 @@ test('the names of the files: the SHA-256 of the file and a short hash of the op
   assert.equal(await meshHash(structuredClone(bodies)), meshes, 'the same meshes, the same hash');
   assert.notEqual(await meshHash([bodies[0], body([0, 0, 2, 1, 0, 1, 0, 1, 1], [0, 1, 2])]), meshes, 'a vertex moved');
   assert.notEqual(await meshHash([bodies[1], bodies[0]]), meshes, 'the bodies in another order');
-  assert.equal(names.thickness(meshes), `${names.data.replace(/\.r3d\.gz$/, '')}__epaisseur-${meshes}.r3d.gz`);
+  // The thickness per body (some bodies maybe not computed): a name of its own, that versions before never read (they
+  // would take a body missing for one without thickness); theirs (every closed body) still read.
+  assert.equal(names.thickness(meshes), `${names.data.replace(/\.r3d\.gz$/, '')}__epaisseur-corps-${meshes}.r3d.gz`);
+  assert.equal(names.thicknessBefore(meshes), `${names.data.replace(/\.r3d\.gz$/, '')}__epaisseur-${meshes}.r3d.gz`);
 });
 
 test('what is read is checked: an analysis has bodies with their meshes; a thickness, a value per triangle of each body', () => {
@@ -172,4 +175,41 @@ test('a file of the folder left empty (a write that failed, or cut when the brow
   const again = await writeShared(key, { data: { ...data, summary: { volume: 2 } }, replace: false });
   assert.deepEqual([again.state, again.files], ['written', []]);
   assert.equal(analyses.files.get(names.data).bytes, bytes);
+});
+
+test('a thickness of some bodies only (those checked on a PC) keeps what the folder has of the others; one of a version before is read, never written', async () => {
+  const key = await cacheKey(new TextEncoder().encode('solid trois'), { ext: '.stl', unit: 'mm' });
+  const names = await sharedNames(key);
+  const analyses = fakeFolder({}, { name: 'analyses-3d' });
+  chooseFakeFolder(fakeFolder({ 'analyses-3d': analyses }, { name: 'reseau' }));
+  const tri = (z) => ({ mesh: { positions: new Float32Array([0, 0, z, 1, 0, z, 0, 1, z]), indices: new Uint32Array([0, 1, 2]) } });
+  const data = { summary: { volume: 1 }, bodies: [tri(0), tri(1), tri(2)] };
+  const v = (x) => ({ ray: new Float32Array([x]), sphere: new Float32Array([x]), wall: new Float32Array([x]), version: THICKNESS_VERSION });
+  const walls = (thickness) => thickness?.map((t) => t && t.wall[0]) ?? null;
+  const meshes = await meshHash(data.bodies);
+  await writeShared(key, { data });
+  // A PC with every body checked, then one with the first alone: the others kept, the first one the newer.
+  await writeShared(key, { thickness: [v(3), v(5), v(7)], bodies: data.bodies });
+  await writeShared(key, { thickness: [v(4), null, null], bodies: data.bodies });
+  assert.deepEqual(walls((await readShared(key)).thickness), [4, 5, 7]);
+  // Only the name of this version written: a page of a version before never reads a part of the bodies.
+  assert.deepEqual([...analyses.files.keys()].sort(), [names.data, names.thickness(meshes)].sort());
+
+  // A file of a version before (every closed body, part "epaisseur"), alone in the folder: read.
+  analyses.files.delete(names.thickness(meshes));
+  const before = [...containerParts([v(6), v(8), v(9)], { key: parseKey(key), part: 'epaisseur', date: '2026-01-01T00:00:00.000Z' })];
+  analyses.files.set(names.thicknessBefore(meshes), { bytes: await bytesOf(gzip(streamOf(before))), lastModified: 1 });
+  assert.deepEqual(walls((await readShared(key)).thickness), [6, 8, 9]);
+  // A PC of this version with the second body alone: written under its own name, the others taken from that file.
+  await writeShared(key, { thickness: [null, v(2), null], bodies: data.bodies });
+  assert.deepEqual(walls((await readShared(key)).thickness), [6, 2, 9]);
+  assert.ok(analyses.files.has(names.thicknessBefore(meshes)), 'the file of the version before left as it was');
+  // Its own file of some bodies only, completed by that of the version before when read.
+  analyses.files.set(names.thickness(meshes), { bytes: await bytesOf(gzip(streamOf([...containerParts([null, v(1), null], { key: parseKey(key), part: 'epaisseur-corps', date: '2026-01-02T00:00:00.000Z' })]))), lastModified: 2 });
+  assert.deepEqual(walls((await readShared(key)).thickness), [6, 1, 9]);
+  // Neither: the analysis alone.
+  analyses.files.delete(names.thickness(meshes));
+  analyses.files.delete(names.thicknessBefore(meshes));
+  const alone = await readShared(key);
+  assert.deepEqual([alone.state, alone.thickness], ['read', null]);
 });

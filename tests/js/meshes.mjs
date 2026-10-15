@@ -82,6 +82,34 @@ export function prism(profile, depth, kernel) {
   return { positions: Float32Array.from(positions), indices: Uint32Array.from(indices) };
 }
 
+/**
+ * A bent flat bar, a « V »: two arms `length` long and `width` wide, `angle`
+ * degrees apart, `thickness` thick (z from 0), opening towards +y, the inner
+ * and outer corners of its bend on the y axis; then turned `turn` degrees
+ * about z and moved by `offset`. Its smallest rectangle seen along z has its
+ * longer side along the line joining the ends of the arms (x before the turn).
+ * A prism (each face with its own vertices).
+ */
+export function vBar({ angle = 150, length = 120, width = 20, thickness = 8, turn = 0, offset = [0, 0, 0] } = {}) {
+  const half = (angle * Math.PI) / 360;
+  const corner = width / Math.sin(half) / 2;
+  const outer = [0, -corner], inner = [0, corner];
+  const end = ([x, y], side) => [x + side * Math.sin(half) * length, y + Math.cos(half) * length];
+  // Counter-clockwise: the outer corner, the right arm out and back, the inner corner, the left arm.
+  const profile = [outer, end(outer, 1), end(inner, 1), inner, end(inner, -1), end(outer, -1)];
+  const m = prism(profile, thickness, [0, 0]);
+  // prism lays the profile in (x, z), extruded along y: a quarter turn about x, (x, y, z) -> (x, z, thickness - y).
+  const c = Math.cos((turn * Math.PI) / 180), s = Math.sin((turn * Math.PI) / 180);
+  const P = m.positions;
+  for (let i = 0; i < P.length; i += 3) {
+    const x = P[i], y = P[i + 2], z = thickness - P[i + 1];
+    P[i] = c * x - s * y + offset[0];
+    P[i + 1] = s * x + c * y + offset[1];
+    P[i + 2] = z + offset[2];
+  }
+  return m;
+}
+
 /** Closed mesh of a profile (r, z) turned about z: from ring to ring, closed into a loop or capped at its ends. */
 export function revolve(profile, segments, { loop = false, poles = null } = {}) {
   const positions = [];

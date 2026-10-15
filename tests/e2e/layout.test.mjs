@@ -177,7 +177,8 @@ describe('3D analysis panel: folded cards, width (dist/)', { skip: !existsSync(j
 
   test('folded: a mode of the 3D view stops, the thinnest wall used is shown, an open body\'s warning stays', { timeout: 3 * TIMEOUT }, async () => {
     const { page, errors } = await newPage();
-    await page.goto(base);
+    // Every body checked (a file of several bodies shows its largest one alone by default): the open body in the volume's warning.
+    await page.goto(`${base}?bodies=all`);
     await analyse(page);
     await page.waitForSelector('#parting-main:not([hidden])', { timeout: TIMEOUT });
     await page.waitForSelector('#feeding-main:not([hidden])', { timeout: TIMEOUT });

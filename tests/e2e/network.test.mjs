@@ -3,8 +3,10 @@
 // would choose: chosen in Paramètres; a part analysed written in its
 // subfolder "analyses-3d", with its wall thickness, and opened from there
 // without being analysed once this browser's own results are gone (another
-// PC); a real cycle time saved in the costing written in "retours-experience",
-// and the files of other PCs merged into the history (the newer record only);
+// PC), then kept in this browser with its thickness, or not at all when the
+// page is closed first; a real cycle time saved in the costing written in
+// "retours-experience", and the files of other PCs merged into the history
+// (the newer record only);
 // the conversations of a folder chosen in the IA page before, moved into
 // "historique-ia". With a made-up workbook (tests/js/costing-fixture.mjs).
 //
@@ -64,21 +66,36 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
         localStorage.removeItem('test.prompt');
         return 'granted';
       };
-      // A network slow to answer (the flag "test.slow": ms): each folder or file looked for waits that long (window.__slow counts them).
+      // A network slow to answer (the flag "test.slow": ms): each folder or file looked for waits that long; a file
+      // opened while the flag "test.hold" is set waits until it is removed, the network answering when the test says
+      // so (window.__slow counts them).
       window.__slow = { waiting: 0, done: 0 };
       for (const method of ['getDirectoryHandle', 'getFileHandle']) {
         const real = FileSystemDirectoryHandle.prototype[method];
         FileSystemDirectoryHandle.prototype[method] = async function (...args) {
           const ms = Number(localStorage.getItem('test.slow'));
-          if (ms) {
+          const held = method === 'getFileHandle' && !!localStorage.getItem('test.hold');
+          if (ms || held) {
             window.__slow.waiting++;
-            await new Promise((resolve) => setTimeout(resolve, ms));
+            if (ms) await new Promise((resolve) => setTimeout(resolve, ms));
+            while (held && localStorage.getItem('test.hold')) await new Promise((resolve) => setTimeout(resolve, 20));
             window.__slow.waiting--;
             window.__slow.done++;
           }
           return real.apply(this, args);
         };
       }
+      // The page closed before the results it read from the folder are kept in this browser (the flag
+      // "test.unkept"): the transaction that keeps their thickness aborted, as an unload aborts one not committed.
+      const put = IDBObjectStore.prototype.put;
+      IDBObjectStore.prototype.put = function (value, key) {
+        const request = put.call(this, value, key);
+        if (localStorage.getItem('test.unkept') && this.transaction.db.name === 'reader3d-cache' && String(key).endsWith('#thickness')) {
+          localStorage.removeItem('test.unkept');
+          this.transaction.abort();
+        }
+        return request;
+      };
       window.__posted = [];
       const post = Worker.prototype.postMessage;
       Worker.prototype.postMessage = function (message, ...rest) {
@@ -117,6 +134,38 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     return done === count;
   }, [sub, suffix, n]);
 
+  /**
+   * Wait until the results of the part `sha` (the SHA-256 of its file), with their thickness, are kept in
+   * this browser: written in the background once shown, and a reload drops a write not committed. A read
+   * waits for the writes begun before it.
+   */
+  const keptHere = (page, sha) => until(page, async (hash) => {
+    const db = await new Promise((resolve, reject) => {
+      const req = indexedDB.open('reader3d-cache');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    const keys = await new Promise((resolve, reject) => {
+      const req = db.transaction('data', 'readonly').objectStore('data').getAllKeys();
+      req.onsuccess = () => resolve(req.result.map(String));
+      req.onerror = () => reject(req.error);
+    }).finally(() => db.close());
+    return keys.some((k) => k.split('|')[1] === hash && !k.includes('#') && keys.includes(`${k}#thickness`));
+  }, sha);
+
+  /** The page reloaded and box.stl opened again: read from the shared folder, nothing analysed, with its volume and its thickness. */
+  async function openedFromFolder(page, { volume, min }) {
+    await page.reload();
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
+    assert.match(await page.textContent('#method'), /Analyse lue dans le dossier réseau partagé \(« Actualiser » la recalcule\)/);
+    assert.equal(await page.textContent('#total-volume'), volume);
+    assert.equal(await page.isVisible('#thick-body'), true);
+    assert.equal(await page.textContent('#thick-min'), min);
+    const posted = await page.evaluate(() => window.__posted);
+    assert.deepEqual(posted.filter((type) => ['analyze', 'mesh', 'prepare', 'range'].includes(type)), [], `nothing analysed: ${posted}`);
+  }
+
   /** Choose the shared folder in Paramètres: accessible. */
   async function chooseFolder(page) {
     await page.click('.tab[data-page="parametres"]');
@@ -148,7 +197,8 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     await filesWritten(page, 'analyses-3d', '.r3d.gz', 2);
     const names = Object.keys(await folderFiles(page, 'analyses-3d')).sort();
     assert.match(names[0], new RegExp(`^${key}__[0-9a-f]{8}\\.r3d\\.gz$`));
-    assert.match(names[1], new RegExp(`^${key}__[0-9a-f]{8}__epaisseur-[0-9a-f]{16}\\.r3d\\.gz$`));
+    // The thickness per body (shared-cache.js: a name the versions before do not read).
+    assert.match(names[1], new RegExp(`^${key}__[0-9a-f]{8}__epaisseur-corps-[0-9a-f]{16}\\.r3d\\.gz$`));
     // gzip of the container: its magic, its header (the key, the part), then the bytes of its arrays.
     const header = await page.evaluate(async (name) => {
       const file = await (await (await (await navigator.storage.getDirectory()).getDirectoryHandle('analyses-3d')).getFileHandle(name)).getFile();
@@ -162,18 +212,10 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
 
     // Another PC: this browser's results gone, the shared folder still chosen. Opened from the folder, nothing analysed, thickness included.
     await page.evaluate(async () => (await import(new URL('engine/client.js', location.href).href)).clearCache());
-    await page.reload();
-    await page.setInputFiles('#file-input', fixturePath('box.stl'));
-    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
-    assert.match(await page.textContent('#method'), /Analyse lue dans le dossier réseau partagé \(« Actualiser » la recalcule\)/);
-    assert.equal(await page.textContent('#total-volume'), volume);
-    assert.equal(await page.isVisible('#thick-body'), true);
-    assert.equal(await page.textContent('#thick-min'), min);
-    const posted = await page.evaluate(() => window.__posted);
-    assert.deepEqual(posted.filter((type) => ['analyze', 'mesh', 'prepare', 'range'].includes(type)), [], `nothing analysed: ${posted}`);
+    await openedFromFolder(page, { volume, min });
 
     // Kept in this browser now: opened again, from it.
-    await page.waitForTimeout(500);
+    await keptHere(page, key);
     await page.reload();
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
@@ -202,6 +244,32 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
       const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle('analyses-3d');
       return (await (await dir.getFileHandle(name)).getFile().then((f) => f.size, () => 0)) > 100;
     }, names[0]);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('a part read from the folder, the page closed before it is kept in this browser: opened again, its thickness still there', { timeout: TIMEOUT }, async () => {
+    const { context, page, errors } = await newPage();
+    await page.goto(`${base}?lang=fr`);
+    await chooseFolder(page);
+    await page.click('.tab[data-page="viewer"]');
+    await page.setInputFiles('#file-input', fixturePath('box.stl'));
+    await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
+    const volume = await page.textContent('#total-volume');
+    await page.evaluate(() => window.reader3d.computeThickness());
+    const min = await page.textContent('#thick-min');
+    await filesWritten(page, 'analyses-3d', '.r3d.gz', 2);
+
+    // Another PC, the page closed before what it read from the folder is kept in this browser (test.unkept).
+    await page.evaluate(async () => {
+      await (await import(new URL('engine/client.js', location.href).href)).clearCache();
+      localStorage.setItem('test.unkept', '1');
+    });
+    await openedFromFolder(page, { volume, min });
+    await page.waitForFunction(() => !localStorage.getItem('test.unkept'));
+    // Opened again: kept in this browser all together or not at all, never the analysis without its thickness (it
+    // would open from here, « Résultats mémorisés », without it). Read from the folder again, thickness included.
+    await openedFromFolder(page, { volume, min });
     assert.deepEqual(errors, []);
     await context.close();
   });
@@ -312,10 +380,11 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
       return { state: el.querySelector('.crow strong').textContent, buttons: [...el.querySelectorAll('button')].map((b) => b.textContent), text: el.textContent };
     });
 
-    // Read again, its file opened slowly: meanwhile a history imported, and "Actualiser" clicked again.
-    await page.evaluate(() => localStorage.setItem('test.slow', '3000'));
+    // Read again, its file opened slowly: meanwhile a history imported, and "Actualiser" clicked again. The file
+    // held until then (test.hold): on a loaded machine the import takes longer than any delay the network would take.
+    await page.evaluate(() => localStorage.setItem('test.hold', '1'));
     await page.click('#cnetwork [data-action="network-refresh"]');
-    await page.waitForFunction(() => window.__slow.done >= 1 && window.__slow.waiting > 0); // the folder found, its file being opened
+    await page.waitForFunction(() => window.__slow.waiting > 0); // the folder found, its file being opened
     await page.setInputFiles('#page-parametres input[data-file="historique"]', join(dir, 'historique.json'));
     await page.waitForFunction(() => /Historique « historique\.json » importé/.test(document.querySelector('#page-parametres .cmsg')?.textContent));
     assert.ok(await page.evaluate(() => {
@@ -323,7 +392,7 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
       document.querySelector('#cnetwork [data-action="network-refresh"]').click();
       return true;
     }), '"Actualiser" clicked while the folder is read');
-    await page.evaluate(() => localStorage.removeItem('test.slow'));
+    await page.evaluate(() => localStorage.removeItem('test.hold'));
     // The reading over, the folder checked and read again: the row with its buttons, what the reading brought.
     await page.waitForFunction(() => /— accessible/.test(document.querySelector('#cnetwork .crow')?.textContent) && /lu à/.test(document.getElementById('cnetwork').textContent), null, { timeout: 20_000 });
     const after = await row();
@@ -334,15 +403,18 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     const kept = await page.evaluate(() => JSON.parse(localStorage.getItem('reader3d.chiffrage.historique.v1')).pieces);
     assert.deepEqual(kept.map((r) => [r.ref, r.source]).sort(), [['AUTRE-PC', 'production'], ['DEVIS-PC', 'devis']]);
 
-    // "Ne plus utiliser" while the folder is read: no reading said for a folder no longer used.
+    // "Ne plus utiliser" while the folder is read: no reading said for a folder no longer used. The reading
+    // asked again above may not be over yet (the row says "accessible" once the folder is checked, before
+    // its files are read): "Actualiser" then draws the row "vérification…", without its buttons, until that
+    // reading is over and the folder checked again. Clicked once the row has its buttons and the folder is
+    // read, by the page itself when it sees both (a click from here may come once the folder answered).
     await page.evaluate(() => localStorage.setItem('test.slow', '3000'));
     await page.click('#cnetwork [data-action="network-refresh"]');
-    await page.waitForFunction(() => window.__slow.waiting > 0);
-    assert.ok(await page.evaluate(() => {
-      if (!window.__slow.waiting) return false;
-      setTimeout(() => document.querySelector('#cnetwork [data-action="network-forget"]').click()); // its confirm() accepted out of this evaluate
+    await page.waitForFunction(() => {
+      if (!window.__slow.waiting || !document.querySelector('#cnetwork [data-action="network-forget"]')) return false;
+      setTimeout(() => document.querySelector('#cnetwork [data-action="network-forget"]').click()); // its confirm() accepted out of this wait
       return true;
-    }), '"Ne plus utiliser" clicked while the folder is read');
+    }, null, { timeout: 20_000 });
     await page.evaluate(() => localStorage.removeItem('test.slow'));
     await page.waitForFunction(() => /Dossier réseau partagé :\s*aucun/.test(document.querySelector('#cnetwork .crow')?.textContent), null, { timeout: 20_000 });
     await page.waitForFunction(() => window.__slow.waiting === 0);
@@ -360,17 +432,23 @@ describe('shared network folder (dist/)', { skip: !existsSync(join(DIST, 'index.
     await chooseFolder(page);
     await page.waitForFunction(() => /lu à/.test(document.getElementById('cnetwork')?.textContent));
     await page.click('.tab[data-page="viewer"]');
-    await page.evaluate(() => localStorage.setItem('test.slow', '1500'));
+    await page.evaluate(() => localStorage.setItem('test.hold', '1'));
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
-    await page.waitForFunction(() => window.__slow.waiting > 0);
-    await page.click('#cancel');
+    // Cancel clicked while the file of the part is looked for in the folder: by the page itself as soon as it
+    // looks for it (a click from here may come once the folder answered), then the folder answers.
+    await page.waitForFunction(() => {
+      const cancel = document.getElementById('cancel');
+      if (!window.__slow.waiting || !cancel.checkVisibility()) return false;
+      cancel.click();
+      localStorage.removeItem('test.hold');
+      return true;
+    });
     // The lookup over (the folder found, no file of this part in it): no analysis started for a file cancelled.
-    await page.waitForFunction(() => window.__slow.done >= 2 && window.__slow.waiting === 0, null, { timeout: 20_000 });
+    await page.waitForFunction(() => window.__slow.done >= 1 && window.__slow.waiting === 0, null, { timeout: 20_000 });
     await page.waitForTimeout(1000);
     assert.deepEqual((await page.evaluate(() => window.__posted)).filter((type) => type === 'analyze'), []);
     assert.notEqual(await page.evaluate(() => document.body.dataset.status), 'analysing');
-    // Opened again, the network back: analysed.
-    await page.evaluate(() => localStorage.removeItem('test.slow'));
+    // Opened again, the network answering: analysed.
     await page.setInputFiles('#file-input', fixturePath('box.stl'));
     await page.waitForFunction(() => document.body.dataset.status === 'done', null, { timeout: TIMEOUT });
     assert.deepEqual((await page.evaluate(() => window.__posted)).filter((type) => type === 'analyze'), ['analyze']);

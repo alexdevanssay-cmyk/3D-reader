@@ -3,11 +3,18 @@
 // shared folder (network-folder.js), so that a part analysed on one PC opens
 // at once on another one. One file per key of the cache and per part of its
 // results:
-//   <sha256 of the file>__<tag>.r3d.gz                          the analysis
-//   <sha256 of the file>__<tag>__epaisseur-<meshes>.r3d.gz      the wall thickness
+//   <sha256 of the file>__<tag>.r3d.gz                            the analysis
+//   <sha256 of the file>__<tag>__epaisseur-corps-<meshes>.r3d.gz  the wall thickness
 // <tag>: a short hash of the cache version and of the options of the key
 // (cache.js cacheKey), <meshes>: a short hash of the meshes the thickness was
 // computed on (a model whose open surfaces were closed has other meshes).
+// The thickness has a value per body, null for an open body or for one not
+// computed yet: a PC computes the bodies checked on it only (the bodies
+// analysed, app.js); what the folder has of the other bodies is kept when it
+// writes (merged per body). Versions before that wrote every closed body, in
+// "<…>__epaisseur-<meshes>.r3d.gz" (part "epaisseur"): still read, under the
+// bodies of the file of now; never written, a page of those versions would
+// take a body missing for a body without thickness.
 //
 // A file: a container compressed with gzip (CompressionStream), written and
 // read as a stream (a large model is never held twice in memory):
@@ -205,8 +212,15 @@ export async function sharedNames(key) {
   const k = parseKey(key);
   if (!k) return null;
   const stem = `${k.sha256}__${(await sha256(`${k.cache}|${k.options}`)).slice(0, 8)}`;
-  return { data: `${stem}.r3d.gz`, thickness: (meshes) => `${stem}__epaisseur-${meshes}.r3d.gz` };
+  return {
+    data: `${stem}.r3d.gz`,
+    thickness: (meshes) => `${stem}__epaisseur-corps-${meshes}.r3d.gz`,
+    thicknessBefore: (meshes) => `${stem}__epaisseur-${meshes}.r3d.gz`, // every closed body, by a version before (read only)
+  };
 }
+
+/** The part of the header of a file of the thickness per body, some of them maybe not computed (sharedNames). */
+const THICKNESS_PART = 'epaisseur-corps';
 
 /** A short hash of the meshes of the bodies of an analysis (their positions and indices): the wall thickness is theirs. */
 export async function meshHash(bodies) {
@@ -334,16 +348,8 @@ export async function readShared(key, { signal, onProgress } = {}) {
     const data = await readFile(handle, { key, part: 'analyse', signal, onProgress });
     if (data === null) return { state: 'missing' };
     if (!validData(data)) throw new Error(`« ${handle.name} » : analyse illisible`);
-    // The thickness of these meshes, if one was computed: without it, the analysis anyway.
-    let thickness = null;
-    try {
-      const other = await withTimeout(fileIn(where.dir, names.thickness(await meshHash(data.bodies))), STEP_LIMIT, 'le dossier réseau ne répond pas');
-      if (other) thickness = await readFile(other, { key, part: 'epaisseur', signal });
-      if (thickness && !validThickness(thickness, data)) thickness = null;
-    } catch (err) {
-      if (err?.cancelled) throw err;
-      thickness = null;
-    }
+    // The thickness of these meshes, if one was computed (of some bodies maybe): without it, the analysis anyway.
+    const thickness = await sharedThickness(where.dir, names, key, data.bodies, await meshHash(data.bodies), { signal });
     return { state: 'read', data, thickness };
   } catch (err) {
     if (err?.cancelled || signal?.aborted) throw cancelled();
@@ -352,13 +358,39 @@ export async function readShared(key, { signal, onProgress } = {}) {
   }
 }
 
+/**
+ * The thickness of the meshes `meshes` (meshHash of `bodies`, those of the
+ * analysis) in the folder `dir`, per body: that of this version, the bodies
+ * it has not completed by a file of a version before (every closed body);
+ * null without one. A file not readable is left (null), never thrown, unless
+ * `signal` aborts.
+ */
+async function sharedThickness(dir, names, key, bodies, meshes, { signal } = {}) {
+  const read = async (name, part) => {
+    try {
+      const handle = await withTimeout(fileIn(dir, name), STEP_LIMIT, 'le dossier réseau ne répond pas');
+      const value = handle ? await readFile(handle, { key, part, signal }) : null;
+      return validThickness(value, { bodies }) ? value : null;
+    } catch (err) {
+      if (err?.cancelled || signal?.aborted) throw cancelled();
+      return null;
+    }
+  };
+  const own = await read(names.thickness(meshes), THICKNESS_PART);
+  if (own?.every(Boolean)) return own;
+  const before = await read(names.thicknessBefore(meshes), 'epaisseur');
+  return own && before ? own.map((t, i) => t ?? before[i]) : own ?? before;
+}
+
 // The files written one after the other, in the background: a slow network never holds the page.
 let writing = Promise.resolve();
 
 /**
  * Write the results of the key `key` in the shared folder, in the background:
  *   data      -- the analysis (as cache.js keeps it), or null
- *   thickness -- its wall thickness, or null; with `bodies` (of its analysis) when `data` is not given
+ *   thickness -- its wall thickness (per body; null: open, or not computed here), or null; with `bodies`
+ *                (of its analysis) when `data` is not given. What the folder has of the bodies it has not
+ *                (computed on another PC) is kept: merged per body, unless `replace` is false
  *   replace   -- false: a file already there is left as it is (written by another PC, or before), unless empty
  * Resolves to {state: "written" (files: the names written) | "none" | "prompt" | "error", error}.
  */
@@ -379,7 +411,13 @@ export function writeShared(key, { data = null, thickness = null, bodies = null,
     };
     try {
       if (data) await put(names.data, 'analyse', data);
-      if (thickness) await put(names.thickness(await meshHash(bodies ?? data.bodies)), 'epaisseur', thickness);
+      if (thickness) {
+        const of = bodies ?? data.bodies;
+        const meshes = await meshHash(of);
+        // Some bodies not computed here (not checked on this PC): those the folder has kept with them.
+        const kept = replace && thickness.some((t) => !t) ? await sharedThickness(where.dir, names, key, of, meshes) : null;
+        await put(names.thickness(meshes), THICKNESS_PART, kept ? thickness.map((t, i) => t ?? kept[i] ?? null) : thickness);
+      }
       return { state: 'written', files };
     } catch (err) {
       return { state: 'error', error: err?.message || String(err), files };
