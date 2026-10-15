@@ -38,7 +38,7 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   the AI context and the IA page, the report and `reader3d.analyze()`. The cards say which
   bodies they cover (*Analyse sur 1 corps sur 3 (corps cochés)*); the results say it too
   (`scope`: `{mode: "all" | "checked" | "none", bodies, bodies_in_file, indices}`, also in
-  the semantic contract and the AI context). With no body checked the page says so and shows
+  the semantic contract, and in the AI context when not every body is checked). With no body checked the page says so and shows
   no figure (an export is refused, the results are empty). When the bodies checked change,
   what is known of them shows at once, and what was already asked for is completed for the
   bodies newly checked by itself a moment after the last click (300 ms: a burst of clicks
