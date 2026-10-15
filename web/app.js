@@ -105,7 +105,6 @@ camera.add(headLight);
 const modelGroup = new THREE.Group();
 scene.add(modelGroup);
 let boxHelper = null;
-let axes = null;
 
 const sectionPlane = new THREE.Plane(new THREE.Vector3(0, 0, -1), 0);
 let sectionOn = false;
@@ -168,6 +167,7 @@ renderer.setAnimationLoop(() => {
   syncCaps();
   renderer.render(scene, camera);
   drawFrame(); // the numbers of its points, where they are on the view
+  drawTriad(); // the axes in the corner, turned as the camera
 });
 // Drawn again as soon as the view changes size (the panel's splitter dragged,
 // panels.js; its page shown again): the canvas resized after the frame was drawn
@@ -329,20 +329,125 @@ function defaultBodies(result) {
   return [largestBody(result.bodies)];
 }
 
-/** The envelope and the axes of the model shown (none without a model), and the section plane. */
+/** The envelope of the model shown and the view triad (none without a model), and the section plane. */
 function placeHelpers() {
   if (boxHelper) scene.remove(boxHelper);
-  if (axes) scene.remove(axes);
-  boxHelper = axes = null;
+  boxHelper = null;
   if (!state.bounds.isEmpty()) {
     boxHelper = new THREE.Box3Helper(state.bounds, 0xff8800);
     boxHelper.visible = $("toggle-box").classList.contains("active");
     scene.add(boxHelper);
-    const size = state.bounds.getSize(new THREE.Vector3());
-    axes = new THREE.AxesHelper(Math.max(size.x, size.y, size.z) * 0.25);
-    scene.add(axes);
   }
+  $("view-triad").hidden = state.bounds.isEmpty();
   updateSection();
+}
+
+// ---- the view triad
+
+// The axes X, Y, Z of the part, red, green and blue (a right-handed frame), in
+// the bottom left corner of the 3D view, where they are always seen (the axes
+// drawn before at the origin of the model were inside or behind the part, cut
+// by the section, or off the view). An SVG over the canvas (#view-triad),
+// turned after each frame (drawTriad) by the camera's rotation alone: its
+// quaternion, whatever its up (the trackball and the « Coulée » view turn it),
+// neither moved nor zoomed. Over the part, never cut by the section, sharp at
+// any pixel ratio, no pointer events (a drag over it turns the view), hidden
+// from screen readers. Rather than a second scene drawn in a corner of the
+// canvas: nothing to fit into the frames of the section's caps (stencil,
+// scissor), real text, and "#viewport canvas" still one element. Screenshots
+// of the page have it, to read their orientation (the app itself makes no
+// image of the view; the e2e counts of the colours of the view mask it). Not
+// drawn while the page of the view is hidden (nor is the view); the frame
+// drawn again when the view is resized leaves it as it is (not in the
+// canvas). Shown with a model (placeHelpers); above the actions of the
+// drawing by hand while they are shown, in the same corner (style.css,
+// --draw-actions-h). The axis nearest the viewer is drawn over the others,
+// one pointing away fades; seen end-on (the third axis of the Face, Dessus and
+// Droite views) it is marked as on a drawing, ⊙ towards the viewer, ⊗ away,
+// over the foot of the two others, its letter beside it on the side they
+// leave free.
+const TRIAD_AXIS = 30; // px from the centre to the tip of an axis seen across (the triad: 96 px)
+const TRIAD_HEAD = [8, 4]; // its arrowhead seen across: length and half-width (px)
+const TRIAD_LABEL = 11; // px from the tip of an axis to the centre of its letter
+const TRIAD_GAP = 16; // px at least between the centres of two letters
+const TRIAD_DOT = "M-1.2,0a1.2,1.2 0 1,0 2.4,0a1.2,1.2 0 1,0 -2.4,0"; // ⊙ (its path stroked)
+const TRIAD_CROSS = "M-2.5,-2.5L2.5,2.5M-2.5,2.5L2.5,-2.5"; // ⊗
+const triad = {
+  svg: $("view-triad").querySelector("svg"),
+  axes: ["x", "y", "z"].map((name, k) => {
+    const g = $("view-triad").querySelector(`[data-axis="${name}"]`);
+    const [line, head, end, mark, text] = ["line", "polygon", ".triad-end", ".triad-end path", "text"].map((sel) => g.querySelector(sel));
+    return { name, g, line, head, end, mark, text, unit: new THREE.Vector3().setComponent(k, 1), seen: new THREE.Vector3(), s: 1, at: [0, 0], toward: null };
+  }),
+  drawn: new THREE.Quaternion(0, 0, 0, 0), // the camera's rotation drawn (none yet)
+  order: "", // the axes in drawing order ("yxz": z the nearest)
+};
+// The height of the actions of the drawing by hand (0 while hidden): the triad stands above them.
+new ResizeObserver(() => viewport.style.setProperty("--draw-actions-h", `${$("draw-actions").offsetHeight}px`)).observe($("draw-actions"));
+
+/** The triad as the camera now turns (after each frame of the view; nothing to do when it has not turned). */
+function drawTriad() {
+  if (triad.drawn.equals(camera.quaternion)) return;
+  triad.drawn.copy(camera.quaternion);
+  const toCamera = camera.quaternion.clone().invert();
+  // Each axis in the camera's frame (x to the right, y up, z towards the viewer); on the screen, y down.
+  for (const a of triad.axes) a.seen.copy(a.unit).applyQuaternion(toCamera);
+  const [headLength, headWidth] = TRIAD_HEAD;
+  const f = (x) => x.toFixed(2);
+  for (const a of triad.axes) {
+    const x = a.seen.x, y = -a.seen.y, across = Math.hypot(x, y);
+    const [ux, uy] = across > 1e-6 ? [x / across, y / across] : [1, 0];
+    // 1 seen across, 0 end-on: its arrowhead shrinks to nothing, its ⊙ or ⊗ comes.
+    a.s = Math.min(1, across / 0.3);
+    const s = a.s;
+    const tx = TRIAD_AXIS * x, ty = TRIAD_AXIS * y;
+    const bx = tx - headLength * across * ux, by = ty - headLength * across * uy;
+    const w = headWidth * s;
+    a.line.setAttribute("x2", f(bx));
+    a.line.setAttribute("y2", f(by));
+    a.head.setAttribute("points", `${f(tx)},${f(ty)} ${f(bx - w * uy)},${f(by + w * ux)} ${f(bx + w * uy)},${f(by - w * ux)}`);
+    a.end.style.opacity = f(1 - s);
+    if (a.toward !== a.seen.z >= 0) {
+      a.toward = a.seen.z >= 0;
+      a.mark.setAttribute("d", a.toward ? TRIAD_DOT : TRIAD_CROSS);
+      a.g.classList.toggle("toward", a.toward);
+    }
+    // Its letter beyond its tip; end-on, on the side the two others leave free (the bottom left when they are opposite).
+    let [fx, fy] = [0, 0];
+    for (const b of triad.axes) if (b !== a) [fx, fy] = [fx - b.seen.x, fy + b.seen.y];
+    const free = Math.hypot(fx, fy);
+    [fx, fy] = free > 0.1 ? [fx / free, fy / free] : [-Math.SQRT1_2, Math.SQRT1_2];
+    const [dx, dy] = [s * ux + (1 - s) * fx, s * uy + (1 - s) * fy];
+    const d = Math.hypot(dx, dy) || 1;
+    const gap = TRIAD_LABEL + 3 * (1 - s); // (clear of the ⊙ or ⊗)
+    a.at = [tx + (gap * dx) / d, ty + (gap * dy) / d];
+    // Fainter as it points away from the viewer, from 49° off straight away (the three axes of the Iso view plain); not end-on, where ⊗ says it.
+    a.g.style.opacity = f(1 - 0.5 * s * Math.min(1, Math.max(0, (-a.seen.z - 0.65) / 0.3)));
+  }
+  // Two letters too close (two axes seen almost one over the other) moved apart, half each.
+  for (const [p, q] of [[0, 1], [0, 2], [1, 2]]) {
+    const a = triad.axes[p].at, b = triad.axes[q].at;
+    const d = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (d >= TRIAD_GAP) continue;
+    const r = Math.hypot(...a) || 1;
+    const [nx, ny] = d > 1e-6 ? [(b[0] - a[0]) / d, (b[1] - a[1]) / d] : [-a[1] / r, a[0] / r];
+    const push = (TRIAD_GAP - d) / 2;
+    a[0] -= push * nx;
+    a[1] -= push * ny;
+    b[0] += push * nx;
+    b[1] += push * ny;
+  }
+  for (const a of triad.axes) {
+    a.text.setAttribute("x", f(a.at[0]));
+    a.text.setAttribute("y", f(a.at[1]));
+  }
+  const depth = (a) => (a.s < 1 ? 2 : a.seen.z); // end-on: over the others
+  const order = [...triad.axes].sort((p, q) => depth(p) - depth(q));
+  const key = order.map((a) => a.name).join("");
+  if (key !== triad.order) {
+    triad.order = key;
+    triad.svg.append(...order.map((a) => a.g));
+  }
 }
 
 // ---------------------------------------------------------------- engines

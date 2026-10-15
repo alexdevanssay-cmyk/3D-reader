@@ -438,6 +438,35 @@ table.slides-table tr.selected td { background: color-mix(in srgb, var(--select)
   .draw-actions .draw-label { display: none; }
   .draw-actions .draw-icon { font-size: 18px; }
 }
+/* The view triad (app.js drawTriad): X red, Y green, Z blue, over the part and under the controls, in the bottom left
+   corner. While drawing by hand, above the actions there (--draw-actions-h: their height, app.js), smaller on a view
+   too short for it under the left arrow (52 px high at mid-height). */
+.view-triad {
+  position: absolute; left: 12px; bottom: 12px; width: 96px; height: 96px; z-index: 1; pointer-events: none;
+  --axis-x: #d32f2f; --axis-y: #2e8b3e; --axis-z: #2962d9;
+}
+.draw-overlay:not([hidden]) ~ .view-triad {
+  bottom: calc(16px + var(--draw-actions-h, 48px) + 8px);
+  height: min(96px, calc(50% - 26px - 8px - 16px - var(--draw-actions-h, 48px) - 8px)); width: auto; aspect-ratio: 1;
+}
+.view-triad svg { display: block; width: 100%; height: 100%; }
+.triad-disc { fill: color-mix(in srgb, var(--panel) 80%, transparent); stroke: var(--border); stroke-width: 1px; }
+.triad-axis { color: var(--axis-x); }
+.triad-axis[data-axis="y"] { color: var(--axis-y); }
+.triad-axis[data-axis="z"] { color: var(--axis-z); }
+.triad-axis line { stroke: currentColor; stroke-width: 3px; stroke-linecap: round; }
+.triad-axis polygon { fill: currentColor; stroke: currentColor; stroke-width: 1px; stroke-linejoin: round; }
+.triad-end { opacity: 0; }
+.triad-end circle { fill: var(--panel); stroke: currentColor; stroke-width: 1.5px; }
+.triad-end path { fill: none; stroke: currentColor; stroke-width: 1.6px; stroke-linecap: round; }
+.triad-axis.toward .triad-end path { stroke-width: 2.4px; }
+.triad-axis text {
+  fill: currentColor; font: 700 14px/1 system-ui, sans-serif; text-anchor: middle; dominant-baseline: central;
+  paint-order: stroke; stroke: var(--panel); stroke-width: 3px; stroke-linejoin: round;
+}
+@media (prefers-color-scheme: dark) {
+  .view-triad { --axis-x: #ff6b61; --axis-y: #5cc96b; --axis-z: #6e9bff; }
+}
 /* Risers and gating: the same look as the parting line card. */
 table.feeding-risers { table-layout: fixed; }
 table.feeding-risers th:first-child, table.feeding-risers td:first-child { width: 28%; }

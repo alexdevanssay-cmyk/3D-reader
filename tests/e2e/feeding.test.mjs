@@ -349,10 +349,10 @@ describe('risers and gating (dist/)', { skip: !existsSync(join(DIST, 'index.html
     await page.waitForSelector('#parting-main:not([hidden])', { timeout: 60_000 });
     await horizontalPlane(page, 1);
     const faded = () => page.evaluate(() => document.getElementById('viewport').dataset.faded);
-    // Orange pixels of the 3D view: the risers.
+    // Orange pixels of the 3D view: the risers (the view triad masked: the edges of its red axis are orange).
     const orange = async () => {
       await page.waitForTimeout(300);
-      const png = await page.locator('#viewport canvas').screenshot();
+      const png = await page.locator('#viewport canvas').screenshot({ mask: [page.locator('#view-triad')] });
       return page.evaluate(async (b64) => {
         const img = new Image();
         img.src = `data:image/png;base64,${b64}`;
