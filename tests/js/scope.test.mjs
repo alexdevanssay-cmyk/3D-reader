@@ -91,6 +91,10 @@ describe('the bodies analysed', () => {
     assert.deepEqual(semantic.model.scope, { mode: 'checked', bodies: 1, bodies_in_file: 3, indices: [0] });
     assert.equal(semantic.model.body_count, 1);
     assert.deepEqual(buildAIContext(semantic).model.scope, semantic.model.scope);
+    // Every body of the file: said by the contract; the AI context, as small as before, says nothing.
+    const whole = buildSemantic3D({ ...result, scope: scopeInfo([body], [0]) });
+    assert.equal(whole.model.scope.mode, 'all');
+    assert.equal('scope' in buildAIContext(whole).model, false);
     // A result that does not say it (a script's own): no scope, as before.
     const { scope, ...plain } = result;
     assert.equal('scope' in buildSemantic3D(plain).model, false);

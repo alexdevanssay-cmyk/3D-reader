@@ -234,8 +234,9 @@ function bodyContext(body, task) {
 
 function modelFacts(semantic) {
   return {
-    // Which bodies of the file the figures are of (the bodies checked on the 3D page), when the contract says so.
-    ...(semantic.model?.scope ? { scope: semantic.model.scope } : {}),
+    // Which bodies of the file the figures are of (the bodies checked on the 3D page), when they are not all of them
+    // (every body: nothing to say, the context as small as before).
+    ...(semantic.model?.scope && semantic.model.scope.mode !== "all" ? { scope: semantic.model.scope } : {}),
     body_count: semantic.model?.body_count ?? null,
     solid_count: semantic.model?.solid_count ?? null,
     metrics: semantic.model?.metrics ?? {},
