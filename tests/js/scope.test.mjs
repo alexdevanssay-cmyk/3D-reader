@@ -64,6 +64,9 @@ describe('the bodies analysed', () => {
     assert.deepEqual(missingBodies(BODIES, [0], [null, null, null]), [0]);
     assert.deepEqual(missingBodies(BODIES, [2], [null, null, null]), []);
     assert.deepEqual(missingBodies(BODIES, [], null), []);
+    // Several: being computed, or failed (not asked again until Retry, nor with the others).
+    assert.deepEqual(missingBodies(BODIES, [0, 1], null, new Map([[0, {}]]), new Map([[1, 'no proposal']])), []);
+    assert.deepEqual(missingBodies(BODIES, [0, 1], null, new Map(), new Map([[1, 'no proposal']])), [0]);
   });
 
   test('mergeBodies: each body its newest result, the others kept (a body checked again is not computed again)', () => {

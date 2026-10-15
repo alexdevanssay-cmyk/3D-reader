@@ -82,7 +82,8 @@ const upOf = (up) => (up == null ? null : typeof up === 'string' ? up : [...up])
  * owner   -- what the job is for (a model), to drop it (cancelParting)
  * process -- {plan: "vertical" | "horizontal", alimentation: "haut" | "bas"} (default: gravity, vertical, top)
  * die     -- {marges, densite, cavities} (default: those of the costing)
- * Resolves to {version, options_key, bodies: per body {proposal, side, flags, plane, segments} or null}.
+ * Resolves to {version, options_key, bodies: per body {proposal, side, flags,
+ * plane, segments}, {error} (that body alone could not be proposed) or null}.
  */
 export function computeParting(bodies, { onProgress, owner, process = null, die = null } = {}) {
   const list = bodies.map((b) => (b ? { positions: b.positions, indices: b.indices, thickness: b.thickness ?? null } : null));

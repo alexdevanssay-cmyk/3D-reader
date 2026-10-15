@@ -45,11 +45,12 @@ export function cardBody(bodies, indices, selected = -1) {
 
 /**
  * The closed bodies of `indices` (open ones have no inside: nothing to
- * compute) without a result in `results` (per body; null: none), nor being
- * computed (`busy`: a Set or a Map of bodies).
+ * compute) without a result in `results` (per body; null: none), nor in any
+ * of `busy` (Sets or Maps of bodies: being computed, failed and not to be
+ * asked again until Retry).
  */
-export function missingBodies(bodies, indices, results, busy = null) {
-  return indices.filter((i) => bodies[i]?.closed && !results?.[i] && !busy?.has(i));
+export function missingBodies(bodies, indices, results, ...busy) {
+  return indices.filter((i) => bodies[i]?.closed && !results?.[i] && !busy.some((b) => b?.has(i)));
 }
 
 /** Per-body results merged, for `count` bodies: those of `fresh` (null where not computed) over those `kept`. */

@@ -47,11 +47,17 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
   and the feeding zones of each body checked, then the slides, the orientation and the risers
   of the card's body. Meanwhile the cards concerned say *Mise à jour…* rather than show the
   figures of the bodies before; the costing page and the published results get the new part
-  once the update is done (`reader3d.scope.updating` false, event `reader3d-part`). The
-  results of each body are kept, in memory and with the results of the file in this browser
-  and the shared folder (one record per file, a value per body): a body unchecked then
-  checked again is not computed again, a body unchecked while it is computed keeps its
-  results without showing them. Each tab keeps its own choice. The link modes for scripts
+  once the update is done, with the slides, die blocks and risers of every body checked
+  (`reader3d.scope.updating` false, then one event `reader3d-part`): nothing is published
+  while it runs, never the figures of a part of the bodies, and the costing tells the 3D
+  page its islands only then. A body whose parting or feeding zones cannot be computed says
+  so on its own card (*Retry*; the costing reads its slides as failed), and is not asked
+  again with the bodies checked after it; a thickness that fails is said on its card and
+  computed again by its button only. The results of each body are kept, in memory and with
+  the results of the file in this browser and the shared folder (one record per file, a
+  value per body): a body unchecked then checked again is not computed again, a body
+  unchecked while it is computed keeps its results without showing them. Each tab keeps
+  its own choice; one shown again resumes the thickness of its bodies checked. The link modes for scripts
   (`report=1`, `export=…`) check every body; `?bodies=all` checks every body at first,
   `?bodies=largest` the largest one alone in those modes too.
 - **Wall thickness** for casting design ("épaisseur de toile"), button *Thickness*: colour
@@ -236,7 +242,9 @@ hand" of `web/app.js`:
 - **Shared network folder** (Chrome or Edge; chosen once per PC in *Paramètres*): a
   folder of the company network where every PC writes, and reads, the results of its 3D
   analyses (`analyses-3d`: a part analysed on one PC opens at once on another, wall
-  thickness included), the cycle times measured in production (`retours-experience`,
+  thickness included: a value per body, those a PC computed merged with those the folder
+  has of the others; `…__epaisseur-corps-…`, the files of the versions before, every
+  closed body, still read but never written), the cycle times measured in production (`retours-experience`,
   merged into the history, the newer record of a reference winning) and the
   conversations of the IA page (`historique-ia`). Nothing goes anywhere else.
 - Export of the results to **Excel** (.xlsx, one value per cell: a row per body, a

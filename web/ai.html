@@ -51,8 +51,10 @@ console.log(reader3d.report());   // plain-text summary</pre>
   bodies checked alone, and says which (the AI context when they are not all of them): <code>scope</code> {<code>mode</code> (<code>all</code>, <code>checked</code> or
   <code>none</code>), <code>bodies</code>, <code>bodies_in_file</code>, <code>indices</code>}. After
   <code>reader3d.setSelection(indices)</code> the summary is theirs at once; what is missing for the bodies newly checked
-  (the wall thickness once computed, the parting line) follows a moment later: wait for
-  <code>reader3d.scope.updating</code> to be <code>false</code> (or for the event <code>reader3d-part</code>).</p>
+  (the wall thickness once computed, the parting line, the slides, the risers) follows a moment later, published once,
+  complete: wait for <code>reader3d.scope.updating</code> to be <code>false</code> (or for the event
+  <code>reader3d-part</code>, sent then). Nothing is published while it runs (the JSON result says
+  <code>"updating": true</code> if another tab was shown meanwhile).</p>
 
   <h2>3. Agent or script that can run Python</h2>
   <pre>pip install "git+https://github.com/alexdevanssay-cmyk/3D-reader"

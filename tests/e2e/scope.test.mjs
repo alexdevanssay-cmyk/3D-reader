@@ -13,13 +13,15 @@
 // SCOPE_SHOTS=<folder>: screenshots of the panel at each step, written there.
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 
 import { chromium } from 'playwright';
 
 import { createStaticServer } from '../../scripts/serve.mjs';
+import { costingWorkbook } from '../js/costing-fixture.mjs';
 import { ROOT, approx } from '../js/helpers.mjs';
 
 const DIST = join(ROOT, 'dist');
@@ -68,7 +70,10 @@ const FILE = { name: 'blocks.stl', mimeType: 'text/plain', buffer: boxesStl(BLOC
 /**
  * Every job sent to the workers of the page, logged (window.__jobs): {worker
  * (its script), type, key (the body of a thickness range), bodies (the
- * bodies of a parting or feeding job)}.
+ * bodies of a parting or feeding job)}. And, for the tests of what goes
+ * wrong: the proposal of body window.__failBody made to fail in the parting
+ * worker (its mesh sent without positions), the jobs of the thickness
+ * workers held window.__thickDelay ms.
  */
 function logJobs() {
   const jobs = (window.__jobs = []);
@@ -85,6 +90,13 @@ function logJobs() {
         jobs.push({ worker: this.script, type: message?.type ?? null, key: message?.key ?? null, bodies });
       } catch {
         // logged or not, the job goes
+      }
+      if (this.script === 'partworker.js' && message?.type === 'propose' && window.__failBody != null && message.bodies?.[window.__failBody]) {
+        message = { ...message, bodies: message.bodies.map((b, i) => (i === window.__failBody && b ? { ...b, positions: null } : b)) };
+      }
+      if (this.script === 'thickworker.js' && window.__thickDelay && ['prepare', 'range'].includes(message?.type)) {
+        setTimeout(() => super.postMessage(message, ...rest), window.__thickDelay);
+        return undefined;
       }
       return super.postMessage(message, ...rest);
     }
@@ -274,7 +286,8 @@ describe('the analysis covers the bodies checked (dist/)', { skip: !existsSync(j
     // Its parting shown on the view, A faded, C hidden (not faded).
     await page.waitForFunction(() => document.getElementById('parting-card').dataset.overlay === 'lower upper line', null, { timeout: TIMEOUT });
     assert.equal(await page.evaluate(() => document.getElementById('viewport').dataset.faded), '1');
-    // The costing page told the new part once the update is done.
+    // The costing page told the new part once, the update done (nothing while it ran, the figures of A alone with B checked).
+    assert.equal((await told()).length, 1, JSON.stringify(await told()));
     const last = (await told()).at(-1);
     approx(last.volume, 62400, 1e-9, 0, 'volume told');
     assert.deepEqual([last.thickness, last.selected, last.updating], [12, [A, B].sort(), false]);
@@ -363,6 +376,159 @@ describe('the analysis covers the bodies checked (dist/)', { skip: !existsSync(j
     await scopeSettled(page);
     await page.waitForTimeout(500);
     assert.deepEqual(thicknessBodies(await jobsSince(since)), []);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  /** The page in French with the three blocks opened, the parting card shown on A: {context, page, errors, A, B, C, box, row}. */
+  async function opened() {
+    const { context, page, errors } = await newPage('fr-FR');
+    await page.goto(`${base}?lang=fr`);
+    await page.setInputFiles('#file-input', FILE);
+    await settled(page);
+    const names = await page.evaluate(() => window.reader3d.part().parts.map((p) => p.name));
+    const [A, B, C] = ['A', 'B', 'C'].map((n) => names.indexOf(n));
+    await page.waitForSelector('#parting-main:not([hidden])', { timeout: TIMEOUT });
+    return { context, page, errors, A, B, C, box: (i) => `#bodies tr[data-index="${i}"] input`, row: (i) => `#bodies tr[data-index="${i}"] td.name` };
+  }
+
+  test('a body whose parting cannot be proposed: its own failure, said on its card only, not asked again with the others, Retry', { timeout: 4 * TIMEOUT }, async () => {
+    const { context, page, errors, A, B, C, box, row } = await opened();
+    const card = () => page.evaluate(() => {
+      const text = (id) => (document.getElementById(id).hidden ? '' : document.getElementById(id).textContent);
+      return { body: text('parting-body'), status: text('parting-status'), main: !document.getElementById('parting-main').hidden, retry: !document.getElementById('parting-retry').hidden, updating: document.getElementById('parting-card').dataset.updating };
+    });
+    const slides = (i) => page.evaluate((k) => window.reader3d.part().parts[k].slides, i);
+    const proposed = (since) => page.evaluate((m) => window.__jobs.slice(m).filter((j) => j.worker === 'partworker.js' && j.type === 'propose').map((j) => j.bodies), since);
+    // B checked, its proposal failing: the card on A as it was, no word of B's failure there.
+    await page.evaluate((b) => (window.__failBody = b), B);
+    await page.click(box(B));
+    await scopeSettled(page);
+    assert.deepEqual(await card(), { body: 'Corps : A', status: '', main: true, retry: false, updating: '' });
+    // B's slides for the costing: its failure, not « computing » for ever.
+    const failed = await slides(B);
+    assert.equal(failed.status, 'error');
+    assert.match(failed.message, /null/);
+    // The card on B: its failure, and Retry.
+    await page.click(row(B));
+    let shown = await card();
+    assert.deepEqual([shown.body, shown.main, shown.retry, shown.updating], ['Corps : B', false, true, '']);
+    assert.match(shown.status, /^Plan de joint non calculé : /);
+    // C checked: proposed alone (B not asked again with it), and proposed.
+    let since = await page.evaluate(() => window.__jobs.length);
+    await page.click(row(B)); // B unselected: the card back on A
+    await page.click(box(C));
+    await scopeSettled(page);
+    assert.deepEqual(await proposed(since), [[C]]);
+    await page.click(row(C));
+    shown = await card();
+    assert.deepEqual([shown.body, shown.status, shown.main, shown.retry], ['Corps : C', '', true, false]);
+    assert.equal((await slides(C)).status, 'ready');
+    // B unchecked and checked again: not asked again (until Retry), still said failed on its card.
+    since = await page.evaluate(() => window.__jobs.length);
+    await page.click(box(B));
+    await page.click(box(B));
+    await scopeSettled(page);
+    assert.deepEqual(await proposed(since), []);
+    // Retry on B's card, the cause gone: proposed.
+    await page.click(row(B));
+    await page.evaluate(() => (window.__failBody = null));
+    await page.click('#parting-retry');
+    await page.waitForSelector('#parting-main:not([hidden])', { timeout: TIMEOUT });
+    shown = await card();
+    assert.deepEqual([shown.body, shown.status, shown.retry], ['Corps : B', '', false]);
+    assert.deepEqual(await proposed(since), [[B]]);
+    await page.waitForFunction((b) => window.reader3d.part().parts[b].slides.status === 'ready', B, { timeout: TIMEOUT });
+    assert.equal((await page.evaluate(() => window.reader3d.result)).bodies.every((b) => b.parting), true);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('during an update nothing is published; once done, the part told once, complete: the costing never gets the figures of a part of the bodies; an export waits for it', { timeout: 4 * TIMEOUT }, async () => {
+    const { context, page, errors, A, B, C, box } = await opened();
+    const dir = mkdtempSync(join(tmpdir(), 'scope-costing-'));
+    try {
+      writeFileSync(join(dir, 'chiffrage.xlsm'), costingWorkbook());
+      // The thickness asked for (A), the costing page with its workbook.
+      await page.click('#thick-compute');
+      await page.waitForSelector('#thick-body:not([hidden])', { timeout: TIMEOUT });
+      await page.click('.tab[data-page="chiffrage"]');
+      await page.waitForSelector('#page-chiffrage .ccard');
+      await page.setInputFiles('#page-chiffrage input[data-file="workbook"]', join(dir, 'chiffrage.xlsm'));
+      await page.waitForSelector('#page-chiffrage [data-bind="q.piece"]');
+      await scopeSettled(page);
+      await page.waitForTimeout(500);
+      // What the costing pages are told, and what the costing tells the 3D page of its islands (with the figures it had then).
+      await page.evaluate(() => {
+        window.__told = [];
+        window.__pushes = [];
+        document.addEventListener('reader3d-part', () => {
+          const part = window.reader3d.part();
+          const published = JSON.parse(document.getElementById('reader3d-result').textContent);
+          window.__told.push({ updating: window.reader3d.scope.updating, thickness: part.thickness?.min ?? null, published: published.thickness?.min ?? null, bodies: published.bodies.length });
+        });
+        const native = window.reader3d.setProcess;
+        window.reader3d.setProcess = (...args) => {
+          window.__pushes.push({ updating: window.reader3d.scope.updating, thickness: window.reader3d.part().thickness?.min ?? null });
+          return native(...args);
+        };
+      });
+      // Every piece chosen in the costing: B and C checked on the 3D page, their thickness, proposals and zones computed.
+      await page.selectOption('#page-chiffrage [data-bind="q.piece"]', 'tout');
+      await page.waitForFunction(() => window.reader3d.scope.updating, null, { timeout: 10_000 }).catch(() => {});
+      // What was told by the time the update is done.
+      const told = await (await page.waitForFunction(() => !window.reader3d.scope.updating && window.__told.length > 0 && window.__told, null, { timeout: TIMEOUT })).jsonValue();
+      // Nothing while it ran; once done, every figure of the three bodies (C's wall of 8 mm the thinnest), the JSON written
+      // before the event. (What the costing then tells of its islands may make the 3D page tell the part again: complete too.)
+      assert.deepEqual(told[0], { updating: false, thickness: 8, published: 8, bodies: 3 });
+      assert.deepEqual(told.filter((x) => x.updating || x.thickness !== 8 || x.published !== 8), []);
+      await page.waitForFunction(() => window.__pushes.some((p) => !p.updating), null, { timeout: TIMEOUT });
+      const pushes = await page.evaluate(() => window.__pushes);
+      // The costing told the 3D page its islands only then: never with a thinnest wall unknown (0).
+      assert.deepEqual(pushes.filter((p) => p.updating || p.thickness == null), []);
+      assert.ok(pushes.every((p) => p.thickness === 8), JSON.stringify(pushes));
+
+      // An export right after a body is checked: it waits for its update (the parting and thickness of that body in it).
+      await page.click('.tab[data-page="viewer"]');
+      await page.click(box(C));
+      await scopeSettled(page);
+      const [download] = await Promise.all([
+        page.waitForEvent('download', { timeout: TIMEOUT }),
+        page.evaluate(([c]) => {
+          document.querySelector(c).click();
+          document.getElementById('export-json').click();
+        }, [box(C)]),
+      ]);
+      const exported = JSON.parse(readFileSync(await download.path(), 'utf8'));
+      const c = exported.bodies.find((b) => b.name === 'C');
+      assert.ok(c?.parting && c.thickness && c.slides?.status !== 'computing', JSON.stringify(c && Object.keys(c)));
+      assert.equal(exported.thickness.min, 8);
+      assert.deepEqual(exported.bodies.map((b) => b.name).sort(), ['A', 'B', 'C']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+
+  test('another tab shown while an update waits for a thickness being computed: the bodies checked get theirs when the tab is shown again', { timeout: 4 * TIMEOUT }, async () => {
+    const { context, page, errors, B, box } = await opened();
+    const first = await page.evaluate(() => window.reader3d.tab.id);
+    // The thickness of A asked for and held; B checked meanwhile: its update waits for A's.
+    await page.evaluate(() => (window.__thickDelay = 2500));
+    await page.click('#thick-compute');
+    await page.click(box(B));
+    await page.waitForFunction(() => window.reader3d.scope.updating && /épaisseurs/.test(document.getElementById('thick-status').textContent), null, { timeout: 10_000 });
+    // Another tab shown until A's is done, then this one again.
+    await page.click('.doc-tab-new');
+    await page.waitForTimeout(4000);
+    await page.evaluate(() => (window.__thickDelay = 0));
+    await page.evaluate((id) => window.reader3d.showTab(id), first);
+    await scopeSettled(page);
+    await page.waitForSelector('#thick-body:not([hidden])', { timeout: TIMEOUT });
+    const part = await page.evaluate(() => window.reader3d.part());
+    assert.deepEqual([part.thickness?.min, part.parts[B].thickness?.min], [12, 12]);
+    assert.ok(await page.evaluate((b) => window.__jobs.some((j) => j.worker === 'thickworker.js' && j.key === b), B), 'B computed');
     assert.deepEqual(errors, []);
     await context.close();
   });

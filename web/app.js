@@ -792,8 +792,20 @@ function setIncluded(indices) {
 // What was never asked for (the thickness not launched) stays manual.
 const SCOPE_MS = 300;
 // {timer (the update waiting), waiting (the result it is for), runs (updates
-// started since the page was opened), busy (result -> its update running)}.
-const scope = { timer: 0, waiting: null, runs: 0, busy: new WeakMap() };
+// started since the page was opened), busy (result -> its update running),
+// done (result -> the promise of its last update), jobs (result -> the jobs
+// of its cards asked for while they are drawn: the slides, the orientations,
+// the risers placed; waited for by its update before it publishes)}.
+const scope = { timer: 0, waiting: null, runs: 0, busy: new WeakMap(), done: new WeakMap(), jobs: new WeakMap() };
+
+/** A job of the cards of result r (its promise, which never rejects): waited for by an update of its bodies (scopeUpdate). */
+function trackJob(r, promise) {
+  let jobs = scope.jobs.get(r);
+  if (!jobs) scope.jobs.set(r, (jobs = new Set()));
+  jobs.add(promise);
+  promise.finally(() => jobs.delete(promise));
+  return promise;
+}
 
 /** An update of the bodies analysed, a moment after the last change of the bodies checked. */
 function scheduleScope() {
@@ -809,34 +821,71 @@ function flushScope() {
   runScope();
 }
 
+/** An update of the bodies analysed of the model shown, now (its tab shown again, a thickness to resume). */
+function startScope() {
+  clearTimeout(scope.timer);
+  scope.waiting = state.result;
+  runScope();
+}
+
+/** Once the update of the bodies analysed of r is done (none waiting nor running): at once without one. */
+async function scopeDone(r = state.result) {
+  flushScope();
+  while (r && scope.busy.has(r)) await scope.done.get(r);
+}
+
 /** Whether the bodies checked of result r just changed, their update not started yet: no job is started for them meanwhile. */
 const scopeWaiting = (r = state.result) => !!r && scope.waiting === r;
 
 /** Whether the bodies analysed of result r are being updated (waiting, or computing). */
 const scopeBusy = (r = state.result) => scopeWaiting(r) || (!!r && scope.busy.has(r));
 
-/**
- * The update of the bodies analysed of the model shown: what is missing for
- * the bodies checked computed (the wall thickness once asked for, the
- * parting proposals, the feeding zones), the cards drawn again (the slides,
- * the orientation and the risers of the card's body asked for there), then,
- * all of it done, the part published (costing page, IA page, scripts).
- */
-async function runScope() {
+/** The update of the bodies analysed waiting started (scopeUpdate), its promise kept (scopeDone). */
+function runScope() {
   const r = scope.waiting;
   clearTimeout(scope.timer);
   scope.waiting = null;
   scope.timer = 0;
-  if (!r || r !== state.result) return;
+  if (!r || r !== state.result) return null;
   const run = ++scope.runs;
   scope.busy.set(r, run);
+  const update = scopeUpdate(r, run);
+  scope.done.set(r, update);
+  return update;
+}
+
+/**
+ * The update of the bodies analysed of the model shown: what is missing for
+ * the bodies checked computed (the wall thickness once asked for, unless it
+ * failed: then by its button; the parting proposals and the feeding zones,
+ * not those that failed: by Retry), then what the part given to the costing
+ * reads of each of them (its slides, its orientation and die block, its
+ * risers), the cards drawn again; then, all of it done, the part published
+ * once (costing page, IA page, scripts), never before with the figures of a
+ * part of the bodies (updatePublished).
+ */
+async function scopeUpdate(r, run) {
+  const current = () => scope.busy.get(r) === run && r === state.result;
   // (The proposals of a body checked again made for other options than its own now: proposed again.)
   const jobs = [computePartings(r), reproposeStale(r), computeFeedings(r)];
-  if (thick.asked && thickMissing().length) jobs.push(ensureThickness());
+  if (thick.asked && !thick.failed && thickMissing().length) jobs.push(ensureThickness());
   // And those still running for its bodies, started before (an update before, the opening of the model).
   for (const computing of [partingOf(r).computing, feedingOf(r).computing]) for (const job of computing.values()) jobs.push(job.promise);
   renderScope();
   await Promise.allSettled(jobs.filter(Boolean));
+  // Then, each in turn (the orientation waits for the proposal, the risers for the orientation): asked for, waited for.
+  for (let round = 0; round < 4 && current(); round++) {
+    for (const i of includedIndices()) {
+      if (!r.bodies[i].closed) continue;
+      slidesBrief(i);
+      orientedPart(i);
+      feedingField(i, r);
+    }
+    await null; // the jobs asked for at the end of this task (slidesQueue, feedingPlacement) sent
+    const running = [...(scope.jobs.get(r) ?? [])];
+    if (!running.length) break;
+    await Promise.allSettled(running);
+  }
   if (scope.busy.get(r) !== run) return; // a later update of its bodies took over
   scope.busy.delete(r);
   // Its tab no longer shown: drawn and published when it is shown again (showTab).
@@ -1060,8 +1109,10 @@ function thicknessExport(r, indices) {
 async function withThickness() {
   const r = state.result;
   if (!r) return;
-  flushScope();
   if (!state.included.size) throw new Error(t("export.none"));
+  // The bodies just checked: their parting, slides and risers first (their update), as the page then shows them.
+  await scopeDone(r);
+  if (r !== state.result) return;
   if (r.bodies.some((b, i) => b.closed && state.included.has(i))) await ensureThickness();
 }
 
@@ -1659,6 +1710,7 @@ const thick = {
   minOverride: null, // mm: thinnest wall typed in for the quote (the model was misjudged), or null
   results: null, // per body {ray, sphere, wall} (Float32Array per triangle), or null (open, or not computed: a body not checked)
   asked: false, // computed once for this model (or kept from an earlier opening): the bodies checked next are computed by themselves
+  failed: null, // why its last computation failed (not cancelled): said, not tried again by itself (its button tries again)
   pending: null, // promise of the computation in progress
   colors: false,
   highlight: false,
@@ -1781,6 +1833,7 @@ function thickCovers(indices = includedIndices()) {
 function thicknessNewModel(kept = null) {
   thick.results = null;
   thick.asked = false;
+  thick.failed = null;
   thick.scale = null;
   thick.markCache = new Map();
   thick.minOverride = null;
@@ -1835,6 +1888,7 @@ async function ensureThickness(indices = includedIndices()) {
   const result = state.result;
   if (!result) return null;
   thick.asked = true;
+  thick.failed = null; // asked for again: tried again
   for (let pending; (pending = thick.pending); ) {
     if (!(await pending) || state.result !== result) return null;
   }
@@ -1875,8 +1929,12 @@ async function ensureThickness(indices = includedIndices()) {
       if (!err.cancelled) showError(`${t("thick.title")} : ${tMessage(err.message || String(err))}`);
       if (tab === activeTab) thick.colors = thick.highlight = false;
       // Stopped (Cancel): no longer computed by itself for the bodies checked next, until asked for again.
+      // Failed: said on the card, not tried again by itself at each click of the list (its button tries again).
       const kept = tab === activeTab ? thick : tab.view?.thick;
-      if (err.cancelled && kept && tab.result === result) kept.asked = false;
+      if (kept && tab.result === result) {
+        if (err.cancelled) kept.asked = false;
+        else kept.failed = err.message || String(err);
+      }
       return null;
     } finally {
       if (tab.result === result) {
@@ -2052,13 +2110,14 @@ function renderThickness() {
   // being computed (asked for already), « mise à jour… »; none checked, or none closed, said.
   const none = !state.included.size;
   const missing = thickMissing();
-  const updating = missing.length > 0 && (!!thick.pending || (thick.asked && scopeBusy()));
+  const updating = missing.length > 0 && (!!thick.pending || (thick.asked && !thick.failed && scopeBusy()));
   const ready = thickCovers();
   $("thick-compute").hidden = none || !missing.length || updating;
   $("thick-body").hidden = !ready;
   const status = none ? t("scope.none")
     : updating ? t(thick.results?.some(Boolean) ? "thick.updating" : "thick.computing")
-      : !ready && !missing.length ? t("thick.none") : "";
+      : missing.length && thick.failed ? t("thick.failed", { message: tMessage(thick.failed) })
+        : !ready && !missing.length ? t("thick.none") : "";
   $("thick-status").hidden = !status;
   $("thick-status").textContent = status;
   renderScopeNote($("thick-scope"));
@@ -2340,20 +2399,22 @@ const partClient = () => (partClient.module ??= import("./engine/partclient.js")
 
 // Per result: {results (per body {proposal, side, flags, plane, segments}, or
 // null: open, or not proposed yet: a body not checked), computing (body ->
-// {percent} of the job proposing it), error, current (body -> definition by
-// hand), geom (body -> its faces and edges), evaluated (directions
-// classified), show, mode ("pick" | "assign" | null), busy (directions being
-// classified), seq (the choices made on the card: a direction classified
-// after a later choice is not applied), message, restored (the bodies whose
-// definition kept was put back), draw (body -> its drawing by hand, see
-// "drawing by hand"; mode "draw"), drawBody (the body drawn on)}.
+// {percent} of the job proposing it), failed (body -> why its proposal, or
+// its proposal again, failed: not asked again until Retry), current (body ->
+// definition by hand), geom (body -> its faces and edges), evaluated
+// (directions classified), show, mode ("pick" | "assign" | null), busy
+// (directions being classified), seq (the choices made on the card: a
+// direction classified after a later choice is not applied), message,
+// restored (the bodies whose definition kept was put back), draw (body -> its
+// drawing by hand, see "drawing by hand"; mode "draw"), drawBody (the body
+// drawn on)}.
 const partings = new WeakMap();
 
 function partingOf(r = state.result) {
   if (!r) return null;
   let p = partings.get(r);
   if (!p) {
-    p = { results: null, computing: new Map(), error: null, current: new Map(), geom: new Map(), evaluated: new Map(), show: false, mode: null, busy: 0, seq: 0, message: null, restored: new Set(), draw: new Map(), drawBody: -1 };
+    p = { results: null, computing: new Map(), failed: new Map(), current: new Map(), geom: new Map(), evaluated: new Map(), show: false, mode: null, busy: 0, seq: 0, message: null, restored: new Set(), draw: new Map(), drawBody: -1 };
     partings.set(r, p);
   }
   return p;
@@ -2453,12 +2514,12 @@ function computePartings(r) {
   const p = partingOf(r);
   if (r !== state.result) return null;
   p.results ??= r.bodies.map(() => null);
-  const want = missingBodies(r.bodies, includedIndices(), p.results, p.computing);
+  // (A body whose proposal failed: not again until Retry, nor with the others.)
+  const want = missingBodies(r.bodies, includedIndices(), p.results, p.computing, p.failed);
   if (!want.length) return null;
   const bodies = r.bodies.map((b, i) => (want.includes(i) ? bodyArrays(i) : null));
   const job = { percent: 0, promise: null };
   for (const i of want) p.computing.set(i, job);
-  p.error = null;
   return (job.promise = partClient()
     .then((client) => proposeOriented(client, r, bodies, {
       onProgress: ({ percent }) => {
@@ -2466,11 +2527,16 @@ function computePartings(r) {
         if (r === state.result) renderParting();
       },
     }).then((results) => {
-      for (const i of want) if (results.bodies[i]) p.results[i] = results.bodies[i];
+      // Each body its proposal, or why it has none (that body alone).
+      for (const i of want) {
+        const res = results.bodies[i];
+        if (res?.error) p.failed.set(i, res.error);
+        else if (res) p.results[i] = res;
+      }
       savePartings(client, r, results.version);
     }))
     .catch((err) => {
-      if (!err.cancelled) p.error = err.message || String(err);
+      if (!err.cancelled) for (const i of want) p.failed.set(i, err.message || String(err));
     })
     .finally(() => {
       for (const i of want) if (p.computing.get(i) === job) p.computing.delete(i);
@@ -3158,15 +3224,16 @@ function renderParting() {
   if (i < 0) status = t(state.included.size ? "parting.none" : "scope.none");
   else if (!r.bodies[i].closed) status = t("parting.open");
   else if (job) status = t("parting.computing", { percent: job.percent != null ? `${job.percent} %` : "" });
-  else if (p.error) status = t("parting.error", { message: tMessage(p.error) });
+  // Its own proposal failed (another body's says nothing here).
+  else if (p.failed.has(i)) status = t("parting.error", { message: tMessage(p.failed.get(i)) });
   // Checked a moment ago: proposed by the update of the bodies analysed.
   else if (!p.results?.[i]) status = t("scope.updatingCard");
   else if (p.busy) status = t("parting.busy");
   else if (r.bodies[i].closed && orientOf(r).proposing.has(i)) status = t("parting.reproposing");
   $("parting-status").hidden = !status;
   $("parting-status").textContent = status;
-  card.dataset.updating = i >= 0 && r.bodies[i].closed && !p.results?.[i] && !p.error ? "1" : ""; // for scripts and tests
-  $("parting-retry").hidden = !(p.error && !p.computing.size);
+  card.dataset.updating = i >= 0 && r.bodies[i].closed && !p.results?.[i] && !p.failed.has(i) ? "1" : ""; // for scripts and tests
+  $("parting-retry").hidden = !(i >= 0 && p.failed.has(i) && !job);
   $("parting-show").checked = p.show && !!field;
   $("parting-show").disabled = !field;
   $("parting-blocks").disabled = !field;
@@ -3241,7 +3308,8 @@ $("parting-blocks").addEventListener("change", () => {
 $("parting-retry").addEventListener("click", () => {
   const p = partingOf();
   if (!p) return;
-  p.error = null;
+  // Every body whose proposal failed, asked for again (those checked; the others when checked).
+  p.failed.clear();
   computePartings(state.result);
   renderParting();
 });
@@ -5788,7 +5856,7 @@ function slidesRequest(i, r = state.result) {
   e.pending = run;
   e.percent = null;
   const draftDeg = field.summary?.draft_angle_deg ?? partingOf(r).results[i]?.proposal?.draft_angle_deg ?? 1;
-  slideClient()
+  trackJob(r, slideClient()
     .then((client) => client.computeSlides(
       // The body prepared kept by the worker under the content of the file, else under this result only.
       { positions, indices, bodyKey: `${r.cacheKey ?? slidesResultId(r)}|${i}|${indices.length / 3}` },
@@ -5811,7 +5879,7 @@ function slidesRequest(i, r = state.result) {
         return;
       }
       slidesArrived(r, i, run, null, err.message || String(err));
-    });
+    }));
 }
 
 const slidesResults = new WeakMap(); // result -> its id for the worker's cache, without a key of its content
@@ -6002,8 +6070,12 @@ function slidesBrief(i) {
   const r = state.result;
   if (!r || !state.included.has(i)) return { status: "idle" };
   const field = partingField(i, r);
-  // Its proposal being computed, or to be by the update of the bodies analysed.
-  if (!field) return { status: r.bodies[i]?.closed && !partingOf(r)?.results?.[i] ? "computing" : "none" };
+  if (!field) {
+    const p = partingOf(r);
+    // Its proposal failed: why; being computed, or about to be by the update of the bodies analysed; else none.
+    if (p.failed.has(i)) return { status: "error", message: p.failed.get(i) };
+    return { status: r.bodies[i]?.closed && (p.computing.has(i) || scopeBusy(r)) ? "computing" : "none" };
+  }
   const e = slidesReady(i, r);
   if (e) {
     const v = e.view;
@@ -6425,7 +6497,8 @@ const feedClient = () => (feedClient.module ??= import("./engine/feedclient.js")
 
 // Per result: {results (per body {zones, body, zone, sphere, …}, or null:
 // open, or not computed yet: a body not checked), computing (body ->
-// {percent} of the job finding its zones), error, manual (body -> {risers:
+// {percent} of the job finding its zones), failed (body -> why its zones
+// were not found: not asked again until Retry), manual (body -> {risers:
 // [...] or null (the proposal's), gate: {...} or null (the proposal's)}),
 // placed (body -> the placement for a parting: {key, placement, error}),
 // placing (body -> the parting key being placed in the worker), queued (body
@@ -6439,7 +6512,7 @@ function feedingOf(r = state.result) {
   if (!r) return null;
   let f = feedings.get(r);
   if (!f) {
-    f = { results: null, computing: new Map(), error: null, manual: new Map(), placed: new Map(), placing: new Map(), queued: new Map(), outward: new Map(), show: false, mode: null, selected: null, body: -1, message: null, restored: new Set() };
+    f = { results: null, computing: new Map(), failed: new Map(), manual: new Map(), placed: new Map(), placing: new Map(), queued: new Map(), outward: new Map(), show: false, mode: null, selected: null, body: -1, message: null, restored: new Set() };
     feedings.set(r, f);
   }
   return f;
@@ -6518,10 +6591,10 @@ function placeQueued(r) {
       });
       if (r === state.result) refreshFeeding();
     };
-    feedClient()
+    trackJob(r, feedClient()
       .then((client) => client.placeFeedings(bodies))
       .then((placements) => done((n) => ({ placement: placements[n], error: null })))
-      .catch((err) => done(() => ({ placement: null, error: err.message || String(err) })));
+      .catch((err) => done(() => ({ placement: null, error: err.message || String(err) }))));
   }
 }
 
@@ -6630,7 +6703,7 @@ function computeFeedings(r) {
   const f = feedingOf(r);
   if (r !== state.result) return null;
   f.results ??= r.bodies.map(() => null);
-  const want = missingBodies(r.bodies, includedIndices(), f.results, f.computing);
+  const want = missingBodies(r.bodies, includedIndices(), f.results, f.computing, f.failed);
   if (!want.length) return null;
   // The inscribed spheres of the wall thickness when computed now (the same values, on every
   // core); not those kept from an earlier opening, maybe by an older engine.
@@ -6638,7 +6711,6 @@ function computeFeedings(r) {
   const bodies = r.bodies.map((b, i) => (want.includes(i) ? { ...bodyArrays(i), sphere: sphereOf(i) } : null));
   const job = { percent: 0, promise: null };
   for (const i of want) f.computing.set(i, job);
-  f.error = null;
   return (job.promise = feedClient()
     .then((client) => client.computeFeeding(bodies, {
       onProgress: ({ percent }) => {
@@ -6646,11 +6718,16 @@ function computeFeedings(r) {
         if (r === state.result) renderFeeding();
       },
     }).then((results) => {
-      for (const i of want) if (results.bodies[i]) f.results[i] = results.bodies[i];
+      // Each body its zones, or why it has none (that body alone).
+      for (const i of want) {
+        const res = results.bodies[i];
+        if (res?.error) f.failed.set(i, res.error);
+        else if (res) f.results[i] = res;
+      }
       client.saveFeeding(r.cacheKey, { ...results, bodies: f.results });
     }))
     .catch((err) => {
-      f.error = err.message || String(err);
+      for (const i of want) f.failed.set(i, err.message || String(err));
     })
     .finally(() => {
       for (const i of want) if (f.computing.get(i) === job) f.computing.delete(i);
@@ -6963,7 +7040,8 @@ function renderFeeding() {
   if (i < 0) status = t(state.included.size ? "feeding.none" : "scope.none");
   else if (!r.bodies[i].closed) status = t("feeding.open");
   else if (job) status = t("feeding.computing", { percent: job.percent != null ? `${job.percent} %` : "" });
-  else if (f.error) status = t("feeding.error", { message: tMessage(f.error) });
+  // Its own zones not found (another body's says nothing here).
+  else if (f.failed.has(i)) status = t("feeding.error", { message: tMessage(f.failed.get(i)) });
   else if (p?.computing.has(i)) status = t("feeding.waitParting");
   // Checked a moment ago: its zones found and its risers placed by the update of the bodies analysed.
   else if (!f.results?.[i] || (scopeWaiting(r) && !field)) status = t("scope.updatingCard");
@@ -6974,8 +7052,8 @@ function renderFeeding() {
   }
   $("feeding-status").hidden = !status;
   $("feeding-status").textContent = status;
-  card.dataset.updating = i >= 0 && r.bodies[i].closed && !f.results?.[i] && !f.error ? "1" : ""; // for scripts and tests
-  $("feeding-retry").hidden = !((f.error && !f.computing.size) || (i >= 0 && f.placed.get(i)?.error));
+  card.dataset.updating = i >= 0 && r.bodies[i].closed && !f.results?.[i] && !f.failed.has(i) ? "1" : ""; // for scripts and tests
+  $("feeding-retry").hidden = !(i >= 0 && ((f.failed.has(i) && !job) || f.placed.get(i)?.error));
   $("feeding-show").checked = f.show && !!field;
   $("feeding-show").disabled = !field;
   $("feeding-main").hidden = !field;
@@ -7100,8 +7178,8 @@ $("feeding-show").addEventListener("change", (e) => {
 $("feeding-retry").addEventListener("click", () => {
   const f = feedingOf();
   if (!f) return;
-  f.error = null;
-  // The placements that failed, asked for again.
+  // Every body whose zones were not found, asked for again (those checked; the others when checked), and the placements that failed.
+  f.failed.clear();
   for (const [i, placed] of f.placed) if (placed.error) f.placed.delete(i);
   computeFeedings(state.result);
   refreshFeeding();
@@ -7382,7 +7460,7 @@ function reproposeStale(r, flip = []) {
   const wanted = new Map();
   const bodies = r.bodies.map((b, i) => {
     const res = p.results[i];
-    if (!b.closed || !res || !state.included.has(i) || p.computing.has(i)) return null;
+    if (!b.closed || !res || !state.included.has(i) || p.computing.has(i) || p.failed.has(i)) return null;
     const { key } = partingOptions(i, r);
     const want = `${key}|${thicknessOf(i, r) ? "t" : ""}`;
     if ((res.proposal.options_key === key && !flip.includes(i)) || o.proposing.get(i) === want || o.failed.get(i) === want) return null;
@@ -7396,7 +7474,11 @@ function reproposeStale(r, flip = []) {
       for (const [i, want] of wanted) {
         if (o.proposing.get(i) !== want || !results.bodies[i]) continue; // asked for again since, for other options
         o.proposing.delete(i);
-        p.results[i] = results.bodies[i];
+        // That body alone not proposed again: its proposal before kept, said on its card.
+        if (results.bodies[i].error) {
+          o.failed.set(i, want);
+          p.failed.set(i, results.bodies[i].error);
+        } else p.results[i] = results.bodies[i];
       }
       savePartings(client, r, results.version);
     }))
@@ -7404,9 +7486,10 @@ function reproposeStale(r, flip = []) {
       for (const [i, want] of wanted) {
         if (o.proposing.get(i) !== want) continue;
         o.proposing.delete(i);
-        if (!err.cancelled) o.failed.set(i, want);
+        if (err.cancelled) continue;
+        o.failed.set(i, want);
+        p.failed.set(i, err.message || String(err));
       }
-      if (!err.cancelled) p.error = err.message || String(err);
     })
     .finally(() => orientChanged(r));
 }
@@ -7553,7 +7636,7 @@ function orientJob(i, field, opts, thickness, r) {
   if (job || r !== state.result || scopeWaiting(r)) return job ?? { orientation: null, error: null };
   job = { orientation: null, error: null };
   jobs.set(key, job);
-  partClient()
+  trackJob(r, partClient()
     .then((client) => client.orientDirection({ ...bodyArrays(i), thickness }, field.direction, { owner: r, process: opts.process, die: opts.die }))
     .then(({ orientation }) => {
       job.orientation = orientation;
@@ -7563,7 +7646,7 @@ function orientJob(i, field, opts, thickness, r) {
       if (err.cancelled) jobs.delete(key);
       else job.error = err.message || String(err);
     })
-    .finally(() => orientChanged(r));
+    .finally(() => orientChanged(r)));
   return job;
 }
 
@@ -8040,7 +8123,7 @@ let activeTab = null;
 let nextTabId = 1;
 let defaultMaterial = null; // material of a new tab: the one of the page at start
 // The wall thickness state of a tab (see `thick`), put aside with its model.
-const TAB_THICK = ["results", "asked", "markCache", "minOverride", "pending", "value", "tol", "max", "userMax", "spots"];
+const TAB_THICK = ["results", "asked", "failed", "markCache", "minOverride", "pending", "value", "tol", "max", "userMax", "spots"];
 
 function createTab() {
   const tab = { id: nextTabId++, file: null, handle: null, result: null, view: null, material: null, seq: 0, loading: null, progress: null, serverRequest: null };
@@ -8135,6 +8218,9 @@ function showTab(tab) {
     restoreFeeding();
     renderFeeding();
     applyFeeding();
+    // The thickness of bodies checked asked for, its computation left while the tab was hidden (an update waiting for
+    // another one): taken up again by an update of its bodies.
+    if (thick.asked && !thick.failed && !thick.pending && thickMissing().length) startScope();
   } else if (tab.result) {
     showModel(tab.result);
   } else {
@@ -8150,7 +8236,8 @@ function showTab(tab) {
   }
   renderLoading();
   setStatus(tab.loading && !tab.result ? "analysing" : tab.result ? "done" : "idle");
-  if (tab.result) updatePublished(tab.result);
+  // Told even while its bodies are being updated: the pages that follow the tab shown (costing, IA) must know it.
+  if (tab.result) updatePublished(tab.result, { force: true });
   else {
     $("reader3d-result").textContent = "null";
     publishSemantic();
@@ -8490,12 +8577,18 @@ function publishResult(r) {
   else if (format === "csv") exportCsv().catch((err) => showError(err.message));
 }
 
-/** The machine-readable result in the page (and the text report), kept up to date. */
-function updatePublished(r) {
-  // First: a listener of the event that asks for the contract gets the new one.
-  publishSemantic();
-  document.dispatchEvent(new CustomEvent("reader3d-part"));
+/**
+ * The machine-readable result in the page (and the text report), kept up to
+ * date, then told ("reader3d-part"). While the bodies analysed of r are being
+ * updated, nothing: their update publishes once it is done (scopeUpdate),
+ * never the figures of a part of them. `force`: all the same (another tab
+ * shown: the pages that follow it must know it), said to be updating.
+ */
+function updatePublished(r, { force = false } = {}) {
+  const updating = scopeBusy(r);
+  if (updating && !force) return;
   const data = exportableResult(r);
+  if (updating) data.updating = true; // the bodies just checked still computed: the figures follow
   // "<" escaped so that a part name cannot close the script element.
   $("reader3d-result").textContent = JSON.stringify(data).replace(/</g, "\\u003c");
   if (params.get("report")) {
@@ -8508,6 +8601,9 @@ function updatePublished(r) {
     }
     pre.textContent = plainReport(data);
   }
+  // Then told: a listener of the event reads the result written, and the contract of now when it asks for it.
+  publishSemantic();
+  document.dispatchEvent(new CustomEvent("reader3d-part"));
 }
 
 // The semantic contract (engine/semantic.js) of the result shown, for the IA
@@ -8720,7 +8816,7 @@ window.reader3d = {
   },
   /** Compute the wall thickness of the closed bodies checked of the part shown (with progress), then return part(). */
   async computeThickness() {
-    flushScope();
+    flushScope(); // the update of the bodies just checked started (it computes their thickness along with the rest when asked for)
     if (state.result?.bodies.some((b, i) => b.closed && state.included.has(i))) await ensureThickness();
     return partFeatures();
   },
@@ -8751,7 +8847,7 @@ function partFeatures() {
     scope: scopeInfo(r.bodies, indices),
     updating: scopeBusy(r),
     // Their thickness being computed (asked for already): the costing waits for it rather than offer to compute it.
-    thicknessUpdating: thickMissing(indices).length > 0 && (!!thick.pending || (thick.asked && scopeBusy(r))),
+    thicknessUpdating: thickMissing(indices).length > 0 && (!!thick.pending || (thick.asked && !thick.failed && scopeBusy(r))),
     volume: s.volume,
     area: s.area,
     bboxSize: s.bbox.size,
