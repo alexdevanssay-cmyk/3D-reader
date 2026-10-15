@@ -135,6 +135,15 @@
           <button id="draw-done" type="button"><span class="draw-icon" aria-hidden="true">✓</span><span class="draw-label" data-i18n="parting.draw.done">Done</span></button>
         </div>
       </div>
+      <!-- The view triad: the axes X, Y, Z of the part as the camera turns them, at the bottom left (app.js drawTriad). Decorative. -->
+      <div id="view-triad" class="view-triad" aria-hidden="true" hidden>
+        <svg viewBox="-48 -48 96 96" focusable="false">
+          <circle class="triad-disc" r="46"/>
+          <g class="triad-axis" data-axis="x"><line x1="0" y1="0" x2="0" y2="0"/><polygon points="0,0"/><g class="triad-end"><circle r="5"/><path/></g><text>X</text></g>
+          <g class="triad-axis" data-axis="y"><line x1="0" y1="0" x2="0" y2="0"/><polygon points="0,0"/><g class="triad-end"><circle r="5"/><path/></g><text>Y</text></g>
+          <g class="triad-axis" data-axis="z"><line x1="0" y1="0" x2="0" y2="0"/><polygon points="0,0"/><g class="triad-end"><circle r="5"/><path/></g><text>Z</text></g>
+        </svg>
+      </div>
       <div id="drop-hint" class="drop-hint">
         <div class="drop-card">
           <h2 data-i18n="drop.title">Drop a 3D file here</h2>

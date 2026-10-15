@@ -210,7 +210,11 @@ hand" of `web/app.js`:
 - Viewer: orbit, pan, zoom, standard views, wireframe, envelope display, section plane
   (the solids it cuts, bodies, risers and ingate, are closed: the cut shows as a solid
   face, a body's darker than its own colour; open bodies, meshes whose triangles had to be
-  turned round or held duplicates, and the mould halves stay open).
+  turned round or held duplicates, and the mould halves stay open). A view triad in the
+  bottom left corner of the view, always in sight over the part and its section: the axes
+  X (red), Y (green) and Z (blue) of the part turned as the camera turns, an axis seen
+  end-on marked ⊙ towards the viewer or ⊗ away, as on a drawing (above the actions of the
+  drawing by hand while they are shown).
 - Side panel of the 3D view, condensed at will: each card folds to its title (its chevron,
   a click on the title, or « Tout replier / Tout déplier »), its head's controls still at
   hand and its key value (volume, mass, thinnest wall) beside the title; the panel's width

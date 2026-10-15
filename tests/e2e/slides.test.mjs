@@ -90,11 +90,11 @@ const twoBlocks = () => voxelsObj([['a', slotted], ['b', slotted, [100, 0, 0]]],
 
 /**
  * Pixels of the 3D view by colour (parting.test.mjs), and teal (the second
- * slide's colour, #00a6b8, shaded).
+ * slide's colour, #00a6b8, shaded). The view triad masked.
  */
 async function viewColours(page) {
   await page.waitForTimeout(300); // a frame drawn
-  const png = await page.locator('#viewport canvas').screenshot();
+  const png = await page.locator('#viewport canvas').screenshot({ mask: [page.locator('#view-triad')] });
   return page.evaluate(async (b64) => {
     const img = new Image();
     img.src = `data:image/png;base64,${b64}`;
