@@ -28,11 +28,32 @@ https://alexdevanssay-cmyk.github.io/3D-reader/
 - Surface area, centre of mass, and **mass** from a material density (preset list or custom).
 - **Several bodies** in a file: only the largest one (the largest volume; the largest envelope
   when none has a volume) is checked and shown at first, the others unchecked and hidden, as a
-  note of the *Bodies* card says. Checking them (or *all*) includes them in the volume, the
-  exports, the costing, the wall thickness, the semantic contract and the IA page, as for
-  any body checked; each tab keeps its own choice. The link modes for scripts (`report=1`,
-  `export=…`) keep every body; `?bodies=all` checks every body at first, `?bodies=largest`
-  the largest one alone in those modes too.
+  note of the *Bodies* card says. **The analysis covers the bodies checked, and only them**:
+  the volume, the mass, the area, the envelopes and the centre of mass, the wall thickness
+  (its figures, histogram and scale), the parting line, the orientation and die blank, the
+  slides and the risers (their card shows the body selected in the list when it is checked,
+  else the largest closed body checked: never a body left out), the exports, the part given
+  to the costing (`reader3d.part()`: the figures of the bodies checked; the other bodies
+  listed, to be chosen there, without any result of the analysis), the semantic contract,
+  the AI context and the IA page, the report and `reader3d.analyze()`. The cards say which
+  bodies they cover (*Analyse sur 1 corps sur 3 (corps cochés)*); the results say it too
+  (`scope`: `{mode: "all" | "checked" | "none", bodies, bodies_in_file, indices}`, also in
+  the semantic contract and the AI context). With no body checked the page says so and shows
+  no figure (an export is refused, the results are empty). When the bodies checked change,
+  what is known of them shows at once, and what was already asked for is completed for the
+  bodies newly checked by itself a moment after the last click (300 ms: a burst of clicks
+  starts one update): the wall thickness once launched (computed for those bodies only; never
+  launched, it stays a button, which computes the bodies checked only), the parting proposal
+  and the feeding zones of each body checked, then the slides, the orientation and the risers
+  of the card's body. Meanwhile the cards concerned say *Mise à jour…* rather than show the
+  figures of the bodies before; the costing page and the published results get the new part
+  once the update is done (`reader3d.scope.updating` false, event `reader3d-part`). The
+  results of each body are kept, in memory and with the results of the file in this browser
+  and the shared folder (one record per file, a value per body): a body unchecked then
+  checked again is not computed again, a body unchecked while it is computed keeps its
+  results without showing them. Each tab keeps its own choice. The link modes for scripts
+  (`report=1`, `export=…`) check every body; `?bodies=all` checks every body at first,
+  `?bodies=largest` the largest one alone in those modes too.
 - **Wall thickness** for casting design ("épaisseur de toile"), button *Thickness*: colour
   scale of the thickness (switchable), histogram of the surface per thickness over a
   graduated scale, and a cursor that highlights the zones of one thickness (± a tolerance).
@@ -228,7 +249,9 @@ hand" of `web/app.js`:
   make the browser stop the page; the CAD engine gives its memory back after a large file.
 - **AI assistants and scripts** can use the online reader by link
   (`?url=<model URL>&report=1`, every body of the file), through `window.reader3d.analyze()`
-  in the page (the bodies checked: add `?bodies=all` to the page's address for every body), or
+  in the page (the bodies checked, the largest one alone by default, said by the `scope` of
+  its results: add `?bodies=all` to the page's address for every body; `reader3d.scope` and
+  `reader3d.setSelection(indices)` read and change them), or
   with the Python package: see [web/ai.html](web/ai.html) (published at `/ai.html`).
 - Units: everything is reported in mm / mm² / mm³ (switchable to cm³, dm³, m³, in³).
   CAD files are converted from their own unit automatically. Mesh files have no unit,

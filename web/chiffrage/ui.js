@@ -1428,8 +1428,10 @@ function renderQuote() {
   const months = indices?.months ?? [];
   const ensemble = c.selected === "ensemble";
   const r = ensemble ? null : c.results.find((x) => x.piece.key === c.selected);
+  // The thickness of the bodies just checked being computed on the 3D page (asked for there already): said, not offered.
+  const thicknessComputing = thicknessBusy || !!c.p3d?.thicknessUpdating;
   const thicknessButton = c.p3d && !c.p3d.thickness
-    ? ` <button type="button" class="small" data-action="thickness"${thicknessBusy ? " disabled" : ""}>${thicknessBusy ? "Calcul…" : "Calculer les épaisseurs"}</button>`
+    ? ` <button type="button" class="small" data-action="thickness"${thicknessComputing ? " disabled" : ""}>${thicknessComputing ? "Calcul…" : "Calculer les épaisseurs"}</button>`
     : "";
   const pieceSelect = c.allPieces.length > 1
     ? field("Pièce chiffrée", select("q.piece", c.selected === "ensemble" && c.pieces.length === c.allPieces.length ? "tout" : c.selected ?? "", [

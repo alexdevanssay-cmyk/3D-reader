@@ -175,6 +175,8 @@
         </div>
         <div class="big" id="total-volume">—</div>
         <div class="method" id="method"></div>
+        <!-- Which bodies the figures cover: those checked in the list (app.js scopeText). -->
+        <p class="muted small" id="summary-scope" hidden></p>
 
         <dl class="stats">
           <dt data-i18n="summary.area">Surface area</dt><dd id="total-area">—</dd>
@@ -224,6 +226,8 @@
             </select>
           </label>
         </div>
+        <p class="muted small" id="thick-scope" hidden></p>
+        <p class="small" id="thick-status" hidden></p>
         <button id="thick-compute" class="small" type="button" data-i18n="thick.compute">Analyse the thicknesses</button>
         <div id="thick-body" hidden>
           <div class="thick-min">
@@ -279,7 +283,7 @@
         <div id="body-detail" class="body-detail" hidden></div>
       </section>
 
-      <!-- Draw direction and parting line of the body selected (else the largest closed one). -->
+      <!-- Draw direction and parting line of the body selected when it is checked (else the largest closed one checked). -->
       <section class="card" id="parting-card" hidden>
         <div class="card-head">
           <h3 data-i18n="parting.title">Parting line</h3>
